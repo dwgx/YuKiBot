@@ -217,7 +217,7 @@ class YukikoEngine:
         memory_context = self.memory.get_recent_texts(message.conversation_id, limit=12) if allow_memory else []
         recent_messages = self.memory.get_recent_messages(message.conversation_id, limit=20) if allow_memory else []
         related_memories = (
-            self.memory.search_related(message.conversation_id, text) if allow_memory else []
+            self.memory.search_related(message.conversation_id, text, roles=("user",)) if allow_memory else []
         )
 
         decision = await self.thinking.decide(

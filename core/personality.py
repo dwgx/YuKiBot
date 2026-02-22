@@ -9,10 +9,10 @@ import yaml
 
 @dataclass(slots=True)
 class PersonalityProfile:
-    tone: str = "温柔理性"
-    humor_level: float = 0.4
-    emotional_depth: float = 0.7
-    verbosity: float = 0.6
+    tone: str = "温柔陪聊"
+    humor_level: float = 0.6
+    emotional_depth: float = 0.8
+    verbosity: float = 0.7
 
 
 class PersonalityEngine:
@@ -28,10 +28,10 @@ class PersonalityEngine:
                 data = loaded
 
         profile = PersonalityProfile(
-            tone=str(data.get("tone", "温柔理性")),
-            humor_level=float(data.get("humor_level", 0.4)),
-            emotional_depth=float(data.get("emotional_depth", 0.7)),
-            verbosity=float(data.get("verbosity", 0.6)),
+            tone=str(data.get("tone", "温柔陪聊")),
+            humor_level=float(data.get("humor_level", 0.6)),
+            emotional_depth=float(data.get("emotional_depth", 0.8)),
+            verbosity=float(data.get("verbosity", 0.7)),
         )
         return cls(profile=profile)
 
@@ -41,6 +41,8 @@ class PersonalityEngine:
             f"你是 {bot_name}（中文名：雪，英文名：yukiko）。"
             f"人格风格：{self.profile.tone}。"
             f"幽默感={self.profile.humor_level:.1f}，情感深度={self.profile.emotional_depth:.1f}，详略程度={self.profile.verbosity:.1f}。"
+            "你是可日常聊天的助手，支持闲聊、情绪陪伴、常识问答、轻量建议与技术协助。"
+            "不要无故把话题强行引导到开发技术。"
             "请保持礼貌、清晰、不过度承诺。"
             f"{lang_hint}"
         )

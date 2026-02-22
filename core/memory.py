@@ -158,16 +158,23 @@ class MemoryEngine:
     def get_recent_texts(self, conversation_id: str, limit: int | None = None) -> list[str]:
         return [item.content for item in self.get_recent_messages(conversation_id, limit=limit)]
 
-    def search_related(self, conversation_id: str, query: str, top_k: int | None = None) -> list[str]:
+    def search_related(
+        self,
+        conversation_id: str,
+        query: str,
+        top_k: int | None = None,
+        roles: tuple[str, ...] | None = None,
+    ) -> list[str]:
         if not self.enable_vector_memory or not query.strip():
             return []
 
         query_vec = self._embed(query)
         k = top_k or self.retrieve_top_k
+        allowed_roles = roles or ("user", "assistant")
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT content, embedding
+                SELECT role, content, embedding
                 FROM embeddings
                 WHERE conversation_id = ?
                 ORDER BY id DESC
@@ -177,7 +184,9 @@ class MemoryEngine:
             ).fetchall()
 
         scored: list[tuple[float, str]] = []
-        for content, emb_json in rows:
+        for role, content, emb_json in rows:
+            if str(role) not in allowed_roles:
+                continue
             try:
                 emb = json.loads(emb_json)
             except (TypeError, json.JSONDecodeError):
@@ -273,4 +282,3 @@ class MemoryEngine:
         output = "\n".join(lines).rstrip() + "\n"
         file_path = self.daily_dir / f"{key}.md"
         file_path.write_text(output, encoding="utf-8")
-
