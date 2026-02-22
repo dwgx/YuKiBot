@@ -1,0 +1,5 @@
+nonebot2[fastapi]
+nonebot-adapter-onebot
+httpx>=0.27.0
+PyYAML>=6.0.2
+python-dotenv>=1.0.1
