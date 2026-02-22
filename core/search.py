@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+from html import unescape
 from dataclasses import dataclass
 from typing import Any
 
@@ -64,6 +66,14 @@ class SearchEngine:
             if len(results) >= self.max_results:
                 break
 
+        # 对“域名类查询”做兜底：若通用搜索无结果，直接抓取官网首页标题与简介
+        if not results:
+            domain = self._extract_domain(query)
+            if domain:
+                website_result = await self._fetch_website_overview(domain)
+                if website_result:
+                    results.append(website_result)
+
         return results[: self.max_results]
 
     @staticmethod
@@ -76,3 +86,49 @@ class SearchEngine:
             lines.append(f"   摘要：{item.snippet}")
             lines.append(f"   链接：{item.url}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _extract_domain(text: str) -> str:
+        match = re.search(r"(?:https?://)?((?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,})", text or "")
+        if not match:
+            return ""
+        return match.group(1).lower()
+
+    async def _fetch_website_overview(self, domain: str) -> SearchResult | None:
+        urls = [f"https://{domain}", f"http://{domain}"]
+        for url in urls:
+            try:
+                async with httpx.AsyncClient(timeout=self.timeout_seconds, follow_redirects=True) as client:
+                    response = await client.get(url)
+                response.raise_for_status()
+                html = response.text or ""
+                title = self._extract_html_title(html) or domain
+                description = self._extract_meta_description(html)
+                snippet = description or f"已访问 {domain} 首页，未提取到简介。"
+                return SearchResult(title=title, snippet=snippet, url=str(response.url))
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _extract_html_title(html: str) -> str:
+        match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        title = unescape(match.group(1))
+        return re.sub(r"\s+", " ", title).strip()[:120]
+
+    @staticmethod
+    def _extract_meta_description(html: str) -> str:
+        patterns = (
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+name=["\']description["\']',
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\'](.*?)["\']',
+            r'<meta[^>]+content=["\'](.*?)["\'][^>]+property=["\']og:description["\']',
+        )
+        for pattern in patterns:
+            match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+            if match:
+                content = unescape(match.group(1))
+                return re.sub(r"\s+", " ", content).strip()[:220]
+        return ""

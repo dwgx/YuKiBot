@@ -80,10 +80,36 @@ class ThinkingEngine:
                     prompt=text,
                 )
 
+        # 遇到域名时优先走联网搜索
+        domain_match = re.search(r"(https?://)?(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}", text)
+        if self.allow_search and domain_match:
+            return ThinkingDecision(
+                action="search",
+                reason="domain_query",
+                reply_style="serious",
+                query=text,
+            )
+
         search_cues = (
             "搜索",
             "查一下",
             "搜一下",
+            "搜一搜",
+            "查下",
+            "查查",
+            "上网搜",
+            "网上搜",
+            "去网上搜",
+            "去搜索",
+            "帮我搜",
+            "你去搜索",
+            "你去搜",
+            "你搜",
+            "搜就完事了",
+            "然后呢",
+            "结果呢",
+            "搜完了吗",
+            "继续搜",
             "最新",
             "新闻",
             "资料",

@@ -20,7 +20,7 @@ from core.thinking import ThinkingEngine, ThinkingInput
 from core.trigger import TriggerEngine, TriggerInput
 from services.logger import get_logger
 from services.skiapi import SkiAPIClient
-from utils.text import normalize_text
+from utils.text import clip_text, normalize_text
 
 
 @dataclass(slots=True)
@@ -184,6 +184,13 @@ class YukikoEngine:
             )
 
         if not trigger_result.should_handle:
+            self.logger.info(
+                "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
+                message.conversation_id,
+                message.user_id,
+                trigger_result.reason,
+                clip_text(text, 80),
+            )
             return EngineResponse(action="ignore", reason=trigger_result.reason)
 
         plugin = self.plugins.match(text)
@@ -208,6 +215,7 @@ class YukikoEngine:
                 self.logger.exception("插件执行失败：%s", exc)
 
         memory_context = self.memory.get_recent_texts(message.conversation_id, limit=12) if allow_memory else []
+        recent_messages = self.memory.get_recent_messages(message.conversation_id, limit=20) if allow_memory else []
         related_memories = (
             self.memory.search_related(message.conversation_id, text) if allow_memory else []
         )
@@ -231,7 +239,11 @@ class YukikoEngine:
         search_summary = ""
 
         if decision.action == "search":
-            query = decision.query.strip() or text
+            query = self._resolve_search_query(
+                raw_query=decision.query.strip() or text,
+                current_text=text,
+                recent_messages=recent_messages,
+            )
             try:
                 results = await self.search.search(query)
                 search_summary = self.search.format_results(query, results)
@@ -268,8 +280,71 @@ class YukikoEngine:
         if not rendered and not image_url:
             return EngineResponse(action="ignore", reason="empty_reply")
 
+        self.logger.info(
+            "消息已处理 | 会话=%s | 用户=%s | 动作=%s | 原因=%s | 回复长度=%d",
+            message.conversation_id,
+            message.user_id,
+            decision.action,
+            reason,
+            len(rendered),
+        )
         await self._after_reply(message, rendered)
         return EngineResponse(action=decision.action, reason=reason, reply_text=rendered, image_url=image_url)
+
+    def _resolve_search_query(self, raw_query: str, current_text: str, recent_messages: list[Any]) -> str:
+        query = normalize_text(raw_query)
+        current = normalize_text(current_text)
+        if not query:
+            return current
+
+        generic_queries = {
+            "去网上搜",
+            "去搜索",
+            "你去搜索",
+            "你去搜",
+            "你搜",
+            "你搜就完事了",
+            "搜就完事了",
+            "搜一下",
+            "搜一搜",
+            "搜",
+            "查一下",
+            "查下",
+            "查查",
+            "查",
+            "然后呢",
+            "结果呢",
+            "继续",
+            "搜完了吗",
+            "还有吗",
+        }
+        domain_pattern = re.compile(r"(https?://)?(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}")
+
+        # 查询词本身已具体时，直接使用
+        if query not in generic_queries and len(query) > 4:
+            return query
+
+        # 优先回溯最近一条包含域名的用户消息
+        for item in reversed(recent_messages):
+            role = str(getattr(item, "role", ""))
+            content = normalize_text(str(getattr(item, "content", "")))
+            if role != "user" or not content or content == current:
+                continue
+            if domain_pattern.search(content):
+                return content
+
+        # 次优回溯最近一条较具体的用户消息
+        for item in reversed(recent_messages):
+            role = str(getattr(item, "role", ""))
+            content = normalize_text(str(getattr(item, "content", "")))
+            if role != "user" or not content or content == current:
+                continue
+            if content in generic_queries:
+                continue
+            if len(content) >= 6:
+                return content
+
+        return current
 
     async def _after_reply(self, message: EngineMessage, reply_text: str) -> None:
         self.trigger.activate_session(message.conversation_id, message.timestamp)
