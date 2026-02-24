@@ -23,6 +23,9 @@ storage/cache/
 storage/.secret_key
 storage/admin_state.json
 
+# 本地配置（含加密密钥，不应提交）
+config/config.yml
+
 # 编辑器与系统文件
 .vscode/
 .idea/

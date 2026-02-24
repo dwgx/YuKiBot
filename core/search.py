@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
+import logging
+import random
 import re
 import socket
 import time
@@ -11,6 +14,8 @@ from typing import Any
 from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import httpx
+
+_log = logging.getLogger("yukiko.search")
 
 
 @dataclass(slots=True)
@@ -31,6 +36,23 @@ class SearchImageResult:
 class SearchEngine:
     _CACHE_TTL = 300  # 5 分钟缓存
 
+    # ── UA 池：模拟不同版本的 Edge / Chrome，降低指纹识别风险 ──
+    _UA_POOL = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    ]
+
+    # ── Accept-Encoding 变体 ──
+    _ACCEPT_ENCODINGS = [
+        "gzip, deflate, br, zstd",
+        "gzip, deflate, br",
+        "gzip, deflate",
+    ]
+
     def __init__(self, config: dict[str, Any]):
         self.enabled = bool(config.get("enable", True))
         self.max_results = int(config.get("max_results", 5))
@@ -42,16 +64,44 @@ class SearchEngine:
         self.allow_private_network = bool(config.get("allow_private_network", False))
         self._searxng_base = str(config.get("searxng_base", "")).strip().rstrip("/")
         self.request_headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
+            "User-Agent": random.choice(self._UA_POOL),
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         self._cache: dict[str, tuple[float, list[SearchResult]]] = {}
         self._bili_cache: dict[str, tuple[float, list[SearchResult]]] = {}
         self._domain_safety_cache: dict[str, bool] = {}
+        self._req_count = 0  # 请求计数，用于 UA 轮换
+
+    def _make_headers(self, *, referer: str = "", extra: dict[str, str] | None = None) -> dict[str, str]:
+        """生成随机化请求头，每次请求指纹不同。"""
+        self._req_count += 1
+        # 每 3 次请求轮换 UA
+        ua = self._UA_POOL[self._req_count % len(self._UA_POOL)]
+        headers = {
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "Accept-Language": random.choice([
+                "zh-CN,zh;q=0.9,en;q=0.8",
+                "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                "zh-CN,zh;q=0.9",
+            ]),
+            "Accept-Encoding": random.choice(self._ACCEPT_ENCODINGS),
+            "Cache-Control": random.choice(["max-age=0", "no-cache"]),
+            "Sec-Ch-Ua": '"Microsoft Edge";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Upgrade-Insecure-Requests": "1",
+        }
+        if referer:
+            headers["Referer"] = referer
+            headers["Sec-Fetch-Site"] = "same-origin"
+        if extra:
+            headers.update(extra)
+        return headers
 
     async def search(self, query: str) -> list[SearchResult]:
         clean_query = query.strip()
@@ -66,9 +116,21 @@ class SearchEngine:
 
         results: list[SearchResult] = []
 
-        # SearXNG 优先（聚合多引擎，中文搜索质量最好）
+        # SearXNG 优先（聚合多引擎）
         if self._searxng_base:
             results.extend(await self._search_searxng(clean_query))
+
+        # Bing 网页爬虫（国际通用，中文也不错）
+        if len(results) < self.max_results:
+            results.extend(await self._search_bing_scrape(clean_query))
+
+        # 百度网页爬虫（中文搜索质量最好）
+        if len(results) < self.max_results:
+            results.extend(await self._search_baidu_scrape(clean_query))
+
+        # Google 网页爬虫（补充）
+        if len(results) < self.max_results:
+            results.extend(await self._search_google_scrape(clean_query))
 
         # DuckDuckGo instant API 补充
         if len(results) < self.max_results:
@@ -198,6 +260,383 @@ class SearchEngine:
             if len(items) >= limit:
                 break
         return items
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  自写爬虫引擎：Bing / 百度 / Google
+    #  反检测：UA 轮换 + Sec-CH 指纹 + 随机延迟 + 多层解析 + 自动重试
+    # ═══════════════════════════════════════════════════════════════════
+
+    async def _scrape_with_retry(
+        self, url: str, params: dict, headers: dict, *, max_retries: int = 2,
+    ) -> str:
+        """带重试和随机延迟的 HTTP GET，返回 HTML 文本。"""
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                # 指数退避 + 随机抖动
+                delay = (1.5 ** attempt) + random.uniform(0.3, 1.2)
+                _log.debug("scrape retry #%d after %.1fs", attempt, delay)
+                import asyncio
+                await asyncio.sleep(delay)
+                # 重试时换 UA
+                headers = dict(headers)
+                headers["User-Agent"] = random.choice(self._UA_POOL)
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout_seconds,
+                    follow_redirects=True,
+                    headers=headers,
+                    http2=True,  # HTTP/2 更像真实浏览器
+                ) as client:
+                    resp = await client.get(url, params=params)
+                    # 429 / 503 触发重试
+                    if resp.status_code in (429, 503) and attempt < max_retries:
+                        _log.debug("scrape %s returned %d, retrying", url, resp.status_code)
+                        continue
+                    resp.raise_for_status()
+                    return resp.text or ""
+            except httpx.HTTPStatusError:
+                if attempt < max_retries:
+                    continue
+                return ""
+            except Exception:
+                if attempt < max_retries:
+                    continue
+                return ""
+        return ""
+
+    async def _search_bing_scrape(self, query: str) -> list[SearchResult]:
+        """Bing 网页搜索爬虫 — 多层解析 + cn.bing.com 中文优化。"""
+        headers = self._make_headers(referer="https://cn.bing.com/")
+        # cn.bing.com 中文结果更好；ensearch=0 强制中文
+        html = await self._scrape_with_retry(
+            "https://cn.bing.com/search",
+            {"q": query, "ensearch": "0", "count": str(self.max_results + 5)},
+            headers,
+        )
+        if not html:
+            # 回退到国际版
+            headers = self._make_headers(referer="https://www.bing.com/")
+            html = await self._scrape_with_retry(
+                "https://www.bing.com/search",
+                {"q": query, "ensearch": "0"},
+                headers,
+            )
+        if not html:
+            return []
+
+        results: list[SearchResult] = []
+
+        # ── 策略 1：解析 <li class="b_algo"> 标准结果块 ──
+        blocks = re.findall(
+            r'<li\s+class="b_algo"[^>]*>([\s\S]*?)</li>',
+            html, flags=re.IGNORECASE,
+        )
+        for block in blocks:
+            link_match = re.search(
+                r'<h2[^>]*>\s*<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                block, flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not link_match:
+                continue
+            url = unescape(link_match.group(1)).strip()
+            title = self._clean_html_text(link_match.group(2))
+            if not url or not title:
+                continue
+
+            # 摘要：多种 class 模式
+            snippet = ""
+            for sp in (
+                r'<p\s+class="[^"]*b_lineclamp[^"]*"[^>]*>(.*?)</p>',
+                r'<div\s+class="[^"]*b_caption[^"]*"[^>]*>[\s\S]*?<p[^>]*>(.*?)</p>',
+                r'<p\b[^>]*>(.*?)</p>',
+                r'<span\s+class="[^"]*algoSlug[^"]*"[^>]*>(.*?)</span>',
+            ):
+                m = re.search(sp, block, flags=re.IGNORECASE | re.DOTALL)
+                if m:
+                    candidate = self._clean_html_text(m.group(1))
+                    if len(candidate) > 15:
+                        snippet = candidate
+                        break
+            if not snippet:
+                snippet = title
+
+            results.append(SearchResult(title=title[:120], snippet=snippet[:240], url=url))
+            if len(results) >= self.max_results:
+                return results
+
+        # ── 策略 2：从 JSON-LD 结构化数据中提取 ──
+        for ld_match in re.finditer(
+            r'<script[^>]+type="application/ld\+json"[^>]*>([\s\S]*?)</script>',
+            html, flags=re.IGNORECASE,
+        ):
+            try:
+                ld = json.loads(ld_match.group(1))
+                items = ld if isinstance(ld, list) else [ld]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url", "")).strip()
+                    name = str(item.get("name", "")).strip()
+                    desc = str(item.get("description", "")).strip()
+                    if url and name and not any(r.url == url for r in results):
+                        results.append(SearchResult(
+                            title=name[:120], snippet=(desc or name)[:240], url=url,
+                        ))
+                        if len(results) >= self.max_results:
+                            return results
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return results
+
+    async def _search_baidu_scrape(self, query: str) -> list[SearchResult]:
+        """百度网页搜索爬虫 — data-tools 真实 URL + 多层摘要提取。"""
+        # 生成伪 BAIDUID 避免被识别为同一爬虫
+        fake_baiduid = hashlib.md5(
+            f"{query}{time.monotonic()}{random.random()}".encode()
+        ).hexdigest()[:32].upper()
+
+        headers = self._make_headers(
+            referer="https://www.baidu.com/",
+            extra={"Cookie": f"BAIDUID={fake_baiduid}:FG=1; BIDUPSID={fake_baiduid}"},
+        )
+
+        html = await self._scrape_with_retry(
+            "https://www.baidu.com/s",
+            {
+                "wd": query,
+                "rn": str(self.max_results + 8),
+                "ie": "utf-8",
+                "tn": "baidu",  # 标准搜索模板
+                "usm": "1",
+            },
+            headers,
+        )
+        if not html:
+            return []
+
+        results: list[SearchResult] = []
+
+        # ── 策略 1：解析 data-tools JSON 属性（包含真实 URL）──
+        # 百度结果块: <div ... data-tools='{"title":"...","url":"真实URL"}' ...>
+        for dt_match in re.finditer(
+            r"""data-tools='(\{[^']+\})'""",
+            html,
+        ):
+            try:
+                tools = json.loads(dt_match.group(1))
+                real_url = str(tools.get("url", "")).strip()
+                title = self._clean_html_text(str(tools.get("title", "")).strip())
+                if real_url and title and not any(r.url == real_url for r in results):
+                    # 从同一结果块中提取摘要
+                    # 找到包含此 data-tools 的最近 c-container
+                    pos = dt_match.start()
+                    snippet = self._extract_baidu_snippet_near(html, pos)
+                    results.append(SearchResult(
+                        title=title[:120],
+                        snippet=(snippet or title)[:240],
+                        url=real_url,
+                    ))
+                    if len(results) >= self.max_results:
+                        return results
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        # ── 策略 2：传统 h3 > a 解析（回退）──
+        blocks = re.findall(
+            r'<div[^>]+class="[^"]*(?:c-container|result)[^"]*"[^>]*>([\s\S]*?)(?=<div[^>]+class="[^"]*(?:c-container|result)|<div\s+id="page")',
+            html, flags=re.IGNORECASE,
+        )
+        for block in blocks:
+            link_match = re.search(
+                r'<h3[^>]*>\s*<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>',
+                block, flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not link_match:
+                continue
+            raw_url = unescape(link_match.group(1)).strip()
+            title = self._clean_html_text(link_match.group(2))
+            if not title:
+                continue
+            # 跳过已通过 data-tools 拿到的结果
+            if any(r.title == title[:120] for r in results):
+                continue
+
+            url = raw_url  # 百度跳转链接，后续异步解析
+
+            snippet = ""
+            for pattern in (
+                r'class="[^"]*c-abstract[^"]*"[^>]*>(.*?)</(?:span|div|p)>',
+                r'class="[^"]*content-right[^"]*"[^>]*>(.*?)</(?:span|div)>',
+                r'<span\s+class="[^"]*c-color-text[^"]*"[^>]*>(.*?)</span>',
+            ):
+                sm = re.search(pattern, block, flags=re.IGNORECASE | re.DOTALL)
+                if sm:
+                    candidate = self._clean_html_text(sm.group(1))
+                    if len(candidate) > 20:
+                        snippet = candidate
+                        break
+            if not snippet:
+                snippet = title
+
+            results.append(SearchResult(title=title[:120], snippet=snippet[:240], url=url))
+            if len(results) >= self.max_results:
+                break
+
+        # ── 异步批量解析百度跳转链接 → 真实 URL ──
+        import asyncio
+        resolve_tasks = []
+        for r in results:
+            if "baidu.com/link" in r.url:
+                resolve_tasks.append(self._resolve_baidu_redirect(r))
+        if resolve_tasks:
+            await asyncio.gather(*resolve_tasks, return_exceptions=True)
+
+        return results
+
+    @staticmethod
+    def _extract_baidu_snippet_near(html: str, pos: int) -> str:
+        """从 data-tools 位置附近提取摘要文本。"""
+        # 向后搜索最近的摘要 class
+        window = html[pos:pos + 2000]
+        for pattern in (
+            r'class="[^"]*c-abstract[^"]*"[^>]*>(.*?)</(?:span|div|p)>',
+            r'class="[^"]*content-right[^"]*"[^>]*>(.*?)</(?:span|div)>',
+            r'<span\s+class="[^"]*c-color-text[^"]*"[^>]*>(.*?)</span>',
+        ):
+            m = re.search(pattern, window, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                text = re.sub(r"<[^>]+>", " ", m.group(1))
+                text = unescape(text)
+                text = re.sub(r"\s+", " ", text).strip()
+                if len(text) > 15:
+                    return text
+        return ""
+
+    async def _resolve_baidu_redirect(self, result: SearchResult) -> None:
+        """解析百度跳转链接，原地替换 result.url。"""
+        if "baidu.com/link" not in result.url:
+            return
+        try:
+            async with httpx.AsyncClient(
+                timeout=5.0, follow_redirects=False,
+                headers=self._make_headers(),
+            ) as client:
+                resp = await client.head(result.url)
+                location = resp.headers.get("Location", "")
+                if location and location.startswith("http"):
+                    result.url = location
+        except Exception:
+            pass
+
+    async def _search_google_scrape(self, query: str) -> list[SearchResult]:
+        """Google 网页搜索爬虫 — 多层解析 + 反跟踪 URL 清洗。"""
+        headers = self._make_headers(referer="https://www.google.com/")
+        html = await self._scrape_with_retry(
+            "https://www.google.com/search",
+            {
+                "q": query,
+                "hl": "zh-CN",
+                "gl": "cn",
+                "num": str(self.max_results + 5),
+                "ie": "UTF-8",
+                "oe": "UTF-8",
+            },
+            headers,
+        )
+        if not html:
+            return []
+
+        results: list[SearchResult] = []
+
+        # ── 策略 1：标准 <div class="g"> 结果块 ──
+        blocks = re.findall(
+            r'<div\s+class="g"[^>]*>([\s\S]*?)</div>\s*(?=<div\s+class="g"|<div\s+id="botstuff")',
+            html, flags=re.IGNORECASE,
+        )
+        if not blocks:
+            # 备用：data-hveid 属性标记的结果块
+            blocks = re.findall(
+                r'<div[^>]+data-hveid[^>]*>([\s\S]*?)</div>\s*</div>\s*</div>',
+                html, flags=re.IGNORECASE,
+            )
+
+        for block in blocks:
+            # 标题 + 链接
+            link_match = re.search(
+                r'<a[^>]+href="(https?://(?!(?:www\.)?google\.com)[^"]+)"[^>]*>[\s\S]*?<h3[^>]*>(.*?)</h3>',
+                block, flags=re.IGNORECASE | re.DOTALL,
+            )
+            if not link_match:
+                link_match = re.search(
+                    r'<a[^>]+href="(https?://(?!(?:www\.)?google\.com)[^"]+)"[^>]*>(.*?)</a>',
+                    block, flags=re.IGNORECASE | re.DOTALL,
+                )
+            if not link_match:
+                continue
+
+            url = unescape(link_match.group(1)).strip()
+            # 清洗 Google 跟踪重定向
+            if "/url?" in url:
+                parsed = urlparse(url)
+                q_param = parse_qs(parsed.query).get("q", [""])[0]
+                if q_param:
+                    url = q_param
+            # 去掉 Google 追踪参数
+            if "google.com/url" in url:
+                continue
+
+            title = self._clean_html_text(link_match.group(2))
+            if not url or not title:
+                continue
+
+            # 摘要：Google 经常变 class 名，多模式匹配
+            snippet = ""
+            for sp in (
+                r'<div[^>]+class="[^"]*VwiC3b[^"]*"[^>]*>(.*?)</div>',
+                r'<span[^>]+class="[^"]*aCOpRe[^"]*"[^>]*>(.*?)</span>',
+                r'<div[^>]+data-sncf[^>]*>(.*?)</div>',
+                r'<div[^>]+class="[^"]*IsZvec[^"]*"[^>]*>(.*?)</div>',
+                # 通用回退：结果块内第一个较长的文本段
+                r'<span[^>]*>([\s\S]{30,}?)</span>',
+            ):
+                sm = re.search(sp, block, flags=re.IGNORECASE | re.DOTALL)
+                if sm:
+                    candidate = self._clean_html_text(sm.group(1))
+                    if len(candidate) > 20:
+                        snippet = candidate
+                        break
+            if not snippet:
+                snippet = title
+
+            results.append(SearchResult(title=title[:120], snippet=snippet[:240], url=url))
+            if len(results) >= self.max_results:
+                return results
+
+        # ── 策略 2：JSON-LD 结构化数据 ──
+        for ld_match in re.finditer(
+            r'<script[^>]+type="application/ld\+json"[^>]*>([\s\S]*?)</script>',
+            html, flags=re.IGNORECASE,
+        ):
+            try:
+                ld = json.loads(ld_match.group(1))
+                items = ld if isinstance(ld, list) else [ld]
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    item_url = str(item.get("url", "")).strip()
+                    name = str(item.get("name", "")).strip()
+                    desc = str(item.get("description", "")).strip()
+                    if item_url and name and not any(r.url == item_url for r in results):
+                        results.append(SearchResult(
+                            title=name[:120], snippet=(desc or name)[:240], url=item_url,
+                        ))
+                        if len(results) >= self.max_results:
+                            return results
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        return results
 
     async def _search_instant_api(self, query: str) -> list[SearchResult]:
         params = {

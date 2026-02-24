@@ -211,9 +211,10 @@ def _is_port_free(port: int) -> bool:
 def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dict[str, str]:
     """通过 Chrome DevTools Protocol 提取 cookie。
 
-    启动浏览器（带 --remote-debugging-port），用 CDP 获取 cookie，然后关闭。
-    这种方式不需要管理员权限，能绕过 App-Bound Encryption。
-    注意：浏览器正在运行时无法使用同一 user-data-dir，需先关闭浏览器。
+    策略优先级:
+      1. 尝试连接已运行浏览器的 debug 端口（无需关闭浏览器）
+      2. 复制 cookie 数据库到临时目录，用新 profile 启动 headless 解密
+      3. 如果以上都失败且 auto_close=True，关闭浏览器后用原 profile 启动
     """
     exe = _find_browser_exe(browser)
     if not exe:
@@ -225,39 +226,180 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
         _log.debug("CDP: 未找到 %s User Data 目录", browser)
         return {}
 
-    # 浏览器正在运行且占用 profile 时，无法用同一 user-data-dir 启动第二个实例。
-    if _is_browser_running(browser):
+    # ── 策略 1：尝试连接已运行浏览器的 debug 端口 ──
+    # 扫描常见 debug 端口（用户可能已带 --remote-debugging-port 启动）
+    for probe_port in (9222, 9229, 19222):
+        cookies = _try_connect_existing_debug_port(probe_port, domain)
+        if cookies:
+            _log.debug("CDP: 通过已有 debug 端口 %d 提取成功", probe_port)
+            return cookies
+
+    # ── 策略 2：复制 cookie 文件到临时目录，用新 profile 解密 ──
+    # 这种方式不需要关闭浏览器！
+    cookies = _extract_via_temp_profile(exe, user_data, domain)
+    if cookies:
+        _log.debug("CDP: 通过临时 profile 复制提取成功")
+        return cookies
+
+    # ── 策略 3：关闭浏览器后用原 profile（最后手段）──
+    if not _is_browser_running(browser):
+        # 浏览器没在运行，直接用原 profile
+        return _extract_via_cdp_original_profile(exe, user_data, domain)
+
+    if not auto_close:
         total, foreground = _get_browser_process_state(browser)
-        if not auto_close:
-            if foreground <= 0:
-                print(
-                    f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 后台进程占用配置目录，"
-                    "请允许自动关闭后重试。"
-                )
-            else:
-                print(f"  {_BROWSER_DISPLAY.get(browser, browser)} 正在运行，请先关闭浏览器再试。")
-            return {}
         if foreground <= 0:
             print(
-                f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 后台进程({total}个)，"
-                "尝试自动关闭后继续提取..."
+                f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 后台进程占用配置目录，"
+                "请允许自动关闭后重试。"
             )
         else:
-            print(f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 正在运行，尝试自动关闭后继续提取...")
-        if not _stop_browser_processes(browser):
-            print(f"  自动关闭 {_BROWSER_DISPLAY.get(browser, browser)} 失败，请手动关闭后重试。")
+            print(f"  {_BROWSER_DISPLAY.get(browser, browser)} 正在运行，请先关闭浏览器再试。")
+        return {}
+
+    total, foreground = _get_browser_process_state(browser)
+    if foreground <= 0:
+        print(
+            f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 后台进程({total}个)，"
+            "尝试自动关闭后继续提取..."
+        )
+    else:
+        print(f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 正在运行，尝试自动关闭后继续提取...")
+    if not _stop_browser_processes(browser):
+        print(f"  自动关闭 {_BROWSER_DISPLAY.get(browser, browser)} 失败，请手动关闭后重试。")
+        return {}
+    time.sleep(1.2)
+    if _is_browser_running(browser):
+        print(f"  {_BROWSER_DISPLAY.get(browser, browser)} 仍在运行，请手动关闭后重试。")
+        return {}
+
+    return _extract_via_cdp_original_profile(exe, user_data, domain)
+
+
+def _try_connect_existing_debug_port(port: int, domain: str) -> dict[str, str]:
+    """尝试连接已运行浏览器的 debug 端口获取 cookie。"""
+    import httpx as _httpx
+    try:
+        resp = _httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1.5)
+        if resp.status_code != 200:
             return {}
-        time.sleep(1.2)
-        if _is_browser_running(browser):
-            print(f"  {_BROWSER_DISPLAY.get(browser, browser)} 仍在运行，请手动关闭后重试。")
+    except Exception:
+        return {}
+
+    try:
+        resp = _httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=2)
+        targets = resp.json()
+        if not targets:
+            return {}
+        ws_url = targets[0].get("webSocketDebuggerUrl", "")
+        if not ws_url:
+            return {}
+        return _cdp_get_cookies(ws_url, domain)
+    except Exception:
+        return {}
+
+
+def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str, str]:
+    """复制 cookie 数据库到临时目录，启动 headless 浏览器解密。
+
+    关键：使用临时 user-data-dir，不与正在运行的浏览器冲突。
+    浏览器会用 Local State 中的加密密钥解密临时目录中的 cookie 文件。
+    """
+    tmp_dir = None
+    proc = None
+    try:
+        tmp_dir = tempfile.mkdtemp(prefix="yukiko_cookie_")
+        _copy_cookie_profile(user_data, tmp_dir)
+
+        # 检查 cookie 文件是否存在
+        cookie_exists = False
+        for profile in ("Default", "Profile 1"):
+            if (Path(tmp_dir) / profile / "Cookies").exists():
+                cookie_exists = True
+                break
+        if not cookie_exists:
+            _log.debug("临时 profile 中无 Cookies 文件")
             return {}
 
-    # 找一个空闲端口
+        # 找空闲端口
+        port = 19222
+        while not _is_port_free(port) and port < 19300:
+            port += 1
+        if port >= 19300:
+            return {}
+
+        cmd = [
+            exe,
+            f"--remote-debugging-port={port}",
+            f"--user-data-dir={tmp_dir}",
+            "--no-first-run",
+            "--headless=new",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--no-default-browser-check",
+        ]
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+
+        # 等待 CDP 就绪
+        import httpx as _httpx
+        ready = False
+        for _ in range(40):
+            time.sleep(0.2)
+            try:
+                resp = _httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+                if resp.status_code == 200:
+                    ready = True
+                    break
+            except Exception:
+                continue
+
+        if not ready:
+            _log.debug("临时 profile headless 启动超时")
+            return {}
+
+        resp = _httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=3)
+        targets = resp.json()
+        if not targets:
+            return {}
+        ws_url = targets[0].get("webSocketDebuggerUrl", "")
+        if not ws_url:
+            return {}
+
+        return _cdp_get_cookies(ws_url, domain)
+
+    except Exception as exc:
+        _log.debug("临时 profile 提取失败: %s", exc)
+        return {}
+    finally:
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        if tmp_dir:
+            try:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+
+def _extract_via_cdp_original_profile(exe: str, user_data: str, domain: str) -> dict[str, str]:
+    """用原始 profile 启动 headless 浏览器提取 cookie（需浏览器未运行）。"""
     port = 19222
     while not _is_port_free(port) and port < 19300:
         port += 1
     if port >= 19300:
-        _log.debug("CDP: 无可用端口")
         return {}
 
     proc = None
@@ -277,13 +419,12 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-        # 等待 CDP 端口就绪
-        import httpx
+        import httpx as _httpx
         ready = False
-        for _ in range(40):  # 最多等 8 秒
+        for _ in range(40):
             time.sleep(0.2)
             try:
-                resp = httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+                resp = _httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
                 if resp.status_code == 200:
                     ready = True
                     break
@@ -291,27 +432,20 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
                 continue
 
         if not ready:
-            _log.debug("CDP: 浏览器启动超时")
             return {}
 
-        # 获取 cookie — 直接用 Network.getAllCookies，不需要先导航
-        resp = httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=3)
+        resp = _httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=3)
         targets = resp.json()
-
         if not targets:
-            _log.debug("CDP: 无可用 target")
             return {}
-
         ws_url = targets[0].get("webSocketDebuggerUrl", "")
         if not ws_url:
-            _log.debug("CDP: 无 WebSocket URL")
             return {}
 
-        cookies = _cdp_get_cookies(ws_url, domain)
-        return cookies
+        return _cdp_get_cookies(ws_url, domain)
 
     except Exception as exc:
-        _log.debug("CDP 提取失败: %s", exc)
+        _log.debug("CDP 原始 profile 提取失败: %s", exc)
         return {}
     finally:
         if proc:
@@ -548,7 +682,10 @@ def extract_browser_cookies(browser: str, domain: str, auto_close: bool = False)
 
     策略优先级:
       1. rookiepy（需管理员，支持 Chrome v130+）
-      2. CDP（无需管理员，headless 启动浏览器获取）
+      2. CDP 三级策略:
+         a. 连接已有 debug 端口（无需关闭浏览器）
+         b. 复制 cookie 到临时 profile 解密（无需关闭浏览器）
+         c. 关闭浏览器后用原 profile（最后手段）
       3. browser_cookie3（仅 Firefox 可靠）
     """
     # 策略 1: rookiepy
@@ -557,10 +694,9 @@ def extract_browser_cookies(browser: str, domain: str, auto_close: bool = False)
         _log.debug("rookiepy 提取成功: %s %s", browser, domain)
         return cookies
 
-    # 策略 2: CDP（Chrome/Edge/Brave）
+    # 策略 2: CDP（Chrome/Edge/Brave）— 优先不关闭浏览器
     if browser in ("chrome", "edge", "brave"):
-        print(f"  正在通过 CDP 从 {_BROWSER_DISPLAY.get(browser, browser)} 提取...")
-        print("  (如果浏览器正在运行，可能需要先关闭)")
+        print(f"  正在从 {_BROWSER_DISPLAY.get(browser, browser)} 提取 Cookie...")
         cookies = _extract_via_cdp(browser, domain, auto_close=auto_close)
         if cookies:
             _log.debug("CDP 提取成功: %s %s", browser, domain)
