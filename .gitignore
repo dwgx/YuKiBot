@@ -17,6 +17,11 @@ storage/memory/daily/*
 !storage/memory/daily/.gitkeep
 storage/memory/vector/*
 !storage/memory/vector/.gitkeep
+storage/memory/users/*
+!storage/memory/users/.gitkeep
+storage/cache/
+storage/.secret_key
+storage/admin_state.json
 
 # 编辑器与系统文件
 .vscode/

@@ -3,3 +3,10 @@ nonebot-adapter-onebot
 httpx>=0.27.0
 PyYAML>=6.0.2
 python-dotenv>=1.0.1
+cryptography>=46.0.5
+yt-dlp>=2025.2.19
+bilibili-api-python>=17.0.0
+f2>=0.0.1.6
+rookiepy>=0.5.0
+websockets>=12.0
+pilk>=0.2.4

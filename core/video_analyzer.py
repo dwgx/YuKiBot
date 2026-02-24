@@ -1,0 +1,998 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import os
+import re
+import shutil
+from collections import Counter
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+from core.system_prompts import SystemPromptRelay
+from utils.text import clip_text, normalize_text
+
+
+@dataclass(slots=True)
+class VideoAnalysisResult:
+    """统一的视频分析结果。"""
+
+    source_url: str = ""
+    platform: str = ""  # bilibili | douyin | kuaishou | acfun | direct | unknown
+
+    # 基础元数据
+    title: str = ""
+    uploader: str = ""
+    duration: int = 0
+    description: str = ""
+    webpage_url: str = ""
+    thumbnail_url: str = ""
+    post_type: str = "video"  # video | image_text
+    image_urls: list[str] = field(default_factory=list)
+
+    # 富元数据（B站/抖音专属）
+    tags: list[str] = field(default_factory=list)
+    danmaku_keywords: list[str] = field(default_factory=list)
+    hot_comments: list[str] = field(default_factory=list)
+    view_count: int = 0
+    like_count: int = 0
+    coin_count: int = 0
+    share_count: int = 0
+
+    # 多模态分析（关键帧 → Vision API）
+    keyframe_descriptions: list[str] = field(default_factory=list)
+    subtitle_text: str = ""
+    subtitle_lang: str = ""
+    subtitle_source: str = ""
+
+    # 下载结果
+    local_video_path: str = ""
+
+    # 状态
+    analysis_depth: str = "metadata"  # metadata | rich_metadata | multimodal
+    errors: list[str] = field(default_factory=list)
+
+    def to_context_block(self) -> str:
+        """格式化为结构化上下文，供 ThinkingEngine 使用。"""
+        blocks: list[str] = []
+        if self.title:
+            blocks.append(f"标题: {self.title}")
+        if self.uploader:
+            blocks.append(f"UP主/作者: {self.uploader}")
+        if self.duration > 0:
+            blocks.append(f"时长: {self._fmt_duration()}")
+        if self.platform:
+            blocks.append(f"平台: {self.platform}")
+        if self.post_type and self.post_type != "video":
+            blocks.append("类型: 图文作品")
+        if self.tags:
+            blocks.append(f"标签: {', '.join(self.tags[:10])}")
+        if self.view_count:
+            blocks.append(f"播放量: {self.view_count}")
+        if self.like_count:
+            blocks.append(f"点赞: {self.like_count}")
+        if self.coin_count:
+            blocks.append(f"投币: {self.coin_count}")
+        if self.share_count:
+            blocks.append(f"分享: {self.share_count}")
+        if self.description:
+            blocks.append(f"简介: {clip_text(self.description, 200)}")
+        if self.danmaku_keywords:
+            blocks.append(f"弹幕热词: {', '.join(self.danmaku_keywords[:8])}")
+        if self.hot_comments:
+            blocks.append("热门评论:")
+            for i, c in enumerate(self.hot_comments[:3], 1):
+                blocks.append(f"  {i}. {clip_text(c, 80)}")
+        if self.image_urls:
+            blocks.append(f"图文图片数: {len(self.image_urls)}")
+            for idx, image_url in enumerate(self.image_urls[:3], 1):
+                blocks.append(f"  图{idx}: {clip_text(image_url, 140)}")
+        if self.keyframe_descriptions:
+            blocks.append("关键帧内容描述:")
+            for i, desc in enumerate(self.keyframe_descriptions, 1):
+                blocks.append(f"  帧{i}: {clip_text(desc, 120)}")
+        if self.subtitle_text:
+            blocks.append(f"字幕证据: 已提取（{self.subtitle_lang or 'unknown'}）")
+            lines = [normalize_text(item) for item in re.split(r"[\n\r]+", self.subtitle_text) if normalize_text(item)]
+            if not lines:
+                lines = [
+                    normalize_text(item)
+                    for item in re.split(r"(?<=[。！？.!?])", self.subtitle_text)
+                    if normalize_text(item)
+                ]
+            if lines:
+                blocks.append("字幕摘录:")
+                for i, line in enumerate(lines[:6], 1):
+                    blocks.append(f"  {i}. {clip_text(line, 88)}")
+            if self.subtitle_source:
+                blocks.append(f"字幕来源: {clip_text(self.subtitle_source, 120)}")
+        blocks.append(f"分析深度: {self.analysis_depth}")
+        if self.webpage_url:
+            blocks.append(f"来源: {self.webpage_url}")
+        return "\n".join(blocks)
+
+    def _fmt_duration(self) -> str:
+        s = self.duration
+        if s <= 0:
+            return ""
+        h, remainder = divmod(s, 3600)
+        m, sec = divmod(remainder, 60)
+        return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+
+def _find_ffmpeg_path(name: str = "ffmpeg") -> str:
+    """查找 ffmpeg/ffprobe，兼容 winget 安装路径。"""
+    found = shutil.which(name)
+    if found:
+        return found
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    if local_app:
+        d = os.path.join(local_app, "Microsoft", "WinGet", "Links")
+        candidate = os.path.join(d, f"{name}.exe") if os.name == "nt" else os.path.join(d, name)
+        if os.path.isfile(candidate):
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            return candidate
+    return ""
+
+
+class VideoAnalyzer:
+    """专用视频分析引擎：关键帧提取 + Vision API + B站/抖音富元数据。"""
+
+    def __init__(self, config: dict[str, Any]):
+        va_cfg = config.get("video_analysis", {}) or {}
+        vision_cfg = config.get("vision", {}) or {}
+        search_cfg = config.get("search", {}) or {}
+        video_cfg = search_cfg.get("video_resolver", {}) or {}
+
+        # 关键帧提取配置
+        self._keyframe_count = max(1, min(8, int(va_cfg.get("keyframe_count", 4))))
+        self._keyframe_max_dim = max(256, int(va_cfg.get("keyframe_max_dimension", 720)))
+        self._keyframe_quality = max(1, min(31, int(va_cfg.get("keyframe_quality", 5))))
+
+        # Vision API 配置（复用 vision 段，为空时回退到主 API 配置）
+        api_cfg = config.get("api", {}) or {}
+        self._vision_enable = bool(vision_cfg.get("enable", True))
+        self._vision_provider = normalize_text(str(vision_cfg.get("provider", ""))).lower()
+        self._vision_base_url = normalize_text(str(
+            vision_cfg.get("base_url", "") or api_cfg.get("base_url", "")
+        )).rstrip("/")
+        self._vision_api_key = normalize_text(str(
+            vision_cfg.get("api_key", "") or api_cfg.get("api_key", "")
+        ))
+        self._vision_model = normalize_text(str(
+            vision_cfg.get("model", "") or api_cfg.get("model", "")
+        ))
+        self._vision_timeout = max(8, int(vision_cfg.get("timeout_seconds", 35)))
+        self._vision_max_tokens = max(200, int(vision_cfg.get("max_tokens", 1200)))
+
+        # B站配置
+        bili_cfg = va_cfg.get("bilibili", {}) or {}
+        self._bili_enable = bool(bili_cfg.get("enable", True))
+        self._bili_sessdata = normalize_text(str(bili_cfg.get("sessdata", "")))
+        self._bili_jct = normalize_text(str(bili_cfg.get("bili_jct", "")))
+        self._bili_danmaku_top_n = max(3, int(bili_cfg.get("danmaku_top_n", 8)))
+        self._bili_comments_top_n = max(1, int(bili_cfg.get("comments_top_n", 3)))
+
+        # 抖音配置
+        douyin_cfg = va_cfg.get("douyin", {}) or {}
+        self._douyin_enable = bool(douyin_cfg.get("enable", True))
+        self._douyin_cookie = normalize_text(str(douyin_cfg.get("cookie", "")))
+
+        # 快手配置
+        ks_cfg = va_cfg.get("kuaishou", {}) or {}
+        self._kuaishou_enable = bool(ks_cfg.get("enable", True))
+        self._kuaishou_cookie = normalize_text(str(ks_cfg.get("cookie", "")))
+
+        # 缓存目录
+        cache_raw = str(video_cfg.get("cache_dir", "storage/cache/videos"))
+        self._cache_dir = Path(cache_raw)
+        if not self._cache_dir.is_absolute():
+            self._cache_dir = (Path(__file__).resolve().parents[1] / self._cache_dir).resolve()
+        self._keyframe_dir = self._cache_dir / "keyframes"
+        self._keyframe_dir.mkdir(parents=True, exist_ok=True)
+
+        self._ffmpeg_available = bool(_find_ffmpeg_path("ffmpeg"))
+        self._ffprobe_available = bool(_find_ffmpeg_path("ffprobe"))
+
+    # ── 平台检测 ──
+
+    @staticmethod
+    def detect_platform(url: str) -> str:
+        host = normalize_text(urlparse(url).netloc).lower()
+        if "bilibili.com" in host or host.endswith("b23.tv"):
+            return "bilibili"
+        if "douyin.com" in host or "iesdouyin.com" in host:
+            return "douyin"
+        if "kuaishou.com" in host or "chenzhongtech.com" in host:
+            return "kuaishou"
+        if "acfun.cn" in host or "acfun.com" in host:
+            return "acfun"
+        return "unknown"
+
+    # ── 主入口 ──
+
+    async def analyze(
+        self,
+        source_url: str,
+        local_video_path: str = "",
+        depth: str = "auto",
+        yt_dlp_meta: dict[str, Any] | None = None,
+    ) -> VideoAnalysisResult:
+        """
+        主分析入口。由 tools.py 在视频下载/解析后调用。
+        depth="auto" 时：B站/抖音自动走 rich_metadata，有本地文件+ffmpeg 时升级到 multimodal。
+        """
+        result = VideoAnalysisResult(source_url=source_url)
+        platform = self.detect_platform(source_url)
+        result.platform = platform
+
+        # Step 1: yt-dlp 基础元数据
+        if yt_dlp_meta:
+            self._fill_from_ytdlp(result, yt_dlp_meta)
+
+        # Step 2: 平台专属富元数据
+        if depth in ("auto", "rich_metadata", "multimodal"):
+            if platform == "bilibili" and self._bili_enable:
+                await self._enrich_bilibili(result, source_url)
+                if result.analysis_depth == "metadata":
+                    result.analysis_depth = "rich_metadata"
+            elif platform == "douyin" and self._douyin_enable:
+                await self._enrich_douyin(result, source_url)
+                if result.analysis_depth == "metadata":
+                    result.analysis_depth = "rich_metadata"
+            elif platform == "kuaishou" and self._kuaishou_enable:
+                await self._enrich_kuaishou(result, source_url)
+                if result.analysis_depth == "metadata":
+                    result.analysis_depth = "rich_metadata"
+
+        # Step 3: 多模态关键帧分析
+        if local_video_path:
+            result.local_video_path = local_video_path
+        should_multimodal = depth in ("auto", "multimodal")
+        has_local = bool(result.local_video_path) and Path(result.local_video_path).exists()
+        if should_multimodal and has_local and self._ffmpeg_available and self._vision_enable:
+            keyframe_paths = await self._extract_keyframes(result.local_video_path)
+            if keyframe_paths:
+                descriptions = await self._describe_keyframes(keyframe_paths, result)
+                result.keyframe_descriptions = descriptions
+                result.analysis_depth = "multimodal"
+                for p in keyframe_paths:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+
+        return result
+
+    # ── Step 1: yt-dlp 元数据填充 ──
+
+    @staticmethod
+    def _fill_from_ytdlp(result: VideoAnalysisResult, meta: dict[str, Any]) -> None:
+        result.title = normalize_text(str(meta.get("title", "")))
+        result.uploader = normalize_text(str(meta.get("uploader", "") or meta.get("channel", "")))
+        dur = meta.get("duration")
+        result.duration = int(dur) if isinstance(dur, (int, float)) else 0
+        result.description = clip_text(normalize_text(str(meta.get("description", ""))), 300)
+        result.webpage_url = normalize_text(str(meta.get("webpage_url", "")))
+        result.thumbnail_url = normalize_text(str(meta.get("thumbnail", "")))
+        result.view_count = int(meta.get("view_count", 0) or 0)
+        result.like_count = int(meta.get("like_count", 0) or 0)
+        subtitle_text = normalize_text(str(meta.get("subtitle_text", "")))
+        if subtitle_text and not result.subtitle_text:
+            result.subtitle_text = subtitle_text
+            result.subtitle_lang = normalize_text(str(meta.get("subtitle_lang", "")))
+            result.subtitle_source = normalize_text(str(meta.get("subtitle_source", "")))
+
+    # ── Step 2a: B站富元数据 ──
+
+    async def _enrich_bilibili(self, result: VideoAnalysisResult, url: str) -> None:
+        """使用 bilibili-api-python 获取标签、弹幕热词、热评。"""
+        try:
+            from bilibili_api import video as bili_video, Credential
+        except ImportError:
+            result.errors.append("bilibili-api-python not installed")
+            return
+
+        bvid = self._extract_bvid(url)
+        if not bvid:
+            result.errors.append("无法从URL提取BV号")
+            return
+
+        credential = None
+        if self._bili_sessdata:
+            credential = Credential(
+                sessdata=self._bili_sessdata,
+                bili_jct=self._bili_jct or None,
+            )
+
+        v = bili_video.Video(bvid=bvid, credential=credential)
+
+        # 并行获取 info 和 tags
+        info: dict[str, Any] = {}
+        tags_data: list[Any] = []
+        try:
+            info = await asyncio.wait_for(v.get_info(), timeout=10)
+        except Exception as e:
+            result.errors.append(f"bilibili_info: {e}")
+        try:
+            tags_data = await asyncio.wait_for(v.get_tags(), timeout=10)
+        except Exception as e:
+            result.errors.append(f"bilibili_tags: {e}")
+
+        # 解析 info
+        if isinstance(info, dict):
+            stat = info.get("stat", {})
+            if isinstance(stat, dict):
+                result.view_count = int(stat.get("view", 0) or 0)
+                result.like_count = int(stat.get("like", 0) or 0)
+                result.coin_count = int(stat.get("coin", 0) or 0)
+                result.share_count = int(stat.get("share", 0) or 0)
+            if not result.title:
+                result.title = normalize_text(str(info.get("title", "")))
+            if not result.uploader:
+                owner = info.get("owner", {})
+                if isinstance(owner, dict):
+                    result.uploader = normalize_text(str(owner.get("name", "")))
+            if not result.description:
+                result.description = clip_text(normalize_text(str(info.get("desc", ""))), 300)
+            if not result.thumbnail_url:
+                result.thumbnail_url = normalize_text(str(info.get("pic", "")))
+            dur = info.get("duration")
+            if isinstance(dur, (int, float)) and dur > 0 and result.duration <= 0:
+                result.duration = int(dur)
+
+        # 解析 tags
+        if isinstance(tags_data, list):
+            result.tags = [
+                normalize_text(str(t.get("tag_name", "")))
+                for t in tags_data
+                if isinstance(t, dict) and t.get("tag_name")
+            ][:10]
+
+        # 获取弹幕热词
+        await self._fetch_bilibili_danmaku(v, result)
+
+        # 获取热评
+        await self._fetch_bilibili_comments(info, credential, result)
+        # 获取字幕（优先作为视频总结证据）
+        await self._fetch_bilibili_subtitle(v, result)
+
+    async def _fetch_bilibili_danmaku(self, v: Any, result: VideoAnalysisResult) -> None:
+        try:
+            danmaku_list = await asyncio.wait_for(v.get_danmakus(page_index=0), timeout=10)
+            if danmaku_list:
+                word_freq: Counter[str] = Counter()
+                for dm in danmaku_list:
+                    text = normalize_text(str(getattr(dm, "text", "")))
+                    if text and len(text) >= 2:
+                        word_freq[text] += 1
+                result.danmaku_keywords = [w for w, _ in word_freq.most_common(self._bili_danmaku_top_n)]
+        except Exception as e:
+            result.errors.append(f"bilibili_danmaku: {e}")
+
+    async def _fetch_bilibili_comments(
+        self, info: dict[str, Any], credential: Any, result: VideoAnalysisResult
+    ) -> None:
+        try:
+            from bilibili_api import comment as bili_comment
+            from bilibili_api import ResourceType
+
+            aid = int(info.get("aid", 0) or 0)
+            if aid <= 0:
+                return
+            comments_data = await asyncio.wait_for(
+                bili_comment.get_comments(
+                    oid=aid,
+                    type_=ResourceType.VIDEO,
+                    order=bili_comment.OrderType.LIKE,
+                    credential=credential,
+                ),
+                timeout=10,
+            )
+            if isinstance(comments_data, dict):
+                replies = comments_data.get("replies", [])
+                if isinstance(replies, list):
+                    for reply in replies[: self._bili_comments_top_n]:
+                        if not isinstance(reply, dict):
+                            continue
+                        content = reply.get("content", {})
+                        msg = normalize_text(str(content.get("message", ""))) if isinstance(content, dict) else ""
+                        if msg:
+                            result.hot_comments.append(clip_text(msg, 100))
+        except Exception as e:
+            result.errors.append(f"bilibili_comments: {e}")
+
+    async def _fetch_bilibili_subtitle(self, v: Any, result: VideoAnalysisResult) -> None:
+        if result.subtitle_text:
+            return
+        try:
+            cid = await asyncio.wait_for(v.get_cid(page_index=0), timeout=10)
+        except Exception as e:
+            result.errors.append(f"bilibili_subtitle_cid: {e}")
+            return
+        if not cid:
+            return
+        try:
+            subtitle_info = await asyncio.wait_for(v.get_subtitle(cid=cid), timeout=12)
+        except Exception as e:
+            result.errors.append(f"bilibili_subtitle_info: {e}")
+            return
+
+        rows: list[dict[str, str]] = []
+        if isinstance(subtitle_info, dict):
+            subtitles = subtitle_info.get("subtitles", [])
+            if not isinstance(subtitles, list):
+                subtitle_obj = subtitle_info.get("subtitle", {})
+                if isinstance(subtitle_obj, dict):
+                    subtitles = subtitle_obj.get("subtitles", [])
+            if isinstance(subtitles, list):
+                for item in subtitles:
+                    if not isinstance(item, dict):
+                        continue
+                    lang = normalize_text(str(item.get("lan") or item.get("lang") or item.get("lan_doc")))
+                    sub_url = normalize_text(str(item.get("subtitle_url") or item.get("url")))
+                    if not sub_url:
+                        continue
+                    if sub_url.startswith("//"):
+                        sub_url = f"https:{sub_url}"
+                    rows.append({"lang": lang, "url": sub_url})
+        if not rows:
+            return
+
+        def _score(x: dict[str, str]) -> int:
+            lang = normalize_text(str(x.get("lang", ""))).lower()
+            score = 0
+            if any(token in lang for token in ("zh", "cn", "中文", "汉")):
+                score += 10
+            if "auto" in lang:
+                score -= 1
+            return score
+
+        rows.sort(key=_score, reverse=True)
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": result.webpage_url or result.source_url or "https://www.bilibili.com/",
+        }
+        for row in rows[:4]:
+            sub_url = normalize_text(str(row.get("url", "")))
+            if not sub_url:
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=12, follow_redirects=True, headers=headers) as client:
+                    resp = await client.get(sub_url)
+                if resp.status_code != 200:
+                    continue
+                payload = resp.json() if "json" in str(resp.headers.get("content-type", "")).lower() else {}
+                text = self._extract_subtitle_text_from_bili_payload(payload)
+                if len(text) < 20:
+                    continue
+                result.subtitle_text = clip_text(text, 8000)
+                result.subtitle_lang = normalize_text(str(row.get("lang", "")))
+                result.subtitle_source = sub_url
+                return
+            except Exception:
+                continue
+
+    @staticmethod
+    def _extract_subtitle_text_from_bili_payload(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        body = payload.get("body", [])
+        if not isinstance(body, list):
+            return ""
+        lines: list[str] = []
+        for item in body:
+            if not isinstance(item, dict):
+                continue
+            content = normalize_text(str(item.get("content", "")))
+            if content:
+                lines.append(content)
+        return normalize_text("\n".join(lines))
+
+    @staticmethod
+    def _extract_bvid(url: str) -> str:
+        match = re.search(r"(BV[a-zA-Z0-9]+)", url, re.IGNORECASE)
+        return match.group(1) if match else ""
+
+    @staticmethod
+    def _normalize_url_list(value: Any, limit: int = 18) -> list[str]:
+        rows: list[str] = []
+        seen: set[str] = set()
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            return []
+        for raw in value:
+            item = normalize_text(str(raw))
+            if not item or item in seen:
+                continue
+            if not re.match(r"^https?://", item, flags=re.IGNORECASE):
+                continue
+            rows.append(item)
+            seen.add(item)
+            if len(rows) >= max(1, limit):
+                break
+        return rows
+
+    # ── Step 2b: 抖音富元数据 ──
+
+    async def _enrich_douyin(self, result: VideoAnalysisResult, url: str) -> None:
+        """使用 f2 库获取抖音视频详细信息。"""
+        try:
+            from f2.apps.douyin.handler import DouyinHandler
+            from f2.apps.douyin.utils import AwemeIdFetcher
+        except ImportError:
+            result.errors.append("f2 not installed")
+            return
+
+        try:
+            aweme_id = await asyncio.wait_for(
+                AwemeIdFetcher.get_aweme_id(url), timeout=10
+            )
+            if not aweme_id:
+                result.errors.append("douyin: 无法提取 aweme_id")
+                return
+
+            kwargs: dict[str, Any] = {
+                "headers": {},
+                "cookie": self._douyin_cookie or "",
+            }
+            handler = DouyinHandler(kwargs=kwargs)
+
+            aweme_data = await asyncio.wait_for(
+                handler.fetch_one_video(aweme_id), timeout=15
+            )
+            if not aweme_data:
+                return
+
+            title = normalize_text(str(getattr(aweme_data, "desc", "")))
+            if not result.title:
+                result.title = title
+            if not result.description and title:
+                result.description = clip_text(title, 220)
+            if not result.uploader:
+                uploader = normalize_text(str(getattr(aweme_data, "nickname", "")))
+                if uploader:
+                    result.uploader = uploader
+
+            image_urls = self._normalize_url_list(getattr(aweme_data, "images", []), limit=20)
+            if image_urls:
+                result.post_type = "image_text"
+                result.image_urls = image_urls
+                if not result.thumbnail_url:
+                    result.thumbnail_url = image_urls[0]
+            else:
+                result.post_type = "video"
+
+            play_count = int(getattr(aweme_data, "play_count", 0) or 0)
+            digg_count = int(getattr(aweme_data, "digg_count", 0) or 0)
+            share_count = int(getattr(aweme_data, "share_count", 0) or 0)
+            if play_count > 0:
+                result.view_count = play_count
+            if digg_count > 0:
+                result.like_count = digg_count
+            if share_count > 0:
+                result.share_count = share_count
+
+            hashtags = getattr(aweme_data, "hashtag_names", None)
+            if isinstance(hashtags, list):
+                tags = [normalize_text(str(item)) for item in hashtags if normalize_text(str(item))]
+                if tags:
+                    result.tags = tags[:12]
+
+            dur = getattr(aweme_data, "duration", 0)
+            if (
+                result.post_type != "image_text"
+                and isinstance(dur, (int, float))
+                and dur > 0
+                and result.duration <= 0
+            ):
+                # 抖音 duration 单位是毫秒
+                result.duration = int(dur / 1000) if dur > 1000 else int(dur)
+
+            if not result.webpage_url:
+                aweme_id_text = normalize_text(str(getattr(aweme_data, "aweme_id", ""))) or aweme_id
+                if aweme_id_text:
+                    page_type = "note" if result.post_type == "image_text" else "video"
+                    result.webpage_url = f"https://www.douyin.com/{page_type}/{aweme_id_text}"
+
+        except Exception as e:
+            result.errors.append(f"douyin_f2: {e}")
+
+    # ── Step 2c: 快手富元数据 ──
+
+    async def _enrich_kuaishou(self, result: VideoAnalysisResult, url: str) -> None:
+        """通过快手网页 GraphQL API 获取视频详细信息。"""
+        photo_id = self._extract_kuaishou_photo_id(url)
+        if not photo_id:
+            result.errors.append("kuaishou: 无法提取 photoId")
+            return
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://www.kuaishou.com/",
+            "Content-Type": "application/json",
+            "Origin": "https://www.kuaishou.com",
+        }
+        if self._kuaishou_cookie:
+            headers["Cookie"] = self._kuaishou_cookie
+
+        gql_payload = {
+            "operationName": "visionVideoDetail",
+            "variables": {"photoId": photo_id, "page": "detail"},
+            "query": (
+                "query visionVideoDetail($photoId: String, $page: String) {"
+                "  visionVideoDetail(photoId: $photoId, page: $page) {"
+                "    status type photo {"
+                "      id caption userExt { name id } "
+                "      animatedCoverUrl coverUrl photoUrl "
+                "      timestamp duration "
+                "      realLikeCount viewCount commentCount shareCount "
+                "      tags { name } "
+                "    }"
+                "  }"
+                "}"
+            ),
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=6.0)) as client:
+                resp = await client.post(
+                    "https://www.kuaishou.com/graphql",
+                    headers=headers,
+                    json=gql_payload,
+                )
+            if resp.status_code >= 400:
+                result.errors.append(f"kuaishou_api: HTTP {resp.status_code}")
+                return
+
+            data = resp.json()
+            detail = (data.get("data") or {}).get("visionVideoDetail") or {}
+            photo = detail.get("photo") or {}
+            if not photo:
+                result.errors.append("kuaishou_api: empty photo data")
+                return
+
+            if not result.title:
+                result.title = normalize_text(str(photo.get("caption", "")))
+            if not result.uploader:
+                user_ext = photo.get("userExt") or {}
+                result.uploader = normalize_text(str(user_ext.get("name", "")))
+            if not result.thumbnail_url:
+                result.thumbnail_url = normalize_text(
+                    str(photo.get("coverUrl", "") or photo.get("photoUrl", ""))
+                )
+
+            result.view_count = int(photo.get("viewCount", 0) or 0)
+            result.like_count = int(photo.get("realLikeCount", 0) or 0)
+            result.share_count = int(photo.get("shareCount", 0) or 0)
+
+            dur = photo.get("duration")
+            if isinstance(dur, (int, float)) and dur > 0 and result.duration <= 0:
+                # 快手 duration 单位是毫秒
+                result.duration = int(dur / 1000) if dur > 1000 else int(dur)
+
+            tags_raw = photo.get("tags")
+            if isinstance(tags_raw, list) and not result.tags:
+                result.tags = [
+                    normalize_text(str(t.get("name", "")))
+                    for t in tags_raw
+                    if isinstance(t, dict) and t.get("name")
+                ][:10]
+
+        except Exception as e:
+            result.errors.append(f"kuaishou_gql: {e}")
+
+    @staticmethod
+    def _extract_kuaishou_photo_id(url: str) -> str:
+        """从快手 URL 中提取 photoId。"""
+        # https://www.kuaishou.com/short-video/xxxxx
+        # https://v.kuaishou.com/xxxxx
+        m = re.search(r"/short-video/([a-zA-Z0-9_-]+)", url)
+        if m:
+            return m.group(1)
+        m = re.search(r"photoId=([a-zA-Z0-9_-]+)", url)
+        if m:
+            return m.group(1)
+        # 短链接需要先 resolve，这里只做基本提取
+        parsed = urlparse(url)
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts and len(parts[-1]) >= 8:
+            return parts[-1]
+        return ""
+
+    async def _extract_keyframes(self, video_path: str) -> list[Path]:
+        """用 ffmpeg 提取关键帧：优先场景变化检测，不足时补充均匀采样。"""
+        path = Path(video_path)
+        if not path.exists():
+            return []
+
+        digest = hashlib.sha1(str(path).encode()).hexdigest()[:10]
+        duration = await self._get_video_duration(str(path))
+        if duration <= 0:
+            duration = 60
+
+        scale_filter = (
+            f"scale='min({self._keyframe_max_dim},iw)':"
+            f"'min({self._keyframe_max_dim},ih)':"
+            f"force_original_aspect_ratio=decrease"
+        )
+
+        # 1) 场景变化检测
+        scene_frames = await self._extract_scene_change_frames(
+            path, digest, scale_filter
+        )
+
+        # 2) 如果场景帧不足，用均匀采样补充
+        if len(scene_frames) < self._keyframe_count:
+            uniform_frames = await self._extract_uniform_frames(
+                path, digest, duration, scale_filter
+            )
+            # 合并去重（按文件名排序）
+            existing = {f.name for f in scene_frames}
+            for uf in uniform_frames:
+                if uf.name not in existing and len(scene_frames) < self._keyframe_count:
+                    scene_frames.append(uf)
+
+        return scene_frames[: self._keyframe_count]
+
+    async def _extract_scene_change_frames(
+        self, path: Path, digest: str, scale_filter: str
+    ) -> list[Path]:
+        """用 ffmpeg select='gt(scene,0.3)' 提取场景切换帧。"""
+        pattern = str(self._keyframe_dir / f"{digest}_sc_%02d.jpg")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(path),
+            "-vf", f"select='gt(scene,0.3)',{scale_filter}",
+            "-vsync", "vfr",
+            "-frames:v", str(self._keyframe_count),
+            "-q:v", str(self._keyframe_quality),
+            pattern,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except Exception:
+            return []
+        return sorted(self._keyframe_dir.glob(f"{digest}_sc_*.jpg"))
+
+    async def _extract_uniform_frames(
+        self, path: Path, digest: str, duration: int, scale_filter: str
+    ) -> list[Path]:
+        """均匀采样 N 帧作为兜底。"""
+        pattern = str(self._keyframe_dir / f"{digest}_kf_%02d.jpg")
+        interval = max(1, duration // (self._keyframe_count + 1))
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(path),
+            "-vf", f"fps=1/{interval},{scale_filter}",
+            "-frames:v", str(self._keyframe_count),
+            "-q:v", str(self._keyframe_quality),
+            pattern,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except Exception:
+            return []
+        return sorted(self._keyframe_dir.glob(f"{digest}_kf_*.jpg"))
+
+    async def _get_video_duration(self, video_path: str) -> int:
+        """通过 ffprobe 获取视频时长（秒）。"""
+        if not self._ffprobe_available:
+            return 0
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            return int(float(stdout.decode().strip()))
+        except Exception:
+            return 0
+
+    # ── Step 3b: Vision API 分析关键帧 ──
+
+    async def _describe_keyframes(
+        self, keyframe_paths: list[Path], result: VideoAnalysisResult
+    ) -> list[str]:
+        """批量发送多帧给 Vision API，一次调用获取所有帧描述。"""
+        context_hint = ""
+        if result.title:
+            context_hint = f"视频标题：{result.title}。"
+        if result.tags:
+            context_hint += f"标签：{', '.join(result.tags[:5])}。"
+        if result.uploader:
+            context_hint += f"作者：{result.uploader}。"
+
+        # 尝试批量分析（一次 API 调用）
+        batch_result = await self._vision_describe_batch(keyframe_paths, context_hint)
+        if batch_result and len(batch_result) >= len(keyframe_paths) // 2:
+            return batch_result
+
+        # 批量失败时回退到逐帧分析
+        descriptions: list[str] = []
+        for i, path in enumerate(keyframe_paths, 1):
+            prompt = SystemPromptRelay.video_single_user_prompt(
+                context_hint=context_hint,
+                frame_index=i,
+                total_frames=len(keyframe_paths),
+            )
+            desc = await self._vision_describe_image(path, prompt)
+            if desc:
+                descriptions.append(desc)
+        return descriptions
+
+    async def _vision_describe_batch(
+        self, keyframe_paths: list[Path], context_hint: str
+    ) -> list[str]:
+        """将所有关键帧打包到一次 Vision API 调用中。"""
+        if not self._vision_api_key or not self._vision_base_url or not self._vision_model:
+            return []
+
+        content_parts: list[dict[str, Any]] = []
+        prompt_text = SystemPromptRelay.video_batch_user_prompt(
+            context_hint=context_hint,
+            total_frames=len(keyframe_paths),
+        )
+        content_parts.append({"type": "text", "text": prompt_text})
+
+        for path in keyframe_paths:
+            try:
+                image_bytes = path.read_bytes()
+                b64 = base64.b64encode(image_bytes).decode("ascii")
+                content_parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                })
+            except Exception:
+                continue
+
+        if len(content_parts) <= 1:
+            return []
+
+        payload = {
+            "model": self._vision_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": SystemPromptRelay.video_batch_system_prompt(),
+                },
+                {"role": "user", "content": content_parts},
+            ],
+            "temperature": 0.2,
+            "max_tokens": self._vision_max_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._vision_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        base = self._vision_base_url.rstrip("/")
+        endpoints = (
+            [f"{base}/v1/chat/completions", f"{base}/chat/completions"]
+            if not base.endswith("/v1")
+            else [f"{base}/chat/completions", f"{base[:-3]}/chat/completions"]
+        )
+
+        for endpoint in endpoints:
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(float(self._vision_timeout) * 1.5, connect=8.0)
+                ) as client:
+                    resp = await client.post(endpoint, headers=headers, json=payload)
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                raw = normalize_text(str(choices[0].get("message", {}).get("content", "")))
+                if not raw:
+                    continue
+                # 解析 "帧N: xxx" 格式
+                return self._parse_batch_descriptions(raw, len(keyframe_paths))
+            except Exception:
+                continue
+        return []
+
+    @staticmethod
+    def _parse_batch_descriptions(raw: str, expected: int) -> list[str]:
+        """解析批量描述结果，提取每帧描述。"""
+        descriptions: list[str] = []
+        # 尝试按 "帧N:" 或 "帧 N:" 分割
+        parts = re.split(r"帧\s*\d+\s*[:：]", raw)
+        for part in parts:
+            text = part.strip()
+            if text and len(text) >= 5:
+                descriptions.append(clip_text(text, 150))
+        if descriptions:
+            return descriptions[:expected]
+        # 回退：按换行分割
+        for line in raw.split("\n"):
+            line = line.strip()
+            if line and len(line) >= 5:
+                # 去掉可能的序号前缀
+                cleaned = re.sub(r"^\d+[.、)\]]\s*", "", line).strip()
+                if cleaned:
+                    descriptions.append(clip_text(cleaned, 150))
+        return descriptions[:expected]
+
+    async def _vision_describe_image(self, image_path: Path, prompt: str) -> str:
+        """调用 Vision API 分析单张图片。"""
+        if not self._vision_api_key or not self._vision_base_url or not self._vision_model:
+            return ""
+
+        try:
+            image_bytes = image_path.read_bytes()
+            b64 = base64.b64encode(image_bytes).decode("ascii")
+            data_url = f"data:image/jpeg;base64,{b64}"
+        except Exception:
+            return ""
+
+        payload = {
+            "model": self._vision_model,
+            "messages": [
+                {"role": "system", "content": SystemPromptRelay.video_single_system_prompt()},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                },
+            ],
+            "temperature": 0.2,
+            "max_tokens": self._vision_max_tokens,
+        }
+        headers = {
+            "Authorization": f"Bearer {self._vision_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        base = self._vision_base_url.rstrip("/")
+        endpoints = (
+            [f"{base}/v1/chat/completions", f"{base}/chat/completions"]
+            if not base.endswith("/v1")
+            else [f"{base}/chat/completions", f"{base[:-3]}/chat/completions"]
+        )
+
+        for endpoint in endpoints:
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(float(self._vision_timeout), connect=8.0)
+                ) as client:
+                    resp = await client.post(endpoint, headers=headers, json=payload)
+                if resp.status_code >= 400:
+                    continue
+                data = resp.json()
+                choices = data.get("choices", [])
+                if choices:
+                    content = choices[0].get("message", {}).get("content", "")
+                    text = normalize_text(str(content))
+                    if text:
+                        return text
+            except Exception:
+                continue
+        return ""

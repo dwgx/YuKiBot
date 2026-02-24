@@ -1,203 +1,63 @@
 from __future__ import annotations
 
-import json
-import re
 from dataclasses import dataclass
 from typing import Any
 
 from core.personality import PersonalityEngine
-from services.skiapi import SkiAPIClient
+from core.system_prompts import SystemPromptRelay
+from services.model_client import ModelClient
+from utils.text import clip_text, normalize_text
 
 
 @dataclass(slots=True)
 class ThinkingInput:
     text: str
-    trigger_reason: str
-    sensitive_context: str
-    memory_context: list[str]
-    related_memories: list[str]
+    trigger_reason: str = ""
+    scene_hint: str = "chat"
+    memory_context: list[str] | None = None
+    related_memories: list[str] | None = None
+    search_summary: str = ""
+    user_profile_summary: str = ""
 
 
 @dataclass(slots=True)
 class ThinkingDecision:
     action: str
     reason: str
-    reply_style: str = "casual"
-    query: str = ""
-    prompt: str = ""
+    reply_style: str = "short"
 
 
 class ThinkingEngine:
+    """只负责生成回复正文，不承担本地关键词判定。"""
+
     def __init__(
         self,
         config: dict[str, Any],
         personality: PersonalityEngine,
-        skiapi: SkiAPIClient,
+        model_client: ModelClient,
     ):
-        bot_cfg = config.get("bot", {})
-        search_cfg = config.get("search", {})
-        image_cfg = config.get("image", {})
+        bot_cfg = config.get("bot", {}) if isinstance(config, dict) else {}
+        search_cfg = config.get("search", {}) if isinstance(config, dict) else {}
         self.bot_name = str(bot_cfg.get("name", "yukiko"))
         self.language = str(bot_cfg.get("language", "zh"))
         self.allow_thinking = bool(bot_cfg.get("allow_thinking", True))
-        self.allow_search = bool(bot_cfg.get("allow_search", True)) and bool(
-            search_cfg.get("enable", True)
-        )
-        self.allow_image = bool(bot_cfg.get("allow_image", True)) and bool(image_cfg.get("enable", True))
+        self.default_source_links = max(1, min(3, int(search_cfg.get("default_source_links", 3))))
         self.personality = personality
-        self.skiapi = skiapi
+        self.model_client = model_client
 
-    async def decide(self, payload: ThinkingInput) -> ThinkingDecision:
-        fallback = self._rule_decide(payload)
-        if not self.allow_thinking or not self.skiapi.enabled:
-            return fallback
+    _VERBOSITY_MAX_TOKENS = {
+        "verbose": 8192,
+        "medium": 4096,
+        "brief": 2048,
+        "minimal": 1024,
+    }
 
-        try:
-            llm_decision = await self._llm_decide(payload, fallback)
-        except Exception:
-            return fallback
-        return llm_decision or fallback
-
-    def _rule_decide(self, payload: ThinkingInput) -> ThinkingDecision:
-        text = payload.text.strip()
-        lower = text.lower()
-        if not text:
-            return ThinkingDecision(action="ignore", reason="empty_message", reply_style="short")
-
-        if self.allow_image:
-            if lower.startswith("/draw "):
-                return ThinkingDecision(
-                    action="generate_image",
-                    reason="draw_command",
-                    reply_style="short",
-                    prompt=text[6:].strip(),
-                )
-            if any(keyword in lower for keyword in ("画一张", "来张图", "帮我画", "生成图片")):
-                return ThinkingDecision(
-                    action="generate_image",
-                    reason="image_request",
-                    reply_style="casual",
-                    prompt=text,
-                )
-
-        # 遇到域名时优先走联网搜索
-        domain_match = re.search(r"(https?://)?(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}", text)
-        if self.allow_search and domain_match:
-            return ThinkingDecision(
-                action="search",
-                reason="domain_query",
-                reply_style="serious",
-                query=text,
-            )
-
-        search_cues = (
-            "搜索",
-            "查一下",
-            "搜一下",
-            "搜一搜",
-            "查下",
-            "查查",
-            "上网搜",
-            "网上搜",
-            "去网上搜",
-            "去搜索",
-            "帮我搜",
-            "你去搜索",
-            "你去搜",
-            "你搜",
-            "搜就完事了",
-            "然后呢",
-            "结果呢",
-            "搜完了吗",
-            "继续搜",
-            "最新",
-            "新闻",
-            "资料",
-            "官网",
-            "教程",
-            "天气",
-            "价格",
-        )
-        if self.allow_search and any(cue in text for cue in search_cues):
-            return ThinkingDecision(
-                action="search",
-                reason="search_cue",
-                reply_style="serious",
-                query=text,
-            )
-
-        if payload.trigger_reason == "random_trigger" and len(text) < 8:
-            return ThinkingDecision(action="ignore", reason="random_skip", reply_style="short")
-
-        if len(text) < 20:
-            style = "short"
-        elif any(word in text for word in ("方案", "架构", "设计", "风险", "问题")):
-            style = "serious"
-        elif len(text) > 120:
-            style = "long"
-        else:
-            style = "casual"
-        return ThinkingDecision(action="reply", reason="default_reply", reply_style=style)
-
-    async def _llm_decide(
-        self,
-        payload: ThinkingInput,
-        fallback: ThinkingDecision,
-    ) -> ThinkingDecision | None:
-        allowed_actions = ["reply", "ignore"]
-        if self.allow_search:
-            allowed_actions.append("search")
-        if self.allow_image:
-            allowed_actions.append("generate_image")
-
-        system_prompt = (
-            "你是 Yukiko 的决策器。请在内部思考，不要暴露思维链。"
-            "只输出 JSON。\n"
-            "输出格式：\n"
-            '{"action":"reply|search|generate_image|ignore","reason":"...","reply_style":"casual|serious|short|long","query":"...","prompt":"..."}\n'
-            "规则：\n"
-            f"- 允许动作：{', '.join(allowed_actions)}\n"
-            "- 随机弱触发优先选择 ignore。\n"
-            "- 仅在需要外部或时效信息时使用 search。\n"
-            "- 明确绘图意图时使用 generate_image。\n"
-            "- reason 保持简短。"
-        )
-        user_payload = {
-            "message": payload.text,
-            "trigger_reason": payload.trigger_reason,
-            "sensitive_context": payload.sensitive_context,
-            "memory_context": payload.memory_context[-6:],
-            "related_memories": payload.related_memories[:4],
-            "fallback": fallback.__dict__,
-        }
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ]
-        data = await self.skiapi.chat_json(messages)
-        if not data:
-            return None
-
-        action = str(data.get("action", fallback.action)).strip()
-        if action not in allowed_actions:
-            action = fallback.action
-        reply_style = str(data.get("reply_style", fallback.reply_style)).strip()
-        if reply_style not in {"casual", "serious", "short", "long"}:
-            reply_style = fallback.reply_style
-        reason = str(data.get("reason", fallback.reason)).strip() or fallback.reason
-        query = str(data.get("query", fallback.query)).strip()
-        prompt = str(data.get("prompt", fallback.prompt)).strip()
-        if action == "search" and not query:
-            query = payload.text
-        if action == "generate_image" and not prompt:
-            prompt = payload.text
-        return ThinkingDecision(
-            action=action,
-            reason=reason,
-            reply_style=reply_style,
-            query=query,
-            prompt=prompt,
-        )
+    _VERBOSITY_INSTRUCTIONS = {
+        "verbose": "回复可以详细展开，给出完整的分析和解释。",
+        "medium": "",  # 默认，不加额外指令
+        "brief": "回复简短精炼，抓重点，不要展开。",
+        "minimal": "用一两句话概括，极简回复。",
+    }
 
     async def generate_reply(
         self,
@@ -207,67 +67,165 @@ class ThinkingEngine:
         reply_style: str,
         search_summary: str = "",
         sensitive_context: str = "",
+        user_profile_summary: str = "",
+        trigger_reason: str = "",
+        scene_hint: str = "chat",
+        interest_keywords: tuple[str, ...] = (),
+        conflict_keywords: tuple[str, ...] = (),
+        verbosity: str = "medium",
     ) -> str:
-        if self.skiapi.enabled:
+        _ = (interest_keywords, conflict_keywords)
+        text = normalize_text(user_text)
+        if not text:
+            return ""
+
+        scene_tag = normalize_text(scene_hint) or "chat"
+        style = reply_style if reply_style in {"short", "casual", "serious", "long"} else "short"
+
+        if self.allow_thinking and self.model_client.enabled:
             try:
-                prompt = self.personality.system_instruction(bot_name=self.bot_name, language=self.language)
-                style = self.personality.style_instruction(reply_style)
-                tools_note = (
-                    "你可以参考搜索摘要和记忆信息，但不要虚构来源。"
-                    "内部思考不要输出。"
-                    "普通闲聊场景应自然回应，不要反复追问技术需求。"
-                )
+                system_prompt = self.personality.system_instruction(bot_name=self.bot_name, language=self.language)
+                style_instruction = self.personality.style_instruction(style)
+                scene_instruction = self.personality.scene_instruction(scene_tag)
+                extra_rules = SystemPromptRelay.thinking_extra_rules()
+                verbosity_instruction = self._VERBOSITY_INSTRUCTIONS.get(verbosity, "")
+                if verbosity_instruction:
+                    extra_rules += f"\n输出详细度要求: {verbosity_instruction}"
+                verbosity_max_tokens = self._VERBOSITY_MAX_TOKENS.get(verbosity, 4096)
                 messages = [
                     {
                         "role": "system",
-                        "content": f"{prompt}\n{style}\n{tools_note}",
+                        "content": f"{system_prompt}\n{style_instruction}\n{scene_instruction}\n{extra_rules}",
                     },
                     {
                         "role": "user",
-                        "content": self._compose_reply_payload(
-                            user_text=user_text,
+                        "content": self._build_payload(
+                            user_text=text,
+                            trigger_reason=trigger_reason,
                             memory_context=memory_context,
                             related_memories=related_memories,
                             search_summary=search_summary,
                             sensitive_context=sensitive_context,
+                            user_profile_summary=user_profile_summary,
+                            scene_tag=scene_tag,
                         ),
                     },
                 ]
-                output = (await self.skiapi.chat_text(messages)).strip()
+                output = normalize_text(await self.model_client.chat_text(messages, max_tokens=verbosity_max_tokens))
                 if output:
                     return output
             except Exception:
                 pass
-        return self._fallback_reply(user_text, search_summary, sensitive_context)
 
-    @staticmethod
-    def _compose_reply_payload(
+        return self._fallback_reply(
+            user_text=text,
+            style=style,
+            scene_tag=scene_tag,
+            search_summary=search_summary,
+            trigger_reason=trigger_reason,
+        )
+
+    def _build_payload(
+        self,
         user_text: str,
+        trigger_reason: str,
         memory_context: list[str],
         related_memories: list[str],
         search_summary: str,
         sensitive_context: str,
+        user_profile_summary: str,
+        scene_tag: str,
     ) -> str:
-        blocks = [f"用户消息:\n{user_text}"]
+        blocks = [f"用户消息:\n{user_text}", f"场景: {scene_tag}"]
+        if trigger_reason:
+            blocks.append(f"触发信息: {trigger_reason}")
+        if user_profile_summary:
+            profile_block = (
+                "用户画像（仅当前发言用户，禁止混淆到其他群成员）:\n"
+                f"{clip_text(user_profile_summary, 400)}"
+            )
+            # 根据画像生成自适应回复风格提示
+            style_guide = self._adaptive_style_hint(user_profile_summary)
+            if style_guide:
+                profile_block += f"\n回复风格建议: {style_guide}"
+            blocks.append(profile_block)
         if memory_context:
-            blocks.append("最近对话:\n" + "\n".join(f"- {item}" for item in memory_context[-8:]))
+            rows = [f"- {clip_text(normalize_text(item), 80)}" for item in memory_context[-8:] if normalize_text(item)]
+            if rows:
+                blocks.append("最近对话:\n" + "\n".join(rows))
         if related_memories:
-            blocks.append("长期记忆检索:\n" + "\n".join(f"- {item}" for item in related_memories[:5]))
+            rows = [f"- {clip_text(normalize_text(item), 80)}" for item in related_memories[:5] if normalize_text(item)]
+            if rows:
+                blocks.append("相关长期记忆:\n" + "\n".join(rows))
         if search_summary:
-            blocks.append(f"联网搜索摘要:\n{search_summary}")
+            # 视频分析结果通常更长，给更大的上下文窗口
+            is_video = "关键帧内容描述:" in search_summary or "弹幕热词:" in search_summary
+            is_rich_search = search_summary.count("标题:") >= 2 or search_summary.count("摘要:") >= 2
+            if is_video:
+                max_summary = 2400
+                label = "工具结果(视频分析)"
+            elif is_rich_search:
+                max_summary = 1600
+                label = "工具结果(搜索 — 请从以下多条结果中筛选最相关的信息综合回答)"
+            else:
+                max_summary = 1200
+                label = "工具结果(搜索)"
+            blocks.append(f"{label}:\n{clip_text(search_summary, max_summary)}")
         if sensitive_context:
-            blocks.append(f"敏感词上下文摘要:\n{sensitive_context}")
-        blocks.append("请直接给最终回复内容，不要输出 JSON。")
+            blocks.append(f"风险上下文:\n{clip_text(sensitive_context, 300)}")
+        blocks.append("请只输出最终回复正文，不要输出 JSON。")
         return "\n\n".join(blocks)
 
     @staticmethod
-    def _fallback_reply(user_text: str, search_summary: str, sensitive_context: str) -> str:
+    def _adaptive_style_hint(profile_summary: str) -> str:
+        """根据用户画像生成自适应回复风格提示。"""
+        hints: list[str] = []
+        lower = profile_summary.lower()
+
+        # 语言风格适配
+        if "网络用语多" in lower:
+            hints.append("可以用网络梗和缩写回复，语气轻松活泼")
+        elif "表达偏正式" in lower:
+            hints.append("回复语气稍正式，避免过多网络用语")
+
+        # 消息长度适配
+        if "偏短句" in lower:
+            hints.append("回复尽量简短精炼")
+        elif "描述偏详细" in lower:
+            hints.append("可以适当展开回复")
+
+        # 话题适配
+        if "技术" in lower:
+            hints.append("对方可能懂技术，可以用专业术语")
+        if "游戏" in lower:
+            hints.append("对方是游戏玩家，可以聊游戏相关话题")
+        if "动漫" in lower or "二次元" in lower:
+            hints.append("对方喜欢二次元，可以用相关梗")
+
+        # 情绪适配
+        if "情绪偏消极" in lower or "情绪偏焦虑" in lower:
+            hints.append("注意语气温和，多给鼓励")
+
+        return "；".join(hints) if hints else ""
+
+    def _fallback_reply(
+        self,
+        user_text: str,
+        style: str,
+        scene_tag: str,
+        search_summary: str,
+        trigger_reason: str,
+    ) -> str:
+        _ = (user_text, trigger_reason)
         if search_summary:
-            lines = [line for line in search_summary.splitlines() if line.startswith(("1.", "2.", "3."))]
-            brief = "\n".join(lines[:3]) if lines else "暂时没有有效搜索结果。"
-            return f"我先帮你查到这些信息：\n{brief}"
-        if sensitive_context:
-            return "我在。这个话题我可以认真陪你聊，先告诉我你最想先解决哪一部分。"
-        if re.search(r"[?？]$", user_text.strip()):
-            return "我在，收到你的问题了。你可以再补一点背景，我给你更准确的答复。"
-        return "收到。我在这，继续说。"
+            return clip_text(search_summary, 220)
+
+        if scene_tag == "conflict_mediation":
+            return "先冷静一下，把分歧点说清楚，我帮你们拆开看。"
+        if scene_tag == "emotion_support":
+            return "我在，你可以先说最卡你的那一点。"
+        if style == "short":
+            return "我在，你继续说。"
+        if style == "serious":
+            return "先给我目标、环境和报错信息，我按步骤帮你定位。"
+        return "收到，我在听。"
