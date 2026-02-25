@@ -1,135 +1,162 @@
-"""管理员指令系统 — 超级管理员鉴权、群白名单、热重载、群信息查询、行为调参。
-
-指令格式（仅超级管理员可用，/help 除外）：
-  /yuki help | /help          功能帮助
-  /yuki reload | /yukibot     热重载配置
-  /yuki ping | /ping          存活检测
-  /yuki status                运行状态
-  /yuki say <text>            复读
-  /yuki 加白 | /whitelist add 当前群加白
-  /yuki 拉黑 | /whitelist rm  当前群移除白名单
-  /yuki 白名单                列出白名单
-  /yuki 群信息                当前群基本信息
-  /yuki 群成员                群成员列表
-  /yuki 管理员                群管理员列表
-  /yuki debug <user_id>       查看用户画像
-  /yuki cookie [平台] [浏览器] [force] 刷新平台Cookie
-  /yuki 行为                  查看行为参数
-  /yuki 冷漠|安静|活跃        切换行为预设
-  /yuki 行为 <参数名> <值>    单独调参
-"""
+"""Admin command center for Yukiko bot."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-import os
-import random
 import time
+from difflib import get_close_matches
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any
 
-from core.system_prompts import SystemPromptRelay
 from utils.text import normalize_text
-
-if TYPE_CHECKING:
-    pass  # 避免循环导入
 
 _log = logging.getLogger("yukiko.admin")
 
 
+# ── 模糊匹配命令表 ──
+_FUZZY_COMMAND_MAP: dict[str, str] = {
+    "重载": "reload", "重新加载": "reload", "刷新配置": "reload", "reload": "reload",
+    "ping": "ping", "在吗": "ping", "存活": "ping",
+    "状态": "status", "运行状态": "status", "status": "status",
+    "帮助": "help", "help": "help", "菜单": "help", "功能": "help",
+    "详细": "help_detail", "detail": "help_detail", "help_detail": "help_detail", "参数": "help_detail",
+    "加白": "white_add", "加白名单": "white_add", "白名单添加": "white_add",
+    "拉黑": "white_rm", "移除白名单": "white_rm", "删白": "white_rm",
+    "白名单": "white_list", "查白名单": "white_list",
+    "尺度": "scale", "安全尺度": "scale", "scale": "scale",
+    "敏感词": "sensitive", "屏蔽词": "sensitive",
+    "戳": "poke", "戳一戳": "poke", "poke": "poke",
+    "骰子": "dice", "dice": "dice", "扔骰子": "dice",
+    "猜拳": "rps", "rps": "rps", "石头剪刀布": "rps",
+    "音乐": "music_card", "点歌": "music_card", "音乐卡片": "music_card",
+    "json": "json_card", "卡片": "json_card",
+    "行为": "behavior", "模式": "behavior", "冷漠": "behavior_cold",
+    "安静": "behavior_quiet", "活跃": "behavior_active",
+    "插件": "plugins", "plugins": "plugins",
+    "群信息": "group_info",
+    "cookie": "cookie", "cookies": "cookie",
+    "说": "say", "say": "say",
+    "debug": "debug", "调试": "debug",
+    "定海神针": "clear_screen", "刷屏": "clear_screen", "清屏": "clear_screen",
+}
+
+
 class AdminEngine:
-    """管理员指令解析 + 群白名单管理 + 群信息查询。"""
-
-    # ── 顶级指令（第一个词直接匹配）──
-    _TOP_COMMANDS: dict[str, str] = {
-        "/yukibot": "_cmd_reload",
-        "/yukiko": "_cmd_reload",
-        "/ping": "_cmd_ping",
-        "/health": "_cmd_health",
-        "/help": "_cmd_help",
-        "/plugins": "_cmd_plugins",
+    _TOP = {
+        "/help": "help",
+        "/plugins": "plugins",
+        "/ping": "ping",
+        "/health": "ping",
+        "/yukibot": "reload",
+        "/yukiko": "reload",
     }
 
-    # ── /yuki 子命令映射 ──
-    _YUKI_SUBS: dict[str, str] = {
-        "help": "_cmd_help",
-        "帮助": "_cmd_help",
-        "reload": "_cmd_reload",
-        "重载": "_cmd_reload",
-        "热重载": "_cmd_reload",
-        "ping": "_cmd_ping",
-        "status": "_cmd_status",
-        "状态": "_cmd_status",
-        "health": "_cmd_health",
-        "say": "_cmd_say",
-        "说": "_cmd_say",
-        "加白": "_cmd_whitelist_add",
-        "加白本群": "_cmd_whitelist_add",
-        "whitelist": "_cmd_whitelist",
-        "拉黑": "_cmd_whitelist_remove",
-        "拉黑本群": "_cmd_whitelist_remove",
-        "移除白名单": "_cmd_whitelist_remove",
-        "白名单": "_cmd_whitelist_list",
-        "群信息": "_cmd_group_info",
-        "群成员": "_cmd_group_members",
-        "群管理员": "_cmd_group_admins",
-        "管理员": "_cmd_group_admins",
-        "debug": "_cmd_debug",
-        "调试": "_cmd_debug",
-        "cookie": "_cmd_cookie_refresh",
-        "cookies": "_cmd_cookie_refresh",
-        "plugins": "_cmd_plugins",
-        "刷新cookie": "_cmd_cookie_refresh",
-        "行为": "_cmd_behavior",
-        "behavior": "_cmd_behavior",
-        "冷漠": "_cmd_behavior_cold",
-        "活跃": "_cmd_behavior_active",
-        "安静": "_cmd_behavior_quiet",
-        "定海神针": "_cmd_clear_screen",
-        "清屏": "_cmd_clear_screen",
+    _SUB = {
+        "help": "help",
+        "帮助": "help",
+        "help_detail": "help_detail",
+        "详细": "help_detail",
+        "detail": "help_detail",
+        "plugins": "plugins",
+        "reload": "reload",
+        "重载": "reload",
+        "ping": "ping",
+        "status": "status",
+        "状态": "status",
+        "say": "say",
+        "说": "say",
+        "加白": "white_add",
+        "加白本群": "white_add",
+        "拉黑": "white_rm",
+        "拉黑本群": "white_rm",
+        "白名单": "white_list",
+        "whitelist": "white",
+        "群信息": "group_info",
+        "debug": "debug",
+        "cookie": "cookie",
+        "cookies": "cookie",
+        "尺度": "scale",
+        "scale": "scale",
+        "敏感词": "sensitive",
+        "sensitive": "sensitive",
+        "戳": "poke",
+        "poke": "poke",
+        "骰子": "dice",
+        "dice": "dice",
+        "猜拳": "rps",
+        "rps": "rps",
+        "音乐卡片": "music_card",
+        "music": "music_card",
+        "json": "json_card",
+        "jsoncard": "json_card",
+        "行为": "behavior",
+        "冷漠": "behavior_cold",
+        "安静": "behavior_quiet",
+        "活跃": "behavior_active",
+        "定海神针": "clear_screen",
+        "刷屏": "clear_screen",
     }
+
+    _PUBLIC = {"help", "help_detail", "plugins"}
 
     def __init__(self, config: dict[str, Any], storage_dir: Path):
-        admin_cfg = config.get("admin", {}) or {}
-        self.super_admin_qq: str = str(admin_cfg.get("super_admin_qq", "")).strip()
-        self.non_whitelist_mode: str = str(admin_cfg.get("non_whitelist_mode", "minimal")).strip()
-        self._whitelist_file = storage_dir / "admin_state.json"
-        self._whitelisted_groups: set[int] = self._load_whitelist()
-        self._start_time = time.time()
-        self._message_count = 0
+        self.config = config if isinstance(config, dict) else {}
+        self.storage_dir = Path(storage_dir)
+        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        self._started = time.time()
+        self._count = 0
 
-    # ── 公共接口 ──────────────────────────────────────────────
+        admin_cfg = self.config.get("admin", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(admin_cfg, dict):
+            admin_cfg = {}
+        self._enabled = bool(admin_cfg.get("enable", True))
+        # Some QQ clients will show "发送者版本过低" for JSON card messages.
+        # Keep help as plain text by default; allow opt-in via config.
+        self._help_json_card = bool(admin_cfg.get("help_json_card", False))
+        self.non_whitelist_mode = normalize_text(str(admin_cfg.get("non_whitelist_mode", "silent"))).lower() or "silent"
+        self._super_users = {str(x).strip() for x in (admin_cfg.get("super_users", []) or []) if str(x).strip()}
+
+        self._white_path = self.storage_dir / "whitelist_groups.json"
+        self._white: set[int] = set()
+        for x in admin_cfg.get("whitelist_groups", []) or []:
+            try:
+                self._white.add(int(x))
+            except Exception:
+                pass
+        self._load_white()
+
     @property
     def enabled(self) -> bool:
-        return bool(self.super_admin_qq)
+        return self._enabled
 
     def is_admin_command(self, text: str) -> bool:
-        """判断消息是否为管理员指令。"""
-        stripped = text.strip()
-        if not stripped:
+        t = normalize_text(text)
+        if not t:
             return False
-        parts = stripped.split()
-        first = parts[0].lower()
-        # 顶级指令
-        if first in self._TOP_COMMANDS:
-            return True
-        # /yuki 前缀
-        if first in ("/yuki", "/yuki帮助"):
-            return True
-        return False
+        head = t.split(maxsplit=1)[0].lower()
+        return head in self._TOP or head in {"/yuki", "/yuki帮助"}
 
     def is_super_admin(self, user_id: str) -> bool:
-        return self.enabled and str(user_id) == self.super_admin_qq
-
-    def is_group_whitelisted(self, group_id: int | str) -> bool:
-        """群是否在白名单中。权限系统未启用时所有群都算白名单。"""
         if not self.enabled:
             return True
-        return int(group_id) in self._whitelisted_groups if group_id else True
+        if not self._super_users:
+            return True
+        return str(user_id).strip() in self._super_users
+
+    def is_group_whitelisted(self, group_id: int | str) -> bool:
+        if not self.enabled:
+            return True
+        if not self._white:
+            return True
+        try:
+            gid = int(group_id)
+        except Exception:
+            return True
+        return gid in self._white
 
     def increment_message_count(self) -> None:
-        self._message_count += 1
+        self._count += 1
 
     async def handle_command(
         self,
@@ -139,426 +166,494 @@ class AdminEngine:
         engine: Any = None,
         api_call: Any = None,
     ) -> str | None:
-        """处理管理员指令。返回回复文本，非指令返回 None。"""
-        stripped = text.strip()
-        if not stripped:
+        raw = normalize_text(text).strip()
+        if not raw:
             return None
-        parts = stripped.split(maxsplit=2)
+
+        parts = raw.split(maxsplit=2)
         first = parts[0].lower()
 
-        # 顶级指令
-        if first in self._TOP_COMMANDS:
-            method_name = self._TOP_COMMANDS[first]
-            # /help 不需要鉴权
-            if method_name in {"_cmd_help", "_cmd_plugins"}:
-                handler = getattr(self, method_name)
-                return await handler(arg="", group_id=group_id, engine=engine, api_call=api_call)
-            if not self.is_super_admin(user_id):
-                return "权限不足，仅超级管理员可使用此指令。"
-            handler = getattr(self, method_name)
+        if first in self._TOP:
+            action = self._TOP[first]
             arg = parts[1].strip() if len(parts) > 1 else ""
-            return await handler(arg=arg, user_id=user_id, group_id=group_id, engine=engine, api_call=api_call)
+            return await self._dispatch(action, arg, user_id, group_id, engine, api_call)
 
-        # /yuki 前缀
-        if first in ("/yuki", "/yuki帮助"):
-            sub = parts[1].lower() if len(parts) > 1 else "help"
+        if first in {"/yuki", "/yuki帮助"}:
+            sub = normalize_text(parts[1]).lower() if len(parts) > 1 else "help"
             if first == "/yuki帮助":
                 sub = "help"
-            method_name = self._YUKI_SUBS.get(sub)
-            if not method_name:
-                return f"未知子命令: {sub}\n发 /yuki help 查看可用指令。"
-            # /help 不需要鉴权
-            if method_name in {"_cmd_help", "_cmd_plugins"}:
-                handler = getattr(self, method_name)
-                return await handler(arg="", group_id=group_id, engine=engine, api_call=api_call)
-            if not self.is_super_admin(user_id):
-                return "权限不足，仅超级管理员可使用此指令。"
-            handler = getattr(self, method_name)
+            action = self._SUB.get(sub)
+            if not action:
+                # 模糊匹配: 用户输错了命令
+                action = self._fuzzy_match_command(sub)
+            if not action:
+                # 列出相似命令提示
+                suggestions = self._suggest_commands(sub)
+                if suggestions:
+                    return f"未知命令「{sub}」，你是不是想用:\n" + "\n".join(f"  /yuki {s}" for s in suggestions)
+                return "未知子命令 发送 /yuki help 查看用法"
             arg = parts[2].strip() if len(parts) > 2 else ""
-            return await handler(arg=arg, user_id=user_id, group_id=group_id, engine=engine, api_call=api_call)
-
+            return await self._dispatch(action, arg, user_id, group_id, engine, api_call)
         return None
 
-    # ── 指令实现 ──────────────────────────────────────────────
-    async def _cmd_help(self, **_: Any) -> str:
+    def _fuzzy_match_command(self, text: str) -> str | None:
+        """模糊匹配命令名。"""
+        t = text.strip().lower()
+        if not t:
+            return None
+        # 先查全局模糊表
+        if t in _FUZZY_COMMAND_MAP:
+            return _FUZZY_COMMAND_MAP[t]
+        # 前缀匹配
+        for key, action in _FUZZY_COMMAND_MAP.items():
+            if key.startswith(t) or t.startswith(key):
+                return action
+        # difflib 近似匹配
+        candidates = list(_FUZZY_COMMAND_MAP.keys())
+        matches = get_close_matches(t, candidates, n=1, cutoff=0.6)
+        if matches:
+            return _FUZZY_COMMAND_MAP[matches[0]]
+        # 也查 _SUB 表
+        sub_matches = get_close_matches(t, list(self._SUB.keys()), n=1, cutoff=0.6)
+        if sub_matches:
+            return self._SUB[sub_matches[0]]
+        return None
+
+    def _suggest_commands(self, text: str) -> list[str]:
+        """返回最相似的命令建议。"""
+        t = text.strip().lower()
+        if not t:
+            return []
+        candidates = list(self._SUB.keys())
+        matches = get_close_matches(t, candidates, n=3, cutoff=0.4)
+        return matches
+
+    async def _dispatch(self, action: str, arg: str, user_id: str, group_id: int, engine: Any, api_call: Any) -> str | None:
+        if action not in self._PUBLIC and not self.is_super_admin(user_id):
+            return "权限不足 仅超级管理员可使用此指令"
+        handler = getattr(self, f"_act_{action}", None)
+        if handler is None:
+            return "命令暂未实现"
+        return await handler(arg=arg, user_id=user_id, group_id=group_id, engine=engine, api_call=api_call)
+
+    async def _act_help(self, **kwargs: Any) -> str:
         return (
-            "YuKiKo Bot 指令列表\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "功能:\n"
-            "  @我 或叫 雪/yukiko/yuki 触发对话\n"
-            "  发送视频链接 → 自动解析（B站/抖音/快手）\n"
-            "  网络搜索、AI 画图、GitHub 搜索\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "管理指令（仅管理员）:\n"
-            "  /yuki reload  热重载配置\n"
-            "  /yuki ping    存活检测\n"
-            "  /yuki status  运行状态\n"
-            "  /yuki say <文本>  复读\n"
-            "  /yuki 加白    当前群加白名单\n"
-            "  /yuki 拉黑    当前群移除白名单\n"
-            "  /yuki 白名单  列出白名单\n"
-            "  /yuki 群信息  当前群基本信息\n"
-            "  /yuki debug <QQ号>  查看用户画像\n"
-            "  /yuki cookie [平台] [浏览器] [force]  刷新Cookie\n"
-            "  /plugins 或 /yuki plugins  列出已加载插件和 rules\n"
-            "  /yuki 定海神针 [总行数] [分段数] [段间延迟秒]\n"
-            "      例: /yuki 定海神针 3000 10 5\n"
-            "━━━━━━━━━━━━━━━━━━━━\n"
-            "行为调参:\n"
-            "  /yuki 行为          查看当前参数\n"
-            "  /yuki 冷漠          只回@和叫名字的\n"
-            "  /yuki 安静          偶尔接话，门槛高\n"
-            "  /yuki 活跃          积极参与群聊\n"
-            "  /yuki 行为 默认     恢复出厂设置\n"
-            "  /yuki 行为 接话门槛 3.0  单独调参"
+            "YuKiKo 管理面板\n"
+            "─────────────────────\n"
+            "reload / ping / status\n"
+            "加白 / 拉黑 / 白名单\n"
+            "尺度 / 敏感词 / 行为\n"
+            "戳 / 骰子 / 猜拳\n"
+            "音乐卡片 / json / 定海神针\n"
+            "─────────────────────\n"
+            "/yuki help_detail 查看详细参数"
         )
 
-    async def _cmd_plugins(self, engine: Any = None, **_: Any) -> str:
-        if engine is None:
-            return "引擎未就绪。"
-        registry = getattr(engine, "plugins", None)
-        schemas = getattr(registry, "schemas", None) if registry is not None else None
-        if not isinstance(schemas, list):
-            return "插件系统未就绪。"
-        if not schemas:
-            return "当前没有已加载插件。"
+    async def _act_help_detail(self, **kwargs: Any) -> str:
+        return (
+            "YuKiKo Command Reference\n"
+            "─────────────────────\n"
+            "System\n"
+            "  /yuki reload\n"
+            "  /yuki ping\n"
+            "  /yuki status\n"
+            "  /yuki plugins\n"
+            "  /yuki debug <QQ>\n"
+            "  /yuki cookie [platform] [browser] [force]\n"
+            "─────────────────────\n"
+            "Whitelist\n"
+            "  /yuki 加白          add current group\n"
+            "  /yuki 拉黑          remove current group\n"
+            "  /yuki 白名单        list all groups\n"
+            "─────────────────────\n"
+            "Safety & Behavior\n"
+            "  /yuki 尺度 <0-3>    0=off 1=loose 2=standard 3=strict\n"
+            "  /yuki 敏感词 添加 <word>\n"
+            "  /yuki 敏感词 删除 <word>\n"
+            "  /yuki 行为          show current params\n"
+            "  /yuki 冷漠          only respond to @ and name\n"
+            "  /yuki 安静          high threshold, rare reply\n"
+            "  /yuki 活跃          active in group chat\n"
+            "  /yuki 行为 默认     reset to default\n"
+            "  /yuki 行为 接话门槛 <float>\n"
+            "─────────────────────\n"
+            "Interactive\n"
+            "  /yuki 戳 <QQ>       poke user\n"
+            "  /yuki 骰子          roll dice\n"
+            "  /yuki 猜拳          rock-paper-scissors\n"
+            "  /yuki say <text>    echo text\n"
+            "─────────────────────\n"
+            "Media\n"
+            "  /yuki 音乐卡片 <keyword>\n"
+            "  /yuki 音乐卡片 <platform> <id>\n"
+            "  /yuki json <raw JSON string>\n"
+            "─────────────────────\n"
+            "Special\n"
+            "  /yuki 定海神针 [lines] [segments] [delay_sec]\n"
+            "    default: 3000 lines, 10 segments, 0.8s delay\n"
+            "    range: lines 120-20000, segments 1-80, delay 0-30\n"
+            "─────────────────────\n"
+            "Fuzzy match enabled - typos are auto-corrected"
+        )
 
-        lines: list[str] = [f"已加载插件（共 {len(schemas)} 个）:"]
+    async def _send_help_card(self, api_call: Any, group_id: int, user_id: str) -> bool:
+        """尝试发送 JSON 卡片格式的帮助菜单。失败则回退纯文本。"""
+        try:
+            # 使用 structmsg news 格式 — 兼容性最好
+            card = {
+                "app": "com.tencent.structmsg",
+                "desc": "YuKiKo 管理面板",
+                "view": "news",
+                "ver": "0.0.0.1",
+                "prompt": "[YuKiKo] 管理面板",
+                "meta": {
+                    "news": {
+                        "action": "",
+                        "android_pkg_name": "",
+                        "app_type": 1,
+                        "appid": 100446242,
+                        "desc": (
+                            "⚙ reload / ping / status\n"
+                            "🛡 加白 / 拉黑 / 白名单\n"
+                            "🎛 尺度 / 敏感词 / 行为\n"
+                            "🎮 戳 / 骰子 / 猜拳\n"
+                            "🎵 音乐卡片 / json / 定海神针\n"
+                            "💡 输错命令也没关系 AI会帮你猜"
+                        ),
+                        "jumpUrl": "",
+                        "preview": "",
+                        "source_icon": "",
+                        "source_url": "",
+                        "tag": "YuKiKo",
+                        "title": "YuKiKo 管理面板",
+                    }
+                },
+            }
+            payload = [{"type": "json", "data": {"data": json.dumps(card, ensure_ascii=False)}}]
+            if group_id:
+                await api_call("send_group_msg", group_id=group_id, message=payload)
+            else:
+                await api_call("send_private_msg", user_id=int(user_id), message=payload)
+            return True
+        except Exception as exc:
+            _log.debug("help_card_fail | %s", exc)
+            return False
+
+    async def _act_plugins(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if engine is None:
+            return "引擎未就绪"
+        schemas = getattr(getattr(engine, "plugins", None), "schemas", None)
+        if not isinstance(schemas, list):
+            return "插件系统未就绪"
+        if not schemas:
+            return "当前没有已加载插件"
+        lines = [f"已加载插件 共 {len(schemas)} 个"]
         for item in schemas:
             if not isinstance(item, dict):
                 continue
-            name = normalize_text(str(item.get("name", ""))) or "unknown"
-            desc = normalize_text(str(item.get("description", ""))) or "无描述"
-            lines.append(f"- {name}: {desc}")
-
-            intents_raw = item.get("intent_examples", [])
-            intents = [normalize_text(str(x)) for x in intents_raw if normalize_text(str(x))]
-            if intents:
-                lines.append(f"  intents: {' | '.join(intents[:2])}")
-
-            rules_raw = item.get("rules", [])
-            rules: list[str] = []
-            if isinstance(rules_raw, str):
-                one = normalize_text(rules_raw)
-                if one:
-                    rules.append(one)
-            elif isinstance(rules_raw, list):
-                rules = [normalize_text(str(x)) for x in rules_raw if normalize_text(str(x))]
-            elif isinstance(rules_raw, dict):
-                for key, value in rules_raw.items():
-                    left = normalize_text(str(key))
-                    right = normalize_text(str(value))
-                    if left and right:
-                        rules.append(f"{left}: {right}")
-                    elif left:
-                        rules.append(left)
-            if rules:
-                lines.append(f"  rules: {' ; '.join(rules[:3])}")
+            lines.append(f"- {normalize_text(str(item.get('name', 'unknown')))}: {normalize_text(str(item.get('description', '')))}")
         return "\n".join(lines)
 
-    async def _cmd_ping(self, **_: Any) -> str:
+    async def _act_ping(self, **_: Any) -> str:
         return "pong"
 
-    async def _cmd_health(self, **_: Any) -> str:
-        uptime = int(time.time() - self._start_time)
-        h, m, s = uptime // 3600, (uptime % 3600) // 60, uptime % 60
-        pid = os.getpid()
-        return f"运行中 | PID {pid} | 已处理 {self._message_count} 条 | 运行 {h}h{m}m{s}s"
+    async def _act_status(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        uptime = int(time.time() - self._started)
+        hours = uptime // 3600
+        minutes = (uptime % 3600) // 60
+        uptime_str = f"{hours}h{minutes}m" if hours else f"{minutes}m{uptime % 60}s"
 
-    async def _cmd_say(self, arg: str = "", **_: Any) -> str:
-        return arg or "（空消息）"
-
-    async def _cmd_reload(self, engine: Any = None, **_: Any) -> str:
-        if engine is None:
-            return "引擎未就绪，无法重载。"
-        reload_fn = getattr(engine, "reload_config", None)
-        if not reload_fn:
-            return "引擎不支持热重载。"
-        ok, msg = reload_fn()
-        return f"重载{'成功' if ok else '失败'}: {msg}"
-
-    async def _cmd_whitelist(self, arg: str = "", group_id: int = 0, **_: Any) -> str:
-        sub = arg.lower().split()[0] if arg else ""
-        if sub in ("add", "加白"):
-            return await self._cmd_whitelist_add(group_id=group_id)
-        if sub in ("remove", "rm", "拉黑", "移除"):
-            return await self._cmd_whitelist_remove(group_id=group_id)
-        if sub in ("list", "列表", ""):
-            return await self._cmd_whitelist_list()
-        return "用法: /whitelist add | remove | list"
-
-    async def _cmd_whitelist_add(self, group_id: int = 0, **_: Any) -> str:
-        if not group_id:
-            return "请在群聊中使用此指令。"
-        self._whitelisted_groups.add(group_id)
-        self._save_whitelist()
-        return f"群 {group_id} 已加入白名单。"
-
-    async def _cmd_whitelist_remove(self, group_id: int = 0, **_: Any) -> str:
-        if not group_id:
-            return "请在群聊中使用此指令。"
-        self._whitelisted_groups.discard(group_id)
-        self._save_whitelist()
-        return f"群 {group_id} 已移出白名单。"
-
-    async def _cmd_whitelist_list(self, **_: Any) -> str:
-        if not self._whitelisted_groups:
-            return "白名单为空。"
-        items = ", ".join(str(g) for g in sorted(self._whitelisted_groups))
-        return f"白名单群: {items}"
-
-    async def _cmd_status(self, engine: Any = None, **_: Any) -> str:
-        lines = [await self._cmd_health()]
-        lines.append(f"白名单群数: {len(self._whitelisted_groups)}")
-        if engine:
-            mem = getattr(engine, "memory", None)
-            if mem:
-                profiles = getattr(mem, "_profiles", {})
-                lines.append(f"用户画像数: {len(profiles)}")
+        lines = [
+            "YuKiKo 运行状态",
+            "─────────────────────",
+            f"  运行时长  {uptime_str}",
+            f"  消息计数  {self._count}",
+            f"  白名单群  {len(self._white)} 个",
+        ]
+        if engine is not None:
+            if getattr(engine, "safety", None) is not None:
+                scale = int(getattr(engine.safety, "scale", 2))
+                names = getattr(engine.safety, "SCALE_NAMES", {})
+                lines.append(f"  安全尺度  {scale} ({names.get(scale, '?')})")
+            if getattr(engine, "agent", None) is not None:
+                agent_enable = getattr(engine.agent, "enable", False)
+                lines.append(f"  Agent模式 {'开启' if agent_enable else '关闭'}")
+            if getattr(engine, "model_client", None) is not None:
+                provider = getattr(engine.model_client, "provider", "?")
+                model = getattr(engine.model_client, "model", "?")
+                lines.append(f"  AI模型    {provider}/{model}")
+            if getattr(engine, "agent_tool_registry", None) is not None:
+                tool_count = getattr(engine.agent_tool_registry, "tool_count", 0)
+                lines.append(f"  可用工具  {tool_count} 个")
         return "\n".join(lines)
 
-    async def _cmd_debug(self, arg: str = "", engine: Any = None, **_: Any) -> str:
+    async def _act_say(self, **kwargs: Any) -> str:
+        return normalize_text(str(kwargs.get("arg", "")))
+
+    async def _act_reload(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if engine is None:
+            return "引擎未就绪"
+        ok, msg = engine.reload_config()
+        return f"重载{'成功' if ok else '失败'}: {msg}"
+
+    async def _act_white(self, **kwargs: Any) -> str:
+        sub = normalize_text(str(kwargs.get("arg", ""))).lower()
+        if sub in {"add", "+", "加", "加白"}:
+            return await self._act_white_add(**kwargs)
+        if sub in {"rm", "remove", "del", "-", "拉黑", "删"}:
+            return await self._act_white_rm(**kwargs)
+        return await self._act_white_list(**kwargs)
+
+    async def _act_white_add(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        if not gid:
+            return "仅可在群聊内执行"
+        self._white.add(gid)
+        self._save_white()
+        return f"已加白本群 {gid}"
+
+    async def _act_white_rm(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        if not gid:
+            return "仅可在群聊内执行"
+        self._white.discard(gid)
+        self._save_white()
+        return f"已从白名单移除本群 {gid}"
+
+    async def _act_white_list(self, **_: Any) -> str:
+        if not self._white:
+            return "白名单为空"
+        return "白名单群\n" + "\n".join(f"- {x}" for x in sorted(self._white))
+
+    async def _act_group_info(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        api_call = kwargs.get("api_call")
+        if not gid or not api_call:
+            return "仅可在群聊内执行"
+        try:
+            data = await api_call("get_group_info", group_id=gid, no_cache=True)
+            return f"群信息\n- ID: {gid}\n- 名称: {normalize_text(str((data or {}).get('group_name', '未知')))}\n- 人数: {int((data or {}).get('member_count', 0) or 0)}"
+        except Exception as exc:
+            return f"获取群信息失败: {str(exc)[:80]}"
+
+    async def _act_debug(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if engine is None:
+            return "引擎未就绪"
         if not arg:
             return "用法: /yuki debug <QQ号>"
-        if not engine:
-            return "引擎未就绪。"
-        mem = getattr(engine, "memory", None)
-        if not mem:
-            return "记忆系统未就绪。"
-        summary = mem.get_user_profile_summary(arg)
-        return summary or f"未找到用户 {arg} 的画像。"
-
-    async def _cmd_cookie_refresh(self, arg: str = "", engine: Any = None, **_: Any) -> str:
-        """刷新平台 Cookie（通过浏览器提取）。
-        用法: /yuki cookie [bilibili|douyin|kuaishou] [浏览器] [force]
-        """
-        parts_raw = arg.split() if arg else []
-        force_tokens = {"force", "auto", "close"}
-        auto_close = any(normalize_text(str(p)).lower() in force_tokens for p in parts_raw)
-        parts = [p for p in parts_raw if normalize_text(str(p)).lower() not in force_tokens]
-
-        platform = normalize_text(parts[0]).lower() if parts else "all"
-        browser = normalize_text(parts[1]).lower() if len(parts) > 1 else ("edge" if os.name == "nt" else "chrome")
-        results: list[str] = []
-        running_hint_needed = False
-
+        memory = getattr(engine, "memory", None)
+        if memory is None:
+            return "记忆系统未就绪"
         try:
-            from core.cookie_auth import (
-                extract_bilibili_cookies,
-                extract_douyin_cookie,
-                extract_kuaishou_cookie,
-                is_browser_running,
-            )
-        except ImportError:
-            return "cookie_auth 模块不可用。"
+            out = memory.get_user_profile_summary(arg)
+            return out or "暂无画像数据"
+        except Exception as exc:
+            return f"读取画像失败: {str(exc)[:80]}"
 
-        if platform in ("all", "bilibili", "bili", "b站"):
-            bili = extract_bilibili_cookies(browser, auto_close=auto_close)
-            if bili.get("sessdata"):
-                results.append(f"B站: 提取成功 (SESSDATA={bili['sessdata'][:8]}...)")
-                if engine:
-                    self._update_engine_cookie(engine, "bilibili", bili)
-            else:
-                results.append(f"B站: 提取失败（检查 {browser}）")
-                running_hint_needed = running_hint_needed or (not auto_close)
+    async def _act_cookie(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if engine is None:
+            return "引擎未就绪"
 
-        if platform in ("all", "douyin", "抖音"):
-            cookie = extract_douyin_cookie(browser, auto_close=auto_close)
-            if cookie:
-                results.append(f"抖音: 提取成功 ({len(cookie)} 字节)")
-                if engine:
-                    self._update_engine_cookie(engine, "douyin", {"cookie": cookie})
-            else:
-                results.append(f"抖音: 提取失败（检查 {browser}）")
-                running_hint_needed = running_hint_needed or (not auto_close)
+        platform = "all"
+        browser = "edge"
+        force = False
+        parts = [x for x in arg.split() if x]
+        if parts:
+            platform = parts[0].lower()
+        if len(parts) >= 2:
+            browser = parts[1].lower()
+        if len(parts) >= 3:
+            force = parts[2].lower() in {"1", "true", "yes", "y", "force"}
 
-        if platform in ("all", "kuaishou", "快手"):
-            cookie = extract_kuaishou_cookie(browser, auto_close=auto_close)
-            if cookie:
-                results.append(f"快手: 提取成功 ({len(cookie)} 字节)")
-                if engine:
-                    self._update_engine_cookie(engine, "kuaishou", {"cookie": cookie})
-            else:
-                results.append(f"快手: 提取失败（检查 {browser}）")
-                running_hint_needed = running_hint_needed or (not auto_close)
+        from core.cookie_auth import extract_bilibili_cookies, extract_douyin_cookie, extract_kuaishou_cookie
 
-        if not results:
-            return f"未知平台: {platform}\n用法: /yuki cookie [bilibili|douyin|kuaishou] [浏览器] [force]"
+        ok: list[str] = []
+        fail: list[str] = []
 
-        if running_hint_needed and browser in {"edge", "chrome", "brave"}:
+        async def refresh_one(name: str) -> None:
             try:
-                if is_browser_running(browser):
-                    results.append(
-                        f"提示: 检测到 {browser} 正在运行，试试 `/yuki cookie {platform} {browser} force` 强制提取"
-                    )
-            except Exception:
-                pass
+                if name == "bilibili":
+                    data = await asyncio.to_thread(extract_bilibili_cookies, browser, force)
+                    sess = normalize_text(str((data or {}).get("SESSDATA", "")))
+                    jct = normalize_text(str((data or {}).get("bili_jct", "")))
+                    if sess:
+                        tools = getattr(engine, "tools", None)
+                        if tools is not None:
+                            setattr(tools, "_bilibili_sessdata", sess)
+                            setattr(tools, "_bilibili_jct", jct)
+                            setattr(tools, "_bilibili_cookie", f"SESSDATA={sess}; bili_jct={jct}" if jct else f"SESSDATA={sess}")
+                        ok.append("bilibili")
+                    else:
+                        fail.append("bilibili(empty)")
+                elif name == "douyin":
+                    cookie = await asyncio.to_thread(extract_douyin_cookie, browser, force)
+                    if cookie:
+                        tools = getattr(engine, "tools", None)
+                        if tools is not None:
+                            setattr(tools, "_douyin_cookie", normalize_text(str(cookie)))
+                        ok.append("douyin")
+                    else:
+                        fail.append("douyin(empty)")
+                elif name == "kuaishou":
+                    cookie = await asyncio.to_thread(extract_kuaishou_cookie, browser, force)
+                    if cookie:
+                        tools = getattr(engine, "tools", None)
+                        if tools is not None:
+                            setattr(tools, "_kuaishou_cookie", normalize_text(str(cookie)))
+                        ok.append("kuaishou")
+                    else:
+                        fail.append("kuaishou(empty)")
+            except Exception as exc:
+                fail.append(f"{name}({str(exc)[:40]})")
 
-        return "Cookie 刷新结果:\n" + "\n".join(results)
+        targets = ["bilibili", "douyin", "kuaishou"] if platform in {"all", "*"} else [platform]
+        for one in targets:
+            await refresh_one(one)
+        return f"cookie 刷新完成 成功 {ok or '无'} 失败 {fail or '无'}"
 
-    @staticmethod
-    def _update_engine_cookie(engine: Any, platform: str, data: dict[str, str]) -> None:
-        """热更新 engine/tools 中的 cookie（不写入配置文件，重启后失效）。"""
-        tools = getattr(engine, "tools", None)
-        if not tools:
-            return
-
-        va = getattr(tools, "_video_analyzer", None)
-
-        if platform == "bilibili":
-            sessdata = data.get("sessdata", "")
-            bili_jct = data.get("bili_jct", "")
-            if va:
-                va._bili_sessdata = sessdata
-                va._bili_jct = bili_jct
-        elif platform == "douyin":
-            cookie = data.get("cookie", "")
-            tools._douyin_cookie = cookie
-            if va:
-                va._douyin_cookie = cookie
-        elif platform == "kuaishou":
-            cookie = data.get("cookie", "")
-            tools._kuaishou_cookie = cookie
-            if va:
-                va._kuaishou_cookie = cookie
-
-    # ── 行为调参 ──────────────────────────────────────────────
-
-    # 预设模板：(trigger 覆盖, routing 覆盖, self_check 覆盖, 描述)
-    _BEHAVIOR_PRESETS: dict[str, tuple[dict, dict, dict, str]] = {
-        "默认": (
-            {"ai_listen_enable": True, "delegate_undirected_to_ai": True,
-             "ai_listen_min_messages": 8, "ai_listen_min_score": 2.2,
-             "followup_reply_window_seconds": 30, "followup_max_turns": 2},
-            {"min_confidence": 0.55, "followup_min_confidence": 0.75,
-             "non_directed_min_confidence": 0.72, "ai_gate_min_confidence": 0.66},
-            {"listen_probe_min_confidence": 0.86, "non_direct_reply_min_confidence": 0.78},
-            "出厂默认，适度主动",
-        ),
-        "冷漠": (
-            {"ai_listen_enable": False, "delegate_undirected_to_ai": False,
-             "followup_reply_window_seconds": 10, "followup_max_turns": 1},
-            {"min_confidence": 0.70, "followup_min_confidence": 0.88,
-             "non_directed_min_confidence": 0.90, "ai_gate_min_confidence": 0.85},
-            {"listen_probe_min_confidence": 0.98, "non_direct_reply_min_confidence": 0.92},
-            "只在被 @ 或叫名字时回复，几乎不主动接话",
-        ),
-        "安静": (
-            {"ai_listen_enable": True, "delegate_undirected_to_ai": True,
-             "ai_listen_min_messages": 15, "ai_listen_min_score": 3.5,
-             "followup_reply_window_seconds": 15, "followup_max_turns": 1},
-            {"min_confidence": 0.65, "followup_min_confidence": 0.82,
-             "non_directed_min_confidence": 0.82, "ai_gate_min_confidence": 0.78},
-            {"listen_probe_min_confidence": 0.92, "non_direct_reply_min_confidence": 0.85},
-            "偶尔接话，但门槛较高",
-        ),
-        "活跃": (
-            {"ai_listen_enable": True, "delegate_undirected_to_ai": True,
-             "ai_listen_min_messages": 4, "ai_listen_min_score": 1.5,
-             "followup_reply_window_seconds": 45, "followup_max_turns": 3},
-            {"min_confidence": 0.45, "followup_min_confidence": 0.60,
-             "non_directed_min_confidence": 0.58, "ai_gate_min_confidence": 0.50},
-            {"listen_probe_min_confidence": 0.75, "non_direct_reply_min_confidence": 0.65},
-            "积极参与群聊，主动接话频率高",
-        ),
-    }
-
-    # 可单独调的参数 → (config section, key, 类型, 说明)
-    _BEHAVIOR_PARAMS: dict[str, tuple[str, str, type, str]] = {
-        "主动接话": ("trigger", "ai_listen_enable", bool, "是否主动加入群聊讨论"),
-        "接话门槛": ("trigger", "ai_listen_min_score", float, "主动接话热度门槛 (越高越不容易触发)"),
-        "接话消息数": ("trigger", "ai_listen_min_messages", int, "触发主动接话的最少消息数"),
-        "跟随窗口": ("trigger", "followup_reply_window_seconds", int, "跟随对话窗口(秒)"),
-        "跟随轮数": ("trigger", "followup_max_turns", int, "跟随对话最大轮数"),
-        "非指名置信度": ("routing", "non_directed_min_confidence", float, "非指名回复最低置信度"),
-        "跟随置信度": ("routing", "followup_min_confidence", float, "跟随对话最低置信度"),
-        "基础置信度": ("routing", "min_confidence", float, "基础最低置信度"),
-        "旁听置信度": ("self_check", "listen_probe_min_confidence", float, "旁听模式最低置信度"),
-    }
-
-    async def _cmd_behavior(self, arg: str = "", engine: Any = None, **_: Any) -> str:
-        """行为调参主命令。"""
+    async def _act_scale(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if engine is None or getattr(engine, "safety", None) is None:
+            return "安全系统未就绪"
         if not arg:
-            return self._behavior_status(engine)
+            level = int(getattr(engine.safety, "scale", 2))
+            names = getattr(engine.safety, "SCALE_NAMES", {})
+            return f"当前尺度 {level} ({names.get(level, 'unknown')})"
+        try:
+            level = int(arg)
+        except Exception:
+            return "用法: /yuki 尺度 <0-3>"
+        return engine.safety.set_scale(level)
 
+    async def _act_sensitive(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if engine is None or getattr(engine, "safety", None) is None:
+            return "安全系统未就绪"
+        args = [x for x in arg.split() if x]
+        if not args:
+            rows = engine.safety.list_output_words()
+            if not rows:
+                return "输出敏感词为空"
+            # 只返回数量，不暴露具体词汇
+            return f"当前共 {len(rows)} 条输出敏感词（防封群用，具体内容不对外展示）"
+        cmd = args[0].lower()
+        if cmd in {"添加", "add"} and len(args) >= 2:
+            word = args[1]
+            repl = args[2] if len(args) >= 3 else "**"
+            engine.safety.add_output_word(word, repl)
+            return f"已添加敏感词 {word} -> {repl}"
+        if cmd in {"删除", "del", "remove"} and len(args) >= 2:
+            ok = engine.safety.remove_output_word(args[1])
+            return f"已删除敏感词 {args[1]}" if ok else f"未找到敏感词 {args[1]}"
+        return "用法: /yuki 敏感词 [添加|删除] ..."
+
+    async def _act_poke(self, **kwargs: Any) -> str | None:
+        api_call = kwargs.get("api_call")
+        gid = int(kwargs.get("group_id", 0) or 0)
+        uid = str(kwargs.get("user_id", ""))
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if not api_call:
+            return "API 不可用"
+        target = arg or uid
+        try:
+            if gid:
+                try:
+                    await api_call("group_poke", group_id=gid, user_id=int(target))
+                except Exception:
+                    await api_call("send_group_msg", group_id=gid, message=[{"type": "poke", "data": {"type": "1", "id": "-1"}}])
+            else:
+                await api_call("send_private_msg", user_id=int(target), message=[{"type": "poke", "data": {"type": "1", "id": "-1"}}])
+            return None
+        except Exception as exc:
+            return f"戳一戳失败: {str(exc)[:80]}"
+
+    async def _act_dice(self, **kwargs: Any) -> str | None:
+        return await self._send_segment(kwargs, "dice", {})
+
+    async def _act_rps(self, **kwargs: Any) -> str | None:
+        return await self._send_segment(kwargs, "rps", {})
+
+    async def _act_music_card(self, **kwargs: Any) -> str | None:
+        api_call = kwargs.get("api_call")
+        gid = int(kwargs.get("group_id", 0) or 0)
+        uid = str(kwargs.get("user_id", ""))
+        engine = kwargs.get("engine")
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if not api_call:
+            return "API 不可用"
+        if not arg:
+            return "用法: /yuki 音乐卡片 <歌名> 或 <平台> <数字ID>"
         parts = arg.split(maxsplit=1)
-        sub = parts[0]
+        if len(parts) == 2 and parts[0].lower() in {"qq", "163", "kugou", "kuwo", "migu"} and parts[1].isdigit():
+            return await self._send_segment(kwargs, "music", {"type": parts[0].lower(), "id": parts[1]})
+        tools = getattr(engine, "tools", None) if engine is not None else None
+        me = getattr(tools, "_music_engine", None) if tools is not None else None
+        if me is None:
+            return "音乐引擎未就绪"
+        try:
+            rows = await me.search(arg, limit=6)
+        except Exception as exc:
+            return f"搜索失败: {str(exc)[:80]}"
+        if not rows:
+            return f"没找到「{arg}」相关歌曲"
+        song = rows[0]
+        data = {
+            "type": "custom",
+            "url": f"https://music.163.com/#/song?id={song.song_id}",
+            "audio": f"https://music.163.com/song/media/outer/url?id={song.song_id}.mp3",
+            "title": song.name or arg,
+            "content": song.artist or "未知艺人",
+            "image": "https://p2.music.126.net/6y-UleORITEDbvrOLV0Q8A==/5639395138885805.jpg",
+        }
+        msg = [{"type": "music", "data": data}]
+        try:
+            if gid:
+                await api_call("send_group_msg", group_id=gid, message=msg)
+            else:
+                await api_call("send_private_msg", user_id=int(uid), message=msg)
+            return None
+        except Exception as exc:
+            return f"音乐卡片发送失败: {str(exc)[:80]}"
 
-        # 预设切换
-        if sub in self._BEHAVIOR_PRESETS:
-            return self._apply_behavior_preset(sub, engine)
+    async def _act_clear_screen(self, **kwargs: Any) -> str | None:
+        """定海神针 — 分段发送大量空行刷屏，末尾附 AI 语录。"""
+        arg = str(kwargs.get("arg", "")).strip()
+        api_call = kwargs.get("api_call")
+        group_id = int(kwargs.get("group_id", 0) or 0)
+        user_id = str(kwargs.get("user_id", ""))
+        engine = kwargs.get("engine")
 
-        # 单参数调整: /yuki 行为 参数名 值
-        if sub in self._BEHAVIOR_PARAMS:
-            if len(parts) < 2:
-                section, key, typ, desc = self._BEHAVIOR_PARAMS[sub]
-                current = self._get_config_value(engine, section, key)
-                return f"{sub}: {current} ({desc})"
-            return self._set_behavior_param(sub, parts[1].strip(), engine)
-
-        # 列出可用预设和参数
-        presets = " | ".join(self._BEHAVIOR_PRESETS.keys())
-        params = "\n".join(f"  {name}: {desc}" for name, (_, _, _, desc) in self._BEHAVIOR_PARAMS.items())
-        return (
-            f"未知参数: {sub}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"预设: {presets}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"可调参数:\n{params}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"用法:\n"
-            f"  /yuki 行为 冷漠\n"
-            f"  /yuki 行为 接话门槛 3.0"
-        )
-
-    async def _cmd_behavior_cold(self, engine: Any = None, **_: Any) -> str:
-        return self._apply_behavior_preset("冷漠", engine)
-
-    async def _cmd_behavior_active(self, engine: Any = None, **_: Any) -> str:
-        return self._apply_behavior_preset("活跃", engine)
-
-    async def _cmd_behavior_quiet(self, engine: Any = None, **_: Any) -> str:
-        return self._apply_behavior_preset("安静", engine)
-
-    async def _cmd_clear_screen(
-        self,
-        arg: str = "",
-        group_id: int = 0,
-        user_id: str = "",
-        api_call: Any = None,
-        engine: Any = None,
-        **_: Any,
-    ) -> str | None:
-        """定海神针 — 分段多次发送，可自定义总行数/分段数/延迟。"""
-        # 用法: /yuki 定海神针 3000 10 5
         total_lines = 3000
         segment_count = 10
         delay_seconds = 0.8
 
-        parts = [p for p in (arg or "").split() if p.strip()]
+        parts = [p for p in arg.split() if p.strip()]
         if len(parts) >= 1:
-            try:
-                total_lines = int(parts[0])
-            except ValueError:
-                pass
+            try: total_lines = int(parts[0])
+            except ValueError: pass
         if len(parts) >= 2:
-            try:
-                segment_count = int(parts[1])
-            except ValueError:
-                pass
+            try: segment_count = int(parts[1])
+            except ValueError: pass
         if len(parts) >= 3:
-            try:
-                delay_seconds = float(parts[2])
-            except ValueError:
-                pass
+            try: delay_seconds = float(parts[2])
+            except ValueError: pass
 
         total_lines = max(120, min(20000, total_lines))
         segment_count = max(1, min(80, segment_count))
         delay_seconds = max(0.0, min(30.0, delay_seconds))
 
+        # AI 语录
         quote = await self._random_ai_quote(engine)
 
-        # 无 api_call 时回退为单条文本（兼容单测/离线场景）。
         if not api_call:
             lines = ["　" for _ in range(total_lines)]
             lines.append(f"「{quote}」")
@@ -566,7 +661,6 @@ class AdminEngine:
 
         base = total_lines // segment_count
         rem = total_lines % segment_count
-        sent_any = False
 
         for idx in range(segment_count):
             n = base + (1 if idx < rem else 0)
@@ -576,302 +670,205 @@ class AdminEngine:
             if idx == segment_count - 1:
                 lines.append(f"「{quote}」")
             msg = "\n".join(lines)
-
             try:
                 if group_id:
                     await api_call("send_group_msg", group_id=int(group_id), message=msg)
                 else:
                     await api_call("send_private_msg", user_id=int(user_id), message=msg)
-                sent_any = True
             except Exception as exc:
                 return f"定海神针发送失败（第 {idx + 1}/{segment_count} 段）：{exc}"
-
             if idx < segment_count - 1 and delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
-
-        if not sent_any:
-            return "定海神针未发送：缺少有效会话目标。"
-        # 已在命令内部发送完毕，不再让上层重复发一条回执。
         return None
 
     async def _random_ai_quote(self, engine: Any = None) -> str:
         """随机语录：优先 AI 生成，失败则本地兜底。"""
+        import random
         local_pool = [
             "潮落归海，言尽于此。",
-            "风过无痕，事了拂衣。",
-            "山高路远，步履不停。",
-            "心有定锚，万浪自平。",
-            "言有尽，而意无穷。",
-            "尘嚣退场，星河入席。",
+            "山高水长，后会有期。",
+            "风起于青萍之末。",
+            "浮生若梦，为欢几何。",
+            "天地一逆旅，同悲万古尘。",
+            "人生到处知何似，应似飞鸿踏雪泥。",
+            "此去经年，应是良辰好景虚设。",
         ]
-
-        try:
-            model_client = getattr(engine, "model_client", None)
-            if model_client and bool(getattr(model_client, "enabled", False)):
-                messages = [
-                    {
-                        "role": "system",
-                        "content": SystemPromptRelay.admin_quote_system_prompt(),
-                    },
-                    {
-                        "role": "user",
-                        "content": "随机来一句有气势、适合收尾的语录。",
-                    },
-                ]
-                text = str(await model_client.chat_text(messages, max_tokens=48)).strip()
-                text = " ".join(text.split())
-                if text:
-                    # 避免模型输出多段，取第一句并裁剪长度。
-                    text = text.split("\n", 1)[0].strip("。.!！?？ ")
-                    if text:
-                        return text[:24]
-        except Exception:
-            pass
-
+        if engine and hasattr(engine, "model_client"):
+            try:
+                client = engine.model_client
+                resp = await asyncio.wait_for(
+                    client.chat([{"role": "user", "content": "用一句古风短句作为定海神针的结尾语录，15字以内，只输出语录本身"}]),
+                    timeout=5,
+                )
+                text = (resp or "").strip().strip("\"'「」""")
+                if 2 < len(text) < 30:
+                    return text
+            except Exception:
+                pass
         return random.choice(local_pool)
 
-    def _behavior_status(self, engine: Any = None) -> str:
-        """显示当前行为参数。"""
-        lines = ["当前行为参数:"]
-        for name, (section, key, typ, desc) in self._BEHAVIOR_PARAMS.items():
-            val = self._get_config_value(engine, section, key)
-            lines.append(f"  {name}: {val}")
-
-        # 判断当前最接近哪个预设
-        closest = self._detect_closest_preset(engine)
-        if closest:
-            lines.append(f"\n当前模式: {closest}")
-
-        presets = " | ".join(self._BEHAVIOR_PRESETS.keys())
-        lines.append(f"\n可用预设: {presets}")
-        lines.append("用法: /yuki 行为 <预设名|参数名> [值]")
-        return "\n".join(lines)
-
-    def _apply_behavior_preset(self, preset_name: str, engine: Any = None) -> str:
-        """应用行为预设。"""
-        preset = self._BEHAVIOR_PRESETS.get(preset_name)
-        if not preset:
-            return f"未知预设: {preset_name}"
-
-        trigger_overrides, routing_overrides, self_check_overrides, desc = preset
-
-        if not engine:
-            return "引擎未就绪，无法调参。"
-
-        config = getattr(engine, "config", None)
-        if not isinstance(config, dict):
-            return "配置不可用。"
-
-        # 合并到 config
-        if "trigger" not in config:
-            config["trigger"] = {}
-        config["trigger"].update(trigger_overrides)
-
-        if "routing" not in config:
-            config["routing"] = {}
-        config["routing"].update(routing_overrides)
-
-        if "self_check" not in config:
-            config["self_check"] = {}
-        config["self_check"].update(self_check_overrides)
-
-        # 触发引擎重新读取参数
-        init_fn = getattr(engine, "_init_from_config", None)
-        if init_fn:
-            init_fn()
-
-        # 重建 trigger engine
-        trigger = getattr(engine, "trigger", None)
-        if trigger:
-            trigger.__init__(config.get("trigger", {}), config.get("bot", {}))
-
-        # 持久化到 config.yml
-        self._save_config_to_file(engine)
-
-        return f"已切换到「{preset_name}」模式: {desc}"
-
-    def _set_behavior_param(self, param_name: str, value_str: str, engine: Any = None) -> str:
-        """设置单个行为参数。"""
-        if not engine:
-            return "引擎未就绪。"
-
-        info = self._BEHAVIOR_PARAMS.get(param_name)
-        if not info:
-            return f"未知参数: {param_name}"
-
-        section, key, typ, desc = info
-
+    async def _act_json_card(self, **kwargs: Any) -> str | None:
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        if not arg:
+            return "用法: /yuki json <JSON字符串>"
         try:
-            if typ is bool:
-                value = value_str.lower() in ("true", "1", "yes", "on", "开", "是")
-            elif typ is float:
-                value = float(value_str)
-            elif typ is int:
-                value = int(value_str)
-            else:
-                value = value_str
-        except (ValueError, TypeError):
-            return f"参数值格式错误: {value_str} (期望 {typ.__name__})"
+            json.loads(arg)
+        except json.JSONDecodeError:
+            return "JSON 格式错误"
+        return await self._send_segment(kwargs, "json", {"data": arg})
 
-        config = getattr(engine, "config", None)
-        if not isinstance(config, dict):
-            return "配置不可用。"
-
-        if section not in config:
-            config[section] = {}
-        config[section][key] = value
-
-        # 重新加载
-        init_fn = getattr(engine, "_init_from_config", None)
-        if init_fn:
-            init_fn()
-
-        trigger = getattr(engine, "trigger", None)
-        if trigger and section == "trigger":
-            trigger.__init__(config.get("trigger", {}), config.get("bot", {}))
-
-        self._save_config_to_file(engine)
-
-        return f"{param_name} 已设为 {value} ({desc})"
-
-    def _get_config_value(self, engine: Any, section: str, key: str) -> Any:
-        """从 engine.config 读取参数值。"""
-        if not engine:
-            return "N/A"
-        config = getattr(engine, "config", None)
-        if not isinstance(config, dict):
-            return "N/A"
-        return config.get(section, {}).get(key, "未设置")
-
-    def _detect_closest_preset(self, engine: Any = None) -> str:
-        """检测当前参数最接近哪个预设。"""
-        if not engine:
-            return ""
-        config = getattr(engine, "config", None)
-        if not isinstance(config, dict):
-            return ""
-
-        best_name = ""
-        best_match = 0
-        for name, (trigger_ov, routing_ov, sc_ov, _) in self._BEHAVIOR_PRESETS.items():
-            match_count = 0
-            total = 0
-            for k, v in trigger_ov.items():
-                total += 1
-                if config.get("trigger", {}).get(k) == v:
-                    match_count += 1
-            for k, v in routing_ov.items():
-                total += 1
-                if config.get("routing", {}).get(k) == v:
-                    match_count += 1
-            for k, v in sc_ov.items():
-                total += 1
-                if config.get("self_check", {}).get(k) == v:
-                    match_count += 1
-            if total > 0 and match_count / total > best_match:
-                best_match = match_count / total
-                best_name = name
-
-        return f"{best_name} ({int(best_match * 100)}% 匹配)" if best_match > 0.5 else ""
-
-    @staticmethod
-    def _save_config_to_file(engine: Any) -> None:
-        """将当前 config 持久化到 config.yml。"""
-        try:
-            import yaml
-            config_manager = getattr(engine, "config_manager", None)
-            if config_manager:
-                config_path = getattr(config_manager, "_config_file", None)
-                if config_path and Path(config_path).exists():
-                    config = getattr(engine, "config", None)
-                    if isinstance(config, dict):
-                        Path(config_path).write_text(
-                            yaml.dump(config, allow_unicode=True, default_flow_style=False, sort_keys=False),
-                            encoding="utf-8",
-                        )
-                        _log.info("行为参数已保存到 %s", config_path)
-                        return
-        except Exception as exc:
-            _log.warning("保存行为参数失败: %s", exc)
-
-    # ── 群信息查询（通过 OneBot API）─────────────────────────
-    async def _cmd_group_info(self, group_id: int = 0, api_call: Any = None, **_: Any) -> str:
-        if not group_id:
-            return "请在群聊中使用此指令。"
-        if not api_call:
-            return "API 不可用。"
-        try:
-            info = await api_call("get_group_info", group_id=group_id)
-            name = info.get("group_name", "未知")
-            count = info.get("member_count", "?")
-            max_count = info.get("max_member_count", "?")
-            return f"群名: {name}\n群号: {group_id}\n成员: {count}/{max_count}"
-        except Exception as exc:
-            return f"获取群信息失败: {str(exc)[:100]}"
-
-    async def _cmd_group_members(self, group_id: int = 0, api_call: Any = None, **_: Any) -> str:
-        if not group_id:
-            return "请在群聊中使用此指令。"
-        if not api_call:
-            return "API 不可用。"
-        try:
-            members = await api_call("get_group_member_list", group_id=group_id)
-            if not members:
-                return "获取群成员列表为空。"
-            total = len(members)
-            # 只显示前 30 个
-            lines = [f"群 {group_id} 成员列表（共 {total} 人）:"]
-            for m in members[:30]:
-                nick = m.get("card") or m.get("nickname") or str(m.get("user_id", ""))
-                role = m.get("role", "member")
-                tag = " [管理]" if role == "admin" else " [群主]" if role == "owner" else ""
-                lines.append(f"  {nick} ({m.get('user_id', '?')}){tag}")
-            if total > 30:
-                lines.append(f"  ... 还有 {total - 30} 人")
-            return "\n".join(lines)
-        except Exception as exc:
-            return f"获取群成员失败: {str(exc)[:100]}"
-
-    async def _cmd_group_admins(self, group_id: int = 0, api_call: Any = None, **_: Any) -> str:
-        if not group_id:
-            return "请在群聊中使用此指令。"
-        if not api_call:
-            return "API 不可用。"
-        try:
-            members = await api_call("get_group_member_list", group_id=group_id)
-            if not members:
-                return "获取群成员列表为空。"
-            admins = [m for m in members if m.get("role") in ("admin", "owner")]
-            if not admins:
-                return "未找到管理员信息。"
-            lines = [f"群 {group_id} 管理员列表:"]
-            for m in admins:
-                nick = m.get("card") or m.get("nickname") or str(m.get("user_id", ""))
-                role = "群主" if m.get("role") == "owner" else "管理员"
-                lines.append(f"  [{role}] {nick} ({m.get('user_id', '?')})")
-            return "\n".join(lines)
-        except Exception as exc:
-            return f"获取管理员列表失败: {str(exc)[:100]}"
-
-    # ── 白名单持久化 ─────────────────────────────────────────
-    def _load_whitelist(self) -> set[int]:
-        if not self._whitelist_file.exists():
-            return set()
-        try:
-            data = json.loads(self._whitelist_file.read_text(encoding="utf-8"))
-            groups = data.get("whitelisted_groups", [])
-            return {int(g) for g in groups if str(g).isdigit()}
-        except Exception as exc:
-            _log.warning("加载白名单失败: %s", exc)
-            return set()
-
-    def _save_whitelist(self) -> None:
-        try:
-            self._whitelist_file.parent.mkdir(parents=True, exist_ok=True)
-            data = {"whitelisted_groups": sorted(self._whitelisted_groups)}
-            self._whitelist_file.write_text(
-                json.dumps(data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
+    async def _act_behavior(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        arg = normalize_text(str(kwargs.get("arg", ""))).lower()
+        if engine is None or not isinstance(getattr(engine, "config", None), dict):
+            return "行为系统未就绪"
+        if not arg:
+            trigger_cfg = engine.config.get("trigger", {}) if isinstance(engine.config.get("trigger"), dict) else {}
+            routing_cfg = engine.config.get("routing", {}) if isinstance(engine.config.get("routing"), dict) else {}
+            return (
+                "行为参数\n"
+                f"- ai_listen_enable: {trigger_cfg.get('ai_listen_enable', True)}\n"
+                f"- ai_listen_min_messages: {trigger_cfg.get('ai_listen_min_messages', 8)}\n"
+                f"- ai_listen_min_score: {trigger_cfg.get('ai_listen_min_score', 2.2)}\n"
+                f"- min_confidence: {routing_cfg.get('min_confidence', 0.58)}\n"
+                f"- followup_min_confidence: {routing_cfg.get('followup_min_confidence', 0.75)}"
             )
+        if arg in {"默认", "default"}:
+            return self._set_behavior_mode(engine, "default")
+        if arg in {"冷漠", "cold"}:
+            return self._set_behavior_mode(engine, "cold")
+        if arg in {"安静", "quiet"}:
+            return self._set_behavior_mode(engine, "quiet")
+        if arg in {"活跃", "active"}:
+            return self._set_behavior_mode(engine, "active")
+        return "用法: /yuki 行为 [默认|冷漠|安静|活跃]"
+
+    async def _act_behavior_cold(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if engine is None:
+            return "行为系统未就绪"
+        return self._set_behavior_mode(engine, "cold")
+
+    async def _act_behavior_quiet(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if engine is None:
+            return "行为系统未就绪"
+        return self._set_behavior_mode(engine, "quiet")
+
+    async def _act_behavior_active(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if engine is None:
+            return "行为系统未就绪"
+        return self._set_behavior_mode(engine, "active")
+
+    def _set_behavior_mode(self, engine: Any, mode: str) -> str:
+        trigger_cfg = engine.config.setdefault("trigger", {}) if isinstance(engine.config, dict) else {}
+        routing_cfg = engine.config.setdefault("routing", {}) if isinstance(engine.config, dict) else {}
+        if not isinstance(trigger_cfg, dict):
+            trigger_cfg = {}
+            engine.config["trigger"] = trigger_cfg
+        if not isinstance(routing_cfg, dict):
+            routing_cfg = {}
+            engine.config["routing"] = routing_cfg
+
+        if mode == "cold":
+            trigger_cfg.update({
+                "ai_listen_enable": False,
+                "delegate_undirected_to_ai": False,
+                "followup_reply_window_seconds": 10,
+                "followup_max_turns": 1,
+            })
+            routing_cfg.update({
+                "min_confidence": 0.72,
+                "followup_min_confidence": 0.88,
+                "non_directed_min_confidence": 0.90,
+                "ai_gate_min_confidence": 0.84,
+            })
+            return "已切换到冷漠模式"
+        if mode == "quiet":
+            trigger_cfg.update({
+                "ai_listen_enable": True,
+                "delegate_undirected_to_ai": True,
+                "ai_listen_min_messages": 12,
+                "ai_listen_min_score": 3.6,
+                "followup_reply_window_seconds": 20,
+                "followup_max_turns": 1,
+            })
+            routing_cfg.update({
+                "min_confidence": 0.66,
+                "followup_min_confidence": 0.84,
+                "non_directed_min_confidence": 0.86,
+                "ai_gate_min_confidence": 0.80,
+            })
+            return "已切换到安静模式"
+        if mode == "active":
+            trigger_cfg.update({
+                "ai_listen_enable": True,
+                "delegate_undirected_to_ai": True,
+                "ai_listen_min_messages": 5,
+                "ai_listen_min_score": 1.6,
+                "followup_reply_window_seconds": 40,
+                "followup_max_turns": 4,
+            })
+            routing_cfg.update({
+                "min_confidence": 0.48,
+                "followup_min_confidence": 0.62,
+                "non_directed_min_confidence": 0.64,
+                "ai_gate_min_confidence": 0.54,
+            })
+            return "已切换到活跃模式"
+
+        trigger_cfg.update({
+            "ai_listen_enable": True,
+            "delegate_undirected_to_ai": True,
+            "ai_listen_min_messages": 8,
+            "ai_listen_min_score": 2.2,
+            "followup_reply_window_seconds": 30,
+            "followup_max_turns": 2,
+        })
+        routing_cfg.update({
+            "min_confidence": 0.58,
+            "followup_min_confidence": 0.75,
+            "non_directed_min_confidence": 0.72,
+            "ai_gate_min_confidence": 0.66,
+        })
+        return "已恢复默认行为模式"
+
+    async def _send_segment(self, kwargs: dict[str, Any], seg_type: str, data: dict[str, Any]) -> str | None:
+        api_call = kwargs.get("api_call")
+        gid = int(kwargs.get("group_id", 0) or 0)
+        uid = str(kwargs.get("user_id", ""))
+        if not api_call:
+            return "API 不可用"
+        msg = [{"type": seg_type, "data": data}]
+        try:
+            if gid:
+                await api_call("send_group_msg", group_id=gid, message=msg)
+            else:
+                await api_call("send_private_msg", user_id=int(uid), message=msg)
+            return None
         except Exception as exc:
-            _log.error("保存白名单失败: %s", exc)
+            return f"消息段发送失败: {str(exc)[:80]}"
+
+    def _load_white(self) -> None:
+        if not self._white_path.exists():
+            return
+        try:
+            data = json.loads(self._white_path.read_text(encoding="utf-8"))
+            rows = data.get("groups", []) if isinstance(data, dict) else []
+            if isinstance(rows, list):
+                for x in rows:
+                    try:
+                        self._white.add(int(x))
+                    except Exception:
+                        pass
+        except Exception as exc:
+            _log.debug("load_whitelist_fail | %s", exc)
+
+    def _save_white(self) -> None:
+        try:
+            payload = {"groups": sorted(self._white)}
+            self._white_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _log.debug("save_whitelist_fail | %s", exc)
+

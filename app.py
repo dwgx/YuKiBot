@@ -283,15 +283,9 @@ def register_handlers(engine: YukikoEngine) -> None:
                     delivered = True
                     # 语音前置文案已发送，避免后续文本分段重复发送一遍。
                     reply_text = ""
-                # 发送语音条：优先 base64（避免 file:// 可达但时长识别异常）
+                # 发送语音条：优先 file://（NapCat 对本地文件时长识别最准确）
                 sent_voice = False
-                if record_b64:
-                    try:
-                        await send_msg(Message(MessageSegment.record(file=f"base64://{record_b64}")))
-                        sent_voice = True
-                    except Exception as _voice_b64_err:
-                        _log.warning("voice_send_b64_fail | %s", _voice_b64_err)
-                if not sent_voice and audio_file:
+                if audio_file:
                     try:
                         audio_uri = ""
                         try:
@@ -309,6 +303,12 @@ def register_handlers(engine: YukikoEngine) -> None:
                         sent_voice = True
                     except Exception as _voice_file_err:
                         _log.warning("voice_send_file_fail | %s", _voice_file_err)
+                if not sent_voice and record_b64:
+                    try:
+                        await send_msg(Message(MessageSegment.record(file=f"base64://{record_b64}")))
+                        sent_voice = True
+                    except Exception as _voice_b64_err:
+                        _log.warning("voice_send_b64_fail | %s", _voice_b64_err)
                 if sent_voice:
                     delivered = True
                 else:

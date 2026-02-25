@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import json
+import logging
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -12,6 +14,8 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
 from core.admin import AdminEngine
+from core.agent import AgentContext, AgentLoop, AgentResult
+from core.agent_tools import AgentToolRegistry, register_builtin_tools
 from core.config_manager import ConfigManager
 from core.emotion import EmotionEngine
 from core.image import ImageEngine
@@ -208,6 +212,21 @@ class YukikoEngine:
             search_engine=self.search,
             image_engine=self.image,
             plugin_runner=self._run_plugin,
+            config=self.config,
+        )
+
+        # ── Agent 系统 ──
+        self.agent_tool_registry = AgentToolRegistry()
+        register_builtin_tools(
+            registry=self.agent_tool_registry,
+            search_engine=self.search,
+            image_engine=self.image,
+            model_client=self.model_client,
+            config=self.config,
+        )
+        self.agent = AgentLoop(
+            model_client=self.model_client,
+            tool_registry=self.agent_tool_registry,
             config=self.config,
         )
 
@@ -496,6 +515,19 @@ class YukikoEngine:
         )
         if runtime_group_context:
             memory_context = (memory_context + [f"[群聊缓存]{item}" for item in runtime_group_context])[-18:]
+
+        # ── Agent 模式：优先走 Agent 循环 ──
+        if self.agent.enable and self.model_client.enabled:
+            agent_result = await self._try_agent_path(
+                message=message,
+                text=text,
+                trigger=trigger,
+                memory_context=memory_context,
+                related_memories=related_memories,
+                user_profile_summary=user_profile_summary,
+            )
+            if agent_result is not None:
+                return agent_result
 
         router_input = RouterInput(
             text=text,
@@ -850,12 +882,18 @@ class YukikoEngine:
                 reply_text = normalize_text(str(tool_result.payload.get("text", "")))
             if not reply_text:
                 reply_text = "这个请求执行失败了，你稍后再试一次。"
+        elif action == "send_segment":
+            # 消息段已在 tools 层直接发送，这里只处理回复文本
+            if tool_result is not None and tool_result.ok:
+                return EngineResponse(action="ignore", reason="segment_sent_directly")
+            reply_text = normalize_text(str(getattr(tool_result, "error", ""))) if tool_result else "消息段发送失败。"
         else:
             return EngineResponse(action="ignore", reason="router_unknown_action")
 
         reply_text = self._sanitize_reply_output(reply_text, action=action)
         reply_text = self._enforce_identity_claim(reply_text)
         reply_text = self._apply_tone_guard(reply_text)
+        reply_text = self.safety.filter_output(reply_text)
         if reply_text:
             reply_text = self._inject_user_name(
                 reply_text=reply_text,
@@ -937,6 +975,120 @@ class YukikoEngine:
                 "target_user_id": getattr(decision, "target_user_id", ""),
             },
         )
+
+    async def _try_agent_path(
+        self,
+        message: EngineMessage,
+        text: str,
+        trigger: Any,
+        memory_context: list[str],
+        related_memories: list[str],
+        user_profile_summary: str,
+    ) -> EngineResponse | None:
+        """尝试走 Agent 循环处理消息。成功返回 EngineResponse，失败返回 None 回退旧管线。"""
+        try:
+            media_summary = self._build_media_summary(message.raw_segments)
+            # 构建 admin_handler 闭包
+            _engine_ref = self
+            async def _admin_handler_for_agent(text: str, user_id: str, group_id: int) -> str | None:
+                return await _engine_ref.admin.handle_command(
+                    text=text, user_id=user_id, group_id=group_id,
+                    engine=_engine_ref, api_call=message.api_call,
+                )
+
+            ctx = AgentContext(
+                conversation_id=message.conversation_id,
+                user_id=message.user_id,
+                user_name=message.user_name,
+                group_id=message.group_id,
+                bot_id=message.bot_id,
+                is_private=message.is_private,
+                mentioned=message.mentioned,
+                message_text=text,
+                raw_segments=message.raw_segments,
+                api_call=message.api_call,
+                admin_handler=_admin_handler_for_agent,
+                trace_id=message.trace_id,
+                memory_context=memory_context,
+                related_memories=related_memories,
+                user_profile_summary=user_profile_summary,
+                media_summary=media_summary,
+            )
+
+            agent_result = await asyncio.wait_for(
+                self.agent.run(ctx),
+                timeout=max(30, self.router_timeout_seconds * 3),
+            )
+
+            self.logger.info(
+                "agent_done | trace=%s | 会话=%s | 用户=%s | steps=%d | tools=%d | time=%dms | reason=%s",
+                message.trace_id,
+                message.conversation_id,
+                message.user_id,
+                len(agent_result.steps),
+                agent_result.tool_calls_made,
+                agent_result.total_time_ms,
+                agent_result.reason,
+            )
+
+            reply_text = normalize_text(agent_result.reply_text)
+            if not reply_text and not agent_result.image_url and not agent_result.video_url:
+                # Agent 没产出有效回复，回退旧管线
+                return None
+
+            # 后处理
+            reply_text = self._sanitize_reply_output(reply_text, action=agent_result.action)
+            reply_text = self._enforce_identity_claim(reply_text)
+            reply_text = self._apply_tone_guard(reply_text)
+            reply_text = self.safety.filter_output(reply_text)
+            if reply_text:
+                reply_text = self._inject_user_name(
+                    reply_text=reply_text,
+                    user_name=message.user_name,
+                    should_address=(message.mentioned or message.is_private),
+                )
+                reply_text = clip_text(reply_text, max(480, self.max_reply_chars * 2))
+
+            rendered = self.markdown.render(reply_text) if reply_text else ""
+            rendered = self._ensure_min_reply_text(
+                rendered=rendered,
+                action=agent_result.action,
+                user_text=text,
+                search_summary="",
+                message=message,
+                recent_messages=[],
+            )
+
+            if not rendered and not agent_result.image_url and not agent_result.video_url:
+                return None
+
+            await self._after_reply(
+                message, rendered, proactive=False,
+                action=agent_result.action,
+                open_followup=True,
+            )
+            self._record_intent(message, action=agent_result.action, reason=agent_result.reason, text=text)
+
+            return EngineResponse(
+                action=agent_result.action,
+                reason=agent_result.reason,
+                reply_text=rendered,
+                image_url=agent_result.image_url,
+                image_urls=agent_result.image_urls,
+                video_url=agent_result.video_url,
+                meta={
+                    "trace_id": message.trace_id,
+                    "agent_steps": len(agent_result.steps),
+                    "agent_tool_calls": agent_result.tool_calls_made,
+                    "agent_time_ms": agent_result.total_time_ms,
+                },
+            )
+        except TimeoutError:
+            self.logger.warning("agent_timeout | trace=%s | 回退旧管线", message.trace_id)
+            return None
+        except Exception as exc:
+            self.logger.warning("agent_error | trace=%s | %s | 回退旧管线", message.trace_id, exc)
+            return None
 
     async def _route_with_failover(self, payload: RouterInput) -> tuple[RouterDecision | None, str]:
         try:
@@ -2309,6 +2461,18 @@ class YukikoEngine:
         content = re.sub(r"</\s*tool\s*>", "", content, flags=re.IGNORECASE)
         content = re.sub(r"\n{3,}", "\n\n", content)
         content = content.strip()
+
+        # 防止 Agent 内部 JSON tool_call 泄漏到回复中
+        if content.startswith("{") and content.endswith("}"):
+            try:
+                maybe_tool = json.loads(content)
+                if isinstance(maybe_tool, dict) and "tool" in maybe_tool:
+                    # 这是一个 Agent 内部 tool_call，不应该发给用户
+                    _log_sanitize = logging.getLogger("yukiko.sanitize")
+                    _log_sanitize.warning("sanitize_leaked_tool_call | tool=%s", maybe_tool.get("tool"))
+                    return ""
+            except (json.JSONDecodeError, ValueError):
+                pass
         lower_content = content.lower()
         english_refusal_cues = (
             "i can't discuss",

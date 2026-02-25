@@ -93,6 +93,7 @@ class RouterEngine:
                     "get_group_member_count",
                     "get_group_member_names",
                     "plugin_call",
+                    "send_segment",
                     "moderate",
                 ],
             )

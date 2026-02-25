@@ -427,6 +427,13 @@ class ToolExecutor:
                         "user_name": user_name,
                     },
                 )
+            if action == "send_segment":
+                return await self._send_onebot_segment(
+                    tool_args=tool_args,
+                    group_id=group_id,
+                    user_id=user_id,
+                    api_call=api_call,
+                )
             return ToolResult(ok=False, tool_name=action or "unknown", error="unsupported_action")
         finally:
             _tool_trace_id_ctx.reset(token)
@@ -836,7 +843,7 @@ class ToolExecutor:
                     payload={
                         "mode": "image",
                         "query": query,
-                        "text": f"收到，直接把这张图发你。来源：{url}",
+                        "text": f"收到    ，直接把这张图发你。来源：{url}",
                         "image_url": url,
                         "results": [],
                     },
@@ -4571,14 +4578,15 @@ class ToolExecutor:
 
         payload: dict[str, Any] = {"text": result.message}
 
-        # 优先发本地 SILK 文件（NapCat 对 file:// 的时长识别通常更稳定）
+        # 优先发本地 SILK 文件路径（NapCat 对 file:// 的时长识别最稳定）
+        # 不再同时设置 record_b64，避免 app.py 优先走 base64 导致 0s
         if result.silk_path and api_call:
             payload["audio_file"] = result.silk_path
-        # 备用：base64 SILK
-        if result.silk_b64 and api_call:
+        elif result.silk_b64 and api_call:
+            # 仅在无本地文件时才用 base64
             payload["record_b64"] = result.silk_b64
-        # 最后回退发 MP3 文件
-        elif result.audio_path and api_call and "audio_file" not in payload:
+        elif result.audio_path and api_call:
+            # 最后回退发 MP3 文件
             payload["audio_file"] = result.audio_path
 
         return ToolResult(ok=True, tool_name="music_play", payload=payload)
@@ -4707,6 +4715,61 @@ class ToolExecutor:
             return ToolResult(ok=False, tool_name="plugin_call", error="plugin_empty_reply")
 
         return ToolResult(ok=True, tool_name="plugin_call", payload={"text": reply})
+
+    async def _send_onebot_segment(
+        self,
+        tool_args: dict[str, Any],
+        group_id: int,
+        user_id: str,
+        api_call: Callable[..., Awaitable[Any]] | None,
+    ) -> ToolResult:
+        """发送 OneBot 消息段。
+
+        tool_args 格式:
+          segment_type: 消息段类型
+          data: dict — 消息段 data 字段
+          text: str — 可选，附带的文本消息（与消息段一起发送）
+
+        支持的 segment_type:
+          poke, dice, rps, face, mface,
+          image, record, video, file,
+          music, json, forward, at, reply
+        """
+        if not api_call:
+            return ToolResult(ok=False, tool_name="send_segment", error="api_not_available")
+
+        seg_type = normalize_text(str(tool_args.get("segment_type", ""))).lower()
+        seg_data = tool_args.get("data", {})
+        if not isinstance(seg_data, dict):
+            seg_data = {}
+
+        allowed_types = {
+            "poke", "dice", "rps", "face", "mface",
+            "image", "record", "video", "file",
+            "music", "json", "forward", "at", "reply",
+        }
+        if seg_type not in allowed_types:
+            return ToolResult(
+                ok=False, tool_name="send_segment",
+                error=f"unsupported_segment_type:{seg_type}, allowed: {','.join(sorted(allowed_types))}",
+            )
+
+        # 构建消息数组
+        msg: list[dict[str, Any]] = []
+        # 可选附带文本
+        extra_text = normalize_text(str(tool_args.get("text", "")))
+        if extra_text:
+            msg.append({"type": "text", "data": {"text": extra_text}})
+        msg.append({"type": seg_type, "data": seg_data})
+
+        try:
+            if group_id:
+                await api_call("send_group_msg", group_id=int(group_id), message=msg)
+            else:
+                await api_call("send_private_msg", user_id=int(user_id), message=msg)
+            return ToolResult(ok=True, tool_name="send_segment", payload={"text": f"已发送 {seg_type} 消息段"})
+        except Exception as exc:
+            return ToolResult(ok=False, tool_name="send_segment", error=f"send_failed:{exc}")
 
     @staticmethod
     def _pick_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int:
