@@ -1174,14 +1174,21 @@ _VIDEO_SEND_MAX_BYTES = 25 * 1024 * 1024  # 压缩后仍超 25MB 走文件上传
 
 async def _download_remote_video_to_tmp(url: str) -> Path | None:
     """下载远程视频到本地临时文件，供 NapCat 发送。返回本地路径或 None。"""
+    part_path: Path | None = None
     try:
         _VIDEO_TMP_DIR.mkdir(parents=True, exist_ok=True)
         # 用 URL hash 做文件名避免冲突
         import hashlib
         url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
         tmp_path = _VIDEO_TMP_DIR / f"{url_hash}.mp4"
+        part_path = _VIDEO_TMP_DIR / f"{url_hash}.part"
         if tmp_path.exists() and tmp_path.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
-            return tmp_path
+            ok, reason = await _probe_local_video_health(tmp_path)
+            if ok:
+                return tmp_path
+            _log.warning("video_tmp_cache_invalid | %s | %s", tmp_path.name, reason)
+            tmp_path.unlink(missing_ok=True)
+        part_path.unlink(missing_ok=True)
         async with httpx.AsyncClient(
             timeout=_VIDEO_DOWNLOAD_TIMEOUT,
             follow_redirects=True,
@@ -1191,18 +1198,28 @@ async def _download_remote_video_to_tmp(url: str) -> Path | None:
                 if resp.status_code != 200:
                     return None
                 total = 0
-                with tmp_path.open("wb") as fp:
+                with part_path.open("wb") as fp:
                     async for chunk in resp.aiter_bytes(chunk_size=65536):
                         total += len(chunk)
                         if total > _VIDEO_DOWNLOAD_MAX_BYTES:
-                            tmp_path.unlink(missing_ok=True)
+                            part_path.unlink(missing_ok=True)
                             return None
                         fp.write(chunk)
-        if tmp_path.exists() and tmp_path.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
+        if not part_path.exists() or part_path.stat().st_size <= _MEDIA_MIN_VIDEO_BYTES:
+            part_path.unlink(missing_ok=True)
+            return None
+        part_path.replace(tmp_path)
+        ok, reason = await _probe_local_video_health(tmp_path)
+        if ok:
             return tmp_path
+        _log.warning("video_tmp_download_invalid | %s | %s", tmp_path.name, reason)
         tmp_path.unlink(missing_ok=True)
+        part_path.unlink(missing_ok=True)
         return None
-    except Exception:
+    except Exception as exc:
+        _log.debug("video_tmp_download_error | %s", exc)
+        if part_path is not None:
+            part_path.unlink(missing_ok=True)
         return None
 
 
