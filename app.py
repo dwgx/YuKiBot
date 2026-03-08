@@ -656,6 +656,7 @@ def create_engine() -> YukikoEngine:
 
 def register_handlers(engine: YukikoEngine) -> None:
     dispatcher = GroupQueueDispatcher(engine.config.get("queue", {}))
+    _latest_queue_task_ctx: dict[str, dict[str, Any]] = {}
     router = on_message(priority=90, block=False)
     meta_router = on_metaevent(priority=90, block=False)
     notice_router = on_notice(priority=90, block=False)
@@ -1635,6 +1636,7 @@ def register_handlers(engine: YukikoEngine) -> None:
         async def on_dispatch_complete(dispatch: Any) -> None:
             status = str(getattr(dispatch, "status", ""))
             reason = str(getattr(dispatch, "reason", ""))
+            dispatch_seq = int(getattr(dispatch, "seq", seq) or seq)
             dispatch_trace = str(getattr(dispatch, "trace_id", payload.trace_id))
             engine.logger.info(
                 "queue_final | trace=%s | conversation=%s | seq=%s | status=%s | reason=%s | pending=%s",
@@ -1645,6 +1647,9 @@ def register_handlers(engine: YukikoEngine) -> None:
                 reason,
                 str(getattr(dispatch, "pending_count", 0)),
             )
+            latest_ctx = _latest_queue_task_ctx.get(conversation_id)
+            if isinstance(latest_ctx, dict) and int(latest_ctx.get("seq", -1) or -1) == dispatch_seq:
+                _latest_queue_task_ctx.pop(conversation_id, None)
             pending_count = int(getattr(dispatch, "pending_count", 0) or 0)
             if status == "cancelled" and reason in {"process_timeout", "process_error"}:
                 # 队列里还有后续任务时，避免对每条超时都刷屏报错。
@@ -1688,6 +1693,9 @@ def register_handlers(engine: YukikoEngine) -> None:
             bool(payload.reply_to_user_id)
             and str(payload.reply_to_user_id) == str(payload.bot_id)
         )
+        interrupt_force_enabled = bool(queue_cfg.get("cancel_previous_on_interrupt_request", True))
+        force_cancel_previous = False
+        cancel_previous_reason = "cancelled_by_new_trace"
         if cancel_mode == "always":
             allow_cancel_previous = True
         elif cancel_mode == "high_priority":
@@ -1695,18 +1703,47 @@ def register_handlers(engine: YukikoEngine) -> None:
         else:
             allow_cancel_previous = _looks_like_cancel_previous_request(text)
             if allow_cancel_previous:
+                force_cancel_previous = interrupt_force_enabled
+                cancel_previous_reason = "cancelled_by_interrupt_request"
                 engine.logger.info(
                     "queue_interrupt_requested | trace=%s | conversation=%s | text=%s",
                     payload.trace_id,
                     payload.conversation_id,
                     clip_text(text, 80),
                 )
+        if not allow_cancel_previous and bool(queue_cfg.get("smart_interrupt_enable", True)):
+            previous_ctx = _latest_queue_task_ctx.get(conversation_id, {})
+            previous_uid = str(previous_ctx.get("user_id", "")) if isinstance(previous_ctx, dict) else ""
+            previous_text = str(previous_ctx.get("text", "")) if isinstance(previous_ctx, dict) else ""
+            smart_interrupt, smart_reason = engine.should_interrupt_previous_task(
+                message=payload,
+                previous_user_id=previous_uid,
+                previous_text=previous_text,
+                pending_count=int(payload.queue_depth),
+                high_priority=high_priority,
+                reply_to_bot=reply_to_bot,
+            )
+            if smart_interrupt:
+                allow_cancel_previous = True
+                force_cancel_previous = interrupt_force_enabled
+                cancel_previous_reason = "cancelled_by_smart_interrupt"
+                engine.logger.info(
+                    "queue_smart_interrupt | trace=%s | conversation=%s | reason=%s | prev_user=%s | user=%s | text=%s",
+                    payload.trace_id,
+                    payload.conversation_id,
+                    smart_reason,
+                    previous_uid or "-",
+                    payload.user_id,
+                    clip_text(text, 80),
+                )
 
         engine.logger.debug(
-            "queue_cancel_policy | trace=%s | mode=%s | allow=%s | high_priority=%s | reply_to_bot=%s | text=%s",
+            "queue_cancel_policy | trace=%s | mode=%s | allow=%s | force=%s | reason=%s | high_priority=%s | reply_to_bot=%s | text=%s",
             payload.trace_id,
             cancel_mode,
             allow_cancel_previous,
+            force_cancel_previous,
+            cancel_previous_reason,
             high_priority,
             reply_to_bot,
             clip_text(text, 80),
@@ -1728,7 +1765,17 @@ def register_handlers(engine: YukikoEngine) -> None:
             trace_id=payload.trace_id,
             send_overload_notice=send_overload_notice,
             on_complete=on_dispatch_complete,
+            force_cancel_previous=force_cancel_previous,
+            cancel_previous_reason=cancel_previous_reason,
         )
+        if dispatch_result.status == "queued":
+            _latest_queue_task_ctx[conversation_id] = {
+                "seq": seq,
+                "trace_id": payload.trace_id,
+                "user_id": payload.user_id,
+                "text": text,
+                "timestamp": payload.timestamp,
+            }
         if dispatch_result.status == "cancelled":
             engine.logger.info(
                 "queue_cancelled | trace=%s | conversation=%s | seq=%d | reason=%s",

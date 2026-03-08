@@ -242,6 +242,11 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "single_inflight_per_conversation": False,
             "cancel_previous_on_new": False,
             "cancel_previous_mode": "high_priority",
+            "cancel_previous_on_interrupt_request": True,
+            "smart_interrupt_enable": True,
+            "smart_interrupt_cross_user_enable": True,
+            "smart_interrupt_require_directed": True,
+            "smart_interrupt_min_pending": 1,
             "group_isolate_by_user": True,
         },
         "prompt_control": {

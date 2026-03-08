@@ -632,6 +632,17 @@ class YukikoEngine:
         self.agent_single_inflight_per_conversation = bool(
             queue_cfg.get("single_inflight_per_conversation", True)
         )
+        self.smart_interrupt_enable = bool(queue_cfg.get("smart_interrupt_enable", True))
+        self.smart_interrupt_cross_user_enable = bool(
+            queue_cfg.get("smart_interrupt_cross_user_enable", True)
+        )
+        self.smart_interrupt_require_directed = bool(
+            queue_cfg.get("smart_interrupt_require_directed", True)
+        )
+        self.smart_interrupt_min_pending = max(
+            1,
+            int(queue_cfg.get("smart_interrupt_min_pending", 1)),
+        )
         self_check_cfg = self.config.get("self_check", {})
         if not isinstance(self_check_cfg, dict):
             self_check_cfg = {}
@@ -3187,6 +3198,69 @@ class YukikoEngine:
                 self._last_reply_state.pop(k, None)
         if len(self._recent_search_cache) > 100:
             self._recent_search_cache.clear()
+
+    def should_interrupt_previous_task(
+        self,
+        *,
+        message: EngineMessage,
+        previous_user_id: str = "",
+        previous_text: str = "",
+        pending_count: int = 0,
+        high_priority: bool = False,
+        reply_to_bot: bool = False,
+    ) -> tuple[bool, str]:
+        if not self.smart_interrupt_enable:
+            return False, "smart_interrupt_disabled"
+        if int(pending_count or 0) < self.smart_interrupt_min_pending:
+            return False, "pending_below_threshold"
+
+        content = normalize_text(message.text)
+        if not content:
+            return False, "empty_text"
+        prev_uid = normalize_text(previous_user_id)
+        if not prev_uid:
+            return False, "no_previous_context"
+
+        # 消息明确在和其他人对话时，不打断队列中的任务。
+        if message.at_other_user_only and not message.mentioned and not reply_to_bot:
+            return False, "at_other_user_context"
+
+        directed = bool(
+            high_priority
+            or message.mentioned
+            or message.is_private
+            or reply_to_bot
+            or self._looks_like_bot_call(content)
+            or self._has_recent_directed_hint(message)
+        )
+        task_like = bool(
+            self._looks_like_explicit_request(content)
+            or self._looks_like_music_request(content)
+            or self._looks_like_download_task_intent(content)
+            or self._looks_like_video_request(content)
+            or self._looks_like_media_request(content)
+        )
+        low_info = self._looks_like_low_info_group_chitchat(content)
+        same_user = prev_uid == str(message.user_id)
+
+        if same_user:
+            if low_info and not directed:
+                return False, "same_user_low_info"
+            if task_like or directed:
+                if normalize_text(previous_text) == content:
+                    return False, "same_user_duplicate_task"
+                return True, "same_user_new_task"
+            return False, "same_user_non_task"
+
+        if not self.smart_interrupt_cross_user_enable:
+            return False, "cross_user_interrupt_disabled"
+        if self.smart_interrupt_require_directed and not directed:
+            return False, "cross_user_not_directed"
+        if low_info and not high_priority:
+            return False, "cross_user_low_info"
+        if not task_like and not high_priority:
+            return False, "cross_user_not_task_like"
+        return True, "cross_user_task_interrupt"
 
     @staticmethod
     def _looks_like_media_request(text: str) -> bool:

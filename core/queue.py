@@ -109,13 +109,18 @@ class GroupQueueDispatcher:
         trace_id: str = "",
         send_overload_notice: Callable[[str], Awaitable[None]] | None = None,
         on_complete: Callable[[QueueDispatchResult], Awaitable[None]] | None = None,
+        force_cancel_previous: bool = False,
+        cancel_previous_reason: str = "cancelled_by_new_trace",
     ) -> QueueDispatchResult:
         state = self._state(conversation_id)
-        if self.cancel_previous_on_new and allow_cancel_previous:
+        cancel_reason = str(cancel_previous_reason or "").strip()
+        if not cancel_reason:
+            cancel_reason = "cancelled_by_new_trace"
+        if allow_cancel_previous and (self.cancel_previous_on_new or force_cancel_previous):
             await self._cancel_previous_items(
                 conversation_id=conversation_id,
                 keep_seq=seq,
-                reason="cancelled_by_new_trace",
+                reason=cancel_reason,
             )
 
         if not high_priority and state.pending_count >= self.max_pending_per_group:
