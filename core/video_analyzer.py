@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from core.prompt_policy import PromptPolicy
 from core.system_prompts import SystemPromptRelay
 from utils.text import clip_text, normalize_text
 
@@ -130,13 +131,48 @@ def _find_ffmpeg_path(name: str = "ffmpeg") -> str:
     found = shutil.which(name)
     if found:
         return found
+    extra_dirs: list[str] = []
     local_app = os.environ.get("LOCALAPPDATA", "")
     if local_app:
-        d = os.path.join(local_app, "Microsoft", "WinGet", "Links")
+        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Links"))
+        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Packages"))
+        extra_dirs.append(os.path.join(local_app, "Programs", "ffmpeg", "bin"))
+    program_files = os.environ.get("ProgramFiles", "")
+    if program_files:
+        extra_dirs.append(os.path.join(program_files, "ffmpeg", "bin"))
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+    if program_files_x86:
+        extra_dirs.append(os.path.join(program_files_x86, "ffmpeg", "bin"))
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        extra_dirs.append(os.path.join(user_profile, "scoop", "apps", "ffmpeg", "current", "bin"))
+        extra_dirs.append(os.path.join(user_profile, "scoop", "shims"))
+
+    for d in extra_dirs:
         candidate = os.path.join(d, f"{name}.exe") if os.name == "nt" else os.path.join(d, name)
         if os.path.isfile(candidate):
             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
             return candidate
+
+    if name == "ffmpeg":
+        try:
+            import imageio_ffmpeg
+
+            bundled = imageio_ffmpeg.get_ffmpeg_exe()
+            if bundled and os.path.isfile(bundled):
+                bundled_dir = str(Path(bundled).resolve().parent)
+                os.environ["PATH"] = bundled_dir + os.pathsep + os.environ.get("PATH", "")
+                return bundled
+        except Exception:
+            pass
+    elif name == "ffprobe":
+        ffmpeg_path = _find_ffmpeg_path("ffmpeg")
+        if ffmpeg_path:
+            ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+            sibling = str(Path(ffmpeg_path).resolve().parent / ffprobe_name)
+            if os.path.isfile(sibling):
+                os.environ["PATH"] = str(Path(sibling).resolve().parent) + os.pathsep + os.environ.get("PATH", "")
+                return sibling
     return ""
 
 
@@ -198,6 +234,7 @@ class VideoAnalyzer:
 
         self._ffmpeg_available = bool(_find_ffmpeg_path("ffmpeg"))
         self._ffprobe_available = bool(_find_ffmpeg_path("ffprobe"))
+        self._prompt_policy = PromptPolicy.from_config(config)
 
     # ── 平台检测 ──
 
@@ -212,6 +249,10 @@ class VideoAnalyzer:
             return "kuaishou"
         if "acfun.cn" in host or "acfun.com" in host:
             return "acfun"
+        if "youku.com" in host:
+            return "youku"
+        if "v.qq.com" in host or "qq.com" in host:
+            return "tencent"
         return "unknown"
 
     # ── 主入口 ──
@@ -525,13 +566,23 @@ class VideoAnalyzer:
     # ── Step 2b: 抖音富元数据 ──
 
     async def _enrich_douyin(self, result: VideoAnalysisResult, url: str) -> None:
-        """使用 f2 库获取抖音视频详细信息。"""
+        """使用 f2 库获取抖音视频详细信息，失败时回退到分享页提取。"""
+        # 先尝试 F2 库
+        f2_ok = await self._enrich_douyin_via_f2(result, url)
+        if f2_ok:
+            return
+
+        # F2 失败时回退到分享页 API
+        await self._enrich_douyin_via_share_api(result, url)
+
+    async def _enrich_douyin_via_f2(self, result: VideoAnalysisResult, url: str) -> bool:
+        """通过 F2 库获取抖音元数据，成功返回 True。"""
         try:
             from f2.apps.douyin.handler import DouyinHandler
             from f2.apps.douyin.utils import AwemeIdFetcher
         except ImportError:
             result.errors.append("f2 not installed")
-            return
+            return False
 
         try:
             aweme_id = await asyncio.wait_for(
@@ -539,7 +590,7 @@ class VideoAnalyzer:
             )
             if not aweme_id:
                 result.errors.append("douyin: 无法提取 aweme_id")
-                return
+                return False
 
             kwargs: dict[str, Any] = {
                 "headers": {},
@@ -551,7 +602,7 @@ class VideoAnalyzer:
                 handler.fetch_one_video(aweme_id), timeout=15
             )
             if not aweme_data:
-                return
+                return False
 
             title = normalize_text(str(getattr(aweme_data, "desc", "")))
             if not result.title:
@@ -595,8 +646,7 @@ class VideoAnalyzer:
                 and dur > 0
                 and result.duration <= 0
             ):
-                # 抖音 duration 单位是毫秒
-                result.duration = int(dur / 1000) if dur > 1000 else int(dur)
+                result.duration = max(1, int(dur / 1000))
 
             if not result.webpage_url:
                 aweme_id_text = normalize_text(str(getattr(aweme_data, "aweme_id", ""))) or aweme_id
@@ -604,8 +654,84 @@ class VideoAnalyzer:
                     page_type = "note" if result.post_type == "image_text" else "video"
                     result.webpage_url = f"https://www.douyin.com/{page_type}/{aweme_id_text}"
 
+            return True
         except Exception as e:
             result.errors.append(f"douyin_f2: {e}")
+            return False
+
+    async def _enrich_douyin_via_share_api(self, result: VideoAnalysisResult, url: str) -> None:
+        """通过 iesdouyin 分享页 API 获取抖音元数据（F2 失败时的回退）。"""
+        aweme_id = ""
+        m = re.search(r"/(?:video|note)/(\d+)", url)
+        if m:
+            aweme_id = m.group(1)
+
+        if not aweme_id:
+            # 尝试从短链接解析
+            try:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, connect=5.0),
+                    follow_redirects=True,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+                    },
+                ) as client:
+                    resp = await client.get(url)
+                    final_url = str(resp.url)
+                    m = re.search(r"/(?:video|note)/(\d+)", final_url)
+                    if m:
+                        aweme_id = m.group(1)
+            except Exception:
+                pass
+
+        if not aweme_id:
+            return
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(10.0, connect=5.0),
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15",
+                },
+            ) as client:
+                api_url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={aweme_id}"
+                resp = await client.get(api_url)
+                if not resp.is_success:
+                    return
+                data = resp.json()
+
+            items = data.get("item_list", []) if isinstance(data, dict) else []
+            if not items:
+                return
+            item = items[0] if isinstance(items, list) else {}
+            if not isinstance(item, dict):
+                return
+
+            desc = normalize_text(str(item.get("desc", "")))
+            if not result.title and desc:
+                result.title = desc
+            if not result.description and desc:
+                result.description = clip_text(desc, 220)
+
+            author = item.get("author", {}) or {}
+            if isinstance(author, dict) and not result.uploader:
+                result.uploader = normalize_text(str(author.get("nickname", "")))
+
+            stats = item.get("statistics", {}) or {}
+            if isinstance(stats, dict):
+                if not result.view_count:
+                    result.view_count = int(stats.get("play_count", 0) or 0)
+                if not result.like_count:
+                    result.like_count = int(stats.get("digg_count", 0) or 0)
+                if not result.share_count:
+                    result.share_count = int(stats.get("share_count", 0) or 0)
+
+            if not result.webpage_url:
+                result.webpage_url = f"https://www.douyin.com/video/{aweme_id}"
+
+        except Exception as e:
+            result.errors.append(f"douyin_share_api: {e}")
 
     # ── Step 2c: 快手富元数据 ──
 
@@ -677,8 +803,8 @@ class VideoAnalyzer:
 
             dur = photo.get("duration")
             if isinstance(dur, (int, float)) and dur > 0 and result.duration <= 0:
-                # 快手 duration 单位是毫秒
-                result.duration = int(dur / 1000) if dur > 1000 else int(dur)
+                # 快手 duration 单位是毫秒，统一转为秒
+                result.duration = max(1, int(dur / 1000))
 
             tags_raw = photo.get("tags")
             if isinstance(tags_raw, list) and not result.tags:
@@ -834,10 +960,15 @@ class VideoAnalyzer:
         # 批量失败时回退到逐帧分析
         descriptions: list[str] = []
         for i, path in enumerate(keyframe_paths, 1):
-            prompt = SystemPromptRelay.video_single_user_prompt(
+            base_prompt = SystemPromptRelay.video_single_user_prompt(
                 context_hint=context_hint,
                 frame_index=i,
                 total_frames=len(keyframe_paths),
+            )
+            prompt = self._prompt_policy.compose_prompt(
+                channel="video",
+                base_prompt=base_prompt,
+                tool_name="video.analyze",
             )
             desc = await self._vision_describe_image(path, prompt)
             if desc:
@@ -852,9 +983,14 @@ class VideoAnalyzer:
             return []
 
         content_parts: list[dict[str, Any]] = []
-        prompt_text = SystemPromptRelay.video_batch_user_prompt(
+        base_user_prompt = SystemPromptRelay.video_batch_user_prompt(
             context_hint=context_hint,
             total_frames=len(keyframe_paths),
+        )
+        prompt_text = self._prompt_policy.compose_prompt(
+            channel="video",
+            base_prompt=base_user_prompt,
+            tool_name="video.analyze",
         )
         content_parts.append({"type": "text", "text": prompt_text})
 
@@ -872,12 +1008,18 @@ class VideoAnalyzer:
         if len(content_parts) <= 1:
             return []
 
+        base_system_prompt = SystemPromptRelay.video_batch_system_prompt()
+        system_prompt = self._prompt_policy.compose_prompt(
+            channel="video",
+            base_prompt=base_system_prompt,
+            tool_name="video.analyze",
+        )
         payload = {
             "model": self._vision_model,
             "messages": [
                 {
                     "role": "system",
-                    "content": SystemPromptRelay.video_batch_system_prompt(),
+                    "content": system_prompt,
                 },
                 {"role": "user", "content": content_parts},
             ],
@@ -951,10 +1093,16 @@ class VideoAnalyzer:
         except Exception:
             return ""
 
+        base_system_prompt = SystemPromptRelay.video_single_system_prompt()
+        system_prompt = self._prompt_policy.compose_prompt(
+            channel="video",
+            base_prompt=base_system_prompt,
+            tool_name="video.analyze",
+        )
         payload = {
             "model": self._vision_model,
             "messages": [
-                {"role": "system", "content": SystemPromptRelay.video_single_system_prompt()},
+                {"role": "system", "content": system_prompt},
                 {
                     "role": "user",
                     "content": [

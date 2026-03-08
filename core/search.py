@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -120,17 +121,28 @@ class SearchEngine:
         if self._searxng_base:
             results.extend(await self._search_searxng(clean_query))
 
-        # Bing 网页爬虫（国际通用，中文也不错）
+        # 并发网页爬虫（替代串行），显著降低慢站点拖累导致的整体等待时间。
         if len(results) < self.max_results:
-            results.extend(await self._search_bing_scrape(clean_query))
+            async def _safe(fn_name: str) -> list[SearchResult]:
+                fn = getattr(self, fn_name, None)
+                if not callable(fn):
+                    return []
+                try:
+                    return await fn(clean_query)
+                except Exception as exc:
+                    _log.debug("search_engine_error | fn=%s | err=%s", fn_name, exc)
+                    return []
 
-        # 百度网页爬虫（中文搜索质量最好）
-        if len(results) < self.max_results:
-            results.extend(await self._search_baidu_scrape(clean_query))
-
-        # Google 网页爬虫（补充）
-        if len(results) < self.max_results:
-            results.extend(await self._search_google_scrape(clean_query))
+            parallel_chunks = await asyncio.gather(
+                _safe("_search_bing_scrape"),
+                _safe("_search_baidu_scrape"),
+                _safe("_search_google_scrape"),
+            )
+            for chunk in parallel_chunks:
+                if chunk:
+                    results.extend(chunk)
+                if len(results) >= self.max_results:
+                    break
 
         # DuckDuckGo instant API 补充
         if len(results) < self.max_results:
@@ -965,7 +977,8 @@ class SearchEngine:
                 )
                 resp.raise_for_status()
                 data = resp.json()
-            return data.get("data", {}).get("result", []) or []
+            result_list = (data.get("data") or {}).get("result") or []
+            return result_list if isinstance(result_list, list) else []
         except Exception:
             return []
 
@@ -1072,6 +1085,20 @@ class SearchEngine:
             return cached
 
         try:
+            import asyncio as _aio
+            loop = _aio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            # 在 async 上下文中不能同步调用，先放行，由调用方异步校验
+            return True
+
+        return self._resolve_and_check_host(host)
+
+    def _resolve_and_check_host(self, host: str) -> bool:
+        """同步 DNS 解析并检查是否为公网 IP（仅在非 async 上下文使用）。"""
+        try:
             infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
         except Exception:
             self._domain_safety_cache[host] = False
@@ -1097,8 +1124,58 @@ class SearchEngine:
         self._domain_safety_cache[host] = saw_ip
         return saw_ip
 
+    async def _is_safe_public_domain_async(self, domain: str) -> bool:
+        """异步版本的域名安全检查，不阻塞事件循环。"""
+        host = (domain or "").strip().lower().rstrip(".")
+        if not host:
+            return False
+        if self.allow_private_network:
+            return True
+        if host in {"localhost", "metadata", "metadata.google.internal"} or host.endswith(".localhost"):
+            return False
+        if host.endswith((".local", ".internal", ".localdomain", ".home", ".lan", ".arpa")):
+            return False
+        try:
+            ip_obj = ipaddress.ip_address(host)
+        except ValueError:
+            ip_obj = None
+        if ip_obj is not None:
+            return self._is_public_ip_obj(ip_obj)
+
+        cached = self._domain_safety_cache.get(host)
+        if cached is not None:
+            return cached
+
+        import asyncio as _aio
+        try:
+            loop = _aio.get_running_loop()
+            infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except Exception:
+            self._domain_safety_cache[host] = False
+            return False
+
+        saw_ip = False
+        for info in infos:
+            sockaddr = info[4] if len(info) >= 5 else None
+            if not sockaddr:
+                continue
+            address = str(sockaddr[0]).split("%", 1)[0]
+            if not address:
+                continue
+            saw_ip = True
+            try:
+                resolved_ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if not self._is_public_ip_obj(resolved_ip):
+                self._domain_safety_cache[host] = False
+                return False
+
+        self._domain_safety_cache[host] = saw_ip
+        return saw_ip
+
     async def _fetch_website_overview(self, domain: str) -> SearchResult | None:
-        if not self._is_safe_public_domain(domain):
+        if not await self._is_safe_public_domain_async(domain):
             return None
         urls = [f"https://{domain}", f"http://{domain}"]
         for url in urls:

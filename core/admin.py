@@ -39,6 +39,7 @@ _FUZZY_COMMAND_MAP: dict[str, str] = {
     "说": "say", "say": "say",
     "debug": "debug", "调试": "debug",
     "定海神针": "clear_screen", "刷屏": "clear_screen", "清屏": "clear_screen",
+    "学习表情包": "learn_sticker", "表情包": "sticker_status", "扫描表情包": "scan_sticker",
 }
 
 
@@ -96,6 +97,10 @@ class AdminEngine:
         "活跃": "behavior_active",
         "定海神针": "clear_screen",
         "刷屏": "clear_screen",
+        "学习表情包": "learn_sticker",
+        "表情包": "sticker_status",
+        "表情包状态": "sticker_status",
+        "扫描表情包": "scan_sticker",
     }
 
     _PUBLIC = {"help", "help_detail", "plugins"}
@@ -116,6 +121,10 @@ class AdminEngine:
         self._help_json_card = bool(admin_cfg.get("help_json_card", False))
         self.non_whitelist_mode = normalize_text(str(admin_cfg.get("non_whitelist_mode", "silent"))).lower() or "silent"
         self._super_users = {str(x).strip() for x in (admin_cfg.get("super_users", []) or []) if str(x).strip()}
+        # 兼容 setup / webui 使用的单值字段：admin.super_admin_qq
+        super_admin_qq = normalize_text(str(admin_cfg.get("super_admin_qq", "")))
+        if super_admin_qq:
+            self._super_users.add(super_admin_qq)
 
         self._white_path = self.storage_dir / "whitelist_groups.json"
         self._white: set[int] = set()
@@ -147,12 +156,14 @@ class AdminEngine:
     def is_group_whitelisted(self, group_id: int | str) -> bool:
         if not self.enabled:
             return True
-        if not self._white:
-            return True
         try:
             gid = int(group_id)
         except Exception:
-            return True
+            return False
+        if gid <= 0:
+            return False
+        if not self._white:
+            return False
         return gid in self._white
 
     def increment_message_count(self) -> None:
@@ -239,20 +250,21 @@ class AdminEngine:
     async def _act_help(self, **kwargs: Any) -> str:
         return (
             "YuKiKo 管理面板\n"
-            "─────────────────────\n"
+            "---------------------\n"
             "reload / ping / status\n"
             "加白 / 拉黑 / 白名单\n"
             "尺度 / 敏感词 / 行为\n"
             "戳 / 骰子 / 猜拳\n"
             "音乐卡片 / json / 定海神针\n"
-            "─────────────────────\n"
+            "表情包 / 学习表情包 / 扫描表情包\n"
+            "---------------------\n"
             "/yuki help_detail 查看详细参数"
         )
 
     async def _act_help_detail(self, **kwargs: Any) -> str:
         return (
             "YuKiKo Command Reference\n"
-            "─────────────────────\n"
+            "---------------------\n"
             "System\n"
             "  /yuki reload\n"
             "  /yuki ping\n"
@@ -260,12 +272,12 @@ class AdminEngine:
             "  /yuki plugins\n"
             "  /yuki debug <QQ>\n"
             "  /yuki cookie [platform] [browser] [force]\n"
-            "─────────────────────\n"
+            "---------------------\n"
             "Whitelist\n"
             "  /yuki 加白          add current group\n"
             "  /yuki 拉黑          remove current group\n"
             "  /yuki 白名单        list all groups\n"
-            "─────────────────────\n"
+            "---------------------\n"
             "Safety & Behavior\n"
             "  /yuki 尺度 <0-3>    0=off 1=loose 2=standard 3=strict\n"
             "  /yuki 敏感词 添加 <word>\n"
@@ -276,23 +288,31 @@ class AdminEngine:
             "  /yuki 活跃          active in group chat\n"
             "  /yuki 行为 默认     reset to default\n"
             "  /yuki 行为 接话门槛 <float>\n"
-            "─────────────────────\n"
+            "  /yuki 收藏表情      custom face status\n"
+            "  /yuki 拉取收藏表情 [n]  fetch n custom faces (default 48)\n"
+            "  /yuki 学习收藏表情 [n]  learn n custom faces via LLM\n"
+            "---------------------\n"
             "Interactive\n"
             "  /yuki 戳 <QQ>       poke user\n"
             "  /yuki 骰子          roll dice\n"
             "  /yuki 猜拳          rock-paper-scissors\n"
             "  /yuki say <text>    echo text\n"
-            "─────────────────────\n"
+            "---------------------\n"
             "Media\n"
             "  /yuki 音乐卡片 <keyword>\n"
             "  /yuki 音乐卡片 <platform> <id>\n"
             "  /yuki json <raw JSON string>\n"
-            "─────────────────────\n"
+            "---------------------\n"
             "Special\n"
             "  /yuki 定海神针 [lines] [segments] [delay_sec]\n"
             "    default: 3000 lines, 10 segments, 0.8s delay\n"
             "    range: lines 120-20000, segments 1-80, delay 0-30\n"
-            "─────────────────────\n"
+            "---------------------\n"
+            "Sticker\n"
+            "  /yuki 表情包          sticker system status\n"
+            "  /yuki 扫描表情包      rescan QQ emoji cache\n"
+            "  /yuki 学习表情包 [n]  learn n stickers via LLM (default 5)\n"
+            "---------------------\n"
             "Fuzzy match enabled - typos are auto-corrected"
         )
 
@@ -367,7 +387,7 @@ class AdminEngine:
 
         lines = [
             "YuKiKo 运行状态",
-            "─────────────────────",
+            "---------------------",
             f"  运行时长  {uptime_str}",
             f"  消息计数  {self._count}",
             f"  白名单群  {len(self._white)} 个",
@@ -387,6 +407,44 @@ class AdminEngine:
             if getattr(engine, "agent_tool_registry", None) is not None:
                 tool_count = getattr(engine.agent_tool_registry, "tool_count", 0)
                 lines.append(f"  可用工具  {tool_count} 个")
+            plugin_map = getattr(getattr(engine, "plugins", None), "plugins", {})
+            if isinstance(plugin_map, dict):
+                abnormal_rows: list[str] = []
+                for pname, pobj in plugin_map.items():
+                    status_fn = getattr(pobj, "status_text", None)
+                    if not callable(status_fn):
+                        continue
+                    try:
+                        status_raw = normalize_text(str(status_fn()))
+                    except Exception:
+                        continue
+                    if not status_raw:
+                        continue
+                    rows = [normalize_text(x) for x in status_raw.splitlines() if normalize_text(x)]
+                    if not rows:
+                        continue
+                    lines.append(f"  插件状态  {pname}")
+                    for row in rows[:5]:
+                        lines.append(f"    {row}")
+                    lower_blob = "\n".join(rows[:5]).lower()
+                    if any(
+                        key in lower_blob
+                        for key in (
+                            " fail",
+                            "异常",
+                            "error",
+                            "not_logged_in",
+                            "invalid_",
+                            "timeout",
+                            "unavailable",
+                            "disabled",
+                        )
+                    ):
+                        abnormal_rows.append(f"{pname}: {rows[0]}")
+                if abnormal_rows:
+                    lines.append("  插件异常汇总")
+                    for row in abnormal_rows:
+                        lines.append(f"    {row}")
         return "\n".join(lines)
 
     async def _act_say(self, **kwargs: Any) -> str:
@@ -697,7 +755,7 @@ class AdminEngine:
             try:
                 client = engine.model_client
                 resp = await asyncio.wait_for(
-                    client.chat([{"role": "user", "content": "用一句古风短句作为定海神针的结尾语录，15字以内，只输出语录本身"}]),
+                    client.chat_text([{"role": "user", "content": "用一句古风短句作为定海神针的结尾语录，15字以内，只输出语录本身"}]),
                     timeout=5,
                 )
                 text = (resp or "").strip().strip("\"'「」""")
@@ -741,7 +799,54 @@ class AdminEngine:
             return self._set_behavior_mode(engine, "quiet")
         if arg in {"活跃", "active"}:
             return self._set_behavior_mode(engine, "active")
-        return "用法: /yuki 行为 [默认|冷漠|安静|活跃]"
+
+        # ── 单参数精细调整: /yuki 行为 <参数名> <值> ──
+        _PARAM_MAP: dict[str, tuple[str, str]] = {
+            # 中文别名 -> (config section, key)
+            "接话门槛": ("routing", "min_confidence"),
+            "min_confidence": ("routing", "min_confidence"),
+            "追问门槛": ("routing", "followup_min_confidence"),
+            "followup_min_confidence": ("routing", "followup_min_confidence"),
+            "旁听门槛": ("routing", "non_directed_min_confidence"),
+            "non_directed_min_confidence": ("routing", "non_directed_min_confidence"),
+            "ai门槛": ("routing", "ai_gate_min_confidence"),
+            "ai_gate_min_confidence": ("routing", "ai_gate_min_confidence"),
+            "旁听开关": ("trigger", "ai_listen_enable"),
+            "ai_listen_enable": ("trigger", "ai_listen_enable"),
+            "旁听消息数": ("trigger", "ai_listen_min_messages"),
+            "ai_listen_min_messages": ("trigger", "ai_listen_min_messages"),
+            "旁听分数": ("trigger", "ai_listen_min_score"),
+            "ai_listen_min_score": ("trigger", "ai_listen_min_score"),
+            "追问窗口": ("trigger", "followup_reply_window_seconds"),
+            "followup_reply_window_seconds": ("trigger", "followup_reply_window_seconds"),
+            "追问轮数": ("trigger", "followup_max_turns"),
+            "followup_max_turns": ("trigger", "followup_max_turns"),
+        }
+        parts = arg.split(None, 1)
+        if len(parts) == 2 and parts[0] in _PARAM_MAP:
+            section, key = _PARAM_MAP[parts[0]]
+            raw_val = parts[1]
+            cfg = engine.config.setdefault(section, {}) if isinstance(engine.config, dict) else {}
+            if not isinstance(cfg, dict):
+                cfg = {}
+                engine.config[section] = cfg
+            # 类型推断
+            if raw_val in {"true", "True", "1", "开", "on"}:
+                cfg[key] = True
+            elif raw_val in {"false", "False", "0", "关", "off"}:
+                cfg[key] = False
+            else:
+                try:
+                    cfg[key] = int(raw_val) if raw_val.isdigit() else float(raw_val)
+                except ValueError:
+                    return f"参数值无效，需要数字: {raw_val}"
+            return f"已设置 {key} = {cfg[key]}"
+
+        return (
+            "用法: /yuki 行为 [默认|冷漠|安静|活跃]\n"
+            "或: /yuki 行为 <参数名> <值>\n"
+            "可用参数: 接话门槛 追问门槛 旁听门槛 ai门槛 旁听开关 旁听消息数 旁听分数 追问窗口 追问轮数"
+        )
 
     async def _act_behavior_cold(self, **kwargs: Any) -> str:
         engine = kwargs.get("engine")
@@ -872,3 +977,53 @@ class AdminEngine:
         except Exception as exc:
             _log.debug("save_whitelist_fail | %s", exc)
 
+    # ── 表情包管理 ──
+
+    async def _act_sticker_status(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if not engine or not hasattr(engine, "sticker"):
+            return "表情系统未初始化"
+        return engine.sticker.status_text()
+
+    async def _act_scan_sticker(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if not engine or not hasattr(engine, "sticker"):
+            return "表情系统未初始化"
+        result = engine.sticker.scan()
+        return (
+            f"扫描完成\n"
+            f"经典表情: {result['faces']}\n"
+            f"本地表情包: {result['emojis']}\n"
+            f"已学习: {engine.sticker.learned_count}"
+        )
+
+    async def _act_learn_sticker(self, **kwargs: Any) -> str:
+        engine = kwargs.get("engine")
+        if not engine or not hasattr(engine, "sticker"):
+            return "表情系统未初始化"
+
+        unregistered = engine.sticker.get_unregistered()
+        if not unregistered:
+            return f"所有表情包已注册完毕 ({engine.sticker.registered_count}/{engine.sticker.emoji_count})"
+
+        total = len(unregistered)
+        batch_size = int(kwargs.get("arg", "").strip() or "5")
+        batch_size = max(1, min(batch_size, 20))
+
+        async def _llm_vision_call(messages: list[dict]) -> str:
+            client = engine.model_client
+            resp = await client.chat_text(messages=messages, max_tokens=200)
+            return str(resp)
+
+        try:
+            learned = await engine.sticker.learn_batch(
+                llm_call=_llm_vision_call,
+                batch_size=batch_size,
+            )
+            return (
+                f"注册完成: 本次 {learned}/{batch_size}\n"
+                f"总进度: {engine.sticker.registered_count}/{engine.sticker.emoji_count}\n"
+                f"剩余: {total - learned}"
+            )
+        except Exception as e:
+            return f"学习失败: {str(e)[:100]}"

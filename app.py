@@ -4,11 +4,13 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import subprocess
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -16,9 +18,11 @@ from uuid import uuid4
 
 import httpx
 import nonebot
-from nonebot import on_message
-from nonebot.adapters.onebot.v11 import Bot, Message, MessageEvent, MessageSegment
+from nonebot import on_message, on_metaevent, on_notice, on_request
+from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageEvent, MessageSegment
 
+from core.chat_splitter import coalesce_for_rate_limit, split_semantic_text
+from core import prompt_loader as _pl
 from core.engine import EngineMessage, YukikoEngine
 from core.queue import GroupQueueDispatcher
 from utils.text import clip_text, normalize_text
@@ -41,6 +45,344 @@ if not _FFPROBE_BIN:
             _FFPROBE_BIN = _probe_candidate
 
 _log = logging.getLogger("yukiko.app")
+_GROUP_SEND_BLOCK_UNTIL: dict[int, datetime] = {}
+_GROUP_SEND_BLOCK_REASON: dict[int, str] = {}
+_GROUP_SEND_BLOCK_DEFAULT_SECONDS = 180
+_BOT_SEND_SUSPEND_UNTIL: dict[str, datetime] = {}
+_BOT_SEND_SUSPEND_REASON: dict[str, str] = {}
+_BOT_ONLINE_STATE: dict[str, bool] = {}
+
+
+class _TokenBucket:
+    def __init__(self, capacity: int, refill_seconds: int, warn_threshold: int):
+        self.capacity = max(1, int(capacity))
+        self.refill_seconds = max(1, int(refill_seconds))
+        self.refill_per_second = self.capacity / float(self.refill_seconds)
+        self.warn_threshold = max(1, min(self.capacity, int(warn_threshold)))
+        self.tokens = float(self.capacity)
+        self.updated_at = time.monotonic()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        elapsed = max(0.0, now - self.updated_at)
+        self.updated_at = now
+        if elapsed <= 0:
+            return
+        self.tokens = min(float(self.capacity), self.tokens + elapsed * self.refill_per_second)
+
+    def reserve(self, amount: int = 1) -> tuple[float, bool]:
+        self._refill()
+        need = max(1, int(amount))
+        if self.tokens >= need:
+            self.tokens -= need
+            return 0.0, self.used_in_window() >= self.warn_threshold
+        missing = float(need) - self.tokens
+        wait_seconds = missing / self.refill_per_second if self.refill_per_second > 0 else float(self.refill_seconds)
+        self.tokens = 0.0
+        return max(0.0, wait_seconds), True
+
+    def used_in_window(self) -> int:
+        return int(math.ceil(float(self.capacity) - self.tokens))
+
+    def near_warn(self) -> bool:
+        self._refill()
+        return self.used_in_window() >= self.warn_threshold
+
+
+_SEND_RATE_BUCKETS: dict[str, _TokenBucket] = {}
+
+
+def _check_group_send_block(group_id: int) -> tuple[bool, str]:
+    if group_id <= 0:
+        return False, ""
+    until = _GROUP_SEND_BLOCK_UNTIL.get(group_id)
+    if not isinstance(until, datetime):
+        return False, ""
+    now = datetime.now(timezone.utc)
+    if now >= until:
+        _GROUP_SEND_BLOCK_UNTIL.pop(group_id, None)
+        _GROUP_SEND_BLOCK_REASON.pop(group_id, None)
+        return False, ""
+    return True, _GROUP_SEND_BLOCK_REASON.get(group_id, "temporary_block")
+
+
+def _mark_group_send_block(group_id: int, until: datetime, reason: str) -> None:
+    if group_id <= 0:
+        return
+    _GROUP_SEND_BLOCK_UNTIL[group_id] = until
+    _GROUP_SEND_BLOCK_REASON[group_id] = reason
+    _log.warning(
+        "group_send_blocked | group=%s | until=%s | reason=%s",
+        group_id,
+        until.astimezone(timezone.utc).isoformat(),
+        reason,
+    )
+
+
+def _check_bot_send_suspended(bot_id: str) -> tuple[bool, str]:
+    bid = normalize_text(str(bot_id))
+    if not bid:
+        return False, ""
+    until = _BOT_SEND_SUSPEND_UNTIL.get(bid)
+    if not isinstance(until, datetime):
+        return False, ""
+    now = datetime.now(timezone.utc)
+    if now >= until:
+        _BOT_SEND_SUSPEND_UNTIL.pop(bid, None)
+        _BOT_SEND_SUSPEND_REASON.pop(bid, None)
+        return False, ""
+    return True, _BOT_SEND_SUSPEND_REASON.get(bid, "send_channel_suspended")
+
+
+def _suspend_bot_send(bot_id: str, seconds: int, reason: str) -> None:
+    bid = normalize_text(str(bot_id))
+    if not bid:
+        return
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=max(5, int(seconds)))
+    prev = _BOT_SEND_SUSPEND_UNTIL.get(bid)
+    if isinstance(prev, datetime) and prev > until:
+        until = prev
+    _BOT_SEND_SUSPEND_UNTIL[bid] = until
+    _BOT_SEND_SUSPEND_REASON[bid] = normalize_text(reason) or "send_channel_suspended"
+    _log.warning(
+        "bot_send_suspended | bot=%s | until=%s | reason=%s",
+        bid,
+        until.astimezone(timezone.utc).isoformat(),
+        _BOT_SEND_SUSPEND_REASON[bid],
+    )
+
+
+def _resume_bot_send(bot_id: str, reason: str = "") -> None:
+    bid = normalize_text(str(bot_id))
+    if not bid:
+        return
+    had = bid in _BOT_SEND_SUSPEND_UNTIL
+    _BOT_SEND_SUSPEND_UNTIL.pop(bid, None)
+    _BOT_SEND_SUSPEND_REASON.pop(bid, None)
+    if had:
+        _log.info("bot_send_resumed | bot=%s | reason=%s", bid, normalize_text(reason) or "-")
+
+
+def _resolve_send_rate_profile(config: dict[str, Any]) -> tuple[int, int, int, bool]:
+    send_rate_cfg = config.get("send_rate", {}) if isinstance(config, dict) else {}
+    if not isinstance(send_rate_cfg, dict):
+        send_rate_cfg = {}
+    control_cfg = config.get("control", {}) if isinstance(config, dict) else {}
+    if not isinstance(control_cfg, dict):
+        control_cfg = {}
+
+    profile = normalize_text(
+        str(
+            send_rate_cfg.get(
+                "profile",
+                control_cfg.get("send_rate_profile", "safe_qq_group"),
+            )
+        )
+    ).lower()
+    if not profile:
+        profile = "safe_qq_group"
+
+    defaults: dict[str, tuple[int, int, int]] = {
+        "safe_qq_group": (10, 60, 8),
+        "balanced": (12, 60, 9),
+        "active": (15, 60, 12),
+    }
+    cap_default, refill_default, warn_default = defaults.get(profile, defaults["safe_qq_group"])
+    max_per_window = max(1, int(send_rate_cfg.get("max_per_window", send_rate_cfg.get("max_per_minute", cap_default))))
+    refill_seconds = max(10, int(send_rate_cfg.get("window_seconds", refill_default)))
+    warn_threshold = max(1, int(send_rate_cfg.get("warn_threshold", warn_default)))
+    enable = bool(send_rate_cfg.get("enable", True))
+    return max_per_window, refill_seconds, min(max_per_window, warn_threshold), enable
+
+
+def _get_send_bucket(
+    conversation_id: str,
+    group_id: int,
+    max_per_window: int,
+    refill_seconds: int,
+    warn_threshold: int,
+) -> _TokenBucket:
+    key = f"group:{group_id}" if group_id > 0 else f"conv:{conversation_id}"
+    bucket = _SEND_RATE_BUCKETS.get(key)
+    if (
+        bucket is None
+        or bucket.capacity != max_per_window
+        or bucket.refill_seconds != refill_seconds
+        or bucket.warn_threshold != warn_threshold
+    ):
+        bucket = _TokenBucket(
+            capacity=max_per_window,
+            refill_seconds=refill_seconds,
+            warn_threshold=warn_threshold,
+        )
+        _SEND_RATE_BUCKETS[key] = bucket
+    return bucket
+
+
+async def _maybe_block_group_send_on_error(bot: Bot, event: MessageEvent, exc: Exception) -> bool:
+    """检测发送失败是否为群禁言/权限拒绝，并在短时间内停发，避免刷屏重试。"""
+    group_id = int(getattr(event, "group_id", 0) or 0)
+    if group_id <= 0:
+        return False
+
+    err_text = normalize_text(str(exc))
+    err_lower = err_text.lower()
+    is_rate_limited = bool(
+        re.search(r'"result"\s*:\s*299\b', err_text)
+        or re.search(r"\bresult\s*[:=]\s*299\b", err_lower)
+        or "rate limit" in err_lower
+        or "发送频率" in err_text
+        or "过快" in err_text
+    )
+    if not (
+        is_rate_limited
+        or
+        re.search(r'"result"\s*:\s*120\b', err_text)
+        or re.search(r"\bresult\s*[:=]\s*120\b", err_lower)
+        or "forbidden" in err_lower
+        or "mute" in err_lower
+        or "禁言" in err_text
+    ):
+        return False
+
+    now = datetime.now(timezone.utc)
+    if is_rate_limited:
+        until = now + timedelta(seconds=65)
+        reason = "send_error_299_rate_limit"
+    else:
+        until = now + timedelta(seconds=_GROUP_SEND_BLOCK_DEFAULT_SECONDS)
+        reason = "send_error_120_or_forbidden"
+
+    # 尝试读取机器人在该群的禁言结束时间，尽量给出精确停发窗口。
+    try:
+        if not is_rate_limited:
+            info = await bot.call_api(
+                "get_group_member_info",
+                group_id=group_id,
+                user_id=int(bot.self_id),
+                no_cache=True,
+            )
+        else:
+            info = {}
+        payload: dict[str, Any] = {}
+        if isinstance(info, dict):
+            data_part = info.get("data")
+            payload = data_part if isinstance(data_part, dict) else info
+        if isinstance(payload, dict):
+            shut_ts = 0
+            for key in ("shut_up_timestamp", "shut_up_time", "mute_end_time"):
+                raw_val = payload.get(key)
+                try:
+                    shut_ts = int(raw_val or 0)
+                except Exception:
+                    shut_ts = 0
+                if shut_ts > 0:
+                    break
+            now_ts = int(now.timestamp())
+            if shut_ts > now_ts:
+                until = datetime.fromtimestamp(shut_ts, timezone.utc)
+                reason = f"group_member_muted_until:{shut_ts}"
+    except Exception as probe_exc:
+        _log.debug("group_send_block_probe_fail | group=%s | %s", group_id, probe_exc)
+
+    _mark_group_send_block(group_id=group_id, until=until, reason=reason)
+    return True
+
+
+def _build_send_error_text(exc: Exception) -> str:
+    """展开异常链，提升发送错误分类的命中率。"""
+    parts: list[str] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    for _ in range(4):
+        if current is None:
+            break
+        ident = id(current)
+        if ident in seen:
+            break
+        seen.add(ident)
+        text = normalize_text(str(current))
+        if text:
+            parts.append(text)
+        nxt = current.__cause__ or current.__context__
+        current = nxt if isinstance(nxt, BaseException) else None
+    return " | ".join(parts)
+
+
+def _is_transient_send_error(exc: Exception) -> bool:
+    """识别可短暂重试的发送异常（网络抖动/连接瞬断）。"""
+    err_text = _build_send_error_text(exc)
+    err_lower = err_text.lower()
+    err_compact = re.sub(r"\s+", "", err_lower)
+    if not err_text:
+        return False
+    # NapCat 发消息通道超时通常不是瞬时抖动，重试会导致重复刷屏。
+    if "timeout:ntevent" in err_compact and "nodeikernelmsgservice/sendmsg" in err_compact:
+        return False
+    # 明确不可重试的限流/权限类错误，避免无意义重试。
+    if (
+        re.search(r'"result"\s*:\s*299\b', err_text)
+        or re.search(r"\bresult\s*[:=]\s*299\b", err_lower)
+        or re.search(r'"result"\s*:\s*120\b', err_text)
+        or re.search(r"\bresult\s*[:=]\s*120\b", err_lower)
+        or "forbidden" in err_lower
+        or "mute" in err_lower
+        or "禁言" in err_text
+        or "发送频率" in err_text
+        or "过快" in err_text
+    ):
+        return False
+    transient_cues = (
+        "网络连接异常",
+        "network abnormal",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "websocket",
+        "ws closed",
+        "timeout",
+        "timed out",
+        "1006514",
+    )
+    return any(cue in err_lower for cue in transient_cues) or any(cue in err_text for cue in ("网络连接异常",))
+
+
+def _is_hard_send_channel_error(exc: Exception) -> bool:
+    """识别需要立即熔断发送通道的错误。"""
+    err_text = _build_send_error_text(exc)
+    err_lower = err_text.lower()
+    err_compact = re.sub(r"\s+", "", err_lower)
+    if not err_text:
+        return False
+    if "kickedoffline" in err_lower or "登录已失效" in err_text:
+        return True
+    if "timeout:ntevent" in err_compact and "nodeikernelmsgservice/sendmsg" in err_compact:
+        return True
+    if "nodeikernelmsglistener/onmsginfolistupdate" in err_compact and "sendmsg" in err_compact:
+        return True
+    return False
+
+
+def _is_payload_send_error(exc: Exception) -> bool:
+    """仅这类错误才值得做“去 reply / 纯文本”回退。"""
+    err_text = _build_send_error_text(exc)
+    err_lower = err_text.lower()
+    if not err_text:
+        return False
+    payload_cues = (
+        "invalid message",
+        "invalid segment",
+        "unsupported segment",
+        "segment format",
+        "bad request",
+        "参数错误",
+        "消息格式",
+        "消息段",
+        "cq code",
+        "illegal message",
+    )
+    return any(cue in err_lower for cue in payload_cues)
 
 
 def _find_ffmpeg_bin() -> str:
@@ -48,13 +390,39 @@ def _find_ffmpeg_bin() -> str:
     found = shutil.which("ffmpeg")
     if found:
         return found
+    extra_dirs: list[str] = []
     local_app = os.environ.get("LOCALAPPDATA", "")
     if local_app:
-        winget_dir = os.path.join(local_app, "Microsoft", "WinGet", "Links")
-        candidate = os.path.join(winget_dir, "ffmpeg.exe") if os.name == "nt" else os.path.join(winget_dir, "ffmpeg")
+        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Links"))
+        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Packages"))
+        extra_dirs.append(os.path.join(local_app, "Programs", "ffmpeg", "bin"))
+    program_files = os.environ.get("ProgramFiles", "")
+    if program_files:
+        extra_dirs.append(os.path.join(program_files, "ffmpeg", "bin"))
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+    if program_files_x86:
+        extra_dirs.append(os.path.join(program_files_x86, "ffmpeg", "bin"))
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        extra_dirs.append(os.path.join(user_profile, "scoop", "apps", "ffmpeg", "current", "bin"))
+        extra_dirs.append(os.path.join(user_profile, "scoop", "shims"))
+
+    for d in extra_dirs:
+        candidate = os.path.join(d, "ffmpeg.exe") if os.name == "nt" else os.path.join(d, "ffmpeg")
         if os.path.isfile(candidate):
-            os.environ["PATH"] = winget_dir + os.pathsep + os.environ.get("PATH", "")
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
             return candidate
+
+    try:
+        import imageio_ffmpeg
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            bundled_dir = str(Path(bundled).resolve().parent)
+            os.environ["PATH"] = bundled_dir + os.pathsep + os.environ.get("PATH", "")
+            return bundled
+    except Exception:
+        pass
     return ""
 
 
@@ -64,6 +432,7 @@ _FFMPEG_BIN = _find_ffmpeg_bin()
 def _generate_video_thumbnail_sync(video_path: Path) -> Path | None:
     """用 ffmpeg 为视频生成缩略图，返回 jpg 路径或 None。"""
     if not _FFMPEG_BIN:
+        _log.warning("thumbnail_skip | no ffmpeg | video=%s", video_path.name)
         return None
     thumb_path = video_path.with_suffix(".thumb.jpg")
     if thumb_path.exists() and thumb_path.stat().st_size > 1000:
@@ -81,14 +450,203 @@ def _generate_video_thumbnail_sync(video_path: Path) -> Path | None:
         if proc.returncode == 0 and thumb_path.exists() and thumb_path.stat().st_size > 500:
             _log.info("thumbnail_ok | %s | %d bytes", thumb_path.name, thumb_path.stat().st_size)
             return thumb_path
-        _log.warning("thumbnail_fail | rc=%d | stderr=%s", proc.returncode, (proc.stderr or b"")[:200])
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="ignore")[:300]
+        _log.warning("thumbnail_fail | video=%s | rc=%d | stderr=%s", video_path.name, proc.returncode, stderr_text)
     except Exception as exc:
-        _log.warning("thumbnail_error | %s", exc)
+        _log.warning("thumbnail_error | video=%s | %s", video_path.name, exc)
     return None
 
 
 async def _generate_video_thumbnail(video_path: Path) -> Path | None:
     return await asyncio.to_thread(_generate_video_thumbnail_sync, video_path)
+
+
+def _probe_audio_duration_seconds_sync(audio_path: Path) -> float:
+    """探测音频时长（秒），失败返回 0。"""
+    if not audio_path.exists() or not audio_path.is_file():
+        return 0.0
+    if _FFPROBE_BIN:
+        cmd = [
+            _FFPROBE_BIN,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "json",
+            str(audio_path),
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            if proc.returncode == 0:
+                payload = json.loads(proc.stdout or "{}")
+                duration = float(payload.get("format", {}).get("duration", 0) or 0)
+                if duration > 0:
+                    return duration
+        except Exception:
+            pass
+    if _FFMPEG_BIN:
+        cmd = [_FFMPEG_BIN, "-hide_banner", "-i", str(audio_path)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            text = (proc.stderr or "") + "\n" + (proc.stdout or "")
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", text, flags=re.IGNORECASE)
+            if m:
+                hh = int(m.group(1))
+                mm = int(m.group(2))
+                ss = float(m.group(3))
+                return hh * 3600 + mm * 60 + ss
+        except Exception:
+            pass
+    return 0.0
+
+
+def _prepare_voice_audio_file_sync(audio_path: Path, max_seconds: int) -> tuple[Path, float, bool]:
+    """发送前把语音素材裁到可控长度，降低 rich media 上传失败概率。"""
+    duration = _probe_audio_duration_seconds_sync(audio_path)
+    if max_seconds <= 0:
+        return audio_path, duration, False
+    if duration <= 0 or duration <= float(max_seconds) + 0.8:
+        return audio_path, duration, False
+    if not _FFMPEG_BIN:
+        return audio_path, duration, False
+    if audio_path.suffix.lower() in {".silk"}:
+        return audio_path, duration, False
+
+    trimmed = audio_path.with_name(f"{audio_path.stem}.voice{max_seconds}s.mp3")
+    try:
+        if (
+            trimmed.exists()
+            and trimmed.stat().st_size > 1024
+            and trimmed.stat().st_mtime >= audio_path.stat().st_mtime
+        ):
+            return trimmed, duration, True
+    except Exception:
+        pass
+
+    cmd = [
+        _FFMPEG_BIN,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-i",
+        str(audio_path),
+        "-t",
+        str(max_seconds),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "24000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        str(trimmed),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+        if proc.returncode == 0 and trimmed.exists() and trimmed.stat().st_size > 1024:
+            return trimmed, duration, True
+    except Exception:
+        pass
+
+    trimmed.unlink(missing_ok=True)
+    return audio_path, duration, False
+
+
+async def _prepare_voice_audio_file(audio_path: Path, max_seconds: int) -> tuple[Path, float, bool]:
+    return await asyncio.to_thread(_prepare_voice_audio_file_sync, audio_path, max_seconds)
+
+
+def _build_file_uri(path_like: Path | str) -> str:
+    source = str(path_like).strip()
+    if not source:
+        return ""
+    lower_source = source.lower()
+    if lower_source.startswith(("file://", "http://", "https://", "base64://")):
+        return source
+    try:
+        p = Path(source).expanduser().resolve()
+        if p.exists():
+            return p.as_uri()
+    except Exception:
+        pass
+    normalized = source.replace("\\", "/")
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    return f"file://{normalized}"
+
+
+def _split_voice_audio_file_sync(audio_path: Path, segment_seconds: int, max_segments: int) -> list[Path]:
+    """把长音频切成多个小段，供 record 分段发送。"""
+    if segment_seconds <= 0 or max_segments <= 0:
+        return []
+    if not audio_path.exists() or not audio_path.is_file():
+        return []
+    if not _FFMPEG_BIN:
+        return []
+    if audio_path.suffix.lower() in {".silk"}:
+        return []
+
+    parts_dir = audio_path.with_name(f"{audio_path.stem}.parts_{segment_seconds}s")
+    parts_pattern = f"{audio_path.stem}.part*.mp3"
+    try:
+        parts_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+
+    existing = sorted(parts_dir.glob(parts_pattern))
+    try:
+        if existing and all(p.stat().st_size > 1024 for p in existing):
+            src_mtime = audio_path.stat().st_mtime
+            newest_part_mtime = max(p.stat().st_mtime for p in existing)
+            if newest_part_mtime >= src_mtime:
+                return existing[:max_segments]
+    except Exception:
+        pass
+
+    for old in parts_dir.glob(parts_pattern):
+        old.unlink(missing_ok=True)
+
+    out_tpl = parts_dir / f"{audio_path.stem}.part%03d.mp3"
+    cmd = [
+        _FFMPEG_BIN,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-i",
+        str(audio_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "24000",
+        "-c:a",
+        "libmp3lame",
+        "-b:a",
+        "64k",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(int(segment_seconds)),
+        str(out_tpl),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        if proc.returncode != 0:
+            return []
+    except Exception:
+        return []
+
+    parts = [p for p in sorted(parts_dir.glob(parts_pattern)) if p.stat().st_size > 1024]
+    return parts[:max_segments]
+
+
+async def _split_voice_audio_file(audio_path: Path, segment_seconds: int, max_segments: int) -> list[Path]:
+    return await asyncio.to_thread(_split_voice_audio_file_sync, audio_path, segment_seconds, max_segments)
 
 
 def create_engine() -> YukikoEngine:
@@ -99,19 +657,189 @@ def create_engine() -> YukikoEngine:
 def register_handlers(engine: YukikoEngine) -> None:
     dispatcher = GroupQueueDispatcher(engine.config.get("queue", {}))
     router = on_message(priority=90, block=False)
+    meta_router = on_metaevent(priority=90, block=False)
+    notice_router = on_notice(priority=90, block=False)
+    request_router = on_request(priority=90, block=False)
+    def _normalize_trigger_guard_flags(
+        bot_cfg_any: dict[str, Any],
+        trigger_cfg_any: dict[str, Any],
+        control_cfg_any: dict[str, Any],
+    ) -> tuple[bool, bool, bool, str]:
+        allow_non_to_me_defined = "allow_non_to_me" in bot_cfg_any
+        ai_listen_defined = "ai_listen_enable" in trigger_cfg_any
+        delegate_undirected_defined = "delegate_undirected_to_ai" in trigger_cfg_any
+
+        allow_non_to_me_flag = bool(bot_cfg_any.get("allow_non_to_me", False))
+        ai_listen_enable_flag = bool(trigger_cfg_any.get("ai_listen_enable", False))
+        delegate_undirected_flag = bool(trigger_cfg_any.get("delegate_undirected_to_ai", False))
+        policy = (
+            normalize_text(str(control_cfg_any.get("undirected_policy", ""))).lower()
+            or "high_confidence_only"
+        )
+
+        if policy in {"off", "disabled", "mention_only", "directed_only"}:
+            return False, False, False, policy
+
+        if policy == "high_confidence_only":
+            # 仅在字段缺省时才注入策略默认值；显式配置优先，避免“关不掉旁听”。
+            if not allow_non_to_me_defined:
+                allow_non_to_me_flag = True
+            if not ai_listen_defined:
+                ai_listen_enable_flag = allow_non_to_me_flag
+            if not delegate_undirected_defined:
+                delegate_undirected_flag = ai_listen_enable_flag
+
+        if not allow_non_to_me_flag:
+            ai_listen_enable_flag = False
+            delegate_undirected_flag = False
+
+        return allow_non_to_me_flag, ai_listen_enable_flag, delegate_undirected_flag, policy
+
     bot_cfg = engine.config.get("bot", {}) if isinstance(engine.config, dict) else {}
-    reply_with_quote = bool(bot_cfg.get("reply_with_quote", True))
-    reply_with_at = bool(bot_cfg.get("reply_with_at", False))
-    multi_reply_enable = bool(bot_cfg.get("multi_reply_enable", True))
-    multi_reply_max_chunks = max(1, int(bot_cfg.get("multi_reply_max_chunks", 4)))
-    multi_reply_max_lines = max(1, int(bot_cfg.get("multi_reply_max_lines", 1)))
-    multi_reply_max_chars = max(80, int(bot_cfg.get("multi_reply_max_chars", 220)))
-    multi_image_max_count = max(1, int(bot_cfg.get("multi_image_max_count", 9)))
-    multi_image_interval_ms = max(0, int(bot_cfg.get("multi_image_interval_ms", 150)))
+    trigger_cfg = engine.config.get("trigger", {}) if isinstance(engine.config, dict) else {}
+    control_cfg = engine.config.get("control", {}) if isinstance(engine.config, dict) else {}
+    (
+        allow_non_to_me,
+        ai_listen_enable_effective,
+        delegate_undirected_effective,
+        undirected_policy,
+    ) = _normalize_trigger_guard_flags(
+        bot_cfg if isinstance(bot_cfg, dict) else {},
+        trigger_cfg if isinstance(trigger_cfg, dict) else {},
+        control_cfg if isinstance(control_cfg, dict) else {},
+    )
+    _log.info(
+        "trigger_guard_effective | allow_non_to_me=%s | ai_listen_enable=%s | delegate_undirected_to_ai=%s | undirected_policy=%s",
+        allow_non_to_me,
+        ai_listen_enable_effective,
+        delegate_undirected_effective,
+        undirected_policy or "-",
+    )
+    _trigger_guard_runtime_snapshot = ""
+
+    def _resolve_runtime_matcher_flags() -> tuple[bool, dict[str, Any], dict[str, Any], dict[str, Any]]:
+        nonlocal _trigger_guard_runtime_snapshot
+        cfg = engine.config if isinstance(engine.config, dict) else {}
+        bot_cfg_rt = cfg.get("bot", {}) if isinstance(cfg.get("bot"), dict) else {}
+        trigger_cfg_rt = cfg.get("trigger", {}) if isinstance(cfg.get("trigger"), dict) else {}
+        control_cfg_rt = cfg.get("control", {}) if isinstance(cfg.get("control"), dict) else {}
+
+        (
+            allow_non_to_me_rt,
+            ai_listen_enable_rt,
+            delegate_undirected_rt,
+            undirected_policy_rt,
+        ) = _normalize_trigger_guard_flags(
+            bot_cfg_rt,
+            trigger_cfg_rt,
+            control_cfg_rt,
+        )
+
+        guard_snapshot = (
+            f"{int(allow_non_to_me_rt)}|"
+            f"{int(ai_listen_enable_rt)}|"
+            f"{int(delegate_undirected_rt)}|"
+            f"{undirected_policy_rt}"
+        )
+        if guard_snapshot != _trigger_guard_runtime_snapshot:
+            _trigger_guard_runtime_snapshot = guard_snapshot
+            _log.info(
+                "trigger_guard_runtime | allow_non_to_me=%s | ai_listen_enable=%s | delegate_undirected_to_ai=%s | undirected_policy=%s",
+                allow_non_to_me_rt,
+                ai_listen_enable_rt,
+                delegate_undirected_rt,
+                undirected_policy_rt or "-",
+            )
+        return allow_non_to_me_rt, bot_cfg_rt, trigger_cfg_rt, control_cfg_rt
+
+    def _starts_with_bot_alias(text: str, bot_cfg_any: dict[str, Any]) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        aliases: list[str] = []
+        for item in bot_cfg_any.get("nicknames", []) if isinstance(bot_cfg_any.get("nicknames"), list) else []:
+            alias = normalize_text(str(item)).lower()
+            if alias:
+                aliases.append(alias)
+        bot_name = normalize_text(str(bot_cfg_any.get("name", ""))).lower()
+        if bot_name:
+            aliases.append(bot_name)
+        if not aliases:
+            return False
+        aliases = sorted(set(aliases), key=len, reverse=True)
+        return any(content.startswith(alias) for alias in aliases)
+
+    # ── 消息去重：同一用户短时间内发送完全相同的消息只处理一次 ──
+    _recent_msg_hashes: dict[str, tuple[str, float]] = {}  # key=conv:uid → (hash, timestamp)
+    _DEDUP_WINDOW_SECONDS = 5.0
+    def _as_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _resolve_runtime_send_options() -> dict[str, Any]:
+        cfg = engine.config if isinstance(engine.config, dict) else {}
+        bot_cfg_rt = cfg.get("bot", {})
+        if not isinstance(bot_cfg_rt, dict):
+            bot_cfg_rt = {}
+        music_cfg_rt = cfg.get("music", {})
+        if not isinstance(music_cfg_rt, dict):
+            music_cfg_rt = {}
+        chat_split_cfg_rt = cfg.get("chat_split", {})
+        if not isinstance(chat_split_cfg_rt, dict):
+            chat_split_cfg_rt = {}
+        control_cfg_rt = cfg.get("control", {})
+        if not isinstance(control_cfg_rt, dict):
+            control_cfg_rt = {}
+        voice_limit_default = _as_int(music_cfg_rt.get("max_voice_duration_seconds", 60), 60)
+        voice_limit_raw = bot_cfg_rt.get("voice_send_max_seconds", voice_limit_default)
+        voice_send_max_seconds = max(0, _as_int(voice_limit_raw, voice_limit_default))
+        # QQ/NapCat 语音常见 60s 限制，默认先分段，避免“整段发送看似成功但被平台截断”。
+        voice_send_try_full_first = bool(bot_cfg_rt.get("voice_send_try_full_first", False))
+        voice_send_split_enable = bool(bot_cfg_rt.get("voice_send_split_enable", True))
+        voice_send_split_max_segments = max(1, min(20, _as_int(bot_cfg_rt.get("voice_send_split_max_segments", 8), 8)))
+        # 点歌语音默认优先整段直发，不走分段切片。
+        voice_send_music_force_full = bool(bot_cfg_rt.get("voice_send_music_force_full", True))
+        voice_send_music_disable_split = bool(bot_cfg_rt.get("voice_send_music_disable_split", True))
+        send_rate_max_per_window, send_rate_window_seconds, send_rate_warn_threshold, send_rate_enable = (
+            _resolve_send_rate_profile(cfg)
+        )
+        return {
+            "reply_with_quote": bool(bot_cfg_rt.get("reply_with_quote", True)),
+            "reply_with_at": bool(bot_cfg_rt.get("reply_with_at", False)),
+            "multi_reply_enable": bool(bot_cfg_rt.get("multi_reply_enable", True)),
+            "multi_reply_max_chunks": max(1, _as_int(bot_cfg_rt.get("multi_reply_max_chunks", 4), 4)),
+            "multi_reply_max_lines": max(1, _as_int(bot_cfg_rt.get("multi_reply_max_lines", 1), 1)),
+            "multi_reply_max_chars": max(80, _as_int(bot_cfg_rt.get("multi_reply_max_chars", 160), 160)),
+            "multi_reply_chat_max_chars": max(60, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chars", 120), 120)),
+            "multi_reply_chat_max_chunks": max(1, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chunks", 6), 6)),
+            "multi_reply_interval_ms": max(0, _as_int(bot_cfg_rt.get("multi_reply_interval_ms", 260), 260)),
+            "multi_image_max_count": max(1, _as_int(bot_cfg_rt.get("multi_image_max_count", 9), 9)),
+            "multi_image_interval_ms": max(0, _as_int(bot_cfg_rt.get("multi_image_interval_ms", 150), 150)),
+            "video_send_strategy": normalize_text(str(bot_cfg_rt.get("video_send_strategy", "direct_first"))).lower(),
+            "chat_split_mode": normalize_text(
+                str(chat_split_cfg_rt.get("mode", control_cfg_rt.get("split_mode", "semantic")))
+            ).lower() or "semantic",
+            "send_rate_max_per_window": send_rate_max_per_window,
+            "send_rate_window_seconds": send_rate_window_seconds,
+            "send_rate_warn_threshold": send_rate_warn_threshold,
+            "send_rate_enable": send_rate_enable,
+            "voice_send_max_seconds": voice_send_max_seconds,
+            "voice_send_try_full_first": voice_send_try_full_first,
+            "voice_send_split_enable": voice_send_split_enable,
+            "voice_send_split_max_segments": voice_send_split_max_segments,
+            "voice_send_music_force_full": voice_send_music_force_full,
+            "voice_send_music_disable_split": voice_send_music_disable_split,
+        }
 
     # 启动时验证各平台 cookie 有效性
     @nonebot.get_driver().on_startup
     async def _check_cookies_on_startup():
+        try:
+            await engine.async_init()
+        except Exception as e:
+            _log.warning("engine_async_init_failed | %s", e)
         try:
             from core.cookie_auth import check_all_cookies
             results = await check_all_cookies(engine.config)
@@ -121,17 +849,75 @@ def register_handlers(engine: YukikoEngine) -> None:
         except Exception as e:
             _log.debug("cookie_check_skip | %s", e)
 
+    @nonebot.get_driver().on_shutdown
+    async def _flush_memory_on_shutdown():
+        try:
+            memory = getattr(engine, "memory", None)
+            if memory is not None and hasattr(memory, "close") and callable(getattr(memory, "close")):
+                memory.close()
+                _log.info("memory_close_on_shutdown | ok")
+            elif memory is not None and hasattr(memory, "flush") and callable(getattr(memory, "flush")):
+                memory.flush()
+                _log.info("memory_flush_on_shutdown | ok")
+        except Exception as e:
+            _log.warning("memory_flush_on_shutdown_failed | %s", e)
+
     @router.handle()
     async def handle_message(bot: Bot, event: MessageEvent) -> None:
+        raw_segments = _extract_raw_segments(event)
+        _log_qq_message_event(event=event, raw_segments=raw_segments, bot_id=str(bot.self_id))
         if str(event.get_user_id()) == str(bot.self_id):
             return
 
-        conversation_id = _build_conversation_id(event)
+        # ── 去重：同一用户短时间内发送完全相同的消息只处理一次 ──
+        import hashlib as _hl
+        import time as _time
+        _dedup_uid = str(event.get_user_id())
+        _dedup_conv = _build_conversation_id(event)
+        _dedup_key = f"{_dedup_conv}:{_dedup_uid}"
+        _dedup_raw = str(event.get_message())
+        _dedup_hash = _hl.md5(_dedup_raw.encode("utf-8", errors="replace")).hexdigest()
+        _dedup_now = _time.monotonic()
+        _prev = _recent_msg_hashes.get(_dedup_key)
+        if _prev and _prev[0] == _dedup_hash and (_dedup_now - _prev[1]) < _DEDUP_WINDOW_SECONDS:
+            _log.debug("dedup_skip | conv=%s | user=%s", _dedup_conv, _dedup_uid)
+            return
+        _recent_msg_hashes[_dedup_key] = (_dedup_hash, _dedup_now)
+        # 清理过期条目（惰性清理，避免内存泄漏）
+        if len(_recent_msg_hashes) > 500:
+            expired = [k for k, v in _recent_msg_hashes.items() if _dedup_now - v[1] > 30]
+            for k in expired:
+                _recent_msg_hashes.pop(k, None)
+
+        conversation_id = _dedup_conv
         at_targets = _extract_at_targets(event)
+        is_group_message = str(getattr(event, "message_type", "")) == "group"
+        event_group_id = int(getattr(event, "group_id", 0) or 0)
+        allow_non_to_me_rt, runtime_bot_cfg, _, _ = _resolve_runtime_matcher_flags()
+        raw_text = _extract_text_segments(raw_segments) or event.get_plaintext().strip()
+        admin_command = engine.admin.is_admin_command(raw_text)
+        alias_prefix_call = _starts_with_bot_alias(raw_text, runtime_bot_cfg)
+
+        # 最外层 matcher 硬门禁：非 @ 群消息不进入 agent/queue（除非显式开启 allow_non_to_me）。
+        if is_group_message and not allow_non_to_me_rt and not admin_command:
+            event_to_me = bool(getattr(event, "to_me", False))
+            fast_at_me = any(item in {"all", str(bot.self_id)} for item in at_targets)
+            if not event_to_me and not fast_at_me and not _extract_reply_message_id(event) and not alias_prefix_call:
+                _log.debug("matcher_skip_non_to_me | conv=%s | user=%s", conversation_id, event.get_user_id())
+                return
+
         reply_to_message_id = _extract_reply_message_id(event)
         reply_to_user_id = ""
+        reply_to_user_name = ""
+        reply_to_text = ""
+        reply_media_segments: list[dict[str, Any]] = []
         if reply_to_message_id:
-            reply_to_user_id = await _resolve_reply_to_user_id(bot, reply_to_message_id)
+            (
+                reply_to_user_id,
+                reply_to_user_name,
+                reply_to_text,
+                reply_media_segments,
+            ) = await _resolve_reply_context(bot, reply_to_message_id, event=event)
 
         mentioned = _is_mentioned(bot, event, at_targets=at_targets) or (
             reply_to_user_id and str(reply_to_user_id) == str(bot.self_id)
@@ -144,45 +930,82 @@ def register_handlers(engine: YukikoEngine) -> None:
             (bool(at_targets) and not mentioned)
             or (bool(reply_to_user_id) and str(reply_to_user_id) != str(bot.self_id))
         )
-        raw_segments = _extract_raw_segments(event)
         has_media = _has_media_segments(raw_segments)
-        text = _extract_text_segments(raw_segments) or event.get_plaintext().strip()
-        # nickname 前缀也视为 mentioned（如 "yuki点歌"、"雪 帮我搜"）
-        if not mentioned and text:
+        text = raw_text
+        # nickname 前缀命中：显式别名调用总是允许；其余场景仅在 allow_non_to_me=true 时启用。
+        if (allow_non_to_me_rt or alias_prefix_call) and not mentioned and text:
             _nick_lower = text.lower()
-            _bot_nicks = {str(n).lower() for n in bot_cfg.get("nicknames", []) if n}
-            _bot_nicks.add(str(bot_cfg.get("name", "")).lower())
+            _bot_nicks = {str(n).lower() for n in runtime_bot_cfg.get("nicknames", []) if n}
+            _bot_nicks.add(str(runtime_bot_cfg.get("name", "")).lower())
             _bot_nicks.discard("")
             for _nick in _bot_nicks:
                 if _nick_lower.startswith(_nick):
                     mentioned = True
                     text = text[len(_nick):].lstrip()
                     break
+        if is_group_message and not allow_non_to_me_rt and not mentioned and not admin_command and not alias_prefix_call:
+            _log.debug("matcher_skip_non_to_me_resolved | conv=%s | user=%s", conversation_id, event.get_user_id())
+            return
         if not text and mentioned and not has_media:
             # Mention-only prompt fallback.
             text = "__mention_only__"
         if has_media:
+            # 尝试解析语音消息为文字
+            voice_text = await _try_extract_voice_text(bot, raw_segments)
             # Normalize media placeholders produced by adapter text rendering.
             clean_text = _strip_media_placeholder_text(text)
             media_event = _build_multimodal_text(raw_segments, mentioned=mentioned)
+            if voice_text:
+                media_event = f"{media_event}\n[语音内容] {voice_text}"
             text = f"{media_event}\n{clean_text}" if clean_text else media_event
         if not text:
             return
+
+        queue_cfg_rt = engine.config.get("queue", {}) if isinstance(engine.config, dict) else {}
+        if not isinstance(queue_cfg_rt, dict):
+            queue_cfg_rt = {}
+        # 群聊默认按“用户”隔离会话，避免多人上下文互串；同时允许不同用户并行处理。
+        if is_group_message and bool(queue_cfg_rt.get("group_isolate_by_user", True)):
+            group_id = int(getattr(event, "group_id", 0) or 0)
+            user_id = str(event.get_user_id())
+            if group_id > 0 and user_id:
+                scoped_conversation = f"group:{group_id}:user:{user_id}"
+                if scoped_conversation != conversation_id:
+                    _log.debug(
+                        "conversation_scope_user | base=%s | scoped=%s | mentioned=%s | to_me=%s",
+                        conversation_id,
+                        scoped_conversation,
+                        mentioned,
+                        bool(getattr(event, "to_me", False)),
+                    )
+                conversation_id = scoped_conversation
 
         async def api_call(api: str, **kwargs: Any) -> Any:
             return await bot.call_api(api, **kwargs)
 
         # ── 管理员指令拦截 ──
         if engine.admin.is_admin_command(text):
+            if (
+                is_group_message
+                and engine.admin.enabled
+                and engine.admin.non_whitelist_mode == "silent"
+                and not engine.admin.is_group_whitelisted(event_group_id)
+            ):
+                _log.debug(
+                    "admin_command_silent_skip | group=%s | user=%s",
+                    event_group_id,
+                    event.get_user_id(),
+                )
+                return
             admin_reply = await engine.admin.handle_command(
                 text=text,
                 user_id=str(event.get_user_id()),
-                group_id=int(getattr(event, "group_id", 0) or 0),
+                group_id=event_group_id,
                 engine=engine,
                 api_call=api_call,
             )
             if admin_reply:
-                await bot.send(event=event, message=Message(admin_reply))
+                await _safe_send(bot=bot, event=event, message=Message(admin_reply))
             return
 
         seq = dispatcher.next_seq(conversation_id)
@@ -200,37 +1023,73 @@ def register_handlers(engine: YukikoEngine) -> None:
             mentioned=mentioned,
             is_private=getattr(event, "message_type", "") == "private",
             timestamp=_event_timestamp(event),
-            group_id=int(getattr(event, "group_id", 0) or 0),
+            group_id=event_group_id,
             bot_id=str(bot.self_id),
             at_other_user_only=at_other_user_only,
             at_other_user_ids=at_other_user_ids,
             reply_to_message_id=reply_to_message_id,
             reply_to_user_id=reply_to_user_id,
+            reply_to_user_name=reply_to_user_name,
+            reply_to_text=reply_to_text,
+            reply_media_segments=reply_media_segments,
             api_call=api_call,
             trace_id=trace_id,
+            sender_role=_extract_sender_role(event),
         )
         video_pre_ack_sent = False
-        queue_cfg = engine.config.get("queue", {}) if isinstance(engine.config, dict) else {}
+        queue_cfg = queue_cfg_rt
         video_heavy_request = _looks_like_video_heavy_request(text=text, raw_segments=raw_segments)
+        download_heavy_request = _looks_like_download_heavy_request(text=text, raw_segments=raw_segments)
         default_video_timeout = max(dispatcher.process_timeout_seconds + 45, 190)
         video_process_timeout = max(
             dispatcher.process_timeout_seconds,
             int(queue_cfg.get("video_process_timeout_seconds", default_video_timeout)),
         )
-        process_timeout_override = video_process_timeout if video_heavy_request else None
-        allow_late_emit_on_timeout = bool(video_heavy_request and queue_cfg.get("video_late_emit_on_timeout", True))
+        default_download_timeout = max(dispatcher.process_timeout_seconds + 90, 240)
+        download_process_timeout = max(
+            dispatcher.process_timeout_seconds,
+            int(queue_cfg.get("download_process_timeout_seconds", default_download_timeout)),
+        )
+        process_timeout_override = None
+        if video_heavy_request:
+            process_timeout_override = video_process_timeout
+        if download_heavy_request:
+            process_timeout_override = max(process_timeout_override or 0, download_process_timeout)
 
         async def process() -> Any:
             return await engine.handle_message(payload)
 
         async def send_response(result: Any) -> None:
+            nonlocal video_pre_ack_sent
+            send_opts = _resolve_runtime_send_options()
+            reply_with_quote = bool(send_opts["reply_with_quote"])
+            reply_with_at = bool(send_opts["reply_with_at"])
+            multi_reply_enable = bool(send_opts["multi_reply_enable"])
+            multi_reply_max_chunks = int(send_opts["multi_reply_max_chunks"])
+            multi_reply_max_lines = int(send_opts["multi_reply_max_lines"])
+            multi_reply_max_chars = int(send_opts["multi_reply_max_chars"])
+            multi_reply_chat_max_chars = int(send_opts["multi_reply_chat_max_chars"])
+            multi_reply_chat_max_chunks = int(send_opts["multi_reply_chat_max_chunks"])
+            multi_reply_interval_ms = int(send_opts["multi_reply_interval_ms"])
+            multi_image_max_count = int(send_opts["multi_image_max_count"])
+            multi_image_interval_ms = int(send_opts["multi_image_interval_ms"])
+            video_send_strategy = str(send_opts["video_send_strategy"])
+            chat_split_mode = str(send_opts["chat_split_mode"])
+            send_rate_max_per_window = int(send_opts["send_rate_max_per_window"])
+            send_rate_window_seconds = int(send_opts["send_rate_window_seconds"])
+            send_rate_warn_threshold = int(send_opts["send_rate_warn_threshold"])
+            send_rate_enable = bool(send_opts["send_rate_enable"])
+            voice_send_max_seconds = int(send_opts["voice_send_max_seconds"])
+            voice_send_try_full_first = bool(send_opts["voice_send_try_full_first"])
+            voice_send_split_enable = bool(send_opts["voice_send_split_enable"])
+            voice_send_split_max_segments = int(send_opts["voice_send_split_max_segments"])
+            voice_send_music_force_full = bool(send_opts["voice_send_music_force_full"])
+            voice_send_music_disable_split = bool(send_opts["voice_send_music_disable_split"])
             if getattr(result, "action", "") == "ignore":
                 return
 
-            async def send_msg(msg: Message) -> None:
-                await _safe_send(bot=bot, event=event, message=msg)
-
             action = str(getattr(result, "action", "") or "")
+            is_music_voice_action = action in {"music_play", "music_play_by_id", "bilibili_audio_extract"}
             reply_text = _normalize_reply_text(str(getattr(result, "reply_text", "") or ""))
             image_url = str(getattr(result, "image_url", "") or "")
             raw_image_urls = getattr(result, "image_urls", []) or []
@@ -249,7 +1108,26 @@ def register_handlers(engine: YukikoEngine) -> None:
             cover_url = str(getattr(result, "cover_url", "") or "")
             record_b64 = str(getattr(result, "record_b64", "") or "")
             audio_file = str(getattr(result, "audio_file", "") or "")
+            if not is_music_voice_action and audio_file:
+                audio_hint = normalize_text(audio_file).replace("\\", "/").lower()
+                looks_like_music_cache = (
+                    "/storage/cache/music/" in audio_hint
+                    or audio_hint.startswith("storage/cache/music/")
+                    or bool(re.search(r"(?:^|/)(?:netease_|music_)[^/]*\.(?:mp3|m4a|wav|ogg|flac|silk)$", audio_hint))
+                )
+                if looks_like_music_cache:
+                    is_music_voice_action = True
+                    _log.info(
+                        "voice_send_music_action_infer | trace=%s | action=%s | audio=%s",
+                        payload.trace_id,
+                        action or "-",
+                        clip_text(audio_hint, 120),
+                    )
             delivered = False
+            send_attempts = 0
+            send_success = 0
+            rate_limited = False
+            chunk_count = 0
             video_issue = ""
             video_analysis_requested = bool(getattr(result, "pre_ack", ""))
             prefix = _build_reply_prefix(
@@ -261,6 +1139,36 @@ def register_handlers(engine: YukikoEngine) -> None:
             )
             prefixed_sent = False
 
+            async def send_msg(msg: Message) -> bool:
+                nonlocal delivered, send_attempts, send_success, rate_limited
+                send_attempts += 1
+                if send_rate_enable:
+                    bucket = _get_send_bucket(
+                        conversation_id=payload.conversation_id,
+                        group_id=payload.group_id,
+                        max_per_window=send_rate_max_per_window,
+                        refill_seconds=send_rate_window_seconds,
+                        warn_threshold=send_rate_warn_threshold,
+                    )
+                    wait_seconds, rate_flag = bucket.reserve()
+                    if rate_flag:
+                        rate_limited = True
+                    if wait_seconds > 0:
+                        _log.warning(
+                            "send_rate_limit_wait | trace=%s | conversation=%s | wait=%.2fs | used=%d/%d",
+                            payload.trace_id,
+                            payload.conversation_id,
+                            wait_seconds,
+                            bucket.used_in_window(),
+                            bucket.capacity,
+                        )
+                        await asyncio.sleep(wait_seconds)
+                ok = await _safe_send(bot=bot, event=event, message=msg)
+                if ok:
+                    send_success += 1
+                    delivered = True
+                return ok
+
             if video_url and video_analysis_requested and not video_pre_ack_sent:
                 progress = Message()
                 if not prefixed_sent:
@@ -269,6 +1177,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                 pre_ack_text = str(getattr(result, "pre_ack", "") or "OK，我现在去深度分析这个视频，稍等。")
                 progress += Message(pre_ack_text)
                 await send_msg(progress)
+                video_pre_ack_sent = True
                 delivered = True
 
             # ── 语音/音频消息（点歌功能）──
@@ -279,34 +1188,177 @@ def register_handlers(engine: YukikoEngine) -> None:
                         voice_msg += prefix
                         prefixed_sent = True
                     voice_msg += Message(reply_text)
-                    await send_msg(voice_msg)
-                    delivered = True
-                    # 语音前置文案已发送，避免后续文本分段重复发送一遍。
-                    reply_text = ""
+                    text_ok = await send_msg(voice_msg)
+                    delivered = delivered or text_ok
+                    # 仅在文案发送成功时清空，避免失败后文本丢失。
+                    if text_ok:
+                        reply_text = ""
                 # 发送语音条：优先 file://（NapCat 对本地文件时长识别最准确）
                 sent_voice = False
                 if audio_file:
                     try:
-                        audio_uri = ""
+                        resolved_audio_path: Path | None = None
+                        audio_source = normalize_text(audio_file)
+                        audio_source_l = audio_source.lower()
                         try:
-                            p = Path(audio_file).expanduser().resolve()
-                            if p.exists():
-                                audio_uri = p.as_uri()
+                            if not audio_source_l.startswith(("file://", "http://", "https://", "base64://")):
+                                resolved_audio_path = Path(audio_source).expanduser().resolve()
+                                if not resolved_audio_path.exists() or not resolved_audio_path.is_file():
+                                    resolved_audio_path = None
                         except Exception:
-                            audio_uri = ""
-                        if not audio_uri:
-                            normalized = audio_file.replace("\\", "/")
-                            if not normalized.startswith("/"):
-                                normalized = f"/{normalized}"
-                            audio_uri = f"file://{normalized}"
-                        await send_msg(Message(MessageSegment.record(file=audio_uri)))
-                        sent_voice = True
+                            resolved_audio_path = None
+
+                        effective_audio_path = resolved_audio_path
+                        source_is_silk = bool(
+                            resolved_audio_path is not None
+                            and resolved_audio_path.suffix.lower() == ".silk"
+                        )
+                        if source_is_silk and resolved_audio_path is not None:
+                            for ext in (".mp3", ".m4a", ".wav", ".aac", ".ogg", ".flac"):
+                                candidate = resolved_audio_path.with_suffix(ext)
+                                try:
+                                    if candidate.exists() and candidate.is_file() and candidate.stat().st_size > 1024:
+                                        effective_audio_path = candidate
+                                        _log.info(
+                                            "voice_send_silk_source_swap | trace=%s | silk=%s | split_src=%s",
+                                            payload.trace_id,
+                                            resolved_audio_path.name,
+                                            candidate.name,
+                                        )
+                                        break
+                                except Exception:
+                                    continue
+
+                        segment_seconds = voice_send_max_seconds if voice_send_max_seconds > 0 else 60
+                        original_duration = 0.0
+                        is_long_audio = False
+                        if effective_audio_path is not None and voice_send_max_seconds > 0:
+                            original_duration = await asyncio.to_thread(_probe_audio_duration_seconds_sync, effective_audio_path)
+                            is_long_audio = original_duration > float(voice_send_max_seconds) + 0.8
+
+                        full_audio_uri = _build_file_uri(effective_audio_path if effective_audio_path is not None else audio_source)
+                        try_full_for_current = voice_send_try_full_first
+                        split_enable_for_current = voice_send_split_enable
+                        if is_music_voice_action and voice_send_music_force_full:
+                            try_full_for_current = True
+                        if is_music_voice_action and voice_send_music_disable_split:
+                            split_enable_for_current = False
+                        if source_is_silk and effective_audio_path is not None and effective_audio_path != resolved_audio_path:
+                            if is_long_audio and split_enable_for_current:
+                                try_full_for_current = False
+                        tried_full_direct = False
+                        # 短音频默认直接发送；长音频按配置决定是否先尝试完整发送。
+                        if full_audio_uri and (try_full_for_current or not is_long_audio):
+                            tried_full_direct = True
+                            _log.info(
+                                "voice_send_try_full | trace=%s | src=%s | duration=%.2fs | max=%ss | long=%s",
+                                payload.trace_id,
+                                effective_audio_path.name if effective_audio_path is not None else clip_text(audio_source, 80),
+                                original_duration,
+                                voice_send_max_seconds,
+                                is_long_audio,
+                            )
+                            sent_voice = await send_msg(Message(MessageSegment.record(file=full_audio_uri)))
+                            if sent_voice:
+                                _log.info("voice_send_try_full_ok | trace=%s", payload.trace_id)
+                            else:
+                                _log.warning("voice_send_try_full_fail | trace=%s", payload.trace_id)
+
+                        # 长音频：完整发送失败后可自动切片分段发送。
+                        if (
+                            not sent_voice
+                            and effective_audio_path is not None
+                            and is_long_audio
+                            and split_enable_for_current
+                        ):
+                            _log.info(
+                                "voice_send_split_start | trace=%s | src=%s | duration=%.2fs | segment=%ss | max_segments=%d",
+                                payload.trace_id,
+                                effective_audio_path.name,
+                                original_duration,
+                                segment_seconds,
+                                voice_send_split_max_segments,
+                            )
+                            split_parts = await _split_voice_audio_file(
+                                effective_audio_path,
+                                segment_seconds=segment_seconds,
+                                max_segments=voice_send_split_max_segments,
+                            )
+                            if split_parts:
+                                split_ok = True
+                                split_sent_count = 0
+                                for part_idx, part_path in enumerate(split_parts, start=1):
+                                    part_uri = _build_file_uri(part_path)
+                                    part_ok = await send_msg(Message(MessageSegment.record(file=part_uri)))
+                                    if not part_ok:
+                                        split_ok = False
+                                        _log.warning(
+                                            "voice_send_split_part_fail | trace=%s | part=%d/%d | file=%s",
+                                            payload.trace_id,
+                                            part_idx,
+                                            len(split_parts),
+                                            part_path.name,
+                                        )
+                                        break
+                                    split_sent_count += 1
+                                if split_ok and split_sent_count > 0:
+                                    sent_voice = True
+                                    _log.info(
+                                        "voice_send_split_ok | trace=%s | parts=%d",
+                                        payload.trace_id,
+                                        split_sent_count,
+                                    )
+                                elif split_sent_count > 0:
+                                    sent_voice = True
+                                    _log.warning(
+                                        "voice_send_split_partial | trace=%s | sent=%d/%d",
+                                        payload.trace_id,
+                                        split_sent_count,
+                                        len(split_parts),
+                                    )
+                                else:
+                                    _log.warning(
+                                        "voice_send_split_fail | trace=%s | reason=all_parts_send_failed",
+                                        payload.trace_id,
+                                    )
+                            else:
+                                _log.warning(
+                                    "voice_send_split_fail | trace=%s | reason=no_parts | src=%s",
+                                    payload.trace_id,
+                                    effective_audio_path.name,
+                                )
+
+                        # 兜底：按最大秒数裁剪后再发一条，避免整段/分段都失败。
+                        if not sent_voice:
+                            send_audio_path = effective_audio_path
+                            allow_trim_fallback = not (is_music_voice_action and voice_send_music_force_full)
+                            if effective_audio_path is not None and voice_send_max_seconds > 0 and allow_trim_fallback:
+                                prepared_path, prepared_duration, trimmed = await _prepare_voice_audio_file(
+                                    effective_audio_path,
+                                    voice_send_max_seconds,
+                                )
+                                send_audio_path = prepared_path
+                                _log.info(
+                                    "voice_send_prepare | trace=%s | src=%s | send=%s | duration=%.2fs | max=%ss | trimmed=%s",
+                                    payload.trace_id,
+                                    effective_audio_path.name,
+                                    prepared_path.name,
+                                    prepared_duration,
+                                    voice_send_max_seconds,
+                                    trimmed,
+                                )
+
+                            fallback_uri = _build_file_uri(send_audio_path if send_audio_path is not None else audio_source)
+                            # 已完整尝试过同一路径则不重复发送。
+                            if fallback_uri and (not tried_full_direct or fallback_uri != full_audio_uri):
+                                sent_voice = await send_msg(Message(MessageSegment.record(file=fallback_uri)))
+                            elif not fallback_uri:
+                                _log.warning("voice_send_file_uri_empty | trace=%s | audio=%s", payload.trace_id, clip_text(audio_source, 80))
                     except Exception as _voice_file_err:
                         _log.warning("voice_send_file_fail | %s", _voice_file_err)
                 if not sent_voice and record_b64:
                     try:
-                        await send_msg(Message(MessageSegment.record(file=f"base64://{record_b64}")))
-                        sent_voice = True
+                        sent_voice = await send_msg(Message(MessageSegment.record(file=f"base64://{record_b64}")))
                     except Exception as _voice_b64_err:
                         _log.warning("voice_send_b64_fail | %s", _voice_b64_err)
                 if sent_voice:
@@ -328,16 +1380,27 @@ def register_handlers(engine: YukikoEngine) -> None:
                         warn += prefix
                         prefixed_sent = True
                     warn += Message(f"意外日志：{video_issue}")
-                    warn += Message("\n意外发现：视频资源疑似损坏，我先走降级方案给你来源链接。")
+                    if "无音轨" in video_issue or "没声音" in video_issue:
+                        warn += Message("\n意外发现：这个视频没有可用音轨，发送后会没声音。我先走降级方案给你来源链接。")
+                    else:
+                        warn += Message("\n意外发现：视频资源疑似损坏，我先走降级方案给你来源链接。")
                     await send_msg(warn)
                     delivered = True
 
             text_chunks: list[str] = []
             if reply_text:
-                if multi_reply_enable:
+                # 视频场景默认单条文本，避免“昵称 + 逗号开头下一条”的断裂体验
+                if video_url:
+                    text_chunks = [reply_text]
+                elif multi_reply_enable:
                     chunk_max_lines = multi_reply_max_lines
                     chunk_max_chars = multi_reply_max_chars
                     chunk_max_count = multi_reply_max_chunks
+                    if action == "reply":
+                        # 日常聊天默认更积极分段，避免“AI 一大段”
+                        chunk_max_lines = min(chunk_max_lines, 1)
+                        chunk_max_chars = min(chunk_max_chars, multi_reply_chat_max_chars)
+                        chunk_max_count = max(chunk_max_count, multi_reply_chat_max_chunks)
                     if action == "search":
                         chunk_max_lines = max(chunk_max_lines, 4)
                         chunk_max_chars = max(chunk_max_chars, 260)
@@ -346,18 +1409,43 @@ def register_handlers(engine: YukikoEngine) -> None:
                         chunk_max_lines = max(chunk_max_lines, 6)
                         chunk_max_chars = max(chunk_max_chars, 360)
                         chunk_max_count = max(chunk_max_count, 8)
-                    text_chunks = _split_reply_chunks(
-                        reply_text,
-                        max_lines=chunk_max_lines,
-                        max_chars=chunk_max_chars,
-                        max_chunks=chunk_max_count,
-                    )
+                    if chat_split_mode == "semantic":
+                        text_chunks = split_semantic_text(
+                            reply_text,
+                            max_lines=chunk_max_lines,
+                            max_chars=chunk_max_chars,
+                            max_chunks=chunk_max_count,
+                        )
+                    else:
+                        text_chunks = _split_reply_chunks(
+                            reply_text,
+                            max_lines=chunk_max_lines,
+                            max_chars=chunk_max_chars,
+                            max_chunks=chunk_max_count,
+                        )
                 if not text_chunks:
                     text_chunks = [reply_text]
 
-            # ── 有视频时：文本+封面图 → 视频分开发 ──
+            if text_chunks and send_rate_enable:
+                bucket = _get_send_bucket(
+                    conversation_id=payload.conversation_id,
+                    group_id=payload.group_id,
+                    max_per_window=send_rate_max_per_window,
+                    refill_seconds=send_rate_window_seconds,
+                    warn_threshold=send_rate_warn_threshold,
+                )
+                if bucket.near_warn():
+                    text_chunks = coalesce_for_rate_limit(
+                        text_chunks,
+                        max_chars=max(220, multi_reply_max_chars + 80),
+                        short_chunk_chars=90,
+                    )
+                    rate_limited = True
+
+            chunk_count = len(text_chunks)
+
+            # ── 有视频时：先发视频（或文件）确认可达，再发文本/封面 ──
             if video_url:
-                # 1) 发文本（第一条带 prefix + 封面图）
                 cover_seg = None
                 if cover_url:
                     cover_seg = await _build_image_segment(cover_url)
@@ -369,62 +1457,107 @@ def register_handlers(engine: YukikoEngine) -> None:
                         if thumb:
                             cover_seg = await _build_image_segment(str(thumb.resolve()))
 
-                first_chunk = True
-                for chunk in text_chunks:
-                    msg = Message()
-                    if not prefixed_sent:
-                        msg += prefix
-                        prefixed_sent = True
-                    msg += Message(chunk)
-                    if first_chunk and cover_seg is not None:
-                        msg += cover_seg
-                        cover_seg = None
-                    first_chunk = False
-                    await send_msg(msg)
-                    delivered = True
+                # 1) 先尝试发视频本体（或文件上传）
+                prefer_upload_first = video_send_strategy in {"upload_file_first", "upload_only"}
+                video_delivered = False
+                fallback_sent = False
+                if prefer_upload_first:
+                    uploaded = await _try_upload_group_file(
+                        bot=bot,
+                        event=event,
+                        video_url=video_url,
+                    )
+                    if uploaded:
+                        _log.info("video_send_via_upload_group_file | strategy=%s", video_send_strategy)
+                        delivered = True
+                        video_delivered = True
+                    if video_send_strategy == "upload_only":
+                        if not video_delivered:
+                            fallback = Message()
+                            if not prefixed_sent:
+                                fallback += prefix
+                                prefixed_sent = True
+                            fallback += Message("视频文件上传失败了，你稍后重试或换个链接。")
+                            await send_msg(fallback)
+                            delivered = True
+                            fallback_sent = True
 
-                # 如果没有文本但有封面，单独发封面
-                if not text_chunks and cover_seg is not None:
-                    msg = Message()
-                    if not prefixed_sent:
-                        msg += prefix
-                        prefixed_sent = True
-                    msg += cover_seg
-                    await send_msg(msg)
-                    delivered = True
-
-                # 2) 单独发视频
-                seg = None if video_issue else await _build_video_segment(video_url)
-                if seg is not None:
+                if video_delivered or video_send_strategy == "upload_only":
+                    seg = None
+                else:
+                    seg = None if video_issue else await _build_video_segment(video_url)
+                if video_delivered:
+                    pass
+                elif seg is not None:
+                    sent_video = False
+                    send_exc: Exception | None = None
                     try:
-                        await send_msg(Message(seg))
-                    except Exception as send_exc:
-                        _log.warning("video_send_fail | %s | trying upload_group_file fallback", send_exc)
+                        sent_video = await send_msg(Message(seg))
+                    except Exception as exc:
+                        send_exc = exc
+                    if not sent_video:
+                        if send_exc is not None:
+                            _log.warning("video_send_fail | %s | trying upload_group_file fallback", send_exc)
+                        else:
+                            _log.warning("video_send_fail | safe_send_failed | trying upload_group_file fallback")
                         # 尝试用 upload_group_file 上传（适合大文件）
                         uploaded = await _try_upload_group_file(
                             bot=bot, event=event, video_url=video_url,
                         )
-                        if not uploaded:
-                            direct_url = str(video_url or "").strip()
-                            fallback = Message()
-                            if re.match(r"^https?://", direct_url, flags=re.IGNORECASE):
-                                fallback += Message(f"视频发送失败了，来源链接：{direct_url}")
-                            else:
-                                fallback += Message("视频发送失败了，你换一个分享链接我再试。")
-                            await send_msg(fallback)
-                else:
+                        if uploaded:
+                            _log.info("video_send_via_upload_group_file | strategy=fallback")
+                            video_delivered = True
+                            delivered = True
+                    else:
+                        video_delivered = True
+                        delivered = True
+
+                if not video_delivered and not fallback_sent:
                     direct_url = str(video_url or "").strip()
                     fallback_msg = Message()
+                    if not prefixed_sent:
+                        fallback_msg += prefix
+                        prefixed_sent = True
                     if re.match(r"^https?://", direct_url, flags=re.IGNORECASE):
                         fallback_msg += Message(f"视频暂时不能直发，来源链接：{direct_url}")
                     else:
                         fallback_msg += Message("视频暂时不能直发，你换一个分享链接我再试。")
                     await send_msg(fallback_msg)
-                delivered = True
+                    delivered = True
+                    fallback_sent = True
+
+                # 2) 视频有稳定投递后，再发文本与封面。
+                #    如果视频没投递成功，仅发文本，不发封面，避免“只有坏缩略图”。
+                send_cover_seg = cover_seg if video_delivered else None
+                first_chunk = True
+                for idx, chunk in enumerate(text_chunks):
+                    msg = Message()
+                    if not prefixed_sent:
+                        msg += prefix
+                        prefixed_sent = True
+                    msg += Message(chunk)
+                    if first_chunk and send_cover_seg is not None:
+                        msg += send_cover_seg
+                        send_cover_seg = None
+                    first_chunk = False
+                    await send_msg(msg)
+                    delivered = True
+                    if idx < len(text_chunks) - 1 and multi_reply_interval_ms > 0:
+                        await asyncio.sleep(multi_reply_interval_ms / 1000)
+
+                # 无文本但视频成功且有封面，补发封面
+                if not text_chunks and send_cover_seg is not None:
+                    msg = Message()
+                    if not prefixed_sent:
+                        msg += prefix
+                        prefixed_sent = True
+                    msg += send_cover_seg
+                    await send_msg(msg)
+                    delivered = True
 
             else:
                 # ── 无视频：正常发文本+图片 ──
-                for chunk in text_chunks:
+                for idx, chunk in enumerate(text_chunks):
                     msg = Message()
                     if not prefixed_sent:
                         msg += prefix
@@ -432,6 +1565,8 @@ def register_handlers(engine: YukikoEngine) -> None:
                     msg += Message(chunk)
                     await send_msg(msg)
                     delivered = True
+                    if idx < len(text_chunks) - 1 and multi_reply_interval_ms > 0:
+                        await asyncio.sleep(multi_reply_interval_ms / 1000)
 
                 if image_urls:
                     send_count = min(len(image_urls), multi_image_max_count)
@@ -470,6 +1605,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                         await send_msg(tip_more)
                         delivered = True
 
+            delivered = send_success > 0
             if delivered:
                 engine.on_delivery_success(
                     conversation_id=payload.conversation_id,
@@ -477,7 +1613,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                     action=action,
                 )
             _log.info(
-                "send_final | trace=%s | conversation=%s | seq=%s | action=%s | delivered=%s | has_video=%s | has_image=%s",
+                "send_final | trace=%s | conversation=%s | seq=%s | action=%s | delivered=%s | has_video=%s | has_image=%s | send_attempts=%d | send_success=%d | chunk_count=%d | rate_limited=%s",
                 payload.trace_id,
                 payload.conversation_id,
                 payload.seq,
@@ -485,6 +1621,10 @@ def register_handlers(engine: YukikoEngine) -> None:
                 delivered,
                 bool(video_url),
                 bool(image_url or image_urls),
+                send_attempts,
+                send_success,
+                chunk_count,
+                rate_limited,
             )
 
         async def send_overload_notice(text_notice: str) -> None:
@@ -494,6 +1634,7 @@ def register_handlers(engine: YukikoEngine) -> None:
 
         async def on_dispatch_complete(dispatch: Any) -> None:
             status = str(getattr(dispatch, "status", ""))
+            reason = str(getattr(dispatch, "reason", ""))
             dispatch_trace = str(getattr(dispatch, "trace_id", payload.trace_id))
             engine.logger.info(
                 "queue_final | trace=%s | conversation=%s | seq=%s | status=%s | reason=%s | pending=%s",
@@ -501,39 +1642,75 @@ def register_handlers(engine: YukikoEngine) -> None:
                 str(getattr(dispatch, "conversation_id", conversation_id)),
                 str(getattr(dispatch, "seq", seq)),
                 status,
-                str(getattr(dispatch, "reason", "")),
+                reason,
                 str(getattr(dispatch, "pending_count", 0)),
             )
-            if status == "process_timeout_deferred":
+            pending_count = int(getattr(dispatch, "pending_count", 0) or 0)
+            if status == "cancelled" and reason in {"process_timeout", "process_error"}:
+                # 队列里还有后续任务时，避免对每条超时都刷屏报错。
+                if pending_count > 0:
+                    engine.logger.info(
+                        "queue_error_notice_skip | trace=%s | conversation=%s | reason=%s | pending=%d",
+                        dispatch_trace,
+                        str(getattr(dispatch, "conversation_id", conversation_id)),
+                        reason,
+                        pending_count,
+                    )
+                    return
                 msg = Message()
+                runtime_send_opts = _resolve_runtime_send_options()
                 msg += _build_reply_prefix(
                     event=event,
                     quote_message_id=str(getattr(event, "message_id", "") or ""),
                     sender_user_id=str(event.get_user_id()),
-                    enable_quote=reply_with_quote,
-                    enable_at=reply_with_at,
+                    enable_quote=bool(runtime_send_opts["reply_with_quote"]),
+                    enable_at=bool(runtime_send_opts["reply_with_at"]),
                 )
-                msg += Message("这条请求还在后台继续处理，拿到稳定结果后我会自动发出来。")
-                await _safe_send(bot=bot, event=event, message=msg)
-                return
-            if status in {"process_timeout", "process_error", "late_timeout", "late_process_error"}:
-                msg = Message()
-                msg += _build_reply_prefix(
-                    event=event,
-                    quote_message_id=str(getattr(event, "message_id", "") or ""),
-                    sender_user_id=str(event.get_user_id()),
-                    enable_quote=reply_with_quote,
-                    enable_at=reply_with_at,
-                )
-                if status in {"process_timeout", "late_timeout"}:
-                    msg += Message("意外日志：这次处理超时了。")
-                    msg += Message("\n意外发现：视频链路超时，没拿到稳定结果。你重发同一条链接我继续试。")
+                if reason == "process_timeout":
+                    msg += Message("这条任务处理超时了，我先停下。你可以重试，或把问题拆成更短一步。")
                 else:
-                    msg += Message("意外日志：这次处理失败了。")
-                    msg += Message("\n意外发现：解析阶段出现异常，我先停在安全状态。你重发链接我会走静默重试。")
+                    msg += Message("这条任务执行失败了，我先停下。你可以重试一次。")
                 await _safe_send(bot=bot, event=event, message=msg)
 
         high_priority = bool(payload.mentioned or payload.is_private or text.startswith("/"))
+        legacy_cancel_only_high_priority = bool(queue_cfg.get("cancel_previous_only_high_priority", True))
+        cancel_mode_raw = normalize_text(str(queue_cfg.get("cancel_previous_mode", ""))).lower()
+        if cancel_mode_raw in {"always", "high_priority", "interrupt"}:
+            cancel_mode = cancel_mode_raw
+        elif "cancel_previous_only_high_priority" in queue_cfg and not legacy_cancel_only_high_priority:
+            # 兼容旧配置：旧参数显式关闭“仅高优先级打断”时，等价于 always。
+            cancel_mode = "always"
+        else:
+            # 新默认：不因普通新消息打断当前任务，避免同会话乱序与上下文撕裂
+            cancel_mode = "interrupt"
+
+        reply_to_bot = bool(
+            bool(payload.reply_to_user_id)
+            and str(payload.reply_to_user_id) == str(payload.bot_id)
+        )
+        if cancel_mode == "always":
+            allow_cancel_previous = True
+        elif cancel_mode == "high_priority":
+            allow_cancel_previous = bool(high_priority or reply_to_bot)
+        else:
+            allow_cancel_previous = _looks_like_cancel_previous_request(text)
+            if allow_cancel_previous:
+                engine.logger.info(
+                    "queue_interrupt_requested | trace=%s | conversation=%s | text=%s",
+                    payload.trace_id,
+                    payload.conversation_id,
+                    clip_text(text, 80),
+                )
+
+        engine.logger.debug(
+            "queue_cancel_policy | trace=%s | mode=%s | allow=%s | high_priority=%s | reply_to_bot=%s | text=%s",
+            payload.trace_id,
+            cancel_mode,
+            allow_cancel_previous,
+            high_priority,
+            reply_to_bot,
+            clip_text(text, 80),
+        )
         dispatch_result = await dispatcher.submit(
             conversation_id=conversation_id,
             seq=seq,
@@ -541,20 +1718,37 @@ def register_handlers(engine: YukikoEngine) -> None:
             process=process,
             send=send_response,
             high_priority=high_priority,
+            allow_cancel_previous=allow_cancel_previous,
+            interruptible=not _looks_like_sticker_learning_request(
+                text=text,
+                raw_segments=raw_segments,
+                reply_media_segments=reply_media_segments,
+            ),
             process_timeout_seconds=process_timeout_override,
-            allow_late_emit_on_timeout=allow_late_emit_on_timeout,
             trace_id=payload.trace_id,
             send_overload_notice=send_overload_notice,
             on_complete=on_dispatch_complete,
         )
-        if dispatch_result.status in {"dropped", "expired"}:
+        if dispatch_result.status == "cancelled":
             engine.logger.info(
-                "queue_drop | trace=%s | conversation=%s | seq=%d | reason=%s",
+                "queue_cancelled | trace=%s | conversation=%s | seq=%d | reason=%s",
                 dispatch_result.trace_id,
                 dispatch_result.conversation_id,
                 dispatch_result.seq,
                 dispatch_result.reason,
             )
+
+    @notice_router.handle()
+    async def handle_notice(bot: Bot, event: Event) -> None:
+        _log_qq_generic_event(kind="qq_notice", event=event, bot_id=str(bot.self_id))
+
+    @request_router.handle()
+    async def handle_request(bot: Bot, event: Event) -> None:
+        _log_qq_generic_event(kind="qq_request", event=event, bot_id=str(bot.self_id))
+
+    @meta_router.handle()
+    async def handle_meta(bot: Bot, event: Event) -> None:
+        _log_qq_generic_event(kind="qq_meta", event=event, bot_id=str(bot.self_id))
 
 
 def _event_timestamp(event: MessageEvent) -> datetime:
@@ -562,6 +1756,155 @@ def _event_timestamp(event: MessageEvent) -> datetime:
     if isinstance(ts, int):
         return datetime.fromtimestamp(ts, tz=timezone.utc)
     return datetime.now(timezone.utc)
+
+
+def _log_qq_message_event(event: MessageEvent, raw_segments: list[dict[str, Any]], bot_id: str) -> None:
+    conversation_id = _build_conversation_id(event)
+    message_type = str(getattr(event, "message_type", "") or "")
+    group_id = int(getattr(event, "group_id", 0) or 0)
+    message_id = str(getattr(event, "message_id", "") or "")
+    user_id = str(event.get_user_id())
+    try:
+        plain = normalize_text(event.get_plaintext())
+    except Exception:
+        plain = ""
+    raw_payload = _event_to_dict(event)
+    segment_summary = _summarize_segments(raw_segments)
+    _log.info(
+        "qq_recv | bot=%s | type=%s | conversation=%s | group=%s | user=%s | message_id=%s | plain=%s | segments=%s | raw=%s",
+        bot_id,
+        message_type or "-",
+        conversation_id,
+        group_id,
+        user_id,
+        message_id or "-",
+        clip_text(plain, 180) if plain else "-",
+        segment_summary,
+        _safe_json_dumps(raw_payload, max_chars=900),
+    )
+
+
+def _log_qq_generic_event(kind: str, event: Event, bot_id: str) -> None:
+    payload = _event_to_dict(event)
+    post_type = str(getattr(event, "post_type", "") or "")
+    user_id = str(getattr(event, "user_id", "") or "")
+    group_id = str(getattr(event, "group_id", "") or "")
+    _log.info(
+        "%s | bot=%s | post_type=%s | group=%s | user=%s | raw=%s",
+        kind,
+        bot_id,
+        post_type or "-",
+        group_id or "-",
+        user_id or "-",
+        _safe_json_dumps(payload, max_chars=1000),
+    )
+    if kind == "qq_meta":
+        _update_bot_online_state(bot_id=bot_id, payload=payload)
+
+
+def _update_bot_online_state(bot_id: str, payload: dict[str, Any]) -> None:
+    bid = normalize_text(str(bot_id))
+    if not bid or not isinstance(payload, dict):
+        return
+    meta_event_type = normalize_text(str(payload.get("meta_event_type", ""))).lower()
+    if meta_event_type == "lifecycle":
+        sub_type = normalize_text(str(payload.get("sub_type", ""))).lower()
+        if sub_type == "connect":
+            _BOT_ONLINE_STATE[bid] = True
+            _resume_bot_send(bid, reason="meta_lifecycle_connect")
+        return
+    if meta_event_type != "heartbeat":
+        return
+
+    status = payload.get("status")
+    online: bool | None = None
+    if isinstance(status, dict) and "online" in status:
+        try:
+            online = bool(status.get("online"))
+        except Exception:
+            online = None
+    if online is None:
+        return
+    prev = _BOT_ONLINE_STATE.get(bid)
+    _BOT_ONLINE_STATE[bid] = online
+    if prev is not None and prev == online:
+        return
+    if online:
+        _resume_bot_send(bid, reason="meta_heartbeat_online")
+    else:
+        _suspend_bot_send(bid, seconds=120, reason="meta_heartbeat_offline")
+
+
+def _event_to_dict(event: Event) -> dict[str, Any]:
+    for attr in ("model_dump", "dict"):
+        fn = getattr(event, attr, None)
+        if callable(fn):
+            try:
+                data = fn()
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                pass
+    json_fn = getattr(event, "json", None)
+    if callable(json_fn):
+        try:
+            parsed = json.loads(json_fn())
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    fallback = {
+        "post_type": getattr(event, "post_type", ""),
+        "self_id": getattr(event, "self_id", ""),
+        "time": getattr(event, "time", ""),
+    }
+    if hasattr(event, "get_event_name"):
+        try:
+            fallback["event_name"] = event.get_event_name()
+        except Exception:
+            pass
+    return fallback
+
+
+def _summarize_segments(raw_segments: list[dict[str, Any]]) -> str:
+    if not raw_segments:
+        return "-"
+    parts: list[str] = []
+    for seg in raw_segments[:8]:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        data = seg.get("data", {}) or {}
+        preview = ""
+        if seg_type == "text":
+            preview = clip_text(normalize_text(str(data.get("text", ""))), 30)
+        elif seg_type in {"image", "video", "record", "audio"}:
+            preview = clip_text(
+                normalize_text(str(data.get("url", "") or data.get("file", "") or data.get("summary", ""))),
+                50,
+            )
+        elif seg_type in {"at", "reply"}:
+            preview = clip_text(
+                normalize_text(str(data.get("qq", "") or data.get("user_id", "") or data.get("id", ""))),
+                20,
+            )
+        part = seg_type or "unknown"
+        if preview:
+            part = f"{part}:{preview}"
+        parts.append(part)
+    if len(raw_segments) > 8:
+        parts.append(f"+{len(raw_segments) - 8}")
+    return " | ".join(parts) if parts else "-"
+
+
+def _safe_json_dumps(payload: dict[str, Any], max_chars: int = 1000) -> str:
+    try:
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        text = str(payload)
+    if max_chars > 0:
+        return clip_text(text, max_chars)
+    return text
 
 
 def _build_conversation_id(event: MessageEvent) -> str:
@@ -600,7 +1943,7 @@ def _looks_like_video_heavy_request(text: str, raw_segments: list[dict[str, Any]
 
     cues = (
         "视频",
-        "发出来",
+        "发送",
         "发视频",
         "转发视频",
         "解析这个视频",
@@ -614,6 +1957,107 @@ def _looks_like_video_heavy_request(text: str, raw_segments: list[dict[str, Any]
         "快手",
         "acfun",
         "video",
+    )
+    return any(cue in content for cue in cues)
+
+
+def _looks_like_download_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
+    for seg in raw_segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        if seg_type in {"video", "file"}:
+            return True
+
+    content = normalize_text(text).lower()
+    if not content:
+        return False
+    if re.search(r"https?://[^\s]+", content, flags=re.IGNORECASE) and any(
+        cue in content for cue in ("download", "release", "releases", "安装包", "下载")
+    ):
+        return True
+
+    cues = (
+        "下载",
+        "下载安装",
+        "安装包",
+        "官方安装包",
+        "发我安装包",
+        "发文件",
+        "上传群文件",
+        "exe",
+        "msi",
+        "apk",
+        "zip",
+        "7z",
+        "rar",
+        "github release",
+    )
+    return any(cue in content for cue in cues)
+
+
+def _looks_like_sticker_learning_request(
+    text: str,
+    raw_segments: list[dict[str, Any]],
+    reply_media_segments: list[dict[str, Any]] | None = None,
+) -> bool:
+    all_segments = list(raw_segments or [])
+    if isinstance(reply_media_segments, list) and reply_media_segments:
+        all_segments.extend(reply_media_segments)
+    has_image = any(
+        normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
+        for seg in all_segments
+        if isinstance(seg, dict)
+    )
+    if not has_image:
+        content_for_media = normalize_text(text).lower()
+        has_image = bool("multimodal_event" in content_for_media and "image:" in content_for_media)
+    if not has_image:
+        return False
+
+    content = normalize_text(text).lower()
+    if not content:
+        return False
+
+    direct_cues = (
+        "学习表情包",
+        "学表情包",
+        "学习这个表情",
+        "学习这张表情",
+        "记住这个表情",
+        "学这张图",
+    )
+    if any(cue in content for cue in direct_cues):
+        return True
+    return ("学习" in content or "学会" in content) and ("表情" in content or "表情包" in content)
+
+
+def _looks_like_cancel_previous_request(text: str) -> bool:
+    content = normalize_text(text).lower()
+    if not content:
+        return False
+    if re.search(r"^/(?:cancel|stop|abort|interrupt)\b", content):
+        return True
+    cues = (
+        "取消",
+        "打断",
+        "中断",
+        "终止",
+        "停止",
+        "停一下",
+        "先停",
+        "别回了",
+        "不用回了",
+        "不用继续",
+        "算了别",
+        "结束这条",
+        "换个问题",
+        "重来",
+        "skip",
+        "cancel",
+        "stop",
+        "abort",
+        "interrupt",
     )
     return any(cue in content for cue in cues)
 
@@ -656,6 +2100,14 @@ def _extract_at_targets(event: MessageEvent) -> list[str]:
 
 
 def _extract_reply_message_id(event: MessageEvent) -> str:
+    # NoneBot2 OneBot V11 adapter 会把 reply 段从 get_message() 中剥离，
+    # 转而存放在 event.reply (Reply model, 含 message_id 字段)。
+    if hasattr(event, "reply") and event.reply:
+        mid = getattr(event.reply, "message_id", None)
+        if mid is not None:
+            return str(mid)
+
+    # fallback: 遍历消息段（某些旧版本可能保留 reply 段）
     try:
         for segment in event.get_message():
             if str(segment.type).lower() != "reply":
@@ -663,9 +2115,10 @@ def _extract_reply_message_id(event: MessageEvent) -> str:
             message_id = str(segment.data.get("id") or segment.data.get("message_id") or "").strip()
             if message_id:
                 return message_id
-    except Exception:
-        pass
+    except Exception as exc:
+        _log.warning("reply_extract_error | %s", exc)
 
+    # fallback: 正则匹配 raw 字符串
     try:
         raw = str(event.get_message())
     except Exception:
@@ -680,26 +2133,148 @@ def _extract_reply_message_id(event: MessageEvent) -> str:
     return ""
 
 
-async def _resolve_reply_to_user_id(bot: Bot, reply_message_id: str) -> str:
+def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict[str, Any]]]:
+    """解析 get_msg 或 event.reply 负载，返回 (uid, name, text, media)。"""
+    if payload is None:
+        return "", "", "", []
+
+    data: dict[str, Any] = {}
+    if isinstance(payload, dict):
+        data = payload
+    else:
+        try:
+            model_dump = getattr(payload, "model_dump", None)
+            if callable(model_dump):
+                dumped = model_dump()
+                if isinstance(dumped, dict):
+                    data = dumped
+        except Exception:
+            data = {}
+        if not data:
+            raw_dict = getattr(payload, "__dict__", None)
+            if isinstance(raw_dict, dict):
+                data = dict(raw_dict)
+
+    sender = data.get("sender", {})
+    user_id = ""
+    user_name = ""
+    if isinstance(sender, dict):
+        uid = sender.get("user_id")
+        if uid is not None:
+            user_id = str(uid)
+        user_name = normalize_text(str(sender.get("card") or sender.get("nickname") or ""))
+
+    if not user_id:
+        uid = data.get("user_id")
+        if uid is None:
+            uid = getattr(payload, "user_id", None)
+        user_id = str(uid) if uid is not None else ""
+    if not user_name:
+        user_name = normalize_text(str(data.get("nickname", "")))
+    if not user_name:
+        user_name = normalize_text(str(getattr(payload, "nickname", "")))
+
+    message_content = data.get("message", None)
+    if message_content is None:
+        message_content = getattr(payload, "message", None)
+    if message_content is None:
+        message_content = data.get("raw_message", None)
+    if message_content is None:
+        message_content = getattr(payload, "raw_message", None)
+
+    reply_text_parts: list[str] = []
+    reply_media: list[dict[str, Any]] = []
+
+    def _iter_segments_list(items: list[Any]) -> None:
+        for seg in items:
+            seg_type = ""
+            seg_data: dict[str, Any] = {}
+            if isinstance(seg, dict):
+                seg_type = normalize_text(str(seg.get("type", ""))).lower()
+                raw_data = seg.get("data", {}) or {}
+                if isinstance(raw_data, dict):
+                    seg_data = dict(raw_data)
+            else:
+                seg_type = normalize_text(str(getattr(seg, "type", ""))).lower()
+                raw_data = getattr(seg, "data", {}) or {}
+                if isinstance(raw_data, dict):
+                    seg_data = dict(raw_data)
+            if not seg_type:
+                continue
+            if seg_type == "text":
+                text_piece = normalize_text(str(seg_data.get("text", "")))
+                if text_piece:
+                    reply_text_parts.append(text_piece)
+            if seg_type in {"image", "video", "record", "audio"}:
+                reply_media.append({"type": seg_type, "data": seg_data})
+
+    if isinstance(message_content, list):
+        _iter_segments_list(message_content)
+    elif isinstance(message_content, str):
+        import re as _re
+
+        text_fallback = _re.sub(r"\[CQ:[^\]]+\]", " ", message_content)
+        text_fallback = normalize_text(text_fallback)
+        if text_fallback:
+            reply_text_parts.append(text_fallback)
+        for m in _re.finditer(r"\[CQ:(image|video|record|audio),([^\]]+)\]", message_content):
+            seg_type = m.group(1)
+            pairs = dict(kv.split("=", 1) for kv in m.group(2).split(",") if "=" in kv)
+            reply_media.append({"type": seg_type, "data": pairs})
+
+    reply_text = _normalize_reply_text("\n".join(reply_text_parts))
+    return user_id, user_name, reply_text, reply_media
+
+
+async def _resolve_reply_context(
+    bot: Bot,
+    reply_message_id: str,
+    event: MessageEvent | None = None,
+) -> tuple[str, str, str, list[dict[str, Any]]]:
+    """解析被引用消息，返回 (发送者user_id, 发送者昵称, 被引用文本, 被引用消息的媒体segments列表)。"""
     mid = str(reply_message_id or "").strip()
+    event_reply = getattr(event, "reply", None) if event is not None else None
+    event_ctx = _parse_reply_context_payload(event_reply) if event_reply else ("", "", "", [])
+
     if not mid:
-        return ""
+        return event_ctx
+
+    data: Any = None
     try:
         data = await bot.call_api("get_msg", message_id=int(mid))
     except Exception:
         try:
             data = await bot.call_api("get_msg", message_id=mid)
         except Exception:
-            return ""
+            return event_ctx
     if not isinstance(data, dict):
-        return ""
-    sender = data.get("sender", {})
-    if isinstance(sender, dict):
-        uid = sender.get("user_id")
-        if uid is not None:
-            return str(uid)
-    uid = data.get("user_id")
-    return str(uid) if uid is not None else ""
+        return event_ctx
+
+    user_id, user_name, reply_text, reply_media = _parse_reply_context_payload(data)
+    if not (user_id or user_name or reply_text or reply_media):
+        return event_ctx
+    if not reply_text and event_ctx[2]:
+        reply_text = event_ctx[2]
+    if not reply_media and event_ctx[3]:
+        reply_media = event_ctx[3]
+
+    if reply_media:
+        _log.debug(
+            "reply_media_found | mid=%s | count=%d | types=%s",
+            mid,
+            len(reply_media),
+            [s["type"] for s in reply_media],
+        )
+    else:
+        _log.debug("reply_media_empty | mid=%s | user=%s", mid, user_id)
+    _log.debug(
+        "reply_text_found | mid=%s | user=%s | user_name=%s | text=%s",
+        mid,
+        user_id,
+        user_name or "-",
+        clip_text(reply_text, 120),
+    )
+    return user_id, user_name, reply_text, reply_media
 
 
 def _is_mentioned(bot: Bot, event: MessageEvent, at_targets: list[str] | None = None) -> bool:
@@ -757,18 +2332,90 @@ def _strip_reply_segments(message: Message) -> Message:
     return clean
 
 
-async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> None:
+async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> bool:
+    group_id = int(getattr(event, "group_id", 0) or 0)
+    bot_id = str(getattr(bot, "self_id", "") or "")
+    suspended, suspend_reason = _check_bot_send_suspended(bot_id)
+    if suspended:
+        _log.warning(
+            "safe_send_skipped_bot_suspended | bot=%s | group=%s | reason=%s",
+            bot_id or "-",
+            group_id,
+            suspend_reason,
+        )
+        return False
+    blocked, block_reason = _check_group_send_block(group_id)
+    if blocked:
+        _log.warning("safe_send_skipped_blocked | group=%s | reason=%s", group_id, block_reason)
+        return False
+
     try:
         await bot.send(event=event, message=message)
-        return
-    except Exception:
-        # NapCat may fail on reply segment; resend without reply segment as fallback.
-        fallback = _strip_reply_segments(message)
-        if not fallback:
-            raise
-        if str(fallback) == str(message):
-            raise
-        await bot.send(event=event, message=fallback)
+        return True
+    except Exception as e:
+        _log.debug("safe_send_primary_fail | %s", e)
+        await _maybe_block_group_send_on_error(bot=bot, event=event, exc=e)
+        if _is_hard_send_channel_error(e):
+            _suspend_bot_send(bot_id=bot_id, seconds=120, reason=f"hard_send_error:{clip_text(str(e), 80)}")
+            _log.warning("safe_send_abort_hard_error | bot=%s | group=%s", bot_id or "-", group_id)
+            return False
+        if _is_transient_send_error(e):
+            retry_delays = (0.5, 1.2)
+            for idx, delay in enumerate(retry_delays, start=1):
+                await asyncio.sleep(delay)
+                try:
+                    await bot.send(event=event, message=message)
+                    _log.info("safe_send_retry_ok | attempt=%d | delay=%.1fs", idx, delay)
+                    return True
+                except Exception as retry_exc:
+                    _log.warning("safe_send_retry_fail | attempt=%d | %s", idx, retry_exc)
+                    await _maybe_block_group_send_on_error(bot=bot, event=event, exc=retry_exc)
+                    if _is_hard_send_channel_error(retry_exc):
+                        _suspend_bot_send(
+                            bot_id=bot_id,
+                            seconds=120,
+                            reason=f"hard_send_error:{clip_text(str(retry_exc), 80)}",
+                        )
+                        _log.warning("safe_send_abort_hard_error_retry | bot=%s | group=%s", bot_id or "-", group_id)
+                        return False
+            # 网络/链路类错误重试后仍失败时，不做 payload 回退，避免重复刷同一条。
+            _log.warning("safe_send_abort_after_transient_retries | bot=%s | group=%s", bot_id or "-", group_id)
+            return False
+        # 只有“消息格式不兼容”才值得尝试 fallback；其余错误直接止损。
+        if not _is_payload_send_error(e):
+            _log.warning("safe_send_abort_non_payload_error | bot=%s | group=%s", bot_id or "-", group_id)
+            return False
+
+    # Fallback 1: strip reply segments
+    fallback = _strip_reply_segments(message)
+    if fallback and str(fallback) != str(message):
+        try:
+            await bot.send(event=event, message=fallback)
+            return True
+        except Exception as e:
+            _log.debug("safe_send_fallback1_fail | %s", e)
+            await _maybe_block_group_send_on_error(bot=bot, event=event, exc=e)
+            if _is_hard_send_channel_error(e):
+                _suspend_bot_send(bot_id=bot_id, seconds=120, reason=f"hard_send_error:{clip_text(str(e), 80)}")
+                return False
+            if _is_transient_send_error(e) or not _is_payload_send_error(e):
+                return False
+
+    # Fallback 2: plain text only (strip all non-text segments, replace special chars)
+    plain = message.extract_plain_text().strip()
+    if plain:
+        try:
+            await bot.send(event=event, message=Message(plain))
+            return True
+        except Exception as e:
+            _log.debug("safe_send_fallback2_fail | %s", e)
+            await _maybe_block_group_send_on_error(bot=bot, event=event, exc=e)
+            if _is_hard_send_channel_error(e):
+                _suspend_bot_send(bot_id=bot_id, seconds=120, reason=f"hard_send_error:{clip_text(str(e), 80)}")
+            return False
+
+    _log.warning("safe_send_all_fallbacks_failed | msg=%s", str(message)[:200])
+    return False
 
 
 def _extract_user_name(event: MessageEvent) -> str:
@@ -788,6 +2435,21 @@ def _extract_user_name(event: MessageEvent) -> str:
                 return str(value)
 
     return str(event.get_user_id())
+
+
+def _extract_sender_role(event: MessageEvent) -> str:
+    """从 OneBot 事件中提取发送者的群角色: owner / admin / member。"""
+    sender = getattr(event, "sender", None)
+    if sender is None:
+        return ""
+    role = getattr(sender, "role", None)
+    if role:
+        return str(role).strip().lower()
+    if isinstance(sender, dict):
+        role = sender.get("role", "")
+        if role:
+            return str(role).strip().lower()
+    return ""
 
 
 def _extract_raw_segments(event: MessageEvent) -> list[dict[str, Any]]:
@@ -839,7 +2501,52 @@ def _strip_media_placeholder_text(text: str) -> str:
     return content
 
 
-def _build_multimodal_text(raw_segments: list[dict[str, Any]], mentioned: bool) -> str:
+async def _try_extract_voice_text(bot: Bot, raw_segments: list[dict[str, Any]]) -> str:
+    """尝试从语音消息中提取文字内容。
+
+    使用 NapCat 的 get_record API 获取语音文件，
+    然后尝试通过 QQ 内置的语音转文字功能获取文本。
+    """
+    for seg in raw_segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        if seg_type not in ("record", "audio"):
+            continue
+        data = seg.get("data", {}) or {}
+        file_id = str(data.get("file", "") or data.get("file_id", "")).strip()
+        if not file_id:
+            continue
+        try:
+            # 尝试使用 NapCat 的 get_record API 获取语音文件信息
+            result = await bot.call_api("get_record", file=file_id, out_format="mp3")
+            if isinstance(result, dict):
+                # 某些实现会返回 text 字段（语音转文字结果）
+                text = str(result.get("text", "")).strip()
+                if text:
+                    return text
+        except Exception:
+            pass
+        try:
+            # 尝试使用 NapCat 扩展的 translate_en2zh 或其他 STT 接口
+            # 如果 NapCat 支持 get_msg 获取消息详情中的语音文字
+            msg_id = str(data.get("message_id", "") or data.get("id", "")).strip()
+            if msg_id:
+                msg_detail = await bot.call_api("get_msg", message_id=int(msg_id))
+                if isinstance(msg_detail, dict):
+                    # 检查消息详情中是否有语音转文字结果
+                    for seg_detail in msg_detail.get("message", []):
+                        if isinstance(seg_detail, dict) and seg_detail.get("type") == "text":
+                            t = str(seg_detail.get("data", {}).get("text", "")).strip()
+                            if t:
+                                return t
+        except Exception:
+            pass
+    return ""
+
+
+def _build_multimodal_text(raw_segments: list[dict[str, Any]], mentioned: bool = False) -> str:
+    """从 raw_segments 中提取媒体类型标记，生成多模态事件描述文本。"""
     media_tokens: list[str] = []
     for seg in raw_segments or []:
         if not isinstance(seg, dict):
@@ -847,8 +2554,11 @@ def _build_multimodal_text(raw_segments: list[dict[str, Any]], mentioned: bool) 
         seg_type = normalize_text(str(seg.get("type", ""))).lower()
         if seg_type in {"image", "video", "record", "audio", "forward"}:
             data = seg.get("data", {}) or {}
+            summary = normalize_text(str(data.get("summary", "")))
             url = normalize_text(str(data.get("url", "")))
-            if url:
+            if seg_type == "image" and summary:
+                media_tokens.append(f"image:{summary}")
+            elif url:
                 media_tokens.append(f"{seg_type}:{clip_text(url, 120)}")
             else:
                 media_tokens.append(seg_type)
@@ -858,7 +2568,7 @@ def _build_multimodal_text(raw_segments: list[dict[str, Any]], mentioned: bool) 
 
     prefix = "MULTIMODAL_EVENT_AT" if mentioned else "MULTIMODAL_EVENT"
     human = "user mentioned bot and sent multimodal message:" if mentioned else "user sent multimodal message:"
-    return f"{prefix} {human}{' | '.join(media_tokens)}"
+    return f"{prefix} {human} {' | '.join(media_tokens)}"
 
 
 def _normalize_reply_text(text: str) -> str:
@@ -911,7 +2621,6 @@ def _split_reply_chunks(
     chunks: list[str] = []
     current_lines: list[str] = []
     current_len = 0
-    truncated = False
 
     for token in tokens:
         if token is None:
@@ -920,9 +2629,6 @@ def _split_reply_chunks(
             chunks.append("\n".join(current_lines))
             current_lines = []
             current_len = 0
-            if len(chunks) >= max_chunks:
-                truncated = True
-                break
             continue
 
         line_len = len(token)
@@ -930,34 +2636,49 @@ def _split_reply_chunks(
         projected_len = current_len + (1 if current_lines else 0) + line_len
         if current_lines and (projected_lines > max_lines or projected_len > max_chars):
             chunks.append("\n".join(current_lines))
-            if len(chunks) >= max_chunks:
-                truncated = True
-                break
             current_lines = [token]
             current_len = line_len
         else:
             current_lines.append(token)
             current_len = projected_len
 
-    if not truncated and current_lines and len(chunks) < max_chunks:
+    if current_lines:
         chunks.append("\n".join(current_lines))
-    elif current_lines and len(chunks) >= max_chunks:
-        truncated = True
-
-    if truncated and chunks:
-        tail = chunks[-1].rstrip()
-        if not tail.endswith("..."):
-            tail = tail.rstrip("。！？…")
-            chunks[-1] = f"{tail}..."
-
-    return [chunk for chunk in chunks if chunk.strip()]
+    chunks = [chunk for chunk in chunks if chunk.strip()]
+    if len(chunks) <= max_chunks:
+        return chunks
+    if max_chunks == 1:
+        merged = normalize_text("\n".join(chunks))
+        return [merged] if merged else []
+    head = chunks[: max_chunks - 1]
+    tail = normalize_text("\n".join(chunks[max_chunks - 1 :]))
+    if tail:
+        head.append(tail)
+    return [chunk for chunk in head if chunk.strip()]
 
 
 def _split_line_by_sentence(line: str, max_chars: int) -> list[str]:
     text = str(line or "").strip()
     if not text:
         return []
-    segments = [seg.strip() for seg in re.split(r"(?<=[。！？、])", text) if seg.strip()]
+    url_pattern = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+    url_tokens: dict[str, str] = {}
+
+    def _mask_url(match: re.Match[str]) -> str:
+        key = f"URLTOKEN{len(url_tokens)}PLACEHOLDER"
+        url_tokens[key] = match.group(0)
+        return key
+
+    masked_text = url_pattern.sub(_mask_url, text)
+    segments = [seg.strip() for seg in re.split(r"(?<=[。！？、!?；;])", masked_text) if seg.strip()]
+    if url_tokens:
+        restored_segments: list[str] = []
+        for seg in segments:
+            restored = seg
+            for key, value in url_tokens.items():
+                restored = restored.replace(key, value)
+            restored_segments.append(restored)
+        segments = restored_segments
     if len(segments) <= 1:
         if len(text) <= max_chars:
             return [text]
@@ -994,12 +2715,32 @@ def _hard_wrap_text(text: str, max_chars: int) -> list[str]:
     content = str(text or "").strip()
     if not content:
         return []
+    token_pattern = re.compile(r"https?://[^\s]+|[^\s]+", re.IGNORECASE)
+    url_pattern = re.compile(r"https?://[^\s]+", re.IGNORECASE)
+    tokens = token_pattern.findall(content)
+    if not tokens:
+        return [content]
     parts: list[str] = []
-    for idx in range(0, len(content), max_chars):
-        piece = content[idx : idx + max_chars].strip()
-        if piece:
-            parts.append(piece)
-    return parts
+    current = ""
+    for token in tokens:
+        if url_pattern.fullmatch(token):
+            if current:
+                parts.append(current)
+                current = ""
+            parts.append(token)
+            continue
+        if not current:
+            current = token
+            continue
+        candidate = f"{current} {token}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        parts.append(current)
+        current = token
+    if current:
+        parts.append(current)
+    return [piece for piece in parts if piece.strip()]
 
 
 async def _build_image_segment(url: str) -> MessageSegment | None:
@@ -1070,17 +2811,25 @@ async def _build_image_segment_from_remote_url(url: str) -> MessageSegment | Non
     return MessageSegment.image(f"base64://{b64}")
 
 
-async def _video_seg_with_thumb(local_path: Path) -> MessageSegment:
-    """构建带缩略图的视频 MessageSegment，大文件自动压缩。"""
+async def _video_seg_with_thumb(local_path: Path) -> MessageSegment | None:
+    """构建本地视频 MessageSegment，优先附带本地缩略图。"""
     # 大视频先压缩，避免 NapCat WebSocket 超时
-    actual_path = await _compress_video_if_needed(local_path)
-    abs_path = str(actual_path.resolve())
-    thumb = await _generate_video_thumbnail(actual_path)
-    if thumb is not None:
-        abs_thumb = str(thumb.resolve())
-        _log.info("video_seg_with_thumb | video=%s | thumb=%s", actual_path.name, thumb.name)
-        return MessageSegment("video", {"file": abs_path, "thumb": abs_thumb})
-    return MessageSegment.video(abs_path)
+    actual_path = (await _compress_video_if_needed(local_path)).expanduser().resolve()
+    # 再做 QQ 兼容转码，避免 AV1/HEVC 等格式在客户端无法内联预览。
+    actual_path = (await _ensure_qq_preview_video(actual_path)).expanduser().resolve()
+    ok, reason = await _probe_local_video_health(actual_path)
+    if not ok:
+        _log.warning("video_seg_reject_unhealthy | file=%s | reason=%s", actual_path.name, reason)
+        return None
+    thumb_path = await _generate_video_thumbnail(actual_path)
+
+    data: dict[str, Any] = {"file": str(actual_path)}
+    if thumb_path is not None and thumb_path.exists():
+        data["thumb"] = str(thumb_path.expanduser().resolve())
+        _log.info("video_seg_with_thumb | video=%s | thumb=%s", actual_path.name, thumb_path.name)
+    else:
+        _log.info("video_seg_no_thumb | video=%s", actual_path.name)
+    return MessageSegment("video", data)
 
 
 async def _build_video_segment(url: str) -> MessageSegment | None:
@@ -1118,6 +2867,9 @@ async def _build_video_segment(url: str) -> MessageSegment | None:
     # 先下载到本地临时文件再发送。
     local_tmp = await _download_remote_video_to_tmp(target)
     if local_tmp is not None:
+        ok, _ = await _probe_local_video_health(local_tmp)
+        if not ok:
+            return None
         return await _video_seg_with_thumb(local_tmp)
     # 下载失败则回退，让调用方走文本链接兜底
     return None
@@ -1170,6 +2922,195 @@ _VIDEO_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024  # 64MB
 _VIDEO_DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _VIDEO_SEND_COMPRESS_THRESHOLD = 8 * 1024 * 1024  # 超过 8MB 自动压缩
 _VIDEO_SEND_MAX_BYTES = 25 * 1024 * 1024  # 压缩后仍超 25MB 走文件上传
+
+
+def _read_media_stream_info_sync(path: Path) -> dict[str, str]:
+    """尽量读取视频/音频编码信息（优先 ffprobe，缺失时回退 ffmpeg -i 文本解析）。"""
+    info = {"video_codec": "", "audio_codec": "", "pix_fmt": ""}
+    target = str(path)
+    if _FFPROBE_BIN:
+        cmd = [
+            _FFPROBE_BIN,
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,pix_fmt",
+            "-of",
+            "json",
+            target,
+        ]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            if proc.returncode == 0:
+                payload = json.loads(proc.stdout or "{}")
+                streams = payload.get("streams", [])
+                if isinstance(streams, list):
+                    for stream in streams:
+                        if not isinstance(stream, dict):
+                            continue
+                        codec_type = str(stream.get("codec_type", "")).lower()
+                        codec_name = normalize_text(str(stream.get("codec_name", ""))).lower()
+                        if codec_type == "video" and codec_name and not info["video_codec"]:
+                            info["video_codec"] = codec_name
+                            info["pix_fmt"] = normalize_text(str(stream.get("pix_fmt", ""))).lower()
+                        elif codec_type == "audio" and codec_name and not info["audio_codec"]:
+                            info["audio_codec"] = codec_name
+        except Exception:
+            pass
+        if info["video_codec"]:
+            return info
+
+    # 回退：ffmpeg -i stderr 解析（兼容没有 ffprobe 的环境）
+    if not _FFMPEG_BIN:
+        return info
+    cmd = [_FFMPEG_BIN, "-hide_banner", "-i", target]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+        text = (proc.stderr or "") + "\n" + (proc.stdout or "")
+        for line in text.splitlines():
+            line_low = line.lower()
+            if "video:" in line_low and not info["video_codec"]:
+                m = re.search(r"Video:\s*([a-z0-9_]+)", line, flags=re.IGNORECASE)
+                if m:
+                    info["video_codec"] = normalize_text(m.group(1)).lower()
+                m_pix = re.search(r"Video:\s*[^,]+,\s*([a-z0-9_]+)", line, flags=re.IGNORECASE)
+                if m_pix:
+                    info["pix_fmt"] = normalize_text(m_pix.group(1)).lower()
+            elif "audio:" in line_low and not info["audio_codec"]:
+                m = re.search(r"Audio:\s*([a-z0-9_]+)", line, flags=re.IGNORECASE)
+                if m:
+                    info["audio_codec"] = normalize_text(m.group(1)).lower()
+    except Exception:
+        pass
+    return info
+
+
+def _needs_qq_video_compat(path: Path) -> tuple[bool, str, dict[str, str]]:
+    """判断视频是否需要转为 QQ 兼容格式。"""
+    info = _read_media_stream_info_sync(path)
+    vcodec = normalize_text(info.get("video_codec", "")).lower()
+    acodec = normalize_text(info.get("audio_codec", "")).lower()
+    pix_fmt = normalize_text(info.get("pix_fmt", "")).lower()
+
+    if not vcodec:
+        return True, "video_codec_unknown", info
+    # QQ 预览对 AV1/HEVC/VP9 兼容较差，统一落到 H264。
+    if vcodec not in {"h264", "avc1"}:
+        return True, f"video_codec_{vcodec}", info
+    if pix_fmt and not (pix_fmt.startswith("yuv420") or pix_fmt in {"nv12", "yuvj420p"}):
+        return True, f"pix_fmt_{pix_fmt}", info
+    # 无音轨或音轨非 AAC 时统一转 AAC，避免客户端兼容问题。
+    if not acodec:
+        return True, "audio_missing", info
+    if acodec not in {"aac", "mp3", "mp2"}:
+        return True, f"audio_codec_{acodec}", info
+    return False, "", info
+
+
+def _ensure_qq_preview_video_sync(src: Path) -> Path:
+    """确保视频为 QQ 预览友好格式（H264 + AAC + yuv420p + faststart）。"""
+    if not _FFMPEG_BIN:
+        return src
+    try:
+        size = int(src.stat().st_size)
+    except Exception:
+        return src
+    if size <= _MEDIA_MIN_VIDEO_BYTES:
+        return src
+
+    need, reason, info = _needs_qq_video_compat(src)
+    _log.info(
+        "video_qq_compat_check | file=%s | need=%s | reason=%s | v=%s | a=%s | pix=%s",
+        src.name,
+        need,
+        reason or "-",
+        info.get("video_codec", "") or "-",
+        info.get("audio_codec", "") or "-",
+        info.get("pix_fmt", "") or "-",
+    )
+    if not need:
+        return src
+
+    out = src.with_suffix(".qq.mp4")
+    try:
+        if out.exists() and out.stat().st_mtime >= src.stat().st_mtime and out.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
+            return out
+    except Exception:
+        pass
+
+    src_has_audio = bool(normalize_text(info.get("audio_codec", "")))
+    # 始终保留原始音轨映射；不再注入静音轨，避免误判后无声。
+    cmd: list[str] = [
+        _FFMPEG_BIN,
+        "-y",
+        "-i",
+        str(src),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-profile:v",
+        "main",
+        "-level",
+        "4.0",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "24",
+        "-vf",
+        "scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-ar",
+        "44100",
+        "-ac",
+        "2",
+        "-movflags",
+        "+faststart",
+        str(out),
+    ]
+
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=180, check=False)
+        if proc.returncode == 0 and out.exists() and out.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
+            out_info = _read_media_stream_info_sync(out)
+            out_has_audio = bool(normalize_text(out_info.get("audio_codec", "")))
+            if src_has_audio and not out_has_audio:
+                _log.warning(
+                    "video_qq_compat_drop_audio | src=%s | out=%s | fallback=source",
+                    src.name,
+                    out.name,
+                )
+                out.unlink(missing_ok=True)
+                return src
+            _log.info(
+                "video_qq_compat_ok | src=%s | out=%s | size=%d",
+                src.name,
+                out.name,
+                out.stat().st_size,
+            )
+            return out
+        stderr_text = (proc.stderr or b"").decode("utf-8", errors="ignore")[:500]
+        _log.warning(
+            "video_qq_compat_fail | src=%s | rc=%d | stderr=%s",
+            src.name,
+            proc.returncode,
+            stderr_text,
+        )
+    except Exception as exc:
+        _log.warning("video_qq_compat_error | src=%s | %s", src.name, exc)
+    out.unlink(missing_ok=True)
+    return src
+
+
+async def _ensure_qq_preview_video(path: Path) -> Path:
+    return await asyncio.to_thread(_ensure_qq_preview_video_sync, path)
 
 
 async def _download_remote_video_to_tmp(url: str) -> Path | None:
@@ -1229,14 +3170,38 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
         return src
     try:
         size = src.stat().st_size
+        src_mtime = src.stat().st_mtime
     except Exception:
         return src
     if size <= max_bytes:
         return src
 
     compressed = src.with_suffix(".compressed.mp4")
+    src_info = _read_media_stream_info_sync(src)
+    src_has_audio = bool(normalize_text(src_info.get("audio_codec", "")))
     if compressed.exists() and compressed.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
-        return compressed
+        try:
+            if compressed.stat().st_mtime >= src_mtime:
+                cached_info = _read_media_stream_info_sync(compressed)
+                cached_has_audio = bool(normalize_text(cached_info.get("audio_codec", "")))
+                if src_has_audio and not cached_has_audio:
+                    _log.warning(
+                        "video_compress_cache_drop_audio | src=%s | cached=%s | recalc=true",
+                        src.name,
+                        compressed.name,
+                    )
+                    compressed.unlink(missing_ok=True)
+                else:
+                    return compressed
+            else:
+                _log.info(
+                    "video_compress_cache_stale | src=%s | cached=%s | recalc=true",
+                    src.name,
+                    compressed.name,
+                )
+                compressed.unlink(missing_ok=True)
+        except Exception:
+            compressed.unlink(missing_ok=True)
 
     _log.info("video_compress | src=%s | size=%.1fMB | threshold=%.1fMB",
               src.name, size / 1024 / 1024, max_bytes / 1024 / 1024)
@@ -1279,6 +3244,16 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False)
         if proc.returncode == 0 and compressed.exists() and compressed.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
+            compressed_info = _read_media_stream_info_sync(compressed)
+            compressed_has_audio = bool(normalize_text(compressed_info.get("audio_codec", "")))
+            if src_has_audio and not compressed_has_audio:
+                _log.warning(
+                    "video_compress_drop_audio | src=%s | out=%s | fallback=source",
+                    src.name,
+                    compressed.name,
+                )
+                compressed.unlink(missing_ok=True)
+                return src
             new_size = compressed.stat().st_size
             _log.info("video_compress_ok | %s | %.1fMB -> %.1fMB",
                       src.name, size / 1024 / 1024, new_size / 1024 / 1024)
@@ -1303,6 +3278,10 @@ async def _try_upload_group_file(bot: Bot, event: MessageEvent, video_url: str) 
 
     local_path = _as_local_video_path(video_url)
     if local_path is None:
+        return False
+    ok, reason = await _probe_local_video_health(local_path)
+    if not ok:
+        _log.warning("upload_group_file_skip_unhealthy | file=%s | reason=%s", local_path.name, reason)
         return False
 
     abs_path = str(local_path.resolve())
@@ -1380,7 +3359,12 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     if not _looks_like_video_header(head):
         return False, "视频容器签名异常，疑似损坏"
 
+    stream_info = _read_media_stream_info_sync(path)
+    has_audio = bool(normalize_text(stream_info.get("audio_codec", "")))
+    can_detect_audio = bool(_FFPROBE_BIN or _FFMPEG_BIN)
     if not _FFPROBE_BIN:
+        if can_detect_audio and not has_audio:
+            return False, "视频无音轨（发送会没声音）"
         return True, ""
 
     cmd = [
@@ -1388,7 +3372,7 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
         "-v",
         "error",
         "-show_entries",
-        "stream=width,height,duration,codec_name",
+        "stream=codec_type,width,height,duration,codec_name",
         "-show_entries",
         "format=duration,size",
         "-of",
@@ -1398,6 +3382,8 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
     except Exception:
+        if can_detect_audio and not has_audio:
+            return False, "视频无音轨（发送会没声音）"
         return True, ""
     if proc.returncode != 0:
         return False, "ffprobe 无法解析该视频（可能损坏）"
@@ -1410,7 +3396,6 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     duration = 0.0
     width = 0
     height = 0
-
     fmt = payload.get("format", {})
     if isinstance(fmt, dict):
         try:
@@ -1423,6 +3408,9 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
         for stream in streams:
             if not isinstance(stream, dict):
                 continue
+            codec_type = normalize_text(str(stream.get("codec_type", ""))).lower()
+            if codec_type == "audio":
+                has_audio = True
             codec = str(stream.get("codec_name", "")).strip().lower()
             if codec and codec in {"png", "mjpeg"} and duration <= 0:
                 # 明显是封面流/图片流
@@ -1441,6 +3429,8 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
         return False, f"视频时长异常（{duration:.2f}s）"
     if width > 0 and height > 0 and (width < 64 or height < 64):
         return False, f"视频分辨率异常（{width}x{height}）"
+    if can_detect_audio and not has_audio:
+        return False, "视频无音轨（发送会没声音）"
     return True, ""
 
 

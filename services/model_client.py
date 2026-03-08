@@ -1,16 +1,49 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
+import logging
+import re
 from typing import Any
 
 from services.anthropic import AnthropicClient
 from services.deepseek import DeepSeekClient
 from services.gemini import GeminiClient
+from services.mistral import MistralClient
+from services.moonshot import MoonshotClient
+from services.newapi import NewAPIClient
 from services.openai import OpenAIClient
+from services.openrouter import OpenRouterClient
+from services.qwen import QwenClient
+from services.siliconflow import SiliconFlowClient
 from services.skiapi import SkiAPIClient
+from services.xai import XAIClient
+from services.zhipu import ZhipuClient
+
+_log = logging.getLogger("yukiko.model_client")
+
+# 触发 provider 降级的错误关键词
+_FATAL_ERROR_CUES = (
+    "suspended", "forbidden", "unauthorized", "banned",
+    "account", "disabled", "quota", "rate_limit",
+)
 
 
 class ModelClient:
-    """按 provider 路由到不同厂商客户端。"""
+    """按 provider 路由到不同厂商客户端，支持自动降级。
+
+    配置示例 (config.yml):
+        api:
+          provider: skiapi
+          fallback_providers:
+            - anthropic
+            - openai
+          providers:
+            anthropic:
+              api_key: sk-xxx
+              model: claude-sonnet-4-20250514
+            openai:
+              api_key: sk-xxx
+              model: gpt-4.1
+    """
 
     _ALIASES = {
         "skiapi": "skiapi",
@@ -20,6 +53,25 @@ class ModelClient:
         "claude": "anthropic",
         "gemini": "gemini",
         "gemeni": "gemini",
+        "openrouter": "openrouter",
+        "open_router": "openrouter",
+        "newapi": "newapi",
+        "new_api": "newapi",
+        "new-api": "newapi",
+        "xai": "xai",
+        "x.ai": "xai",
+        "grok": "xai",
+        "qwen": "qwen",
+        "tongyi": "qwen",
+        "dashscope": "qwen",
+        "moonshot": "moonshot",
+        "kimi": "moonshot",
+        "mistral": "mistral",
+        "zhipu": "zhipu",
+        "bigmodel": "zhipu",
+        "glm": "zhipu",
+        "siliconflow": "siliconflow",
+        "silicon_flow": "siliconflow",
     }
     _CLIENTS = {
         "skiapi": SkiAPIClient,
@@ -27,6 +79,14 @@ class ModelClient:
         "deepseek": DeepSeekClient,
         "anthropic": AnthropicClient,
         "gemini": GeminiClient,
+        "openrouter": OpenRouterClient,
+        "newapi": NewAPIClient,
+        "xai": XAIClient,
+        "qwen": QwenClient,
+        "moonshot": MoonshotClient,
+        "mistral": MistralClient,
+        "zhipu": ZhipuClient,
+        "siliconflow": SiliconFlowClient,
     }
 
     def __init__(self, config: dict[str, Any]):
@@ -40,6 +100,13 @@ class ModelClient:
 
         self.provider = provider
         self.client = client_cls(provider_cfg)
+        self._config = raw
+
+        # 降级链: 主 provider 失败时依次尝试
+        self._fallback_providers: list[str] = []
+        self._fallback_clients: dict[str, Any] = {}
+        self._active_provider = provider  # 当前实际使用的 provider
+        self._init_fallbacks(raw)
 
     @property
     def enabled(self) -> bool:
@@ -53,26 +120,182 @@ class ModelClient:
     def base_url(self) -> str:
         return str(getattr(self.client, "base_url", ""))
 
+    def _init_fallbacks(self, config: dict[str, Any]) -> None:
+        """初始化降级 provider 链。"""
+        fb_list = config.get("fallback_providers", [])
+        if not isinstance(fb_list, list):
+            return
+        for name in fb_list:
+            prov = self._normalize_provider(str(name))
+            if prov == self.provider or prov in self._fallback_clients:
+                continue
+            cls = self._CLIENTS.get(prov)
+            if cls is None:
+                continue
+            try:
+                pcfg = self._resolve_provider_config(config, prov)
+                client = cls(pcfg)
+                if getattr(client, "enabled", False):
+                    self._fallback_providers.append(prov)
+                    self._fallback_clients[prov] = client
+                    _log.info("fallback_provider_ready | %s", prov)
+            except Exception as exc:
+                _log.warning("fallback_provider_init_fail | %s | %s", prov, exc)
+
+    @staticmethod
+    def _is_fatal_error(exc: Exception) -> bool:
+        """判断是否为不可恢复错误（应触发 provider 降级）。"""
+        msg = str(exc).lower()
+        return any(cue in msg for cue in _FATAL_ERROR_CUES) or "403" in msg or "401" in msg
+
+    def _get_active_client(self) -> Any:
+        """返回当前活跃的 client（可能已降级）。"""
+        if self._active_provider != self.provider:
+            fb = self._fallback_clients.get(self._active_provider)
+            if fb:
+                return fb
+        return self.client
+
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
-        return await self.client.chat_completion(
-            messages=messages,
-            response_format=response_format,
-            max_tokens=max_tokens,
-        )
+        # 先用当前活跃 provider
+        try:
+            return await self._get_active_client().chat_completion(
+                messages=messages, response_format=response_format, max_tokens=max_tokens,
+            )
+        except Exception as exc:
+            if not self._is_fatal_error(exc) or not self._fallback_providers:
+                raise
+            _log.warning("provider_fatal | %s | %s | trying fallback", self._active_provider, exc)
+
+        # 降级尝试
+        for prov in self._fallback_providers:
+            if prov == self._active_provider:
+                continue
+            client = self._fallback_clients.get(prov)
+            if not client:
+                continue
+            try:
+                result = await client.chat_completion(
+                    messages=messages, response_format=response_format, max_tokens=max_tokens,
+                )
+                _log.info("provider_failover_ok | %s -> %s", self._active_provider, prov)
+                self._active_provider = prov
+                return result
+            except Exception as fb_exc:
+                _log.warning("fallback_also_failed | %s | %s", prov, fb_exc)
+
+        raise RuntimeError("所有 provider 均不可用")
 
     async def chat_text(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> str:
-        return await self.client.chat_text(messages, max_tokens=max_tokens)
+        data = await self.chat_completion(messages=messages, max_tokens=max_tokens)
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        message = choices[0].get("message") or {}
+        content = message.get("content", "")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text", "")))
+            return "".join(parts)
+        return str(content)
+
+    async def chat_text_with_retry(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+        retries: int = 2,
+        backoff: float = 1.0,
+    ) -> str:
+        return await self._get_active_client().chat_text_with_retry(
+            messages, max_tokens=max_tokens, retries=retries, backoff=backoff,
+        )
 
     async def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        return await self.client.chat_json(messages)
+        return await self._get_active_client().chat_json(messages)
 
     async def generate_image(self, prompt: str, size: str = "1024x1024") -> str | None:
-        return await self.client.generate_image(prompt=prompt, size=size)
+        return await self._get_active_client().generate_image(prompt=prompt, size=size)
+
+    def supports_vision_input(self, model: str | None = None) -> bool:
+        """判断当前模型是否支持图片输入（自动启发式，可被配置覆盖）。"""
+        active = self._get_active_client()
+        cfg = getattr(active, "config", {}) or {}
+        override = str(cfg.get("supports_vision_input", "auto")).strip().lower()
+        if override in {"1", "true", "yes", "on"}:
+            return True
+        if override in {"0", "false", "no", "off"}:
+            return False
+
+        model_name = str(model or getattr(active, "model", "") or self.model).strip().lower()
+        provider = self._active_provider
+        return self._infer_vision_support(provider=provider, model_name=model_name)
+
+    @staticmethod
+    def _infer_vision_support(provider: str, model_name: str) -> bool:
+        name = (model_name or "").strip().lower()
+        if not name:
+            return False
+
+        # 明显文本模型（优先排除，避免误发图片）
+        text_only_cues = (
+            "embedding",
+            "rerank",
+            "bge",
+            "text-embedding",
+            "gpt-3.5",
+            "instruct",
+            "reasoner",
+            "coder",
+            "code-",
+            "whisper",
+            "tts",
+            "asr",
+        )
+        if any(cue in name for cue in text_only_cues):
+            return False
+
+        # 常见视觉模型命名
+        vision_cues = (
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-4.5",
+            "o1",
+            "o3",
+            "o4",
+            "claude-3",
+            "claude-4",
+            "gemini",
+            "vision",
+            "-vl",
+            "vl-",
+            "qwen-vl",
+            "glm-4v",
+            "llava",
+            "minicpm-v",
+        )
+        if any(cue in name for cue in vision_cues):
+            return True
+
+        # claude 新模型默认按可看图处理（老 2.x 除外）
+        if "claude" in name:
+            if re.search(r"claude[-_ ]?2", name):
+                return False
+            return True
+
+        # provider 兜底（仅在名字没有明显冲突时启用）
+        if provider in {"gemini"}:
+            return True
+        if provider in {"openai", "newapi", "skiapi", "deepseek", "anthropic"}:
+            # 这些 provider 同时有文本模型和视觉模型，没有明确信号时保守关闭
+            return False
+        return False
 
     @classmethod
     def _normalize_provider(cls, provider: str) -> str:

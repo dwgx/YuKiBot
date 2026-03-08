@@ -19,6 +19,23 @@ STOP_WORDS = {
     "that",
     "with",
     "from",
+    "user",
+    "sent",
+    "message",
+    "multimodal",
+    "image",
+    "video",
+    "audio",
+    "record",
+    "forward",
+    "https",
+    "http",
+    "com",
+    "qq",
+    "appid",
+    "fileid",
+    "download",
+    "and",
 }
 
 

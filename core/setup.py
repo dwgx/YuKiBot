@@ -6,15 +6,17 @@
 """
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 from typing import Any
+
+from core.config_templates import deep_merge_dict, ensure_prompts_file, load_config_template
 
 _ROOT = Path(__file__).resolve().parents[1]
 _CONFIG_DIR = _ROOT / "config"
 _STORAGE_DIR = _ROOT / "storage"
 _CONFIG_FILE = _CONFIG_DIR / "config.yml"
+_PROMPTS_FILE = _CONFIG_DIR / "prompts.yml"
 
 
 def needs_setup() -> bool:
@@ -34,7 +36,7 @@ def run() -> None:
     cfg["api"] = _ask_api()
 
     # 2. 功能开关
-    cfg["bot"], cfg["search"], cfg["image"] = _ask_features()
+    cfg["bot"], cfg["search"], cfg["image"], cfg["image_gen"] = _ask_features()
 
     # 3. 超级管理员
     cfg["admin"] = _ask_admin()
@@ -54,15 +56,25 @@ def run() -> None:
     print("你可以随时编辑 config/config.yml，然后发 /yukibot 热重载。\n")
 
 
+def _safe_input(prompt: str) -> str:
+    """兼容 PyCharm / 非 TTY 环境的 input，确保 prompt 先刷新到屏幕。"""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        return input().strip()
+    except EOFError:
+        return ""
+
+
 def _input(prompt: str, default: str = "") -> str:
     hint = f" [{default}]" if default else ""
-    val = input(f"{prompt}{hint}: ").strip()
+    val = _safe_input(f"{prompt}{hint}: ")
     return val or default
 
 
 def _yes_no(prompt: str, default: bool = True) -> bool:
     hint = "Y/n" if default else "y/N"
-    val = input(f"{prompt} ({hint}): ").strip().lower()
+    val = _safe_input(f"{prompt} ({hint}): ").lower()
     if not val:
         return default
     return val in ("y", "yes", "是", "1")
@@ -73,7 +85,7 @@ def _choice(prompt: str, options: list[str], default: int = 0) -> str:
     for i, opt in enumerate(options):
         marker = " *" if i == default else ""
         print(f"  {i + 1}. {opt}{marker}")
-    val = input(f"选择 [1-{len(options)}，默认 {default + 1}]: ").strip()
+    val = _safe_input(f"选择 [1-{len(options)}，默认 {default + 1}]: ")
     try:
         idx = int(val) - 1
         if 0 <= idx < len(options):
@@ -84,16 +96,38 @@ def _choice(prompt: str, options: list[str], default: int = 0) -> str:
 
 
 def _ask_api() -> dict[str, Any]:
-    providers = ["skiapi", "openai", "deepseek", "anthropic", "gemini"]
+    providers = [
+        "skiapi",
+        "openai",
+        "anthropic",
+        "gemini",
+        "deepseek",
+        "newapi",
+        "openrouter",
+        "xai",
+        "qwen",
+        "moonshot",
+        "mistral",
+        "zhipu",
+        "siliconflow",
+    ]
     provider = _choice("选择 API 提供商:", providers, default=0)
     api_key = _input(f"输入 {provider} 的 API Key（留空则从环境变量读取）")
 
     models = {
         "skiapi": "claude-opus-4-6",
         "openai": "gpt-5.2",
-        "deepseek": "deepseek-chat",
         "anthropic": "claude-sonnet-4-5-20250929",
         "gemini": "gemini-2.5-pro",
+        "deepseek": "deepseek-chat",
+        "newapi": "gpt-5-codex",
+        "openrouter": "openrouter/auto",
+        "xai": "grok-3-latest",
+        "qwen": "qwen-max-latest",
+        "moonshot": "kimi-thinking-preview",
+        "mistral": "mistral-medium-latest",
+        "zhipu": "glm-4-plus",
+        "siliconflow": "Qwen/Qwen2.5-72B-Instruct",
     }
     model = _input("模型名称", models.get(provider, ""))
 
@@ -121,15 +155,23 @@ def _ask_api() -> dict[str, Any]:
             "skiapi": "${SKIAPI_KEY}",
             "openai": "${OPENAI_API_KEY}",
             "deepseek": "${DEEPSEEK_API_KEY}",
+            "newapi": "${NEWAPI_API_KEY}",
             "anthropic": "${ANTHROPIC_API_KEY}",
             "gemini": "${GEMINI_API_KEY}",
+            "openrouter": "${OPENROUTER_API_KEY}",
+            "xai": "${XAI_API_KEY}",
+            "qwen": "${QWEN_API_KEY}",
+            "moonshot": "${MOONSHOT_API_KEY}",
+            "mistral": "${MISTRAL_API_KEY}",
+            "zhipu": "${ZHIPU_API_KEY}",
+            "siliconflow": "${SILICONFLOW_API_KEY}",
         }
         result["api_key"] = env_map.get(provider, "${API_KEY}")
 
     return result
 
 
-def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
     print("\n── 功能开关 ──")
     allow_search = _yes_no("启用网络搜索?", True)
     allow_image = _yes_no("启用 AI 画图?", True)
@@ -142,6 +184,7 @@ def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         "allow_markdown": allow_markdown,
         "allow_image": allow_image,
         "allow_search": allow_search,
+        "allow_non_to_me": True,
     }
     search = {
         "enable": allow_search,
@@ -177,7 +220,8 @@ def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         },
     }
     image = {"enable": allow_image}
-    return bot, search, image
+    image_gen = _ask_image_gen() if allow_image else {"enable": False}
+    return bot, search, image, image_gen
 
 
 def _ask_admin() -> dict[str, Any]:
@@ -185,7 +229,7 @@ def _ask_admin() -> dict[str, Any]:
     qq = _input("超级管理员 QQ 号（留空 = 不启用权限系统）")
     return {
         "super_admin_qq": qq,
-        "non_whitelist_mode": "minimal",
+        "non_whitelist_mode": "silent",
     }
 
 
@@ -199,7 +243,9 @@ def _ask_output() -> dict[str, Any]:
     return {
         "verbosity": verbosity,
         "token_saving": token_saving,
+        "style_instruction": "",
         "group_overrides": {},
+        "group_style_overrides": {},
     }
 
 
@@ -228,6 +274,7 @@ def _ask_cookies() -> dict[str, Any]:
         "bilibili": {"enable": True, "sessdata": "", "bili_jct": "", "danmaku_top_n": 8, "comments_top_n": 3},
         "douyin": {"enable": True, "cookie": ""},
         "kuaishou": {"enable": True, "cookie": ""},
+        "qzone": {"enable": True, "cookie": ""},
     }
 
     # ── B站 ──
@@ -264,7 +311,64 @@ def _ask_cookies() -> dict[str, Any]:
             result["kuaishou"]["cookie"] = cookie
             print("  快手 Cookie 已配置。")
 
+    # ── QQ空间 ──
+    if _yes_no("配置 QQ空间 Cookie?（用于查看空间资料/说说）", False):
+        from core.cookie_auth import interactive_qzone_cookie
+        cookie = interactive_qzone_cookie()
+        if cookie:
+            cookie = _encrypt_value(cookie)
+            result["qzone"]["cookie"] = cookie
+            print("  QQ空间 Cookie 已配置。")
+        else:
+            print("  QQ空间 Cookie 未配置，跳过。")
+
     return result
+
+
+def _ask_image_gen() -> dict[str, Any]:
+    """配置图片生成功能。"""
+    print("\n── 图片生成配置 ──")
+    print("  支持多模型配置（DALL-E / Flux / SD / 任何 OpenAI 兼容 API）")
+    print("  NSFW 过滤强制开启，确保内容安全\n")
+
+    default_model = _input("默认模型名称", "dall-e-3")
+    default_size = _input("默认图片尺寸", "1024x1024")
+
+    models = []
+    if _yes_no("添加自定义图片生成模型?", False):
+        while True:
+            print("\n添加模型配置:")
+            name = _input("  模型名称（如 flux-1）")
+            if not name:
+                break
+            api_base = _input("  API 地址")
+            api_key = _input("  API Key")
+            model = _input("  模型 ID", name)
+            size = _input("  默认尺寸", "1024x1024")
+
+            if api_key:
+                api_key = _encrypt_value(api_key)
+
+            models.append({
+                "name": name,
+                "api_base": api_base,
+                "api_key": api_key,
+                "model": model,
+                "default_size": size,
+            })
+            print(f"  模型 {name} 已添加。")
+
+            if not _yes_no("继续添加更多模型?", False):
+                break
+
+    return {
+        "enable": True,
+        "default_model": default_model,
+        "default_size": default_size,
+        "nsfw_filter": True,
+        "max_prompt_length": 1000,
+        "models": models,
+    }
 
 
 def _encrypt_value(value: str) -> str:
@@ -299,22 +403,8 @@ def _write_config(cfg: dict[str, Any]) -> None:
 
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     _STORAGE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # 读取模板（如果存在 config.example.yml）
-    template = _CONFIG_DIR / "config.example.yml"
-    if template.exists():
-        with open(template, "r", encoding="utf-8") as f:
-            base = yaml.safe_load(f) or {}
-    else:
-        base = {}
-
-    # 合并用户选择到基础配置
-    _deep_merge(base, cfg)
-
-    # 确保必要的段存在
-    for key in ("memory", "trigger", "routing", "self_check", "queue", "safety", "vision", "markdown", "limits"):
-        if key not in base:
-            base[key] = {}
+    base = load_config_template()
+    deep_merge_dict(base, cfg)
 
     header = (
         "# YuKiKo Bot 配置文件\n"
@@ -325,17 +415,9 @@ def _write_config(cfg: dict[str, Any]) -> None:
 
     with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
         f.write(header)
-        yaml.dump(base, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        yaml.safe_dump(base, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
-
-def _deep_merge(base: dict, override: dict) -> dict:
-    """递归合并 override 到 base。"""
-    for k, v in override.items():
-        if k in base and isinstance(base[k], dict) and isinstance(v, dict):
-            _deep_merge(base[k], v)
-        else:
-            base[k] = v
-    return base
+    ensure_prompts_file(_PROMPTS_FILE)
 
 
 if __name__ == "__main__":

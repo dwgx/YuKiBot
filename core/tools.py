@@ -4,12 +4,14 @@ import asyncio
 import base64
 import hashlib
 import ipaddress
+import io
 import json
 import mimetypes
 import os
 import re
 import shutil
 import socket
+import subprocess
 import tempfile
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -17,22 +19,34 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any, Awaitable, Callable
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from urllib.parse import urlencode
 
 import httpx
 
+from core import prompt_loader as _pl
 from core.image import ImageEngine
 from core.music import MusicEngine, MusicPlayResult
+from core.prompt_policy import PromptPolicy
 from core.search import SearchEngine, SearchResult
 from core.system_prompts import SystemPromptRelay
 from core.video_analyzer import VideoAnalyzer, VideoAnalysisResult
+from utils.intent import (
+    looks_like_github_request as _shared_github_request,
+    looks_like_repo_readme_request as _shared_repo_readme_request,
+    looks_like_video_request as _shared_video_request,
+)
 from utils.text import clip_text, normalize_text
 
 try:
     from yt_dlp import YoutubeDL
 except Exception:  # pragma: no cover - optional runtime dependency
     YoutubeDL = None
+
+try:  # pragma: no cover - optional runtime dependency
+    from PIL import Image
+except Exception:  # pragma: no cover - optional runtime dependency
+    Image = None
 
 
 import logging as _logging
@@ -41,6 +55,7 @@ _ytdlp_log = _logging.getLogger("yukiko.ytdlp")
 _tool_log = _logging.getLogger("yukiko.tools")
 _tool_trace_id_ctx: ContextVar[str] = ContextVar("yukiko_tool_trace_id", default="")
 _ytdlp_error_dedupe: set[tuple[str, str]] = set()
+_TOOLS_HEURISTIC_CUES_ENABLED = False
 
 
 def _tool_trace_tag() -> str:
@@ -48,6 +63,25 @@ def _tool_trace_tag() -> str:
     if not trace_id:
         return ""
     return f" | trace={trace_id}"
+
+
+def _prompt_cues(key: str, defaults: tuple[str, ...], lowercase: bool = True) -> tuple[str, ...]:
+    """Load cue list from prompts.yml.
+
+    In LLM-first mode, keyword/regex cue routing is disabled globally.
+    """
+    _ = defaults
+    if not _TOOLS_HEURISTIC_CUES_ENABLED:
+        return ()
+    raw = _pl.get_list(key)
+    items = raw if isinstance(raw, list) else []
+    normalized: list[str] = []
+    for item in items:
+        value = normalize_text(str(item))
+        if not value:
+            continue
+        normalized.append(value.lower() if lowercase else value)
+    return tuple(normalized)
 
 
 class _SilentYTDLPLogger:
@@ -97,12 +131,35 @@ def _find_ffmpeg() -> str:
     local_app = os.environ.get("LOCALAPPDATA", "")
     if local_app:
         extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Links"))
+        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Packages"))
+        extra_dirs.append(os.path.join(local_app, "Programs", "ffmpeg", "bin"))
+    program_files = os.environ.get("ProgramFiles", "")
+    if program_files:
+        extra_dirs.append(os.path.join(program_files, "ffmpeg", "bin"))
+    program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+    if program_files_x86:
+        extra_dirs.append(os.path.join(program_files_x86, "ffmpeg", "bin"))
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        extra_dirs.append(os.path.join(user_profile, "scoop", "apps", "ffmpeg", "current", "bin"))
+        extra_dirs.append(os.path.join(user_profile, "scoop", "shims"))
     for d in extra_dirs:
         candidate = os.path.join(d, "ffmpeg.exe") if os.name == "nt" else os.path.join(d, "ffmpeg")
         if os.path.isfile(candidate):
             # 把目录加到 PATH 以便 yt-dlp 也能找到
             os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
             return candidate
+    # 最后兜底：imageio-ffmpeg 打包的可执行文件
+    try:
+        import imageio_ffmpeg
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            bundled_dir = str(Path(bundled).resolve().parent)
+            os.environ["PATH"] = bundled_dir + os.pathsep + os.environ.get("PATH", "")
+            return bundled
+    except Exception:
+        pass
     return ""
 
 
@@ -149,6 +206,12 @@ class ToolExecutor:
         video_cfg = search_cfg.get("video_resolver", raw_cfg.get("video_resolver", {}))
         if not isinstance(video_cfg, dict):
             video_cfg = {}
+        self._raw_config = raw_cfg
+        control_cfg = raw_cfg.get("control", {}) if isinstance(raw_cfg, dict) else {}
+        if not isinstance(control_cfg, dict):
+            control_cfg = {}
+        global _TOOLS_HEURISTIC_CUES_ENABLED
+        _TOOLS_HEURISTIC_CUES_ENABLED = bool(control_cfg.get("heuristic_rules_enable", False))
 
         self.search_engine = search_engine
         self.image_engine = image_engine
@@ -188,6 +251,12 @@ class ToolExecutor:
         self._video_cache_keep_files = max(5, int(video_cfg.get("cache_keep_files", 24)))
         self._video_prefer_direct_stream = bool(video_cfg.get("prefer_direct_stream", False))
         self._video_silent_mode = bool(video_cfg.get("silent_mode", True))
+        # 默认不发送无音轨视频，避免“能播放但没声音”。
+        self._video_allow_silent_fallback = bool(video_cfg.get("allow_silent_video_fallback", False))
+        # 返回 parse_video 前强校验音轨，避免把“无声视频”继续发给用户。
+        self._video_require_audio_for_send = bool(video_cfg.get("require_audio_for_send", True))
+        # 对直链做下载校验，可显著减少“链接可播但客户端发不出去/无声”的情况。
+        self._video_validate_direct_url = bool(video_cfg.get("validate_direct_url", True))
         self._video_cache_dir = self._resolve_video_cache_dir(str(video_cfg.get("cache_dir", "storage/cache/videos")))
         self._video_cache_dir.mkdir(parents=True, exist_ok=True)
         self._video_cookies_file = normalize_text(str(video_cfg.get("cookies_file", "")))
@@ -196,9 +265,43 @@ class ToolExecutor:
         self._video_parse_api_base = normalize_text(str(video_cfg.get("parse_api_base", ""))).rstrip("/")
         self._video_parse_enable = bool(video_cfg.get("parse_api_enable", bool(self._video_parse_api_base)))
         self._video_parse_timeout_seconds = max(6, int(video_cfg.get("parse_api_timeout_seconds", 12)))
-        self._ffmpeg_available = bool(_find_ffmpeg())
+        self._ffmpeg_bin = normalize_text(_find_ffmpeg())
+        self._ffmpeg_available = bool(self._ffmpeg_bin)
+        # yt-dlp 在 imageio_ffmpeg 场景下必须拿到可执行文件路径，目录路径无法触发合并。
+        self._ffmpeg_location = ""
+        self._ffmpeg_probe_dir = ""
+        if self._ffmpeg_available:
+            try:
+                ffmpeg_path = Path(self._ffmpeg_bin)
+                if ffmpeg_path.is_file():
+                    resolved = ffmpeg_path.resolve()
+                    self._ffmpeg_location = str(resolved)
+                    self._ffmpeg_probe_dir = str(resolved.parent)
+                elif ffmpeg_path.is_dir():
+                    resolved_dir = ffmpeg_path.resolve()
+                    self._ffmpeg_location = str(resolved_dir)
+                    self._ffmpeg_probe_dir = str(resolved_dir)
+            except Exception:
+                self._ffmpeg_location = ""
+                self._ffmpeg_probe_dir = ""
         self._video_analyzer = VideoAnalyzer(raw_cfg)
         self._music_engine = MusicEngine(raw_cfg)
+        self._prompt_policy = PromptPolicy.from_config(raw_cfg)
+
+        # 初始化混合视频解析器（bilix + yt-dlp）
+        self._hybrid_resolver = None
+        try:
+            from core.video_resolver_hybrid import create_hybrid_resolver
+            self._hybrid_resolver = create_hybrid_resolver(
+                ytdlp_download_func=self._download_platform_video_sync,
+                cache_dir=self._video_cache_dir,
+                ffmpeg_location=self._ffmpeg_location
+            )
+            _tool_log.info("hybrid_resolver_enabled | bilix_available=%s",
+                     self._hybrid_resolver.bilix_resolver._bilix_available)
+        except Exception as e:
+            _tool_log.warning("hybrid_resolver_init_failed | error=%s", str(e)[:100])
+
         # 平台专属 cookie（抖音/快手）
         va_cfg = raw_cfg.get("video_analysis", search_cfg.get("video_analysis", {})) or {}
         bili_cfg = va_cfg.get("bilibili", {}) or {}
@@ -214,6 +317,7 @@ class ToolExecutor:
             vision_cfg = {}
         self._vision_enable = bool(vision_cfg.get("enable", True))
         self._vision_timeout_seconds = max(8, int(vision_cfg.get("timeout_seconds", 35)))
+        self._vision_min_image_bytes = max(128, int(vision_cfg.get("min_image_bytes", 1200)))
         self._vision_max_image_bytes = max(256 * 1024, int(vision_cfg.get("max_image_bytes", 6 * 1024 * 1024)))
         self._vision_provider = normalize_text(str(vision_cfg.get("provider", ""))).lower()
         self._vision_base_url = normalize_text(str(vision_cfg.get("base_url", ""))).rstrip("/")
@@ -225,6 +329,10 @@ class ToolExecutor:
         self._vision_retry_translate_enable = bool(vision_cfg.get("retry_translate_enable", True))
         self._vision_second_pass_enable = bool(vision_cfg.get("second_pass_enable", True))
         self._vision_require_independent_config = bool(vision_cfg.get("require_independent_config", False))
+        self._vision_model_supports_image = normalize_text(
+            str(vision_cfg.get("model_supports_image", "auto"))
+        ).lower() or "auto"
+        self._vision_route_text_model_to_local = bool(vision_cfg.get("route_text_model_to_local", True))
         self._project_root = Path(__file__).resolve().parents[1]
         tool_iface_cfg = search_cfg.get("tool_interface", raw_cfg.get("tool_interface", {}))
         if not isinstance(tool_iface_cfg, dict):
@@ -260,6 +368,9 @@ class ToolExecutor:
         self._language_preference = normalize_text(
             str(search_cfg.get("language_preference", raw_cfg.get("language_preference", "zh")))
         ).lower() or "zh"
+        self._search_intent_shortcut_enable = bool(
+            search_cfg.get("intent_shortcut_enable", raw_cfg.get("intent_shortcut_enable", True))
+        )
         self._qq_avatar_shortcut_enable = bool(
             search_cfg.get("qq_avatar_shortcut_enable", raw_cfg.get("qq_avatar_shortcut_enable", False))
         )
@@ -281,6 +392,9 @@ class ToolExecutor:
             "b23.tv",
             "acfun.cn",
             "acfun.com",
+            "youku.com",
+            "v.qq.com",
+            "qq.com",
         }
 
         self._blocked_image_domain_keywords = {
@@ -412,6 +526,10 @@ class ToolExecutor:
                 return await self._music_search(tool_args, message_text)
             if action == "music_play":
                 return await self._music_play(tool_args, message_text, api_call, group_id)
+            if action == "music_play_by_id":
+                return await self._music_play_by_id(tool_args, api_call, group_id)
+            if action == "bilibili_audio_extract":
+                return await self._bilibili_audio_extract(tool_args, message_text, api_call, group_id)
             if action == "get_group_member_count":
                 return await self._group_member_count(group_id, api_call)
             if action == "get_group_member_names":
@@ -464,6 +582,8 @@ class ToolExecutor:
         # 意图识别只看当前这条消息，避免被 query 重写历史污染
         intent_text = self._normalize_multimodal_query(raw_message_text)
         image_candidates = self._extract_message_media_urls(raw_segments, media_type="image")
+        if not image_candidates and conversation_id:
+            image_candidates = self._get_recent_media(conversation_id=conversation_id, media_type="image")
         method_name_peek = normalize_text(str(tool_args.get("method", "")))
         has_video_media = any(
             normalize_text(str((seg or {}).get("type", ""))).lower() == "video"
@@ -477,6 +597,7 @@ class ToolExecutor:
                 message_text=message_text,
                 raw_segments=raw_segments,
                 conversation_id=conversation_id,
+                api_call=api_call,
             )
             if analyzed is not None:
                 return analyzed
@@ -626,7 +747,7 @@ class ToolExecutor:
         if mode in {"video", "movie", "clip"}:
             return await self._search_video(query)
 
-        if self._looks_like_image_request(intent_text):
+        if self._search_intent_shortcut_enable and self._looks_like_image_request(intent_text):
             image_try = await self._search_image(
                 query=query,
                 conversation_id=conversation_id,
@@ -641,7 +762,7 @@ class ToolExecutor:
             if image_try.ok:
                 return image_try
 
-        if self._looks_like_music_request(intent_text):
+        if self._search_intent_shortcut_enable and self._looks_like_music_request(intent_text):
             music_try = await self._music_play(
                 tool_args={"keyword": query}, message_text=message_text,
                 api_call=api_call, group_id=group_id,
@@ -649,7 +770,7 @@ class ToolExecutor:
             if music_try.ok:
                 return music_try
 
-        if self._looks_like_video_request(intent_text):
+        if self._search_intent_shortcut_enable and self._looks_like_video_request(intent_text):
             video_try = await self._search_video(query)
             if video_try.ok:
                 return video_try
@@ -927,7 +1048,7 @@ class ToolExecutor:
             image_url = url_2
 
         text = (
-            f"抓到了，QQ {target} 的头像我给你发出来。\n"
+            f"抓到了，QQ {target} 的头像已经发给你。\n"
             f"接口模板1：{api_tmpl_1}\n"
             f"接口模板2：{api_tmpl_2}"
         )
@@ -1011,15 +1132,30 @@ class ToolExecutor:
         key = f"{conversation_id}:{user_id}"
         q = normalize_text(query)
         prev = normalize_text(self._last_search_query.get(key, ""))
+        followup_cfg = self._raw_config.get("search_followup", {})
+        if not isinstance(followup_cfg, dict):
+            followup_cfg = {}
+        resend_media_cues_raw = followup_cfg.get("resend_media_cues", [])
+        if not isinstance(resend_media_cues_raw, list):
+            resend_media_cues_raw = []
+        resend_media_cues = tuple(
+            normalize_text(str(item))
+            for item in resend_media_cues_raw
+            if normalize_text(str(item))
+        )
 
         short_followup_cues = (
             "人物",
             "二次元人物",
-            "发出来",
             "再找",
-            "换一张",
             "你找一个",
             "继续",
+            "下载发给我",
+            "下载发我",
+            "给我下载",
+            "帮我下载",
+            "下载一下",
+            *resend_media_cues,
         )
 
         merged = q
@@ -1200,6 +1336,9 @@ class ToolExecutor:
                 return "local.media_from_path", {"path": local_path}, "auto_local_media_from_path"
             return "local.read_text", {"path": local_path}, "auto_local_read_text"
 
+        if self._looks_like_software_download_request(merged):
+            return "browser.github_search", {"query": query, "sort": "stars"}, "auto_software_download_search"
+
         if self._looks_like_github_request(merged):
             # 多意图检测：如果同时包含其他平台关键词，不强制走 github
             multi_intent_cues = ("哔哩哔哩", "b站", "bilibili", "抖音", "douyin", "快手", "kuaishou", "视频", "搜索")
@@ -1290,7 +1429,14 @@ class ToolExecutor:
         if name == "douyin.search_video":
             return await self._method_douyin_search_video(name, method_args, query)
         if name == "browser.github_search":
-            return await self._method_browser_github_search(name, method_args, query)
+            return await self._method_browser_github_search(
+                name,
+                method_args,
+                query,
+                message_text=message_text,
+                group_id=group_id,
+                api_call=api_call,
+            )
         if name == "browser.github_readme":
             return await self._method_browser_github_readme(name, method_args, query)
         if name == "local.read_text":
@@ -1324,6 +1470,7 @@ class ToolExecutor:
                 message_text=message_text,
                 raw_segments=raw_segments,
                 conversation_id=conversation_id,
+                api_call=api_call,
             )
         if name == "video.analyze":
             return await self._method_video_analyze(
@@ -1555,7 +1702,7 @@ class ToolExecutor:
         patterns = (
             r"(?is)<article[^>]*>(.*?)</article>",
             r"(?is)<main[^>]*>(.*?)</main>",
-            r'(?is)<div[^>]+(?:id|class)=["\'][^"\']*(?:article|content|post|entry|main|姝ｆ枃)[^"\']*["\'][^>]*>(.*?)</div>',
+            r'(?is)<div[^>]+(?:id|class)=["\'][^"\']*(?:article|content|post|entry|main|正文)[^"\']*["\'][^>]*>(.*?)</div>',
         )
         blocks: list[str] = []
         for pattern in patterns:
@@ -1570,7 +1717,7 @@ class ToolExecutor:
         content = normalize_text(text)
         if not content:
             return []
-        sentences = [s.strip() for s in re.split(r"(?<=[銆傦紒锛??])\s+", content) if s.strip()]
+        sentences = [s.strip() for s in re.split(r"(?<=[。！？!?])\s+", content) if s.strip()]
         out: list[str] = []
         for sentence in sentences:
             if len(sentence) < 14:
@@ -1762,6 +1909,9 @@ class ToolExecutor:
         method_name: str,
         method_args: dict[str, Any],
         query: str,
+        message_text: str = "",
+        group_id: int = 0,
+        api_call: Callable[..., Awaitable[Any]] | None = None,
     ) -> ToolResult:
         if not self._tool_interface_github_enable:
             return ToolResult(
@@ -1846,11 +1996,32 @@ class ToolExecutor:
             )
 
         items = data.get("items", []) if isinstance(data, dict) else []
+        if (not isinstance(items, list) or not items):
+            fallback_terms = re.findall(r"[A-Za-z0-9_.-]{2,}", raw_query)
+            alt_query = " ".join(dict.fromkeys(fallback_terms[:3]))
+            if alt_query and alt_query.lower() != raw_query.lower():
+                alt_params = dict(params)
+                alt_params["q"] = alt_query
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=self._http_timeout,
+                        follow_redirects=True,
+                        headers=self._github_headers,
+                    ) as client:
+                        alt_resp = await client.get(endpoint, params=alt_params)
+                    if alt_resp.status_code < 400:
+                        alt_data = alt_resp.json()
+                        alt_items = alt_data.get("items", []) if isinstance(alt_data, dict) else []
+                        if isinstance(alt_items, list) and alt_items:
+                            items = alt_items
+                except Exception:
+                    pass
         if not isinstance(items, list) or not items:
-            return ToolResult(
-                ok=True,
-                tool_name=method_name,
-                payload={"text": f'GitHub 上没搜到“{raw_query}”的仓库。'},
+            return await self._github_search_web_fallback(
+                method_name=method_name,
+                raw_query=raw_query,
+                reason="github_search_empty",
+                human_reason="GitHub API 未命中，已改用网页搜索兜底。",
             )
 
         results: list[dict[str, Any]] = []
@@ -1886,12 +2057,46 @@ class ToolExecutor:
             lines.append(f"   {html_url}")
             evidence.append({"title": full_name, "point": desc_short, "source": html_url})
 
+        auto_download_notice = ""
+        should_auto_download = (
+            bool(api_call)
+            and int(group_id or 0) > 0
+            and self._looks_like_download_request_text(f"{message_text}\n{raw_query}")
+        )
+        if should_auto_download and results:
+            ok_auto, auto_text, auto_payload = await self._try_auto_upload_github_asset(
+                raw_query=raw_query,
+                results=results,
+                message_text=message_text,
+                group_id=int(group_id),
+                api_call=api_call,
+            )
+            if ok_auto:
+                payload = {
+                    "text": auto_text,
+                    "query": raw_query,
+                    "results": results,
+                    "evidence": evidence,
+                }
+                payload.update(auto_payload)
+                return ToolResult(
+                    ok=True,
+                    tool_name=method_name,
+                    payload=payload,
+                    evidence=evidence,
+                )
+            if auto_text:
+                auto_download_notice = auto_text
+
         if len(lines) == 1:
             return ToolResult(
                 ok=True,
                 tool_name=method_name,
                 payload={"text": f"GitHub 上没拿到可用仓库结果：{raw_query}"},
             )
+
+        if auto_download_notice:
+            lines.insert(1, auto_download_notice)
 
         return ToolResult(
             ok=True,
@@ -1904,6 +2109,88 @@ class ToolExecutor:
             },
             evidence=evidence,
         )
+
+    async def _try_auto_upload_github_asset(
+        self,
+        raw_query: str,
+        results: list[dict[str, Any]],
+        message_text: str,
+        group_id: int,
+        api_call: Callable[..., Awaitable[Any]] | None,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if not api_call or group_id <= 0 or not results:
+            return False, "", {}
+        try:
+            # 复用 Agent 里现成的下载/验签/上传链路，避免重复维护两套逻辑。
+            from core.agent_tools import _handle_smart_download
+        except Exception as exc:
+            return False, f"自动下载不可用（工具加载失败：{clip_text(str(exc), 80)}）", {}
+
+        errors: list[str] = []
+        for item in results[:3]:
+            repo_url = normalize_text(str(item.get("url", "")))
+            repo_name = normalize_text(str(item.get("full_name", "")))
+            if not repo_url:
+                continue
+            prefer_ext, file_name = self._guess_download_preferences(
+                raw_query=raw_query,
+                message_text=message_text,
+                repo_name=repo_name,
+            )
+            args: dict[str, Any] = {
+                "url": repo_url,
+                "query": raw_query,
+                "kind": "file",
+                "upload": True,
+                "group_id": int(group_id),
+            }
+            if prefer_ext:
+                args["prefer_ext"] = prefer_ext
+            if file_name:
+                args["file_name"] = file_name
+            try:
+                dl_result = await _handle_smart_download(
+                    args,
+                    {
+                        "api_call": api_call,
+                        "group_id": int(group_id),
+                        "tool_executor": self,
+                        "config": self._raw_config,
+                    },
+                )
+            except Exception as exc:
+                errors.append(clip_text(f"{repo_name or repo_url}: {exc}", 120))
+                continue
+
+            if not bool(getattr(dl_result, "ok", False)):
+                err_text = normalize_text(str(getattr(dl_result, "display", ""))) or normalize_text(
+                    str(getattr(dl_result, "error", ""))
+                )
+                if err_text:
+                    errors.append(clip_text(f"{repo_name or repo_url}: {err_text}", 120))
+                continue
+
+            data = getattr(dl_result, "data", {}) or {}
+            local_file = normalize_text(str(data.get("local_file", "")))
+            download_url = normalize_text(str(data.get("download_url", "")))
+            source_url = normalize_text(str(data.get("source_url", ""))) or repo_url
+            file_label = Path(local_file).name if local_file else (file_name or "文件")
+            text = normalize_text(str(getattr(dl_result, "display", "")))
+            if not text:
+                text = f"已下载并上传群文件：{file_label}"
+                if download_url:
+                    text += f"\n下载源：{download_url}"
+            payload = {
+                "downloaded_file": local_file,
+                "download_url": download_url,
+                "source_url": source_url,
+                "uploaded": True,
+            }
+            return True, text, payload
+
+        if errors:
+            return False, f"自动下载尝试失败：{errors[0]}。先给你可靠链接。", {}
+        return False, "", {}
 
     async def _github_search_web_fallback(
         self,
@@ -1936,7 +2223,7 @@ class ToolExecutor:
             return ToolResult(
                 ok=False,
                 tool_name=method_name,
-                payload={"text": "GitHub 搜索暂时不可用，网页兜底也没拿到结果。稍后再试。"},
+                payload={},
                 error=reason,
             )
 
@@ -2015,7 +2302,7 @@ class ToolExecutor:
             return ToolResult(
                 ok=False,
                 tool_name=method_name,
-                payload={"text": "读取 GitHub 仓库失败了，稍后再试。"},
+                payload={},
                 error=f"github_readme_failed:{exc}",
             )
 
@@ -2127,11 +2414,44 @@ class ToolExecutor:
             )
 
         if self._is_direct_video_url(url):
+            resolved_direct = url
+            resolved_local: Path | None = None
+            if self._video_validate_direct_url and YoutubeDL is not None:
+                try:
+                    self._cleanup_video_cache()
+                    downloaded_path = await asyncio.to_thread(self._download_platform_video_sync, url)
+                    if downloaded_path:
+                        resolved_local = downloaded_path
+                        resolved_direct = str(downloaded_path.resolve())
+                except Exception as exc:
+                    _ytdlp_log.warning("video_direct_validate_error | url=%s | %s", url[:100], str(exc)[:200])
+            if self._video_validate_direct_url and YoutubeDL is not None and resolved_local is None:
+                return ToolResult(
+                    ok=False,
+                    tool_name=method_name,
+                    payload={"text": "这条直链视频没通过下载校验（可能失效或格式不兼容），换个链接我继续试。"},
+                    error="direct_video_validate_failed",
+                )
+            if resolved_local is not None:
+                if not self._is_video_size_ok(resolved_local):
+                    return ToolResult(
+                        ok=False,
+                        tool_name=method_name,
+                        payload={"text": "这条直链视频下载到了，但文件不完整或超出大小限制。"},
+                        error="direct_video_invalid_file",
+                    )
+                if self._video_require_audio_for_send and not self._video_has_audio_stream(resolved_local):
+                    return ToolResult(
+                        ok=False,
+                        tool_name=method_name,
+                        payload={"text": "这条直链视频没有可用音轨，我已拦截，避免发出后没声音。"},
+                        error="direct_video_no_audio",
+                    )
             evidence = [{"title": "视频直链", "point": "用户提供了可发送视频直链", "source": url}]
             return ToolResult(
                 ok=True,
                 tool_name=method_name,
-                payload={"mode": "video", "text": "已拿到直链视频，马上发你", "video_url": url, "evidence": evidence},
+                payload={"mode": "video", "text": "已拿到直链视频，马上发你", "video_url": resolved_direct, "evidence": evidence},
                 evidence=evidence,
             )
 
@@ -2187,6 +2507,42 @@ class ToolExecutor:
                 },
                 error="video_resolve_failed",
             )
+
+        resolved_local: Path | None = None
+        if resolved and not re.match(r"^https?://", resolved, flags=re.IGNORECASE):
+            try:
+                candidate_path = Path(resolved)
+                if candidate_path.exists() and candidate_path.is_file():
+                    resolved_local = candidate_path
+            except Exception:
+                resolved_local = None
+        elif self._video_validate_direct_url and self._is_direct_video_url(resolved) and YoutubeDL is not None:
+            # parse_api 可能返回可播但不稳定的外链；下载校验后统一转本地路径发送。
+            try:
+                self._cleanup_video_cache()
+                downloaded_path = await asyncio.to_thread(self._download_platform_video_sync, resolved)
+                if downloaded_path:
+                    resolved_local = downloaded_path
+                    resolved = str(downloaded_path.resolve())
+            except Exception as exc:
+                _ytdlp_log.warning("video_resolved_direct_validate_error | url=%s | %s", resolved[:100], str(exc)[:200])
+            if resolved_local is None:
+                return ToolResult(
+                    ok=False,
+                    tool_name=method_name,
+                    payload={"text": "解析到的直链没通过下载校验（可能已过期或平台限流），请重发新链接。"},
+                    error="resolved_direct_validate_failed",
+                )
+
+        if resolved_local is not None and self._video_require_audio_for_send:
+            if not self._video_has_audio_stream(resolved_local):
+                self._last_video_resolve_diagnostic[url] = "video_no_audio_all_formats"
+                return ToolResult(
+                    ok=False,
+                    tool_name=method_name,
+                    payload={"text": "这条视频没有可用音轨，我已拦截，避免发出后没声音。"},
+                    error="video_no_audio_all_formats",
+                )
 
         meta = await self._inspect_platform_video_metadata_safe(url)
 
@@ -2503,12 +2859,31 @@ class ToolExecutor:
         except Exception:
             pass
 
+        # 重定向后如果是 /video/ 路径，说明是视频不是图文，直接返回空
+        # /note/ 或 /share/note/ 视为图文（aweme_type 在不同版本可能不是固定值）。
+        try:
+            final_path = urlparse(final_url).path.lower()
+        except Exception:
+            final_path = ""
+        is_note_path = ("/note/" in final_path) or ("/share/note/" in final_path)
+        if "/video/" in final_path:
+            return {}
+
         decoded_html = (
             html.replace("\\u002F", "/")
             .replace("\\/", "/")
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
         )
+
+        # 从 HTML 检查 aweme_type。抖音不同版本对图文的 aweme_type 不稳定，
+        # 已确认存在 aweme_type=2 的 note 图文；因此 note 路径优先，非 note 时再按类型拦截。
+        aweme_type_match = re.search(r'"aweme_type"\s*:\s*(\d+)', decoded_html)
+        if aweme_type_match:
+            aweme_type_val = int(aweme_type_match.group(1))
+            # 常见图文类型: 2/68/150；其余通常是视频。
+            if (not is_note_path) and aweme_type_val not in (2, 68, 150):
+                return {}
 
         aweme_id = self._extract_douyin_aweme_id(final_url) or self._extract_douyin_aweme_id(target)
         if not aweme_id and decoded_html:
@@ -2532,7 +2907,7 @@ class ToolExecutor:
                     api_resp = await client.get(api_url)
                     if api_resp.is_success and api_resp.content:
                         data = api_resp.json()
-                        if isinstance(data, dict):
+                        if isinstance(data, dict) and data.get("status_code", 0) == 0:
                             item_list = data.get("item_list", [])
                             if isinstance(item_list, list) and item_list and isinstance(item_list[0], dict):
                                 item = item_list[0]
@@ -2583,6 +2958,11 @@ class ToolExecutor:
             image_urls.append(value)
 
         if item:
+            # 检查 aweme_type。note 路径优先按图文处理，避免误判后进入视频下载链。
+            aweme_type = item.get("aweme_type")
+            if isinstance(aweme_type, int) and (not is_note_path) and aweme_type not in (2, 68, 150):
+                return {}
+
             for row in item.get("images", []) if isinstance(item.get("images", []), list) else []:
                 if not isinstance(row, dict):
                     continue
@@ -2694,6 +3074,7 @@ class ToolExecutor:
             "uploader": uploader,
             "source_url": source,
             "image_urls": image_urls,
+            "is_note": is_note_path,
         }
 
     @staticmethod
@@ -2707,7 +3088,7 @@ class ToolExecutor:
         for idx, item in enumerate(image_urls[:3], 1):
             lines.append(f"{idx}. {item}")
         if len(image_urls) > 3:
-            lines.append(f"其余 {len(image_urls) - 3} 张已省略，可继续让我发下一张。")
+            lines.append(f"其余 {len(image_urls) - 3} 张已省略。")
         return "\n".join(lines)
 
     async def _method_browser_resolve_image(
@@ -2921,6 +3302,7 @@ class ToolExecutor:
         message_text: str,
         raw_segments: list[dict[str, Any]],
         conversation_id: str = "",
+        api_call: Callable[..., Awaitable[Any]] | None = None,
     ) -> ToolResult:
         if not self._vision_enable:
             return ToolResult(
@@ -2938,16 +3320,64 @@ class ToolExecutor:
             )
 
         explicit_url = normalize_text(str(method_args.get("url", "")))
+        allow_recent_fallback = bool(method_args.get("allow_recent_fallback", False))
+        recent_only_when_unique = bool(method_args.get("recent_only_when_unique", False))
+        target_source = normalize_text(str(method_args.get("target_source", ""))) or "unspecified"
+        target_message_id = normalize_text(str(method_args.get("target_message_id", "")))
         candidates: list[str] = []
+        candidate_meta: list[dict[str, str]] = []
         if explicit_url:
-            candidates.append(self._unwrap_redirect_url(explicit_url))
+            resolved_explicit = self._unwrap_redirect_url(explicit_url)
+            candidates.append(resolved_explicit)
+            candidate_meta.append(
+                {
+                    "source": "explicit_url",
+                    "message_id": target_message_id or "-",
+                    "url": resolved_explicit,
+                }
+            )
         if not candidates:
-            candidates.extend(self._extract_message_media_urls(raw_segments, media_type="image"))
+            message_candidates = self._extract_message_media_urls(raw_segments, media_type="image")
+            candidates.extend(message_candidates)
+            for item in message_candidates:
+                candidate_meta.append(
+                    {
+                        "source": target_source or "current_or_reply",
+                        "message_id": target_message_id or "-",
+                        "url": item,
+                    }
+                )
         if not candidates:
             merged_text = normalize_text(f"{query}\n{message_text}")
-            candidates.extend(self._extract_urls(merged_text))
-        if not candidates and conversation_id:
-            candidates.extend(self._get_recent_media(conversation_id=conversation_id, media_type="image"))
+            text_candidates = self._extract_urls(merged_text)
+            candidates.extend(text_candidates)
+            for item in text_candidates:
+                candidate_meta.append(
+                    {
+                        "source": "message_text_url",
+                        "message_id": "-",
+                        "url": item,
+                    }
+                )
+        if not candidates and conversation_id and allow_recent_fallback:
+            recent = self._get_recent_media(conversation_id=conversation_id, media_type="image")
+            if recent and recent_only_when_unique and len(recent) > 1:
+                return ToolResult(
+                    ok=False,
+                    tool_name=method_name,
+                    payload={"text": "我这边最近有不止一张图片，请直接回复你要分析的那张图片再问我。"},
+                    error="image_recent_ambiguous",
+                )
+            if recent:
+                candidates.extend(recent[:1] if recent_only_when_unique else recent)
+                for item in (recent[:1] if recent_only_when_unique else recent):
+                    candidate_meta.append(
+                        {
+                            "source": "recent_cache",
+                            "message_id": "-",
+                            "url": item,
+                        }
+                    )
 
         uniq: list[str] = []
         seen: set[str] = set()
@@ -2964,15 +3394,46 @@ class ToolExecutor:
                 payload={"text": '没拿到可识别图片 你可以直接发图或给我图片 URL 也可以先发图再说"分析这张图"'},
                 error="image_not_found",
             )
+        url_file_map = self._extract_image_url_file_map(raw_segments)
+
+        if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
+            _tool_log.info(
+                "vision_route_local%s | method=%s | reason=model_text_only_or_unsupported",
+                _tool_trace_tag(),
+                method_name,
+            )
+            local_result = await self._analyze_image_local_fallback(
+                method_name=method_name,
+                query=query,
+                message_text=message_text,
+                raw_segments=raw_segments,
+                api_call=api_call,
+            )
+            if local_result is not None:
+                return local_result
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "当前模型不支持图片理解，已尝试本地识别但没拿到稳定结果。你可以切换支持图片的模型，或让我只做 OCR 文字提取。"},
+                error="vision_local_unavailable",
+            )
 
         prompt = self._build_vision_prompt(query=query, message_text=message_text)
         _tool_log.info(
-            "vision_analyze_start%s | method=%s | candidates=%d | explicit=%s",
+            "vision_analyze_start%s | method=%s | candidates=%d | explicit=%s | target_source=%s | target_mid=%s",
             _tool_trace_tag(),
             method_name,
             len(uniq),
             bool(explicit_url),
+            target_source,
+            target_message_id or "-",
         )
+        if candidate_meta:
+            preview = " | ".join(
+                f"{idx + 1}:{item.get('source','-')}:{item.get('message_id','-')}:{clip_text(item.get('url',''), 90)}"
+                for idx, item in enumerate(candidate_meta[:6])
+            )
+            _tool_log.info("vision_analyze_candidates%s | method=%s | %s", _tool_trace_tag(), method_name, preview)
         low_confidence_seen = False
         for url in uniq:
             if self._is_blocked_image_url(url):
@@ -2980,9 +3441,29 @@ class ToolExecutor:
             if re.match(r"^https?://", url, flags=re.IGNORECASE) and not self._is_safe_public_http_url(url):
                 continue
             image_ref = await self._prepare_vision_image_ref(url)
+            if (
+                image_ref
+                and re.match(r"^https?://", image_ref, flags=re.IGNORECASE)
+                and api_call is not None
+            ):
+                file_token = url_file_map.get(normalize_text(url)) or url_file_map.get(normalize_text(image_ref))
+                if file_token:
+                    onebot_data_uri = await self._data_uri_from_onebot_image_file(
+                        image_file=file_token,
+                        api_call=api_call,
+                    )
+                    if onebot_data_uri:
+                        image_ref = onebot_data_uri
+                        _tool_log.info(
+                            "vision_image_ref%s | source=onebot_get_image | converted=data_uri",
+                            _tool_trace_tag(),
+                        )
             if not image_ref:
+                _tool_log.warning("vision_image_ref_empty%s | url=%s", _tool_trace_tag(), clip_text(url, 120))
                 continue
+            _tool_log.info("vision_describe_start%s | image_ref=%s", _tool_trace_tag(), clip_text(image_ref, 120))
             raw_answer = await self._vision_describe(image_ref=image_ref, prompt=prompt)
+            _tool_log.info("vision_describe_done%s | raw_answer=%s", _tool_trace_tag(), clip_text(raw_answer or "-", 200))
             answer = await self._normalize_vision_answer_with_retry(
                 image_ref=image_ref,
                 answer=raw_answer,
@@ -2991,8 +3472,10 @@ class ToolExecutor:
                 message_text=message_text,
             )
             if not answer:
+                _tool_log.warning("vision_answer_empty_after_normalize%s", _tool_trace_tag())
                 continue
             if self._looks_like_weak_vision_answer(answer):
+                _tool_log.warning("vision_answer_weak%s | answer=%s", _tool_trace_tag(), clip_text(answer, 100))
                 low_confidence_seen = True
                 continue
             source = self._unwrap_redirect_url(url)
@@ -3038,7 +3521,7 @@ class ToolExecutor:
         return ToolResult(
             ok=False,
             tool_name=method_name,
-            payload={"text": "这张图这次没识别出来 你可以换一张更清晰的图再试"},
+            payload={"text": "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"},
             error="vision_analyze_failed",
         )
 
@@ -3188,6 +3671,13 @@ class ToolExecutor:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             return None
+        if not self._looks_like_vision_web_lookup_request(merged):
+            _tool_log.info(
+                "vision_web_fallback_skip%s | reason=no_web_lookup_intent | query=%s",
+                _tool_trace_tag(),
+                clip_text(merged, 80),
+            )
+            return None
 
         refined = re.sub(r"(image|picture|screenshot|analyze|analysis|identify|ocr)", " ", merged, flags=re.IGNORECASE)
         refined = normalize_text(re.sub(r"\s+", " ", refined))
@@ -3223,6 +3713,7 @@ class ToolExecutor:
         message_text: str,
         raw_segments: list[dict[str, Any]],
         conversation_id: str = "",
+        api_call: Callable[..., Awaitable[Any]] | None = None,
     ) -> ToolResult | None:
         if not self._vision_enable:
             return ToolResult(
@@ -3244,6 +3735,15 @@ class ToolExecutor:
             candidates = self._get_recent_media(conversation_id=conversation_id, media_type="image")
         if not candidates:
             return None
+
+        if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
+            return await self._analyze_image_local_fallback(
+                method_name="vision_analyze_image",
+                query=query,
+                message_text=message_text,
+                raw_segments=raw_segments,
+                api_call=api_call,
+            )
 
         prompt = self._build_vision_prompt(query=query, message_text=message_text)
         low_confidence_seen = False
@@ -3297,9 +3797,138 @@ class ToolExecutor:
         return ToolResult(
             ok=False,
             tool_name="vision_analyze_image",
-            payload={"text": "这张图这次没识别出来 你可以换一张更清晰的图或直接问我要识别哪部分"},
+            payload={"text": "这张图这次没识别出来，请发更清晰的图片，或直接告诉我要识别哪部分。"},
             error="vision_analyze_failed",
         )
+
+    def _can_use_remote_vision_model(self) -> bool:
+        mode = normalize_text(self._vision_model_supports_image).lower()
+        if mode in {"1", "true", "yes", "on"}:
+            return True
+        if mode in {"0", "false", "no", "off"}:
+            return False
+
+        model_client = getattr(self.image_engine, "model_client", None)
+        if model_client is None:
+            return False
+        client = getattr(model_client, "client", None)
+        model_name = self._vision_model or normalize_text(
+            str(getattr(client, "model", "") or getattr(model_client, "model", ""))
+        )
+        checker = getattr(model_client, "supports_vision_input", None)
+        if callable(checker):
+            try:
+                return bool(checker(model=model_name))
+            except Exception:
+                return False
+        return False
+
+    async def _analyze_image_local_fallback(
+        self,
+        method_name: str,
+        query: str,
+        message_text: str,
+        raw_segments: list[dict[str, Any]],
+        api_call: Callable[..., Awaitable[Any]] | None,
+    ) -> ToolResult:
+        if api_call is None:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "当前模型不支持图片理解，且本地 OCR 通道不可用（缺少 OneBot API 上下文）。"},
+                error="local_ocr_api_unavailable",
+            )
+
+        file_tokens = self._extract_image_file_tokens(raw_segments)
+        if not file_tokens:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "当前模型不支持图片理解，本地 OCR 需要直接发送图片（含 file 标识）后再试。"},
+                error="local_ocr_image_token_missing",
+            )
+
+        for token in file_tokens[:3]:
+            try:
+                result = await api_call("ocr_image", image=token)
+            except Exception:
+                continue
+            text = self._extract_ocr_text(result)
+            if not text:
+                continue
+            source = token
+            evidence = [
+                {
+                    "title": "本地 OCR",
+                    "point": clip_text(text, 180),
+                    "source": source,
+                }
+            ]
+            prompt_hint = self._normalize_multimodal_query(f"{query}\n{message_text}")
+            out = f"本地 OCR 识别结果：\n{text}"
+            if any(cue in prompt_hint.lower() for cue in ("总结", "概括", "要点", "分析")):
+                out = f"我先走了本地 OCR（当前模型不支持图片理解）。识别到的文字如下：\n{text}"
+            return ToolResult(
+                ok=True,
+                tool_name=method_name,
+                payload={
+                    "text": clip_text(out, 900),
+                    "analysis": text,
+                    "source": source,
+                    "analysis_route": "local_ocr",
+                    "evidence": evidence,
+                },
+                evidence=evidence,
+            )
+
+        return ToolResult(
+            ok=False,
+            tool_name=method_name,
+            payload={"text": "当前模型不支持图片理解，已尝试本地 OCR，但这张图没有提取到可用文字。"},
+            error="local_ocr_empty",
+        )
+
+    @staticmethod
+    def _extract_image_file_tokens(raw_segments: list[dict[str, Any]]) -> list[str]:
+        tokens: list[str] = []
+        seen: set[str] = set()
+        for seg in raw_segments or []:
+            if not isinstance(seg, dict):
+                continue
+            if normalize_text(str(seg.get("type", ""))).lower() != "image":
+                continue
+            data = seg.get("data", {}) or {}
+            if not isinstance(data, dict):
+                continue
+            for key in ("file", "id", "file_id"):
+                value = normalize_text(str(data.get(key, "")))
+                if not value:
+                    continue
+                if value in seen:
+                    continue
+                seen.add(value)
+                tokens.append(value)
+        return tokens
+
+    @staticmethod
+    def _extract_ocr_text(result: Any) -> str:
+        payload = result
+        if isinstance(result, dict) and isinstance(result.get("data"), dict):
+            payload = result.get("data")
+        if not isinstance(payload, dict):
+            return ""
+        texts = payload.get("texts", [])
+        if not isinstance(texts, list):
+            return ""
+        rows: list[str] = []
+        for item in texts:
+            if isinstance(item, dict):
+                txt = normalize_text(str(item.get("text", "")))
+            else:
+                txt = normalize_text(str(item))
+            if txt:
+                rows.append(txt)
+        return normalize_text("\n".join(rows))
 
     def _build_vision_prompt(self, query: str, message_text: str) -> str:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
@@ -3312,24 +3941,260 @@ class ToolExecutor:
                 "\n如果是桌面/任务栏截图："
                 "按从左到右列出可识别的软件或窗口名称；不确定的项标注“疑似”。"
             )
-        return SystemPromptRelay.vision_main_prompt(user_query=merged, extra=extra)
+        base = SystemPromptRelay.vision_main_prompt(user_query=merged, extra=extra)
+        return self._prompt_policy.compose_prompt(
+            channel="vision",
+            base_prompt=base,
+            tool_name="media.analyze_image",
+        )
 
     def _build_vision_retry_prompt(self, query: str, message_text: str) -> str:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             merged = "请识别这张图。"
-        return SystemPromptRelay.vision_retry_prompt(user_query=merged)
+        base = SystemPromptRelay.vision_retry_prompt(user_query=merged)
+        return self._prompt_policy.compose_prompt(
+            channel="vision",
+            base_prompt=base,
+            tool_name="media.analyze_image",
+        )
+
+    @staticmethod
+    def _extract_image_url_file_map(raw_segments: list[dict[str, Any]]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for seg in raw_segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            if seg_type != "image":
+                continue
+            data = seg.get("data")
+            if not isinstance(data, dict):
+                continue
+            url = normalize_text(str(data.get("url", "")))
+            file_token = normalize_text(str(data.get("file", "")))
+            if url and file_token:
+                mapping[url] = file_token
+                resolved = ToolExecutor._unwrap_redirect_url(url)
+                if resolved:
+                    mapping[resolved] = file_token
+        return mapping
+
+    @staticmethod
+    def _extract_api_data(payload: Any) -> dict[str, Any]:
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, dict):
+                return data
+            return payload
+        data_obj = getattr(payload, "data", None)
+        if isinstance(data_obj, dict):
+            return data_obj
+        return {}
+
+    def _to_data_uri_from_image_bytes(
+        self,
+        data: bytes,
+        mime: str = "image/png",
+        *,
+        source: str = "unknown",
+        allow_gif_keyframes: bool = True,
+    ) -> str:
+        if not data:
+            return ""
+        if len(data) < self._vision_min_image_bytes or len(data) > self._vision_max_image_bytes:
+            return ""
+        head = data[:16]
+        if not ToolExecutor._is_known_image_signature(head):
+            return ""
+        mime_norm = normalize_text(mime).lower()
+        if not mime_norm.startswith("image/"):
+            mime_norm = "image/png"
+        if allow_gif_keyframes and self._is_gif_payload(data=data, mime=mime_norm):
+            keyframe_data_uri = self._gif_keyframes_to_data_uri(data)
+            if keyframe_data_uri:
+                _tool_log.info(
+                    "vision_image_ref%s | source=%s | gif=keyframes_collage",
+                    _tool_trace_tag(),
+                    source,
+                )
+                return keyframe_data_uri
+        b64 = base64.b64encode(data).decode("ascii")
+        data_uri = f"data:{mime_norm};base64,{b64}"
+        _tool_log.info(
+            "vision_image_ref%s | source=%s | mime=%s | bytes=%d",
+            _tool_trace_tag(),
+            source,
+            mime_norm,
+            len(data),
+        )
+        return data_uri
+
+    @staticmethod
+    def _is_gif_payload(data: bytes, mime: str) -> bool:
+        mime_l = normalize_text(mime).lower()
+        if "gif" in mime_l:
+            return True
+        return data.startswith(b"GIF87a") or data.startswith(b"GIF89a")
+
+    @staticmethod
+    def _pick_gif_keyframe_indexes(frame_count: int) -> list[int]:
+        if frame_count <= 1:
+            return [0]
+        picks = [0, frame_count // 2, frame_count - 1]
+        out: list[int] = []
+        seen: set[int] = set()
+        for idx in picks:
+            if idx < 0 or idx >= frame_count or idx in seen:
+                continue
+            seen.add(idx)
+            out.append(idx)
+        return out or [0]
+
+    def _gif_keyframes_to_data_uri(self, gif_bytes: bytes) -> str:
+        if Image is None:
+            _tool_log.info("vision_gif_keyframes_skip%s | reason=pillow_unavailable", _tool_trace_tag())
+            return ""
+        try:
+            with Image.open(io.BytesIO(gif_bytes)) as gif:
+                if not bool(getattr(gif, "is_animated", False)):
+                    return ""
+                frame_count = int(getattr(gif, "n_frames", 1) or 1)
+                frame_indexes = self._pick_gif_keyframe_indexes(frame_count)
+                frames = []
+                for idx in frame_indexes:
+                    gif.seek(idx)
+                    frames.append(gif.convert("RGB").copy())
+        except Exception as exc:
+            _tool_log.warning("vision_gif_keyframes_fail%s | err=%s", _tool_trace_tag(), clip_text(str(exc), 160))
+            return ""
+
+        if not frames:
+            return ""
+
+        target_h = max(120, min(640, max(frame.height for frame in frames)))
+        resized = []
+        for frame in frames:
+            src_h = max(1, int(frame.height))
+            width = max(1, int(round(float(frame.width) * float(target_h) / float(src_h))))
+            resized.append(frame.resize((width, target_h)))
+
+        gap = 8
+        total_w = sum(frame.width for frame in resized) + gap * max(0, len(resized) - 1)
+        canvas = Image.new("RGB", (total_w, target_h), (12, 12, 12))
+        offset = 0
+        for frame in resized:
+            canvas.paste(frame, (offset, 0))
+            offset += frame.width + gap
+
+        buf = io.BytesIO()
+        try:
+            canvas.save(buf, format="JPEG", quality=86, optimize=True)
+        except Exception as exc:
+            _tool_log.warning("vision_gif_keyframes_encode_fail%s | err=%s", _tool_trace_tag(), clip_text(str(exc), 160))
+            return ""
+        merged = buf.getvalue()
+        if not merged:
+            return ""
+        if len(merged) > self._vision_max_image_bytes:
+            return ""
+        return self._to_data_uri_from_image_bytes(
+            merged,
+            mime="image/jpeg",
+            source="gif_keyframes",
+            allow_gif_keyframes=False,
+        )
+
+    async def _data_uri_from_onebot_image_file(
+        self,
+        image_file: str,
+        api_call: Callable[..., Awaitable[Any]] | None,
+    ) -> str:
+        file_token = normalize_text(image_file)
+        if not file_token or api_call is None:
+            return ""
+        for kwargs in ({"file": file_token}, {"file_id": file_token}, {"id": file_token}):
+            try:
+                result = await api_call("get_image", **kwargs)
+            except Exception:
+                continue
+
+            payload = self._extract_api_data(result)
+            for key in ("file", "file_path", "path", "local_path", "filename"):
+                raw_path = normalize_text(str(payload.get(key, "")))
+                if not raw_path:
+                    continue
+                if raw_path.startswith("file://"):
+                    parsed = urlparse(raw_path)
+                    file_part = unquote(parsed.path or "")
+                    if re.match(r"^/[A-Za-z]:/", file_part):
+                        file_part = file_part[1:]
+                    raw_path = file_part
+                local_path = Path(raw_path)
+                if not local_path.is_absolute():
+                    local_path = (self._project_root / local_path).resolve()
+                if not local_path.exists() or not local_path.is_file():
+                    continue
+                try:
+                    data = local_path.read_bytes()
+                except Exception:
+                    continue
+                mime = mimetypes.guess_type(str(local_path))[0] or "image/png"
+                data_uri = self._to_data_uri_from_image_bytes(
+                    data,
+                    mime=mime,
+                    source="onebot_local_file",
+                )
+                if data_uri:
+                    return data_uri
+
+            for key in ("url", "download_url", "src"):
+                remote_url = normalize_text(str(payload.get(key, "")))
+                if not remote_url:
+                    continue
+                data_uri = await self._download_image_as_data_uri(remote_url)
+                if data_uri:
+                    return data_uri
+        return ""
 
     async def _prepare_vision_image_ref(self, raw: str) -> str:
         value = normalize_text(raw)
         if not value:
             return ""
         if value.startswith("data:image"):
+            mime, b64 = self._decode_data_image_ref(value)
+            if mime and b64:
+                try:
+                    raw_bytes = base64.b64decode(b64, validate=False)
+                except Exception:
+                    raw_bytes = b""
+                if raw_bytes:
+                    prepared = self._to_data_uri_from_image_bytes(
+                        raw_bytes,
+                        mime=mime,
+                        source="data_uri",
+                    )
+                    if prepared:
+                        return prepared
+            _tool_log.info("vision_image_ref%s | source=data_uri | passthrough=true", _tool_trace_tag())
             return value
         if value.startswith("base64://"):
             b64 = value[len("base64://") :].strip()
             if not b64:
                 return ""
+            try:
+                raw_bytes = base64.b64decode(b64, validate=False)
+            except Exception:
+                raw_bytes = b""
+            if raw_bytes:
+                prepared = self._to_data_uri_from_image_bytes(
+                    raw_bytes,
+                    mime="image/png",
+                    source="base64_scheme",
+                )
+                if prepared:
+                    return prepared
+            _tool_log.info("vision_image_ref%s | source=base64_scheme | passthrough=true", _tool_trace_tag())
             return f"data:image/png;base64,{b64}"
         if re.match(r"^https?://", value, flags=re.IGNORECASE):
             if not self._is_safe_public_http_url(value):
@@ -3337,8 +4202,21 @@ class ToolExecutor:
             # QQ CDN 等内网图片外部 API 无法访问，统一下载转 base64
             downloaded = await self._download_image_as_data_uri(value)
             if downloaded:
+                _tool_log.info(
+                    "vision_image_ref%s | source=http_url | converted=data_uri",
+                    _tool_trace_tag(),
+                )
                 return downloaded
+            provider_hint = normalize_text(self._vision_provider).lower()
+            if provider_hint in {"anthropic", "gemini"}:
+                _tool_log.warning(
+                    "vision_image_ref_empty%s | source=http_url | reason=download_failed_for_provider_%s",
+                    _tool_trace_tag(),
+                    provider_hint,
+                )
+                return ""
             # 下载失败则回退直传 URL（公网图片 API 可能能访问）
+            _tool_log.info("vision_image_ref%s | source=http_url | converted=direct_url", _tool_trace_tag())
             return value
         if value.startswith("file://"):
             parsed = urlparse(value)
@@ -3356,11 +4234,23 @@ class ToolExecutor:
             data = path.read_bytes()
         except Exception:
             return ""
-        if not data or len(data) > self._vision_max_image_bytes:
+        if not data:
+            return ""
+        if len(data) < self._vision_min_image_bytes:
+            _tool_log.info(
+                "vision_image_ref%s | source=local_file | rejected=too_small | bytes=%d",
+                _tool_trace_tag(),
+                len(data),
+            )
+            return ""
+        if len(data) > self._vision_max_image_bytes:
             return ""
         mime = mimetypes.guess_type(str(path))[0] or "image/png"
-        b64 = base64.b64encode(data).decode("ascii")
-        return f"data:{mime};base64,{b64}"
+        return self._to_data_uri_from_image_bytes(
+            data,
+            mime=mime,
+            source="local_file",
+        )
 
     async def _download_image_as_data_uri(self, url: str) -> str:
         """下载远程图片并转为 data URI（base64），用于 vision API。"""
@@ -3376,15 +4266,27 @@ class ToolExecutor:
             if resp.status_code != 200:
                 return ""
             data = resp.content
-            if not data or len(data) > self._vision_max_image_bytes:
+            if not data:
+                return ""
+            if len(data) < self._vision_min_image_bytes:
+                _tool_log.info(
+                    "vision_image_ref%s | source=http_url | rejected=too_small | bytes=%d",
+                    _tool_trace_tag(),
+                    len(data),
+                )
+                return ""
+            if len(data) > self._vision_max_image_bytes:
                 return ""
             content_type = str(resp.headers.get("content-type", "")).lower()
             if "image/" in content_type:
                 mime = content_type.split(";")[0].strip()
             else:
                 mime = "image/png"
-            b64 = base64.b64encode(data).decode("ascii")
-            return f"data:{mime};base64,{b64}"
+            return self._to_data_uri_from_image_bytes(
+                data,
+                mime=mime,
+                source="http_url_download",
+            )
         except Exception:
             return ""
 
@@ -3392,12 +4294,80 @@ class ToolExecutor:
         model_client = getattr(self.image_engine, "model_client", None)
         client = getattr(model_client, "client", None) if model_client is not None else None
 
+        if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
+            return ""
+
         if self._vision_require_independent_config and not self._has_independent_vision_config():
             return ""
 
         provider = self._vision_provider or normalize_text(str(getattr(model_client, "provider", ""))).lower()
-        if provider not in {"openai", "deepseek", "skiapi"}:
-            # 非 OpenAI 兼容 provider 先走文本降级（可能无法真正看图）
+        api_key = self._vision_api_key or normalize_text(str(getattr(client, "api_key", "")))
+        base_url = (self._vision_base_url or normalize_text(str(getattr(client, "base_url", "")))).rstrip("/")
+        model_name = self._vision_model or normalize_text(str(getattr(client, "model", "")))
+        if not api_key or not base_url or not model_name:
+            return ""
+
+        timeout_seconds = float(
+            getattr(client, "timeout_seconds", self._vision_timeout_seconds) if client is not None else self._vision_timeout_seconds
+        )
+        temperature = float(getattr(client, "temperature", self._vision_temperature)) if client is not None else self._vision_temperature
+        max_tokens = int(getattr(client, "max_tokens", self._vision_max_tokens)) if client is not None else self._vision_max_tokens
+        prefer_v1 = bool(getattr(client, "prefer_v1", self._vision_prefer_v1)) if client is not None else self._vision_prefer_v1
+        image_ref_kind = "data_uri" if image_ref.startswith("data:image") else ("http_url" if image_ref.startswith("http") else "other")
+        _tool_log.info(
+            "vision_request%s | provider=%s | model=%s | image_ref=%s | timeout=%.1fs",
+            _tool_trace_tag(),
+            provider or "-",
+            model_name or "-",
+            image_ref_kind,
+            timeout_seconds,
+        )
+
+        if provider == "anthropic":
+            text = await self._vision_describe_via_anthropic(
+                image_ref=image_ref,
+                prompt=prompt,
+                api_key=api_key,
+                base_url=base_url,
+                model_name=model_name,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                prefer_v1=prefer_v1,
+                anthropic_version=normalize_text(str(getattr(client, "anthropic_version", "2023-06-01"))),
+            )
+            if text:
+                return text
+
+        if provider == "gemini":
+            text = await self._vision_describe_via_gemini(
+                image_ref=image_ref,
+                prompt=prompt,
+                api_key=api_key,
+                base_url=base_url,
+                model_name=model_name,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                api_version=normalize_text(str(getattr(client, "api_version", "v1beta"))) or "v1beta",
+            )
+            if text:
+                return text
+
+        if provider not in {
+            "openai",
+            "newapi",
+            "deepseek",
+            "skiapi",
+            "openrouter",
+            "xai",
+            "qwen",
+            "moonshot",
+            "mistral",
+            "zhipu",
+            "siliconflow",
+        }:
+            # 非 OpenAI 兼容 provider 兜底到文本模式（可能无法真正看图）
             if model_client is None or not bool(getattr(model_client, "enabled", False)):
                 return ""
             try:
@@ -3412,18 +4382,6 @@ class ToolExecutor:
             except Exception:
                 return ""
 
-        api_key = self._vision_api_key or normalize_text(str(getattr(client, "api_key", "")))
-        base_url = (self._vision_base_url or normalize_text(str(getattr(client, "base_url", "")))).rstrip("/")
-        model_name = self._vision_model or normalize_text(str(getattr(client, "model", "")))
-        if not api_key or not base_url or not model_name:
-            return ""
-
-        timeout_seconds = float(
-            getattr(client, "timeout_seconds", self._vision_timeout_seconds) if client is not None else self._vision_timeout_seconds
-        )
-        temperature = float(getattr(client, "temperature", self._vision_temperature)) if client is not None else self._vision_temperature
-        max_tokens = int(getattr(client, "max_tokens", self._vision_max_tokens)) if client is not None else self._vision_max_tokens
-        prefer_v1 = bool(getattr(client, "prefer_v1", self._vision_prefer_v1)) if client is not None else self._vision_prefer_v1
         payload = {
             "model": model_name,
             "messages": [
@@ -3432,7 +4390,7 @@ class ToolExecutor:
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": image_ref}},
+                        {"type": "image_url", "image_url": {"url": image_ref, "detail": "auto"}},
                     ],
                 },
             ],
@@ -3475,6 +4433,143 @@ class ToolExecutor:
                     return text
         return ""
 
+    async def _vision_describe_via_anthropic(
+        self,
+        image_ref: str,
+        prompt: str,
+        api_key: str,
+        base_url: str,
+        model_name: str,
+        timeout_seconds: float,
+        temperature: float,
+        max_tokens: int,
+        prefer_v1: bool,
+        anthropic_version: str,
+    ) -> str:
+        mime, b64 = self._decode_data_image_ref(image_ref)
+        if not mime or not b64:
+            return ""
+
+        payload = {
+            "model": model_name,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "system": SystemPromptRelay.vision_system_prompt_detailed(),
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": mime, "data": b64},
+                        },
+                    ],
+                }
+            ],
+        }
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": anthropic_version or "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        candidates = self._candidate_openai_bases(base_url=base_url, prefer_v1=prefer_v1)
+        for base in candidates:
+            url = f"{base}/messages"
+            try:
+                async with httpx.AsyncClient(timeout=timeout_seconds) as client_http:
+                    resp = await client_http.post(url, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                continue
+            content = data.get("content") if isinstance(data, dict) else None
+            if not isinstance(content, list):
+                continue
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict) and normalize_text(str(item.get("type", ""))) == "text":
+                    parts.append(normalize_text(str(item.get("text", ""))))
+            text = normalize_text("".join(parts))
+            if text:
+                return text
+        return ""
+
+    async def _vision_describe_via_gemini(
+        self,
+        image_ref: str,
+        prompt: str,
+        api_key: str,
+        base_url: str,
+        model_name: str,
+        timeout_seconds: float,
+        temperature: float,
+        max_tokens: int,
+        api_version: str,
+    ) -> str:
+        mime, b64 = self._decode_data_image_ref(image_ref)
+        if not mime or not b64:
+            return ""
+
+        base = normalize_text(base_url).rstrip("/")
+        for suffix in ("/v1beta", "/v1"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        if not base:
+            return ""
+
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {"text": prompt},
+                        {"inline_data": {"mime_type": mime, "data": b64}},
+                    ],
+                }
+            ],
+            "system_instruction": {"parts": [{"text": SystemPromptRelay.vision_system_prompt_detailed()}]},
+            "generationConfig": {
+                "temperature": temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        ver = normalize_text(api_version).strip("/") or "v1beta"
+        url = f"{base}/{ver}/models/{model_name}:generateContent?key={api_key}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout_seconds) as client_http:
+                resp = await client_http.post(url, headers={"Content-Type": "application/json"}, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            return ""
+
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        if not isinstance(candidates, list) or not candidates:
+            return ""
+        content = candidates[0].get("content", {}) if isinstance(candidates[0], dict) else {}
+        parts = content.get("parts", []) if isinstance(content, dict) else []
+        if not isinstance(parts, list):
+            return ""
+        out: list[str] = []
+        for item in parts:
+            if isinstance(item, dict):
+                out.append(normalize_text(str(item.get("text", ""))))
+        return normalize_text("".join(out))
+
+    @staticmethod
+    def _decode_data_image_ref(image_ref: str) -> tuple[str, str]:
+        raw = normalize_text(image_ref)
+        if not raw.startswith("data:image") or ";base64," not in raw:
+            return "", ""
+        head, b64 = raw.split(";base64,", 1)
+        mime = normalize_text(head.replace("data:", ""))
+        data = normalize_text(b64)
+        if not mime or not data:
+            return "", ""
+        return mime, data
+
     def _has_independent_vision_config(self) -> bool:
         return bool(self._vision_provider and self._vision_base_url and self._vision_model and self._vision_api_key)
 
@@ -3484,7 +4579,7 @@ class ToolExecutor:
             return ""
         content = re.sub(r"\s+", " ", content).strip()
         if self._looks_like_english_refusal(content):
-            return "这张图我这次没法稳定识别完整内容。你可以换一张更清晰的图，或告诉我要识别哪一部分。"
+            return "这张图我这次没法稳定识别完整内容。请发更清晰的图片，或告诉我要识别哪一部分。"
 
         if self._looks_like_non_chinese_text(content) and self._vision_retry_translate_enable:
             translated = await self._translate_to_chinese(content=content, prompt=prompt)
@@ -3579,7 +4674,7 @@ class ToolExecutor:
         weak_cues = (
             "这张图我这次没法稳定识别完整内容",
             "这张图识别到了部分内容，但结果不够稳定",
-            "你可以换一张更清晰的图",
+            "请发更清晰的图片",
             "结果不够稳定",
         )
         return any(cue in content for cue in weak_cues)
@@ -3620,17 +4715,13 @@ class ToolExecutor:
         content = normalize_text(query).lower()
         if self._looks_like_video_analysis_request(content):
             return self._video_search_analysis_max_duration_seconds, "analysis"
-        send_cues = (
-            "发出来",
-            "发我",
-            "发到群",
-            "转发",
-            "下载",
-            "解析",
-            "直发",
-            "发视频",
-            "把视频发",
-        )
+        send_cues = [
+            normalize_text(cue).lower()
+            for cue in _pl.get_list("local_media_request_cues")
+            if normalize_text(cue)
+        ]
+        if not send_cues:
+            send_cues = ["发送", "发我", "发到群", "转发", "下载", "解析", "直发", "发视频", "把视频发"]
         if any(cue in content for cue in send_cues):
             return self._video_search_send_max_duration_seconds, "send"
         return self._video_search_max_duration_seconds, "default"
@@ -3919,7 +5010,6 @@ class ToolExecutor:
                     lines.append(f"{idx}. {row}")
             else:
                 lines.append(f"字幕摘录：{clip_text(analysis.subtitle_text, 260)}")
-            lines.append("需要完整补发可回：补发字幕")
             return "\n".join(lines)
 
         if analysis.keyframe_descriptions:
@@ -4079,7 +5169,7 @@ class ToolExecutor:
         scene = normalize_text(str(candidates[0].get("scene", "default"))).lower()
         scene_label = {
             "default": "普通搜索",
-            "send": "发出来/转发",
+            "send": "发送/转发",
             "analysis": "视频解析/分析",
         }.get(scene, "视频搜索")
         longest_text = self._format_duration(longest) or f"{longest}s"
@@ -4526,7 +5616,13 @@ class ToolExecutor:
     # ── 音乐搜索 & 播放 ──────────────────────────────────────────────
 
     async def _music_search(self, tool_args: dict[str, Any], message_text: str) -> ToolResult:
-        keyword = normalize_text(str(tool_args.get("keyword", ""))) or normalize_text(message_text)
+        keyword = normalize_text(str(tool_args.get("keyword", "")))
+        title = normalize_text(str(tool_args.get("title", "")))
+        artist = normalize_text(str(tool_args.get("artist", "")))
+        if not keyword and title:
+            keyword = f"{title} {artist}".strip()
+        if not keyword:
+            keyword = normalize_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
         # 去掉常见前缀
@@ -4555,11 +5651,62 @@ class ToolExecutor:
             ]},
         )
 
+    async def _music_play_by_id(
+        self, tool_args: dict[str, Any],
+        api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
+    ) -> ToolResult:
+        song_id = int(tool_args.get("song_id", 0) or 0)
+        if song_id <= 0:
+            return ToolResult(ok=False, tool_name="music_play_by_id", error="invalid_song_id")
+
+        # 从 tool_args 获取歌曲信息
+        song_name = normalize_text(str(tool_args.get("song_name", "")))
+        artist = normalize_text(str(tool_args.get("artist", "")))
+
+        # 直接根据 ID 播放
+        from core.music import MusicSearchResult
+        song = MusicSearchResult(
+            song_id=song_id,
+            name=song_name,
+            artist=artist,
+            album="",
+            duration_ms=0,
+            source="netease",
+        )
+        result = await self._music_engine._play_song(song, as_voice=True)
+
+        if not result.ok:
+            return ToolResult(
+                ok=False, tool_name="music_play_by_id",
+                payload={"text": result.message or "播放失败。"},
+                error=result.error,
+            )
+
+        payload: dict[str, Any] = {"text": result.message}
+
+        # 优先给完整音频文件
+        if result.audio_path and api_call:
+            payload["audio_file"] = result.audio_path
+            if result.silk_path:
+                payload["audio_file_silk"] = result.silk_path
+        elif result.silk_path and api_call:
+            payload["audio_file"] = result.silk_path
+        elif result.silk_b64 and api_call:
+            payload["record_b64"] = result.silk_b64
+
+        return ToolResult(ok=True, tool_name="music_play_by_id", payload=payload)
+
     async def _music_play(
         self, tool_args: dict[str, Any], message_text: str,
         api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
     ) -> ToolResult:
-        keyword = normalize_text(str(tool_args.get("keyword", ""))) or normalize_text(message_text)
+        keyword = normalize_text(str(tool_args.get("keyword", "")))
+        title = normalize_text(str(tool_args.get("title", "")))
+        artist = normalize_text(str(tool_args.get("artist", "")))
+        if not keyword and title:
+            keyword = f"{title} {artist}".strip()
+        if not keyword:
+            keyword = normalize_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
         for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
@@ -4578,18 +5725,150 @@ class ToolExecutor:
 
         payload: dict[str, Any] = {"text": result.message}
 
-        # 优先发本地 SILK 文件路径（NapCat 对 file:// 的时长识别最稳定）
-        # 不再同时设置 record_b64，避免 app.py 优先走 base64 导致 0s
-        if result.silk_path and api_call:
+        # 优先给完整音频文件，发送层可按策略决定“整段发 / 分段发 / 回退 silk”。
+        if result.audio_path and api_call:
+            payload["audio_file"] = result.audio_path
+            if result.silk_path:
+                payload["audio_file_silk"] = result.silk_path
+        elif result.silk_path and api_call:
             payload["audio_file"] = result.silk_path
         elif result.silk_b64 and api_call:
             # 仅在无本地文件时才用 base64
             payload["record_b64"] = result.silk_b64
-        elif result.audio_path and api_call:
-            # 最后回退发 MP3 文件
-            payload["audio_file"] = result.audio_path
 
         return ToolResult(ok=True, tool_name="music_play", payload=payload)
+
+    async def _bilibili_audio_extract(
+        self, tool_args: dict[str, Any], message_text: str,
+        api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
+    ) -> ToolResult:
+        """从 Bilibili 提取音频作为音乐回退方案。"""
+        keyword = normalize_text(str(tool_args.get("keyword", ""))) or normalize_text(message_text)
+        if not keyword:
+            return ToolResult(ok=False, tool_name="bilibili_audio_extract", error="empty_keyword")
+
+        # 在 B 站搜索视频
+        search_query = f"site:bilibili.com {keyword}"
+        try:
+            from core.search import SearchEngine
+            search_cfg = self._raw_config.get("search", {})
+            search_engine = SearchEngine(search_cfg)
+            results = await search_engine.search(search_query)
+
+            if not results:
+                return ToolResult(
+                    ok=False, tool_name="bilibili_audio_extract",
+                    payload={"text": f"在 B 站未找到「{keyword}」相关视频。"},
+                    error="no_bilibili_results",
+                )
+
+            # 尝试第一个结果
+            first_url = results[0].url
+            _tool_log.info("bilibili_audio_extract | keyword=%s | url=%s", keyword, first_url)
+
+            # 直接下载音频流（不需要 ffmpeg）
+            try:
+                from yt_dlp import YoutubeDL
+
+                digest = hashlib.sha1(first_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                audio_path = self._video_cache_dir / f"{digest}_audio.mp3"
+
+                ydl_opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "format": "bestaudio/best",
+                    "outtmpl": str(audio_path.with_suffix("")),
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }] if self._ffmpeg_available else [],
+                    "socket_timeout": self._video_download_timeout_seconds,
+                    "retries": 2,
+                    "logger": _SilentYTDLPLogger(),
+                }
+
+                if self._video_cookies_file:
+                    ydl_opts["cookiefile"] = self._video_cookies_file
+                if self._video_cookies_from_browser:
+                    ydl_opts["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
+                if self._ffmpeg_location:
+                    ydl_opts["ffmpeg_location"] = self._ffmpeg_location
+                _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, first_url)
+                try:
+                    while True:
+                        try:
+                            with YoutubeDL(ydl_opts) as ydl:
+                                ydl.download([first_url])
+                            break
+                        except Exception as exc:
+                            err_text = normalize_text(str(exc))
+                            lowered = err_text.lower()
+                            # 浏览器 cookie 数据库读取失败时，自动切到非 browser-cookie 重试一次。
+                            if (
+                                self._disable_cookie_browser_on_error(err_text)
+                                or "cookies database" in lowered
+                                or "cookiesfrombrowser" in lowered
+                            ) and "cookiesfrombrowser" in ydl_opts:
+                                _tool_log.warning(
+                                    "bilibili_audio_retry_without_cookie_browser | url=%s | reason=%s",
+                                    first_url,
+                                    clip_text(err_text, 140),
+                                )
+                                ydl_opts.pop("cookiesfrombrowser", None)
+                                continue
+                            raise
+                finally:
+                    if _tmp_cookie_file:
+                        try:
+                            os.unlink(_tmp_cookie_file)
+                        except OSError:
+                            pass
+
+                # 查找生成的音频文件
+                if not audio_path.exists():
+                    # 可能是 .mp3.mp3 或其他后缀
+                    for candidate in self._video_cache_dir.glob(f"{digest}_audio*"):
+                        if candidate.suffix in [".mp3", ".m4a", ".opus", ".webm"]:
+                            audio_path = candidate
+                            break
+
+                if not audio_path.exists():
+                    return ToolResult(
+                        ok=False, tool_name="bilibili_audio_extract",
+                        payload={"text": f"B 站音频下载失败。"},
+                        error="download_failed",
+                    )
+
+            except Exception as exc:
+                _tool_log.warning("bilibili_audio_download_error | url=%s | %s", first_url, exc)
+                return ToolResult(
+                    ok=False, tool_name="bilibili_audio_extract",
+                    payload={"text": f"B 站音频下载失败：{exc}"},
+                    error="download_error",
+                )
+
+            # 转换为 SILK
+            silk_path = None
+            if self._music_engine and self._music_engine._pilk_available:
+                silk_path = await self._music_engine._convert_to_silk(audio_path)
+
+            payload: dict[str, Any] = {"text": f"已从 B 站提取音频：{results[0].title}"}
+            if silk_path and silk_path.exists():
+                payload["audio_file_silk"] = str(silk_path)
+                payload["audio_file"] = str(audio_path)
+            elif audio_path.exists():
+                payload["audio_file"] = str(audio_path)
+
+            return ToolResult(ok=True, tool_name="bilibili_audio_extract", payload=payload)
+
+        except Exception as exc:
+            _tool_log.warning("bilibili_audio_extract_error | keyword=%s | %s", keyword, exc)
+            return ToolResult(
+                ok=False, tool_name="bilibili_audio_extract",
+                payload={"text": f"B 站音频提取失败: {exc}"},
+                error="extract_error",
+            )
 
     async def _group_member_count(
         self,
@@ -4633,7 +5912,7 @@ class ToolExecutor:
         return ToolResult(
             ok=False,
             tool_name="get_group_member_count",
-            payload={"text": "我现在拿不到群成员数量，稍后再试一次。"},
+            payload={},
             error="group_count_unavailable",
         )
 
@@ -5476,7 +6755,67 @@ class ToolExecutor:
             return cached
 
         try:
+            # socket.getaddrinfo 是阻塞调用，但此方法被大量同步代码调用
+            # 使用缓存减少阻塞频率；首次查询仍会阻塞但结果会被缓存
             infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+        except Exception:
+            self._url_host_safety_cache[host] = False
+            return False
+
+        saw_ip = False
+        for info in infos:
+            sockaddr = info[4] if len(info) >= 5 else None
+            if not sockaddr:
+                continue
+            address = normalize_text(str(sockaddr[0])).split("%", 1)[0]
+            if not address:
+                continue
+            saw_ip = True
+            try:
+                resolved_ip = ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            if not self._is_public_ip_obj(resolved_ip):
+                self._url_host_safety_cache[host] = False
+                return False
+        self._url_host_safety_cache[host] = saw_ip
+        return saw_ip
+
+    async def _is_safe_public_http_url_async(self, url: str) -> bool:
+        """异步版本的 URL 安全检查，避免阻塞事件循环。"""
+        target = normalize_text(url)
+        if not target:
+            return False
+        if not re.match(r"^https?://", target, flags=re.IGNORECASE):
+            return False
+        if self._tool_interface_allow_private_network:
+            return True
+        try:
+            parsed = urlparse(target)
+        except Exception:
+            return False
+        host = normalize_text(parsed.hostname or "").strip().lower().rstrip(".")
+        if not host:
+            return False
+        if host in {"localhost", "metadata", "metadata.google.internal"} or host.endswith(".localhost"):
+            return False
+        if host.endswith((".local", ".internal", ".localdomain", ".home", ".lan", ".arpa")):
+            return False
+        try:
+            ip_obj = ipaddress.ip_address(host.split("%", 1)[0])
+        except ValueError:
+            ip_obj = None
+        if ip_obj is not None:
+            return self._is_public_ip_obj(ip_obj)
+
+        cached = self._url_host_safety_cache.get(host)
+        if cached is not None:
+            return cached
+
+        try:
+            import asyncio as _aio
+            loop = _aio.get_running_loop()
+            infos = await loop.getaddrinfo(host, None, type=socket.SOCK_STREAM)
         except Exception:
             self._url_host_safety_cache[host] = False
             return False
@@ -5683,6 +7022,22 @@ class ToolExecutor:
             short_path = path.strip("/")
             return bool(short_path and len(short_path) >= 6)
 
+        if "youku.com" in host:
+            # 优酷视频详情页: /v_show/id_xxx.html
+            if "/v_show/" in path:
+                return True
+            if re.search(r"/id_[a-zA-Z0-9]+", path):
+                return True
+            return False
+
+        if "v.qq.com" in host or ("qq.com" in host and "/x/" in path):
+            # 腾讯视频详情页: /x/cover/xxx/xxx.html 或 /x/page/xxx.html
+            if "/x/cover/" in path or "/x/page/" in path:
+                return True
+            if re.search(r"/[a-z]\d{10}", path):
+                return True
+            return False
+
         return False
 
     def _is_blocked_video_text(self, text: str) -> bool:
@@ -5737,6 +7092,10 @@ class ToolExecutor:
             return "这条视频解析超时了，可能是平台限流或链接失效。你可以稍后重试，或者发一个新的分享链接给我。"
         if code == "format_unavailable":
             return "这条视频当前可用格式不稳定（平台返回格式不可用）。你可以换一个清晰度或换条链接再试。"
+        if "412" in code:
+            return "B站限流了（412），稍等一会儿再试就好。也可以换个链接。"
+        if code == "video_no_audio_all_formats":
+            return "这条视频解析到的都是无音轨版本（发送后会没声音），我已拦截。你换个分享链接我再试。"
         if code == "parse_api_failed":
             return "解析服务这次没拿到可用直链。你可以重发原视频链接，我会继续尝试本地解析。"
         if code == "resolver_disabled":
@@ -5781,21 +7140,34 @@ class ToolExecutor:
                     return str(dy_path.resolve())
             except Exception as exc:
                 _ytdlp_log.warning("douyin_share_error: %s", str(exc)[:300])
-            self._last_video_resolve_diagnostic[url] = "douyin_share_failed"
+            # 分享页失败不立即返回，继续尝试 yt-dlp
             _ytdlp_log.info("douyin_share fallback failed, trying yt-dlp")
 
         if YoutubeDL is not None:
             if self._video_prefer_direct_stream and self._allow_platform_direct_stream(url):
                 direct_url = await asyncio.to_thread(self._extract_platform_video_direct_url_sync, url)
-                if direct_url and await self._is_remote_video_url(direct_url):
+                if direct_url and self._is_direct_video_url(direct_url):
                     return direct_url
 
             self._cleanup_video_cache()
+
+            # 使用混合解析器（bilix优先用于B站）
+            if self._hybrid_resolver:
+                try:
+                    downloaded_path = await self._hybrid_resolver.download_video(url)
+                    if downloaded_path:
+                        return str(downloaded_path.resolve())
+                except Exception as e:
+                    _ytdlp_log.warning("hybrid_resolver_error | error=%s", str(e)[:200])
+
+            # fallback到原有的yt-dlp方法
             downloaded_path = await asyncio.to_thread(self._download_platform_video_sync, url)
             if downloaded_path:
                 return str(downloaded_path.resolve())
             download_error = normalize_text(self._last_video_download_error.pop(url, ""))
-            if "Requested format is not available" in download_error:
+            if download_error == "video_no_audio_all_formats":
+                self._last_video_resolve_diagnostic[url] = "video_no_audio_all_formats"
+            elif "Requested format is not available" in download_error:
                 self._last_video_resolve_diagnostic[url] = "format_unavailable"
             elif "cookies database" in download_error.lower() or "cookiesfrombrowser" in download_error.lower():
                 self._last_video_resolve_diagnostic[url] = f"cookie_unavailable:{clip_text(download_error, 120)}"
@@ -5832,7 +7204,7 @@ class ToolExecutor:
             "noplaylist": True,
             "skip_download": True,
             "socket_timeout": self._video_download_timeout_seconds,
-            "format": "b[ext=mp4]/b/best",
+            "format": "b[ext=mp4]/bv*+ba/b/best[ext=mp4]/best",
             "http_headers": self._http_headers,
             "logger": _SilentYTDLPLogger(),
         }
@@ -5904,6 +7276,11 @@ class ToolExecutor:
             payload = resp.json()
         except Exception:
             return ""
+        # 部分解析 API 返回 HTTP 200 但 JSON body 含错误码
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if code is not None and code not in (0, 200, "0", "200"):
+                return ""
         return self._extract_video_url_from_parse_payload(payload)
 
     def _extract_video_url_from_parse_payload(self, payload: Any) -> str:
@@ -5961,6 +7338,9 @@ class ToolExecutor:
         host = normalize_text(urlparse(source_url).netloc).lower()
         is_douyin = "douyin.com" in host or "iesdouyin.com" in host
         is_kuaishou = "kuaishou.com" in host or "chenzhongtech.com" in host
+        is_youku = "youku.com" in host
+        is_acfun = "acfun.cn" in host or "acfun.com" in host
+        is_tencent = "v.qq.com" in host or ("qq.com" in host and "/x/" in normalize_text(urlparse(source_url).path).lower())
         self._last_video_download_error.pop(source_url, None)
         last_error = ""
         common_options = {
@@ -5968,16 +7348,22 @@ class ToolExecutor:
             "no_warnings": True,
             "noplaylist": True,
             "socket_timeout": self._video_download_timeout_seconds,
-            "retries": 2,
-            "extractor_retries": 1,
-            "fragment_retries": 2,
+            "retries": 3,
+            "extractor_retries": 2,
+            "fragment_retries": 3,
             "skip_unavailable_fragments": True,
             "outtmpl": output_template,
             "http_headers": self._http_headers,
             "logger": _SilentYTDLPLogger(),
         }
+        # B站: 添加 try_look=1 参数，无需登录即可获取 720p/1080p
+        if "bilibili.com" in host or host.endswith("b23.tv"):
+            common_options["extractor_args"] = {"BiliBili": {"try_look": ["1"]}}
         if self._ffmpeg_available:
             common_options["merge_output_format"] = "mp4"
+            if self._ffmpeg_location:
+                # imageio-ffmpeg 的二进制名不是 ffmpeg.exe，显式指定给 yt-dlp 才能完成音视频合并。
+                common_options["ffmpeg_location"] = self._ffmpeg_location
         if self._video_cookies_file:
             common_options["cookiefile"] = self._video_cookies_file
         if self._video_cookies_from_browser:
@@ -5987,26 +7373,76 @@ class ToolExecutor:
         if "bilibili.com" in host or host.endswith("b23.tv"):
             # B站经常是分段流；无 ffmpeg 时优先单文件中低清晰度，保证可发
             # 优先 h264(avc) 编码，避免 av1 导致 NapCat 缩略图生成失败。
+            # 放宽格式限制，增加更多 fallback 避免 "Requested format is not available"
             format_candidates: list[str] = []
             if self._ffmpeg_available:
                 format_candidates.extend(
                     [
+                        # 优先 avc 720p 带音频
                         "bv*[vcodec^=avc][height<=720]+ba/bv*[vcodec^=avc]+ba",
+                        # 放宽到任意编码 720p 带音频
+                        "bv*[height<=720]+ba/bv*+ba",
+                        # 单文件带音频
+                        "best[vcodec^=avc][acodec!=none][height<=720][ext=mp4]/best[vcodec^=avc][acodec!=none][ext=mp4]",
+                        "best[acodec!=none][height<=720][ext=mp4]/best[acodec!=none][ext=mp4]",
+                        # 任意带音频的格式
                         "bv*[vcodec!=none][acodec!=none][height<=720][ext=mp4]/bv*[vcodec!=none][acodec!=none]/b[ext=mp4]/b",
                         "bv*[vcodec!=none]+ba/bv*+ba/b",
                     ]
                 )
-            format_candidates.extend(
-                [
-                    "bv*[vcodec!=none][height<=480][ext=mp4]/bv*[vcodec!=none][height<=360][ext=mp4]/bv*[vcodec!=none][ext=mp4]",
-                    "bv*[vcodec!=none][height<=720][ext=mp4]/bv*[vcodec!=none][ext=mp4]",
-                    "b[ext=mp4]",
-                ]
-            )
+            else:
+                # 无 ffmpeg 时，先尝试单文件格式，如果都不可用则下载纯视频流（无音频）
+                format_candidates.extend(
+                    [
+                        "bv*[vcodec!=none][acodec!=none][height<=480]/bv*[vcodec!=none][acodec!=none][height<=360]",
+                        "bv*[vcodec!=none][acodec!=none][height<=720]/bv*[vcodec!=none][acodec!=none]",
+                        "b[ext=mp4]/b",
+                        # 如果上面都失败，下载纯视频流（无音频但至少有画面）
+                        "bv*[vcodec^=avc][height<=480]/bv*[vcodec^=avc][height<=360]",
+                        "bv*[vcodec^=avc][height<=720]/bv*[vcodec^=avc]",
+                        "bv*[height<=480]/bv*[height<=720]/bv*",
+                        # 最后的fallback：下载任何可用的视频流
+                        "bestvideo[height<=720]/bestvideo",
+                    ]
+                )
+            if self._ffmpeg_available:
+                # 有 ffmpeg 时也添加纯视频流作为最后的fallback
+                format_candidates.extend(
+                    [
+                        "bv*[vcodec!=none][height<=480]/bv*[vcodec!=none][height<=360]",
+                        "bv*[vcodec!=none][height<=720]/bv*[vcodec!=none]",
+                        "b[ext=mp4]/b",
+                        "bestvideo[height<=720]/bestvideo",
+                    ]
+                )
         elif is_douyin or is_kuaishou:
             # 抖音/快手：优先 h264 720p，回退到 best mp4
+            # 注意：快手目前 yt-dlp 官方不支持，可能需要第三方插件
             format_candidates = [
                 f"best[vcodec^=avc][height<=720][ext=mp4]/best[vcodec^=avc][ext=mp4]",
+                f"best[ext=mp4][filesize<{self._video_download_max_mb}M]/best[ext=mp4]",
+                "best[ext=mp4]",
+                "best",
+            ]
+        elif is_youku:
+            # 优酷：优先 mp4 格式，限制文件大小
+            format_candidates = [
+                f"best[ext=mp4][height<=720][filesize<{self._video_download_max_mb}M]/best[ext=mp4][height<=720]",
+                f"best[ext=mp4][filesize<{self._video_download_max_mb}M]/best[ext=mp4]",
+                "best[ext=mp4]",
+                "best",
+            ]
+        elif is_acfun:
+            # ACFUN：优先 mp4 格式
+            format_candidates = [
+                f"best[ext=mp4][height<=720]/best[ext=mp4]",
+                "best[ext=mp4]",
+                "best",
+            ]
+        elif is_tencent:
+            # 腾讯视频：优先 mp4 格式，限制文件大小
+            format_candidates = [
+                f"best[ext=mp4][height<=720][filesize<{self._video_download_max_mb}M]/best[ext=mp4][height<=720]",
                 f"best[ext=mp4][filesize<{self._video_download_max_mb}M]/best[ext=mp4]",
                 "best[ext=mp4]",
                 "best",
@@ -6024,6 +7460,8 @@ class ToolExecutor:
             len(format_candidates),
             source_url[:60],
         )
+        require_audio = bool("bilibili.com" in host or host.endswith("b23.tv") or is_douyin or is_kuaishou or is_youku or is_acfun or is_tencent)
+        no_audio_fallback: Path | None = None
         try:
             for fmt in format_candidates:
                 options = dict(common_options)
@@ -6042,6 +7480,18 @@ class ToolExecutor:
                                         path = Path(maybe)
                                         if path.exists():
                                             if self._is_video_size_ok(path) and self._is_video_file_path(path):
+                                                if require_audio and not self._video_has_audio_stream(path):
+                                                    _ytdlp_log.warning(
+                                                        "video_download_no_audio%s | fmt=%s | path=%s | retry_next_format",
+                                                        _tool_trace_tag(),
+                                                        fmt[:40],
+                                                        path.name,
+                                                    )
+                                                    if no_audio_fallback is None:
+                                                        no_audio_fallback = path
+                                                    else:
+                                                        self._safe_unlink(path)
+                                                    continue
                                                 self._last_video_download_error.pop(source_url, None)
                                                 _ytdlp_log.info(
                                                     "video_download_ok%s | fmt=%s | path=%s | size=%d",
@@ -6058,6 +7508,18 @@ class ToolExecutor:
                             prepared_path = Path(prepared)
                             if prepared_path.exists():
                                 if self._is_video_size_ok(prepared_path) and self._is_video_file_path(prepared_path):
+                                    if require_audio and not self._video_has_audio_stream(prepared_path):
+                                        _ytdlp_log.warning(
+                                            "video_download_no_audio%s | fmt=%s | path=%s | retry_next_format",
+                                            _tool_trace_tag(),
+                                            fmt[:40],
+                                            prepared_path.name,
+                                        )
+                                        if no_audio_fallback is None:
+                                            no_audio_fallback = prepared_path
+                                        else:
+                                            self._safe_unlink(prepared_path)
+                                        continue
                                     self._last_video_download_error.pop(source_url, None)
                                     return prepared_path
                                 self._safe_unlink(prepared_path)
@@ -6073,12 +7535,45 @@ class ToolExecutor:
                             source_url[:80],
                         )
                         break
+                    # 412 Precondition Failed: B站限流，等待后重试下一个格式
+                    if "412" in last_error:
+                        _ytdlp_log.warning(
+                            "video_download_412_throttled%s | url=%s | waiting",
+                            _tool_trace_tag(),
+                            source_url[:80],
+                        )
+                        import time
+                        time.sleep(2)
                     continue
 
             fallback = self._pick_downloaded_video_fallback(digest)
             if fallback is not None:
-                self._last_video_download_error.pop(source_url, None)
-                return fallback
+                if require_audio and not self._video_has_audio_stream(fallback):
+                    _ytdlp_log.warning(
+                        "video_download_fallback_no_audio%s | path=%s",
+                        _tool_trace_tag(),
+                        fallback.name,
+                    )
+                else:
+                    self._last_video_download_error.pop(source_url, None)
+                    return fallback
+            if no_audio_fallback is not None and no_audio_fallback.exists():
+                if self._video_allow_silent_fallback:
+                    _ytdlp_log.warning(
+                        "video_download_no_audio_all_formats%s | return=%s | allow_silent=true",
+                        _tool_trace_tag(),
+                        no_audio_fallback.name,
+                    )
+                    self._last_video_download_error.pop(source_url, None)
+                    return no_audio_fallback
+                _ytdlp_log.warning(
+                    "video_download_no_audio_all_formats%s | drop=%s | allow_silent=false",
+                    _tool_trace_tag(),
+                    no_audio_fallback.name,
+                )
+                self._safe_unlink(no_audio_fallback)
+                self._last_video_download_error[source_url] = "video_no_audio_all_formats"
+                return None
             if last_error:
                 self._last_video_download_error[source_url] = last_error
             return None
@@ -6093,6 +7588,9 @@ class ToolExecutor:
         candidates = sorted(self._video_cache_dir.glob(f"{digest}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in candidates:
             if not path.is_file():
+                continue
+            lower_name = path.name.lower()
+            if lower_name.endswith(".qq.mp4") or ".qq." in lower_name or lower_name.endswith(".thumb.jpg"):
                 continue
             if not self._is_video_file_path(path):
                 continue
@@ -6114,6 +7612,8 @@ class ToolExecutor:
         "v26-web.douyinvod.com",
         "v3-web.douyinvod.com",
         "v9-web.douyinvod.com",
+        "v5-web.douyinvod.com",
+        "v11-web.douyinvod.com",
     ]
 
     async def _download_douyin_via_share_page(self, source_url: str) -> Path | None:
@@ -6135,33 +7635,40 @@ class ToolExecutor:
         tag = aweme_id or video_id
         out_path = self._video_cache_dir / f"{digest}_{tag}.mp4"
 
-        # 多 CDN 回退下载
+        # 多 CDN 回退下载，增加重试
+        host_timeout = max(8.0, min(float(self._video_download_timeout_seconds), 20.0))
         for host in self._DOUYIN_CDN_HOSTS:
-            video_url = f"https://{host}/aweme/v1/play/?video_id={video_id}&ratio=720p&line=0"
-            try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(self._video_download_timeout_seconds, connect=10.0),
-                    follow_redirects=True,
-                    headers={
-                        "User-Agent": self._DOUYIN_MOBILE_UA,
-                        "Referer": "https://www.douyin.com/",
-                        "Accept": "*/*",
-                    },
-                ) as client:
-                    resp = await client.get(video_url)
-                    resp.raise_for_status()
-                    content = resp.content
-                    if len(content) < 4096:
-                        _ytdlp_log.warning("douyin_share: %s content too small (%d bytes)", host, len(content))
-                        continue
-                    out_path.write_bytes(content)
-                    if self._is_video_size_ok(out_path) and self._is_video_file_path(out_path):
-                        _ytdlp_log.info("douyin_share_ok | host=%s | path=%s | size=%d", host, out_path.name, out_path.stat().st_size)
-                        return out_path
-                    self._safe_unlink(out_path)
-            except Exception as exc:
-                _ytdlp_log.warning("douyin_share: %s download failed: %s", host, str(exc)[:200])
-                continue
+            for ratio in ("720p", "540p", "480p"):
+                video_url = f"https://{host}/aweme/v1/play/?video_id={video_id}&ratio={ratio}&line=0"
+                try:
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(host_timeout, connect=8.0),
+                        follow_redirects=True,
+                        headers={
+                            "User-Agent": self._DOUYIN_MOBILE_UA,
+                            "Referer": "https://www.douyin.com/",
+                            "Accept": "*/*",
+                        },
+                    ) as client:
+                        resp = await client.get(video_url)
+                        resp.raise_for_status()
+                        # CDN 可能返回 200 + HTML 错误页，检查 Content-Type
+                        ctype = (resp.headers.get("content-type") or "").lower()
+                        if "text/html" in ctype or "text/plain" in ctype:
+                            _ytdlp_log.warning("douyin_share: %s returned non-video content-type: %s", host, ctype[:60])
+                            break  # 这个 host 不行，换下一个
+                        content = resp.content
+                        if len(content) < 4096:
+                            _ytdlp_log.warning("douyin_share: %s content too small (%d bytes)", host, len(content))
+                            break
+                        out_path.write_bytes(content)
+                        if self._is_video_size_ok(out_path) and self._is_video_file_path(out_path):
+                            _ytdlp_log.info("douyin_share_ok | host=%s | ratio=%s | path=%s | size=%d", host, ratio, out_path.name, out_path.stat().st_size)
+                            return out_path
+                        self._safe_unlink(out_path)
+                except Exception as exc:
+                    _ytdlp_log.warning("douyin_share: %s/%s download failed: %s", host, ratio, str(exc)[:200])
+                    continue
 
         return None
 
@@ -6170,6 +7677,33 @@ class ToolExecutor:
         从抖音 URL 提取 video_id（用于构造直链）和 aweme_id。
         返回 (video_id, aweme_id)。
         """
+        def _extract_video_id_from_text(text: str, final_url: str, aweme_id_hint: str) -> tuple[str, str]:
+            aweme_local = aweme_id_hint or self._extract_douyin_aweme_id(final_url)
+
+            # 先从 URL query 中提取 video_id
+            try:
+                qs = parse_qs(urlparse(final_url).query)
+                for item in qs.get("video_id", []):
+                    candidate = normalize_text(str(item))
+                    if self._is_valid_douyin_video_id(candidate):
+                        return candidate, aweme_local
+            except Exception:
+                pass
+
+            # 从 HTML 里提取 play_addr.uri / video_id
+            patterns = (
+                r'"play_addr"\s*:\s*\{[^{}]*?"uri"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
+                r'"uri"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
+                r'"video_id"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
+                r"video_id=([A-Za-z0-9_-]{8,80})",
+            )
+            for pattern in patterns:
+                for raw in re.findall(pattern, text):
+                    candidate = normalize_text(unquote(str(raw)))
+                    if self._is_valid_douyin_video_id(candidate):
+                        return candidate, aweme_local
+            return "", aweme_local
+
         # 1) 先尝试从 URL 提取 aweme_id
         aweme_id = self._extract_douyin_aweme_id(source_url)
 
@@ -6182,6 +7716,17 @@ class ToolExecutor:
                 "Referer": "https://www.douyin.com/",
             },
         ) as client:
+            # 2.1) 如果已有 aweme_id，先直连分享页（通常比 douyin 主站链接更稳定）
+            if aweme_id:
+                try:
+                    share_url = f"https://www.iesdouyin.com/share/video/{aweme_id}/"
+                    share_resp = await client.get(share_url)
+                    vid, aweme_id = _extract_video_id_from_text(share_resp.text, str(share_resp.url), aweme_id)
+                    if vid:
+                        return vid, aweme_id
+                except Exception:
+                    pass
+
             resp = await client.get(source_url)
             final_url = str(resp.url)
             html = resp.text
@@ -6190,37 +7735,19 @@ class ToolExecutor:
             if not aweme_id:
                 aweme_id = self._extract_douyin_aweme_id(final_url)
 
-            # 3) 先从 URL query 中提取 video_id
-            try:
-                qs = parse_qs(urlparse(final_url).query)
-                for item in qs.get("video_id", []):
-                    candidate = normalize_text(str(item))
-                    if self._is_valid_douyin_video_id(candidate):
-                        return candidate, aweme_id
-            except Exception:
-                pass
+            # 3) 从最终 URL + HTML 提取 video_id
+            vid, aweme_id = _extract_video_id_from_text(html, final_url, aweme_id)
+            if vid:
+                return vid, aweme_id
 
-            # 4) 从 HTML 里提取明确的 play_addr.uri / video_id
-            patterns = (
-                r'"play_addr"\s*:\s*\{[^{}]*?"uri"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
-                r'"uri"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
-                r'"video_id"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
-                r"video_id=([A-Za-z0-9_-]{8,80})",
-            )
-            for pattern in patterns:
-                for raw in re.findall(pattern, html):
-                    candidate = normalize_text(unquote(str(raw)))
-                    if self._is_valid_douyin_video_id(candidate):
-                        return candidate, aweme_id
-
-            # 5) 回退：通过 aweme 接口拿 play_addr.uri
+            # 4) 回退：通过 aweme 接口拿 play_addr.uri
             if aweme_id:
                 try:
                     api_url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={aweme_id}"
                     api_resp = await client.get(api_url)
-                    if api_resp.is_success:
-                        data = api_resp.json() if api_resp.content else {}
-                        item_list = data.get("item_list", []) if isinstance(data, dict) else []
+                    if api_resp.is_success and api_resp.content:
+                        data = api_resp.json()
+                        item_list = (data.get("item_list", []) if isinstance(data, dict) and data.get("status_code", 0) == 0 else [])
                         item = item_list[0] if isinstance(item_list, list) and item_list else {}
                         if isinstance(item, dict):
                             video = item.get("video", {}) or {}
@@ -6238,6 +7765,26 @@ class ToolExecutor:
                                     candidate = normalize_text(match.group(1))
                                     if self._is_valid_douyin_video_id(candidate):
                                         return candidate, aweme_id
+                except Exception:
+                    pass
+
+            # 5) 回退：用 PC UA 访问抖音页面提取 video_id
+            if aweme_id:
+                try:
+                    pc_headers = {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Referer": "https://www.douyin.com/",
+                    }
+                    pc_url = f"https://www.douyin.com/video/{aweme_id}"
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(12.0, connect=5.0),
+                        follow_redirects=True,
+                        headers=pc_headers,
+                    ) as pc_client:
+                        pc_resp = await pc_client.get(pc_url)
+                        vid, aweme_id = _extract_video_id_from_text(pc_resp.text, str(pc_resp.url), aweme_id)
+                        if vid:
+                            return vid, aweme_id
                 except Exception:
                     pass
 
@@ -6287,6 +7834,51 @@ class ToolExecutor:
         if not (0 < size <= max_bytes):
             return False
         return self._is_video_container_signature_ok(path)
+
+    def _video_has_audio_stream(self, path: Path) -> bool:
+        """检测视频是否包含音轨。优先 ffprobe，缺失时回退 ffmpeg -i 文本解析。"""
+        target = str(path)
+        ffprobe_bin = ""
+        if self._ffmpeg_probe_dir:
+            probe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
+            probe_path = Path(self._ffmpeg_probe_dir) / probe_name
+            if probe_path.is_file():
+                ffprobe_bin = str(probe_path)
+
+        if ffprobe_bin:
+            try:
+                cmd = [
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "stream=codec_type",
+                    "-of",
+                    "json",
+                    target,
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+                if proc.returncode == 0:
+                    payload = json.loads(proc.stdout or "{}")
+                    streams = payload.get("streams", [])
+                    if isinstance(streams, list):
+                        return any(
+                            isinstance(item, dict)
+                            and normalize_text(str(item.get("codec_type", ""))).lower() == "audio"
+                            for item in streams
+                        )
+            except Exception:
+                pass
+
+        if not self._ffmpeg_bin:
+            return False
+        try:
+            cmd = [self._ffmpeg_bin, "-hide_banner", "-i", target]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
+            text = normalize_text((proc.stderr or "") + "\n" + (proc.stdout or ""))
+            return bool(re.search(r"\bAudio:\s*[A-Za-z0-9_]+", text, flags=re.IGNORECASE))
+        except Exception:
+            return False
 
     @staticmethod
     def _is_video_container_signature_ok(path: Path) -> bool:
@@ -6364,41 +7956,71 @@ class ToolExecutor:
         content = re.sub(r"\n{3,}", "\n\n", content)
         return normalize_text(content)
 
-    @staticmethod
-    def _looks_like_github_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "github",
-            "git hub",
-            "仓库",
-            "repo",
-            "repository",
-            "开源",
-            "源码",
-            "source code",
-        )
-        if any(cue in content for cue in cues):
-            return True
-        return bool(re.search(r"https?://(?:www\.)?github\.com/[^\s]+", content, flags=re.IGNORECASE))
+    def _looks_like_github_request(self, text: str) -> bool:
+        return _shared_github_request(text, config=self._raw_config)
+
+    def _looks_like_repo_readme_request(self, text: str) -> bool:
+        return _shared_repo_readme_request(text, config=self._raw_config)
 
     @staticmethod
-    def _looks_like_repo_readme_request(text: str) -> bool:
+    def _looks_like_download_request_text(text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
         cues = (
-            "readme",
-            "文档",
-            "怎么用",
-            "怎么跑",
-            "学习",
-            "分析",
-            "看下这个仓库",
-            "看这个项目",
+            "下载",
+            "发给我",
+            "发我",
+            "安装包",
+            "启动器",
+            "客户端",
+            "release",
+            "releases",
+            "installer",
+            "setup",
         )
         return any(cue in content for cue in cues)
+
+    def _looks_like_software_download_request(self, text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if not self._looks_like_download_request_text(content):
+            return False
+        # 避免把“下载视频/图片”误判成软件安装包下载。
+        media_cues = ("视频", "图", "图片", "壁纸", "抖音", "快手", "b站", "bilibili")
+        if any(cue in content for cue in media_cues):
+            return False
+        software_cues = (
+            "hmcl",
+            "启动器",
+            "安装包",
+            "客户端",
+            ".exe",
+            ".msi",
+            ".apk",
+            ".jar",
+            ".zip",
+            "windows",
+            "win",
+            "安卓",
+            "android",
+            "官方",
+        )
+        return any(cue in content for cue in software_cues)
+
+    @staticmethod
+    def _guess_download_preferences(raw_query: str, message_text: str, repo_name: str = "") -> tuple[str, str]:
+        merged = normalize_text(f"{raw_query}\n{message_text}\n{repo_name}").lower()
+        if "hmcl" in merged:
+            return ".jar", "HMCL.jar"
+        if any(cue in merged for cue in ("android", "安卓")):
+            return ".apk", ""
+        if any(cue in merged for cue in ("windows", "win", "电脑", "pc")):
+            return ".exe", ""
+        if any(cue in merged for cue in ("mac", "macos")):
+            return ".dmg", ""
+        return "", ""
 
     @staticmethod
     def _extract_github_repo_from_text(text: str) -> str:
@@ -6523,7 +8145,9 @@ class ToolExecutor:
         content = normalize_text(text).lower()
         if not content:
             return False
-        cues = ("发出来", "发给我", "发送", "转发", "播放", "看图", "发图", "发视频")
+        cues = [normalize_text(cue).lower() for cue in _pl.get_list("local_media_request_cues") if normalize_text(cue)]
+        if not cues:
+            return False
         return any(cue in content for cue in cues)
 
     @staticmethod
@@ -6815,25 +8439,56 @@ class ToolExecutor:
         return " ".join(parts).strip()
 
     @staticmethod
+    def _looks_like_vision_web_lookup_request(text: str) -> bool:
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+
+        # 去掉纯指代词，避免把“这个/这张图”误当成联网查询词。
+        stripped = normalize_text(
+            re.sub(
+                r"(分析|识别|看看|看下|看一看|看一下|图片|照片|截图|这张图|这个图|这个|这玩意|这是什么)",
+                " ",
+                content,
+            )
+        )
+        stripped = normalize_text(re.sub(r"\s+", " ", stripped))
+        if len(stripped) < 4:
+            return False
+
+        strong_cues = (
+            "查一下",
+            "搜一下",
+            "联网",
+            "百度",
+            "维基",
+            "百科",
+            "官网",
+            "出处",
+            "原图",
+            "来源",
+            "是什么梗",
+            "这是谁",
+            "哪个动漫",
+            "哪部电影",
+            "哪部剧",
+            "什么品牌",
+            "什么型号",
+        )
+        if any(cue in content for cue in strong_cues):
+            return True
+
+        # 保守兜底：至少包含“身份/来源”类疑问词，且不是只剩一个代词。
+        return bool(re.search(r"(是谁|叫什么|来自哪里|哪来的|出自|来源|资料|背景)", content))
+
+    @staticmethod
     def _looks_like_image_request(text: str) -> bool:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        cues = (
-            "图",
-            "图片",
-            "壁纸",
-            "头像",
-            "插画",
-            "发图",
-            "搜图",
-            "二次元",
-            "pixiv",
-            "image",
-            "picture",
-            "wallpaper",
-            "illustration",
-        )
+        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_request_cues") if normalize_text(cue)]
+        if not cues:
+            return False
         return any(cue in content for cue in cues)
 
     @staticmethod
@@ -6841,52 +8496,32 @@ class ToolExecutor:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        send_cues = (
-            "发出来",
-            "发给我",
-            "发图",
-            "把图发我",
-            "把图片发我",
-            "转发这张图",
-            "这张图发我",
-            "给我这张图",
-        )
+        send_cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_send_cues") if normalize_text(cue)]
+        if not send_cues:
+            return False
         return ToolExecutor._looks_like_image_request(content) and any(cue in content for cue in send_cues)
 
-    @staticmethod
-    def _looks_like_video_send_request(text: str) -> bool:
-        content = ToolExecutor._normalize_multimodal_query(text).lower()
+    def _looks_like_video_send_request(self, text: str) -> bool:
+        content = self._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        send_cues = (
-            "发出来",
-            "发给我",
-            "发视频",
-            "把视频发我",
-            "转发这个视频",
-            "给我这个视频",
-        )
-        return ToolExecutor._looks_like_video_request(content) and any(cue in content for cue in send_cues)
+        send_cues = [
+            normalize_text(cue).lower()
+            for cue in _pl.get_list("local_media_request_cues")
+            if normalize_text(cue)
+        ]
+        if not send_cues:
+            send_cues = ["发送", "发给我", "发视频", "把视频发我", "转发这个视频", "给我这个视频"]
+        return self._looks_like_video_request(content) and any(cue in content for cue in send_cues)
 
     @staticmethod
     def _looks_like_image_analysis_request(text: str) -> bool:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        cues = (
-            "识图",
-            "看图",
-            "分析这图",
-            "分析这张图",
-            "图里是什么",
-            "图片里是什么",
-            "这是什么",
-            "帮我看图",
-            "解释这张图",
-            "描述这张图",
-            "识别文字",
-            "ocr",
-        )
+        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
+        if not cues:
+            return False
         return any(cue in content for cue in cues)
 
     @staticmethod
@@ -6913,61 +8548,47 @@ class ToolExecutor:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        cues = (
-            "点歌", "听歌", "放歌", "搜歌", "播放歌", "来首", "来一首",
-            "唱一首", "唱首", "音乐", "歌曲", "网易云", "qq音乐",
+        cues = _prompt_cues(
+            "music_request_cues",
+            (
+                "点歌", "听歌", "放歌", "搜歌", "播放歌", "来首", "来一首",
+                "唱一首", "唱首", "音乐", "歌曲", "网易云", "qq音乐",
+            ),
         )
         return any(cue in content for cue in cues)
 
-    @staticmethod
-    def _looks_like_video_request(text: str) -> bool:
-        content = ToolExecutor._normalize_multimodal_query(text).lower()
-        if not content:
-            return False
-        cues = (
-            "视频",
-            "影片",
-            "发视频",
-            "找视频",
-            "video",
-            "clip",
-            "mv",
-            ".mp4",
-            ".webm",
-            "抖音",
-            "快手",
-            "b站",
-            "bilibili",
-            "acfun",
-            "a站",
-        )
-        return any(cue in content for cue in cues)
+    def _looks_like_video_request(self, text: str) -> bool:
+        content = self._normalize_multimodal_query(text)
+        return _shared_video_request(content, config=self._raw_config)
 
-    @staticmethod
-    def _looks_like_douyin_search_request(text: str) -> bool:
-        content = ToolExecutor._normalize_multimodal_query(text).lower()
+    def _looks_like_douyin_search_request(self, text: str) -> bool:
+        content = self._normalize_multimodal_query(text).lower()
         if not content:
             return False
         platform_hit = ("抖音" in content) or ("douyin" in content)
         if not platform_hit:
             return False
-        search_cues = ("搜索", "搜", "找", "推荐", "来点", "给我来", "查")
-        return any(cue in content for cue in search_cues) and ToolExecutor._looks_like_video_request(content)
+        search_cues = _prompt_cues("douyin_search_cues", ("搜索", "搜", "找", "推荐", "来点", "给我来", "查"))
+        return any(cue in content for cue in search_cues) and self._looks_like_video_request(content)
 
     @staticmethod
     def _looks_like_video_analysis_request(text: str) -> bool:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        cues = (
-            "分析",
-            "评价",
-            "解读",
-            "讲讲",
-            "讲了什么",
-            "内容是什么",
-            "总结一下",
-            "怎么看",
+        cues = _prompt_cues(
+            "video_analysis_cues",
+            (
+                "解析",
+                "分析",
+                "评价",
+                "解读",
+                "讲讲",
+                "讲了什么",
+                "内容是什么",
+                "总结一下",
+                "怎么看",
+            ),
         )
         return any(cue in content for cue in cues)
 
@@ -6976,21 +8597,22 @@ class ToolExecutor:
         content = normalize_text(text).lower()
         if not content:
             return False
-        avatar_cues = ("头像", "avatar", "profile")
-        qq_cues = ("qq", "q号", "企鹅号", "uin")
+        avatar_cues = _prompt_cues("qq_avatar_request_cues", ("头像", "avatar", "profile"))
+        qq_cues = _prompt_cues("qq_identity_cues", ("qq", "q号", "企鹅号", "uin"))
+        self_avatar_cues = _prompt_cues("self_avatar_cues", ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"))
+        other_avatar_cues = _prompt_cues("other_avatar_cues", ("他的头像", "她的头像"))
         return any(cue in content for cue in avatar_cues) and (
             any(cue in content for cue in qq_cues)
-            or "我的头像" in content
-            or "我头像" in content
-            or "他的头像" in content
-            or "她的头像" in content
+            or any(cue in content for cue in self_avatar_cues)
+            or any(cue in content for cue in other_avatar_cues)
             or bool(re.search(r"[\u4e00-\u9fffa-z0-9_.-]{2,20}的头像", content))
         )
 
     @staticmethod
     def _contains_self_avatar_cue(text: str) -> bool:
         content = normalize_text(text)
-        return any(cue in content for cue in ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"))
+        cues = _prompt_cues("self_avatar_cues", ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"), lowercase=False)
+        return any(cue in content for cue in cues)
 
     @staticmethod
     def _extract_qq_number(text: str) -> str:

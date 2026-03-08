@@ -16,6 +16,7 @@ from typing import Any
 
 import yaml
 
+from core.config_templates import deep_merge_dict, load_config_template
 from core.crypto import SecretManager
 
 _log = logging.getLogger("yukiko.config")
@@ -54,6 +55,10 @@ class ConfigManager:
         """加载 config.yml 并处理环境变量 + 解密。"""
         with self._lock:
             raw = self._load_yaml(self._config_file)
+            template = load_config_template()
+            if isinstance(template, dict) and template:
+                merged = deep_merge_dict(dict(template), raw if isinstance(raw, dict) else {})
+                raw = merged
             resolved = self._resolve_env_vars(raw)
             self._data = self._secret.decrypt_dict(resolved)  # type: ignore[assignment]
             _log.info("配置已加载: %s", self._config_file)

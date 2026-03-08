@@ -24,6 +24,23 @@ from typing import Any
 _log = logging.getLogger("yukiko.cookie_auth")
 
 
+def _local_httpx_client(**kwargs: Any) -> "httpx.Client":
+    """创建不走系统代理的 httpx Client，用于 CDP 本地回环请求。"""
+    import httpx as _httpx
+    kwargs.setdefault("proxy", None)
+    return _httpx.Client(**kwargs)
+
+
+def _safe_input(prompt: str) -> str:
+    """确保 prompt 先刷新再读取，兼容 PyCharm / 非 TTY。"""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    try:
+        return input().strip()
+    except EOFError:
+        return ""
+
+
 def _print_compact_qr(data: str) -> None:
     """用 Unicode 半块字符渲染紧凑二维码（高度减半）。
 
@@ -190,6 +207,156 @@ _BROWSER_USER_DATA: dict[str, str] = {
 }
 
 _CHROMIUM_BROWSERS = {"chrome", "edge", "brave", "opera", "chromium"}
+_ROOKIEPY_PREFETCH_DOMAINS = [
+    ".bilibili.com",
+    ".douyin.com",
+    ".kuaishou.com",
+    ".qq.com",
+    ".qzone.qq.com",
+]
+_ROOKIEPY_ELEVATED_CACHE: dict[str, dict[str, dict[str, str]]] = {}
+_ROOKIEPY_ELEVATED_SKIP_UNTIL: dict[str, float] = {}
+
+
+def _is_windows_admin() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _ps_single_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _extract_via_rookiepy_elevated_prefetch(
+    browser: str,
+    domains: list[str],
+) -> dict[str, dict[str, str]]:
+    """通过管理员提权进程调用 rookiepy，一次性提取多个域名（不关闭浏览器）。"""
+    if os.name != "nt":
+        return {}
+    if _is_windows_admin():
+        return {}
+
+    now = time.time()
+    skip_until = float(_ROOKIEPY_ELEVATED_SKIP_UNTIL.get(browser, 0.0) or 0.0)
+    cache = _ROOKIEPY_ELEVATED_CACHE.setdefault(browser, {})
+    need = [d for d in domains if d not in cache]
+    if now < skip_until and need:
+        return {d: dict(cache.get(d, {})) for d in domains}
+    if not need:
+        return {d: dict(cache.get(d, {})) for d in domains}
+
+    print("  检测到 AppBound 限制，尝试请求管理员权限读取 Cookie（不会关闭浏览器）...")
+    python_exe = sys.executable or "python"
+    helper_code = (
+        "import json,os,sys\n"
+        "sys.stderr=open(os.devnull,'w',encoding='utf-8',errors='ignore')\n"
+        "sys.stdout=open(os.devnull,'w',encoding='utf-8',errors='ignore')\n"
+        "out=sys.argv[1]\n"
+        "browser=sys.argv[2]\n"
+        "domains_path=sys.argv[3]\n"
+        "res={'ok':False,'data':{},'error':''}\n"
+        "try:\n"
+        "  import rookiepy\n"
+        "  fn=getattr(rookiepy,browser,None)\n"
+        "  if not fn:\n"
+        "    raise RuntimeError(f'browser_not_supported:{browser}')\n"
+        "  domains=json.load(open(domains_path,'r',encoding='utf-8'))\n"
+        "  data={}\n"
+        "  for domain in domains:\n"
+        "    clean=str(domain).lstrip('.').lower()\n"
+        "    cookies={}\n"
+        "    try:\n"
+        "      raw=fn([domain])\n"
+        "    except Exception:\n"
+        "      raw=[]\n"
+        "    if not raw and str(domain).startswith('.'):\n"
+        "      try:\n"
+        "        raw=fn([str(domain).lstrip('.')])\n"
+        "      except Exception:\n"
+        "        raw=[]\n"
+        "    for c in raw:\n"
+        "      name=str(c.get('name',''))\n"
+        "      value=str(c.get('value',''))\n"
+        "      cdom=str(c.get('domain','')).lstrip('.').lower()\n"
+        "      if not name:\n"
+        "        continue\n"
+        "      if clean and not (clean in cdom or cdom in clean):\n"
+        "        continue\n"
+        "      cookies[name]=value\n"
+        "    data[str(domain)] = cookies\n"
+        "  res={'ok':True,'data':data,'error':''}\n"
+        "except Exception as exc:\n"
+        "  res={'ok':False,'data':{},'error':f'{type(exc).__name__}:{exc}'}\n"
+        "json.dump(res,open(out,'w',encoding='utf-8'),ensure_ascii=False)\n"
+    )
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="yukiko_rookiepy_uac_") as td:
+            tmp_root = Path(td)
+            helper_path = tmp_root / "rookiepy_uac_helper.py"
+            out_path = tmp_root / "result.json"
+            domains_path = tmp_root / "domains.json"
+            helper_path.write_text(helper_code, encoding="utf-8")
+            domains_path.write_text(json.dumps(need, ensure_ascii=False), encoding="utf-8")
+
+            arg_values = [
+                str(helper_path),
+                str(out_path),
+                browser,
+                str(domains_path),
+            ]
+            args_expr = ", ".join(_ps_single_quote(v) for v in arg_values)
+            ps_cmd = (
+                f"$p = Start-Process -FilePath {_ps_single_quote(python_exe)} "
+                f"-ArgumentList @({args_expr}) -Verb RunAs -WindowStyle Hidden -PassThru; "
+                "$p.WaitForExit(); exit $p.ExitCode"
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+
+            if proc.returncode != 0:
+                _log.debug("rookiepy elevated process exit=%s stderr=%s", proc.returncode, proc.stderr)
+                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 60.0
+                return {d: dict(cache.get(d, {})) for d in domains}
+            if not out_path.exists():
+                _log.debug("rookiepy elevated result missing")
+                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 30.0
+                return {d: dict(cache.get(d, {})) for d in domains}
+
+            payload = json.loads(out_path.read_text(encoding="utf-8"))
+            if not bool(payload.get("ok")):
+                _log.debug("rookiepy elevated failed: %s", payload.get("error", "unknown"))
+                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 60.0
+                return {d: dict(cache.get(d, {})) for d in domains}
+
+            raw_data = payload.get("data", {})
+            if isinstance(raw_data, dict):
+                for d in need:
+                    row = raw_data.get(d, {})
+                    if isinstance(row, dict):
+                        cache[d] = {
+                            str(k): str(v)
+                            for k, v in row.items()
+                            if str(k)
+                        }
+                    else:
+                        cache[d] = {}
+            return {d: dict(cache.get(d, {})) for d in domains}
+    except Exception as exc:
+        _log.debug("rookiepy elevated exception: %s", exc)
+        _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 60.0
+        return {d: dict(cache.get(d, {})) for d in domains}
 
 
 def _find_browser_exe(browser: str) -> str | None:
@@ -201,6 +368,38 @@ def _find_browser_exe(browser: str) -> str | None:
     names = {"chrome": "chrome", "edge": "msedge", "brave": "brave"}
     found = shutil.which(names.get(browser, browser))
     return found
+
+
+def _list_chromium_profiles(user_data: str) -> list[str]:
+    """列出 Chromium 的可用 profile，优先返回最近使用的 profile。"""
+    root = Path(user_data)
+    if not root.exists():
+        return ["Default"]
+
+    profiles: list[str] = []
+    if (root / "Default").exists():
+        profiles.append("Default")
+    for child in sorted(root.glob("Profile *")):
+        if child.is_dir():
+            profiles.append(child.name)
+
+    # 优先使用 Local State 记录的 last_used profile
+    last_used = ""
+    try:
+        local_state_path = root / "Local State"
+        if local_state_path.exists():
+            payload = json.loads(local_state_path.read_text(encoding="utf-8"))
+            last_used = str(
+                ((payload.get("profile") or {}) if isinstance(payload, dict) else {}).get("last_used", "")
+                or ""
+            ).strip()
+    except Exception:
+        last_used = ""
+
+    if last_used and last_used in profiles:
+        profiles = [last_used] + [p for p in profiles if p != last_used]
+
+    return profiles or ["Default"]
 
 
 def _is_port_free(port: int) -> bool:
@@ -225,6 +424,7 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
     if not user_data or not os.path.isdir(user_data):
         _log.debug("CDP: 未找到 %s User Data 目录", browser)
         return {}
+    profile_candidates = _list_chromium_profiles(user_data)
 
     # ── 策略 1：尝试连接已运行浏览器的 debug 端口 ──
     # 扫描常见 debug 端口（用户可能已带 --remote-debugging-port 启动）
@@ -236,25 +436,24 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
 
     # ── 策略 2：复制 cookie 文件到临时目录，用新 profile 解密 ──
     # 这种方式不需要关闭浏览器！
-    cookies = _extract_via_temp_profile(exe, user_data, domain)
-    if cookies:
-        _log.debug("CDP: 通过临时 profile 复制提取成功")
-        return cookies
+    for profile_dir in profile_candidates:
+        cookies = _extract_via_temp_profile(exe, user_data, domain, profile_dir=profile_dir)
+        if cookies:
+            _log.debug("CDP: 通过临时 profile 提取成功 | profile=%s", profile_dir)
+            return cookies
 
     # ── 策略 3：关闭浏览器后用原 profile（最后手段）──
     if not _is_browser_running(browser):
         # 浏览器没在运行，直接用原 profile
-        return _extract_via_cdp_original_profile(exe, user_data, domain)
+        for profile_dir in profile_candidates:
+            cookies = _extract_via_cdp_original_profile(exe, user_data, domain, profile_dir=profile_dir)
+            if cookies:
+                _log.debug("CDP: 原始 profile 提取成功 | profile=%s", profile_dir)
+                return cookies
+        return {}
 
     if not auto_close:
-        total, foreground = _get_browser_process_state(browser)
-        if foreground <= 0:
-            print(
-                f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 后台进程占用配置目录，"
-                "请允许自动关闭后重试。"
-            )
-        else:
-            print(f"  {_BROWSER_DISPLAY.get(browser, browser)} 正在运行，请先关闭浏览器再试。")
+        _log.debug("CDP 策略 1&2 失败，浏览器运行中，需 auto_close 才能继续")
         return {}
 
     total, foreground = _get_browser_process_state(browser)
@@ -273,22 +472,28 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
         print(f"  {_BROWSER_DISPLAY.get(browser, browser)} 仍在运行，请手动关闭后重试。")
         return {}
 
-    return _extract_via_cdp_original_profile(exe, user_data, domain)
+    for profile_dir in profile_candidates:
+        cookies = _extract_via_cdp_original_profile(exe, user_data, domain, profile_dir=profile_dir)
+        if cookies:
+            _log.debug("CDP: 关闭后原始 profile 提取成功 | profile=%s", profile_dir)
+            return cookies
+    return {}
 
 
 def _try_connect_existing_debug_port(port: int, domain: str) -> dict[str, str]:
     """尝试连接已运行浏览器的 debug 端口获取 cookie。"""
-    import httpx as _httpx
     try:
-        resp = _httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1.5)
-        if resp.status_code != 200:
-            return {}
+        with _local_httpx_client(timeout=1.5) as client:
+            resp = client.get(f"http://127.0.0.1:{port}/json/version")
+            if resp.status_code != 200:
+                return {}
     except Exception:
         return {}
 
     try:
-        resp = _httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=2)
-        targets = resp.json()
+        with _local_httpx_client(timeout=2) as client:
+            resp = client.get(f"http://127.0.0.1:{port}/json/list")
+            targets = resp.json()
         if not targets:
             return {}
         ws_url = targets[0].get("webSocketDebuggerUrl", "")
@@ -299,7 +504,12 @@ def _try_connect_existing_debug_port(port: int, domain: str) -> dict[str, str]:
         return {}
 
 
-def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str, str]:
+def _extract_via_temp_profile(
+    exe: str,
+    user_data: str,
+    domain: str,
+    profile_dir: str = "Default",
+) -> dict[str, str]:
     """复制 cookie 数据库到临时目录，启动 headless 浏览器解密。
 
     关键：使用临时 user-data-dir，不与正在运行的浏览器冲突。
@@ -311,12 +521,15 @@ def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str
         tmp_dir = tempfile.mkdtemp(prefix="yukiko_cookie_")
         _copy_cookie_profile(user_data, tmp_dir)
 
-        # 检查 cookie 文件是否存在
-        cookie_exists = False
-        for profile in ("Default", "Profile 1"):
-            if (Path(tmp_dir) / profile / "Cookies").exists():
-                cookie_exists = True
-                break
+        # 检查 cookie 文件是否存在（Chromium 新版通常在 Network/Cookies）
+        tmp_root = Path(tmp_dir)
+        cookie_exists = any(
+            p.exists()
+            for p in (
+                *tmp_root.glob("*/Network/Cookies"),
+                *tmp_root.glob("*/Cookies"),
+            )
+        )
         if not cookie_exists:
             _log.debug("临时 profile 中无 Cookies 文件")
             return {}
@@ -332,6 +545,7 @@ def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str
             exe,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={tmp_dir}",
+            f"--profile-directory={profile_dir}",
             "--no-first-run",
             "--headless=new",
             "--disable-gpu",
@@ -348,12 +562,12 @@ def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str
         )
 
         # 等待 CDP 就绪
-        import httpx as _httpx
         ready = False
         for _ in range(40):
             time.sleep(0.2)
             try:
-                resp = _httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+                with _local_httpx_client(timeout=1) as client:
+                    resp = client.get(f"http://127.0.0.1:{port}/json/version")
                 if resp.status_code == 200:
                     ready = True
                     break
@@ -361,10 +575,11 @@ def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str
                 continue
 
         if not ready:
-            _log.debug("临时 profile headless 启动超时")
+            _log.debug("临时 profile headless 启动超时 | profile=%s", profile_dir)
             return {}
 
-        resp = _httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=3)
+        with _local_httpx_client(timeout=3) as client:
+            resp = client.get(f"http://127.0.0.1:{port}/json/list")
         targets = resp.json()
         if not targets:
             return {}
@@ -375,7 +590,7 @@ def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str
         return _cdp_get_cookies(ws_url, domain)
 
     except Exception as exc:
-        _log.debug("临时 profile 提取失败: %s", exc)
+        _log.debug("临时 profile 提取失败 | profile=%s | %s", profile_dir, exc)
         return {}
     finally:
         if proc:
@@ -394,7 +609,12 @@ def _extract_via_temp_profile(exe: str, user_data: str, domain: str) -> dict[str
                 pass
 
 
-def _extract_via_cdp_original_profile(exe: str, user_data: str, domain: str) -> dict[str, str]:
+def _extract_via_cdp_original_profile(
+    exe: str,
+    user_data: str,
+    domain: str,
+    profile_dir: str = "Default",
+) -> dict[str, str]:
     """用原始 profile 启动 headless 浏览器提取 cookie（需浏览器未运行）。"""
     port = 19222
     while not _is_port_free(port) and port < 19300:
@@ -408,6 +628,7 @@ def _extract_via_cdp_original_profile(exe: str, user_data: str, domain: str) -> 
             exe,
             f"--remote-debugging-port={port}",
             f"--user-data-dir={user_data}",
+            f"--profile-directory={profile_dir}",
             "--no-first-run",
             "--headless=new",
             "--disable-gpu",
@@ -419,12 +640,12 @@ def _extract_via_cdp_original_profile(exe: str, user_data: str, domain: str) -> 
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
 
-        import httpx as _httpx
         ready = False
         for _ in range(40):
             time.sleep(0.2)
             try:
-                resp = _httpx.get(f"http://127.0.0.1:{port}/json/version", timeout=1)
+                with _local_httpx_client(timeout=1) as client:
+                    resp = client.get(f"http://127.0.0.1:{port}/json/version")
                 if resp.status_code == 200:
                     ready = True
                     break
@@ -434,7 +655,8 @@ def _extract_via_cdp_original_profile(exe: str, user_data: str, domain: str) -> 
         if not ready:
             return {}
 
-        resp = _httpx.get(f"http://127.0.0.1:{port}/json/list", timeout=3)
+        with _local_httpx_client(timeout=3) as client:
+            resp = client.get(f"http://127.0.0.1:{port}/json/list")
         targets = resp.json()
         if not targets:
             return {}
@@ -445,7 +667,7 @@ def _extract_via_cdp_original_profile(exe: str, user_data: str, domain: str) -> 
         return _cdp_get_cookies(ws_url, domain)
 
     except Exception as exc:
-        _log.debug("CDP 原始 profile 提取失败: %s", exc)
+        _log.debug("CDP 原始 profile 提取失败 | profile=%s | %s", profile_dir, exc)
         return {}
     finally:
         if proc:
@@ -580,7 +802,7 @@ def is_browser_running(browser: str) -> bool:
 
 def _copy_cookie_profile(src_data_dir: str, dst_dir: str) -> None:
     """复制浏览器 profile 中的 cookie 相关文件到临时目录。"""
-    # 只复制 Default profile 的 Cookies 和 Local State（解密需要）
+    # 复制 Local State + 常见 profile 的 Cookies（含 Network/Cookies）
     src = Path(src_data_dir)
     dst = Path(dst_dir)
 
@@ -589,48 +811,139 @@ def _copy_cookie_profile(src_data_dir: str, dst_dir: str) -> None:
     if local_state.exists():
         shutil.copy2(local_state, dst / "Local State")
 
-    # Default profile 的 Cookies
-    for profile in ("Default", "Profile 1"):
+    profile_names: list[str] = []
+    if (src / "Default").exists():
+        profile_names.append("Default")
+    for child in sorted(src.glob("Profile *")):
+        if child.is_dir():
+            profile_names.append(child.name)
+    if not profile_names:
+        profile_names = ["Default", "Profile 1"]
+
+    for profile in profile_names:
         src_profile = src / profile
         if not src_profile.exists():
             continue
         dst_profile = dst / profile
         dst_profile.mkdir(parents=True, exist_ok=True)
-        for fname in ("Cookies", "Cookies-journal", "Preferences", "Secure Preferences"):
+
+        for fname in ("Preferences", "Secure Preferences"):
             src_file = src_profile / fname
             if src_file.exists():
                 try:
                     shutil.copy2(src_file, dst_profile / fname)
                 except Exception:
                     pass
-        break  # 只复制第一个找到的 profile
+
+        # Chromium 老版本可能在 profile 根目录；新版本常在 profile/Network 目录。
+        cookie_candidates = [
+            (src_profile / "Cookies", dst_profile / "Cookies"),
+            (src_profile / "Cookies-journal", dst_profile / "Cookies-journal"),
+            (src_profile / "Cookies-wal", dst_profile / "Cookies-wal"),
+            (src_profile / "Cookies-shm", dst_profile / "Cookies-shm"),
+            (src_profile / "Network" / "Cookies", dst_profile / "Network" / "Cookies"),
+            (src_profile / "Network" / "Cookies-journal", dst_profile / "Network" / "Cookies-journal"),
+            (src_profile / "Network" / "Cookies-wal", dst_profile / "Network" / "Cookies-wal"),
+            (src_profile / "Network" / "Cookies-shm", dst_profile / "Network" / "Cookies-shm"),
+        ]
+        for src_file, dst_file in cookie_candidates:
+            if not src_file.exists():
+                continue
+            try:
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src_file, dst_file)
+            except Exception:
+                pass
+
+
+def _cdp_send_and_recv(ws: Any, msg_id: int, method: str, params: dict | None = None, timeout: float = 5.0) -> dict:
+    """CDP 发送命令并等待对应 id 的响应。"""
+    payload: dict[str, Any] = {"id": msg_id, "method": method}
+    if params:
+        payload["params"] = params
+    ws.send(json.dumps(payload))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            raw = ws.recv(timeout=1)
+        except TimeoutError:
+            continue
+        result = json.loads(raw)
+        if result.get("id") == msg_id:
+            return result.get("result", {})
+    return {}
+
+
+# QZone 域名 → 导航 URL 映射，用于 CDP 先导航再取 cookie
+_DOMAIN_NAV_URLS: dict[str, list[str]] = {
+    "qq.com": ["https://user.qzone.qq.com", "https://i.qq.com"],
+    "qzone.qq.com": ["https://user.qzone.qq.com"],
+    "i.qq.com": ["https://i.qq.com"],
+}
 
 
 def _cdp_get_cookies(ws_url: str, domain: str) -> dict[str, str]:
-    """通过 CDP WebSocket 获取指定域名的 cookie。"""
+    """通过 CDP WebSocket 获取指定域名的 cookie。
+
+    策略:
+      1. 先尝试 Network.getAllCookies（快速路径）
+      2. 如果目标域名是 QZone 相关且结果不足，导航到目标页面后重试
+      3. 用 Network.getCookies + 具体 URL 作为补充
+    """
     import websockets.sync.client as ws_client
 
     cookies: dict[str, str] = {}
-    msg_id = 1
+    msg_id = 0
     clean_domain = domain.lstrip(".")
-    try:
-        with ws_client.connect(ws_url, close_timeout=3) as ws:
-            # 直接用 Network.getAllCookies 获取所有 cookie（不需要先导航）
-            ws.send(json.dumps({
-                "id": msg_id,
-                "method": "Network.getAllCookies",
-            }))
 
-            for _ in range(10):
-                raw = ws.recv(timeout=5)
-                result = json.loads(raw)
-                if result.get("id") == msg_id:
-                    all_cookies = result.get("result", {}).get("cookies", [])
-                    for c in all_cookies:
-                        c_domain = c.get("domain", "").lstrip(".")
-                        if clean_domain in c_domain or c_domain in clean_domain:
-                            cookies[c["name"]] = c["value"]
-                    break
+    def _collect(cookie_list: list[dict]) -> None:
+        for c in cookie_list:
+            c_domain = c.get("domain", "").lstrip(".")
+            if clean_domain in c_domain or c_domain in clean_domain:
+                name = c.get("name", "")
+                if name:
+                    cookies[name] = c.get("value", "")
+
+    try:
+        with ws_client.connect(ws_url, close_timeout=5) as ws:
+            # ── 快速路径: Network.getAllCookies ──
+            msg_id += 1
+            result = _cdp_send_and_recv(ws, msg_id, "Network.getAllCookies")
+            _collect(result.get("cookies", []))
+
+            # 对 QZone 相关域名，如果快速路径没拿到关键 cookie，导航后重试
+            is_qzone = _is_qzone_related_domain(domain)
+            if is_qzone and not _has_qzone_signal(cookies):
+                nav_urls = _DOMAIN_NAV_URLS.get(clean_domain, [])
+                for nav_url in nav_urls:
+                    # 启用 Page 域
+                    msg_id += 1
+                    _cdp_send_and_recv(ws, msg_id, "Page.enable", timeout=2)
+                    # 导航到目标页面
+                    msg_id += 1
+                    _cdp_send_and_recv(ws, msg_id, "Page.navigate", {"url": nav_url}, timeout=8)
+                    # 等待页面加载（cookie 设置需要时间）
+                    time.sleep(2.0)
+                    # 重新获取 cookie
+                    msg_id += 1
+                    result = _cdp_send_and_recv(ws, msg_id, "Network.getAllCookies")
+                    _collect(result.get("cookies", []))
+                    if _has_qzone_signal(cookies):
+                        break
+
+                # 补充: 用 Network.getCookies + 具体 URL
+                if not _has_qzone_signal(cookies):
+                    all_urls = []
+                    for urls in _DOMAIN_NAV_URLS.values():
+                        all_urls.extend(urls)
+                    msg_id += 1
+                    result = _cdp_send_and_recv(
+                        ws, msg_id, "Network.getCookies",
+                        {"urls": list(dict.fromkeys(all_urls))},
+                        timeout=5,
+                    )
+                    _collect(result.get("cookies", []))
+
     except ImportError:
         _log.debug("CDP: websockets 库未安装")
     except Exception as exc:
@@ -641,6 +954,10 @@ def _cdp_get_cookies(ws_url: str, domain: str) -> dict[str, str]:
 
 def _extract_via_rookiepy(browser: str, domain: str) -> dict[str, str]:
     """通过 rookiepy 提取 cookie（需管理员权限，支持 Chrome v130+）。"""
+    cached = _ROOKIEPY_ELEVATED_CACHE.get(browser, {}).get(domain, {})
+    if cached:
+        return dict(cached)
+
     try:
         import rookiepy
     except ImportError:
@@ -650,12 +967,146 @@ def _extract_via_rookiepy(browser: str, domain: str) -> dict[str, str]:
     if not fn:
         return {}
 
+    domain_candidates = [domain]
+    stripped = domain.lstrip(".")
+    if stripped and stripped != domain:
+        domain_candidates.append(stripped)
+
     try:
-        raw = fn([domain])
+        raw = fn(domain_candidates)
+        if not raw and len(domain_candidates) > 1:
+            # 部分环境对前导点域名不兼容，回退重试无前导点写法
+            raw = fn([stripped])
         return {c["name"]: c["value"] for c in raw if c.get("name")}
     except Exception as exc:
+        msg = str(exc)
+        lower = msg.lower()
+        if "appbound encryption" in lower or "running as admin" in lower:
+            print(
+                "  提示: Chromium v130+ Cookie 解密可能需要管理员权限。"
+                "请以管理员身份运行，或关闭浏览器后重试。"
+            )
+            domains = list(dict.fromkeys([domain, *_ROOKIEPY_PREFETCH_DOMAINS]))
+            elevated = _extract_via_rookiepy_elevated_prefetch(browser, domains).get(domain, {})
+            if elevated:
+                _log.debug(
+                    "rookiepy elevated 提取成功: %s %s | cookies=%d",
+                    browser,
+                    domain,
+                    len(elevated),
+                )
+                return elevated
         _log.debug("rookiepy %s 失败: %s", browser, exc)
         return {}
+
+
+def _extract_via_sqlite_direct(browser: str, domain: str) -> dict[str, str]:
+    """直接读取 Chromium SQLite cookie 数据库（无需关闭浏览器）。
+
+    策略:
+      1. 复制 Cookies 数据库到临时文件（避免锁冲突）
+      2. 读取 SQLite 数据库中的加密 cookie
+      3. 用 DPAPI 解密（Windows）或 keyring（Linux/Mac）
+      4. 仅适用于 Chrome < v130（v130+ 需要 App-Bound Encryption）
+    """
+    if os.name != "nt":
+        return {}  # 目前仅支持 Windows DPAPI
+
+    user_data = _BROWSER_USER_DATA.get(browser, "")
+    if not user_data or not os.path.isdir(user_data):
+        return {}
+
+    try:
+        import sqlite3
+        import win32crypt  # pywin32
+    except ImportError:
+        return {}
+
+    # 读取 Local State 获取加密密钥
+    local_state_path = Path(user_data) / "Local State"
+    if not local_state_path.exists():
+        return {}
+
+    try:
+        with open(local_state_path, "r", encoding="utf-8") as f:
+            local_state = json.load(f)
+        encrypted_key_b64 = local_state.get("os_crypt", {}).get("encrypted_key", "")
+        if not encrypted_key_b64:
+            return {}
+        import base64
+        encrypted_key = base64.b64decode(encrypted_key_b64)
+        # 去掉 DPAPI 前缀 "DPAPI"
+        if encrypted_key[:5] == b"DPAPI":
+            encrypted_key = encrypted_key[5:]
+        # DPAPI 解密密钥
+        key = win32crypt.CryptUnprotectData(encrypted_key, None, None, None, 0)[1]
+    except Exception as exc:
+        _log.debug("SQLite: 无法读取加密密钥: %s", exc)
+        return {}
+
+    # 查找 Cookies 数据库（优先 Network/Cookies，回退到根目录 Cookies）
+    cookie_db_paths = []
+    for profile in ["Default", "Profile 1", "Profile 2"]:
+        profile_path = Path(user_data) / profile
+        if not profile_path.exists():
+            continue
+        cookie_db_paths.append(profile_path / "Network" / "Cookies")
+        cookie_db_paths.append(profile_path / "Cookies")
+
+    cookies: dict[str, str] = {}
+    clean_domain = domain.lstrip(".").lower()
+
+    for cookie_db in cookie_db_paths:
+        if not cookie_db.exists():
+            continue
+
+        # 复制到临时文件避免锁冲突
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+                tmp_path = tmp.name
+            shutil.copy2(cookie_db, tmp_path)
+        except Exception:
+            continue
+
+        try:
+            conn = sqlite3.connect(tmp_path, timeout=5)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT host_key, name, encrypted_value FROM cookies WHERE host_key LIKE ?",
+                (f"%{clean_domain}%",)
+            )
+            rows = cursor.fetchall()
+            conn.close()
+
+            for host_key, name, encrypted_value in rows:
+                if not name or not encrypted_value:
+                    continue
+                try:
+                    # Chrome v80+ 使用 AES-GCM 加密，前缀 "v10" 或 "v11"
+                    if encrypted_value[:3] == b"v10" or encrypted_value[:3] == b"v11":
+                        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                        nonce = encrypted_value[3:15]
+                        ciphertext = encrypted_value[15:]
+                        aesgcm = AESGCM(key)
+                        decrypted = aesgcm.decrypt(nonce, ciphertext, None)
+                        value = decrypted.decode("utf-8", errors="ignore")
+                    else:
+                        # 老版本 DPAPI 加密
+                        decrypted = win32crypt.CryptUnprotectData(encrypted_value, None, None, None, 0)[1]
+                        value = decrypted.decode("utf-8", errors="ignore")
+                    if value:
+                        cookies[name] = value
+                except Exception:
+                    continue
+        except Exception as exc:
+            _log.debug("SQLite: 读取 %s 失败: %s", cookie_db, exc)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except Exception:
+                pass
+
+    return cookies
 
 
 def _extract_via_browser_cookie3(browser: str, domain: str) -> dict[str, str]:
@@ -671,14 +1122,45 @@ def _extract_via_browser_cookie3(browser: str, domain: str) -> dict[str, str]:
 
     try:
         cj = fn(domain_name=domain)
-        return {c.name: c.value for c in cj if c.domain.endswith(domain)}
+        target = domain.lstrip(".").lower()
+        cookies: dict[str, str] = {}
+        for c in cj:
+            c_domain = str(c.domain or "").lstrip(".").lower()
+            if not c_domain:
+                continue
+            if c_domain == target or c_domain.endswith(f".{target}") or target.endswith(f".{c_domain}"):
+                cookies[c.name] = c.value
+        return cookies
     except Exception as exc:
         _log.debug("browser_cookie3 %s 失败: %s", browser, exc)
         return {}
 
 
-def extract_browser_cookies(browser: str, domain: str, auto_close: bool = False) -> dict[str, str]:
-    """从指定浏览器提取指定域名的 cookie。
+_QZONE_RELATED_DOMAINS = {"qq.com", "qzone.qq.com", "i.qq.com"}
+_QZONE_SIGNAL_KEYS = {"p_skey", "skey", "media_p_skey", "p_uin", "uin", "media_p_uin", "pt2gguin"}
+
+
+def _is_qzone_related_domain(domain: str) -> bool:
+    clean = str(domain or "").strip().lstrip(".").lower()
+    return clean in _QZONE_RELATED_DOMAINS
+
+
+def _has_qzone_signal(cookies: dict[str, str]) -> bool:
+    if not cookies:
+        return False
+    for key in _QZONE_SIGNAL_KEYS:
+        value = str(cookies.get(key, "") or "").strip()
+        if value:
+            return True
+    return False
+
+
+def extract_browser_cookies_with_source(
+    browser: str,
+    domain: str,
+    auto_close: bool = False,
+) -> tuple[dict[str, str], str]:
+    """从指定浏览器提取指定域名 cookie，并返回命中来源。
 
     策略优先级:
       1. rookiepy（需管理员，支持 Chrome v130+）
@@ -686,29 +1168,347 @@ def extract_browser_cookies(browser: str, domain: str, auto_close: bool = False)
          a. 连接已有 debug 端口（无需关闭浏览器）
          b. 复制 cookie 到临时 profile 解密（无需关闭浏览器）
          c. 关闭浏览器后用原 profile（最后手段）
+      2.5. SQLite 直接读取 + DPAPI 解密（Chromium 系，无需关闭浏览器）
       3. browser_cookie3（仅 Firefox 可靠）
+
+    QZone 特殊处理:
+      - CDP 会先导航到 user.qzone.qq.com 触发 cookie 加载
+      - 使用 Network.getCookies + 具体 URL 补充提取
+      - 检查关键 cookie (p_skey/skey) 是否存在
     """
+    qzone_related = _is_qzone_related_domain(domain)
+    partial_candidates: list[tuple[str, dict[str, str]]] = []
+
     # 策略 1: rookiepy
     cookies = _extract_via_rookiepy(browser, domain)
     if cookies:
-        _log.debug("rookiepy 提取成功: %s %s", browser, domain)
-        return cookies
+        if not qzone_related or _has_qzone_signal(cookies):
+            _log.debug("rookiepy 提取成功: %s %s", browser, domain)
+            return cookies, "rookiepy"
+        # QZone 场景下，若 rookiepy 只有无用残片，继续回退 CDP。
+        partial_candidates.append(("rookiepy", cookies))
+        _log.debug("rookiepy 提取到 qzone 残片，继续回退: %s %s", browser, domain)
 
     # 策略 2: CDP（Chrome/Edge/Brave）— 优先不关闭浏览器
     if browser in ("chrome", "edge", "brave"):
         print(f"  正在从 {_BROWSER_DISPLAY.get(browser, browser)} 提取 Cookie...")
         cookies = _extract_via_cdp(browser, domain, auto_close=auto_close)
         if cookies:
-            _log.debug("CDP 提取成功: %s %s", browser, domain)
-            return cookies
+            if not qzone_related or _has_qzone_signal(cookies):
+                _log.debug("CDP 提取成功: %s %s", browser, domain)
+                return cookies, "cdp"
+            partial_candidates.append(("cdp", cookies))
+            _log.debug("CDP 提取到 qzone 残片: %s %s", browser, domain)
+
+    # 策略 2.5: 直接读取 SQLite cookie 数据库（Chromium 系浏览器，无需关闭）
+    if browser in ("chrome", "edge", "brave"):
+        cookies = _extract_via_sqlite_direct(browser, domain)
+        if cookies:
+            if not qzone_related or _has_qzone_signal(cookies):
+                _log.debug("SQLite 直接提取成功: %s %s", browser, domain)
+                return cookies, "sqlite_direct"
+            partial_candidates.append(("sqlite_direct", cookies))
+            _log.debug("SQLite 提取到 qzone 残片: %s %s", browser, domain)
 
     # 策略 3: browser_cookie3（Firefox 回退）
     cookies = _extract_via_browser_cookie3(browser, domain)
     if cookies:
-        _log.debug("browser_cookie3 提取成功: %s %s", browser, domain)
-        return cookies
+        if not qzone_related or _has_qzone_signal(cookies):
+            _log.debug("browser_cookie3 提取成功: %s %s", browser, domain)
+            return cookies, "browser_cookie3"
+        partial_candidates.append(("browser_cookie3", cookies))
 
-    return {}
+    # QZone 场景回退：都不达标时，返回 cookie 最多的一份，方便前端展示诊断信息。
+    if partial_candidates:
+        best_source, best = max(partial_candidates, key=lambda item: len(item[1] or {}))
+        return best, f"{best_source}_partial"
+
+    return {}, "none"
+
+
+def extract_browser_cookies(browser: str, domain: str, auto_close: bool = False) -> dict[str, str]:
+    """从指定浏览器提取指定域名的 cookie。"""
+    cookies, _ = extract_browser_cookies_with_source(
+        browser=browser,
+        domain=domain,
+        auto_close=auto_close,
+    )
+    return cookies
+
+
+def smart_extract_all_cookies_no_restart(
+    browser: str = "edge",
+    domains: list[str] | None = None,
+    *,
+    include_meta: bool = False,
+) -> Any:
+    """无重启提取所有平台 Cookie（默认策略）。
+
+    说明:
+      - 不会关闭/重开浏览器。
+      - 每个域独立提取，优先 rookiepy/CDP，必要时 browser_cookie3 回退。
+    """
+    if domains is None:
+        domains = [".bilibili.com", ".douyin.com", ".kuaishou.com", ".qq.com", ".qzone.qq.com"]
+
+    result: dict[str, dict[str, str]] = {}
+    sources: dict[str, str] = {}
+    warnings: list[str] = []
+
+    for domain in domains:
+        cookies, source = extract_browser_cookies_with_source(
+            browser=browser,
+            domain=domain,
+            auto_close=False,
+        )
+        sources[domain] = source
+        if cookies:
+            result[domain] = cookies
+            _log.info(
+                "smart_extract_no_restart | browser=%s | domain=%s | source=%s | cookies=%d",
+                browser,
+                domain,
+                source,
+                len(cookies),
+            )
+        else:
+            _log.info(
+                "smart_extract_no_restart | browser=%s | domain=%s | source=%s | cookies=0",
+                browser,
+                domain,
+                source,
+            )
+        if source == "browser_cookie3":
+            warnings.append(
+                f"{domain}: 使用 browser_cookie3 回退，若缺少 HttpOnly 字段可切换到 CDP/rookiepy。"
+            )
+
+    meta = {
+        "browser": browser,
+        "sources": sources,
+        "warnings": warnings,
+    }
+    if include_meta:
+        return result, meta
+    return result
+
+
+def smart_extract_all_cookies(
+    browser: str = "edge",
+    setup_url: str = "http://127.0.0.1:8081/webui/setup",
+    domains: list[str] | None = None,
+) -> dict[str, dict[str, str]]:
+    """智能重启浏览器提取所有平台 Cookie（v130+ 唯一可靠方案）。
+
+    流程:
+      1. 关闭目标浏览器
+      2. 用 --remote-debugging-port 重新启动（保留原 profile，自动恢复标签页）
+      3. 通过 CDP Network.getAllCookies 一次性拿到所有 cookie
+      4. 保持浏览器运行（用户继续使用，debug 端口无害）
+
+    返回: {domain: {cookie_name: cookie_value}}
+    """
+    if domains is None:
+        domains = [".bilibili.com", ".douyin.com", ".kuaishou.com", ".qq.com", ".qzone.qq.com"]
+
+    exe = _find_browser_exe(browser)
+    if not exe:
+        _log.warning("smart_extract: 未找到 %s", browser)
+        return {}
+
+    user_data = _BROWSER_USER_DATA.get(browser, "")
+    if not user_data or not os.path.isdir(user_data):
+        _log.warning("smart_extract: 未找到 %s User Data", browser)
+        return {}
+
+    was_running_before = _is_browser_running(browser)
+    closed_for_extract = False
+
+    def _restore_browser_if_needed(stage: str) -> None:
+        if not was_running_before:
+            return
+        if not closed_for_extract:
+            return
+        if _is_browser_running(browser):
+            return
+        try:
+            restore_cmd = [
+                exe,
+                f"--user-data-dir={user_data}",
+                "--restore-last-session",
+                setup_url,
+            ]
+            subprocess.Popen(
+                restore_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            _log.warning(
+                "smart_extract: 阶段 %s 失败，已尝试恢复启动 %s",
+                stage,
+                browser,
+            )
+        except Exception as exc:
+            _log.warning(
+                "smart_extract: 阶段 %s 失败，恢复启动 %s 失败 | %s",
+                stage,
+                browser,
+                exc,
+            )
+
+    # ── 步骤 1: 关闭浏览器 ──
+    if was_running_before:
+        _log.info("smart_extract: 正在关闭 %s ...", browser)
+        if not _stop_browser_processes(browser):
+            _log.warning("smart_extract: 无法关闭 %s", browser)
+            return {}
+        # 等待进程完全退出
+        for _ in range(15):
+            time.sleep(0.3)
+            if not _is_browser_running(browser):
+                break
+        else:
+            _log.warning("smart_extract: %s 未能完全退出", browser)
+            return {}
+        closed_for_extract = True
+        time.sleep(0.5)
+
+    # ── 步骤 2: 带 debug 端口重启 ──
+    port = 19222
+    while not _is_port_free(port) and port < 19300:
+        port += 1
+    if port >= 19300:
+        _log.warning("smart_extract: 无可用端口")
+        _restore_browser_if_needed("port")
+        return {}
+
+    cmd = [
+        exe,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={user_data}",
+        "--restore-last-session",
+        setup_url,
+    ]
+    _log.info("smart_extract: 启动 %s (port=%d)", browser, port)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+    # ── 步骤 3: 等待 CDP 就绪 ──
+    ready = False
+    for _ in range(60):  # 最多等 12 秒
+        time.sleep(0.2)
+        try:
+            with _local_httpx_client(timeout=1) as client:
+                resp = client.get(f"http://127.0.0.1:{port}/json/version")
+            if resp.status_code == 200:
+                ready = True
+                break
+        except Exception:
+            continue
+
+    if not ready:
+        _log.warning("smart_extract: CDP 未就绪")
+        _restore_browser_if_needed("cdp_ready")
+        return {}
+
+    # ── 步骤 4: 获取 WebSocket URL ──
+    try:
+        with _local_httpx_client(timeout=3) as client:
+            resp = client.get(f"http://127.0.0.1:{port}/json/list")
+        targets = resp.json()
+    except Exception:
+        targets = []
+
+    ws_url = ""
+    if targets:
+        ws_url = targets[0].get("webSocketDebuggerUrl", "")
+
+    if not ws_url:
+        # 尝试从 /json/version 获取
+        try:
+            with _local_httpx_client(timeout=3) as client:
+                resp = client.get(f"http://127.0.0.1:{port}/json/version")
+            ver = resp.json()
+            ws_url = ver.get("webSocketDebuggerUrl", "")
+        except Exception:
+            pass
+
+    if not ws_url:
+        _log.warning("smart_extract: 无法获取 WebSocket URL")
+        _restore_browser_if_needed("ws_url")
+        return {}
+
+    # ── 步骤 5: 通过 CDP 提取所有 cookie ──
+    _log.info("smart_extract: 正在通过 CDP 提取 cookie ...")
+    all_cookies = _cdp_get_all_cookies(ws_url)
+
+    # ── 步骤 6: 按域名分组 ──
+    result: dict[str, dict[str, str]] = {}
+    for domain in domains:
+        clean = domain.lstrip(".")
+        matched: dict[str, str] = {}
+        for c_domain, c_name, c_value in all_cookies:
+            c_clean = c_domain.lstrip(".")
+            if clean in c_clean or c_clean in clean:
+                matched[c_name] = c_value
+        if matched:
+            result[domain] = matched
+
+    _log.info("smart_extract: 提取完成，%d 个域名有 cookie", len(result))
+    # 注意：不关闭浏览器，用户继续使用
+    return result
+
+
+def _cdp_get_all_cookies(ws_url: str) -> list[tuple[str, str, str]]:
+    """通过 CDP 获取浏览器所有 cookie，返回 [(domain, name, value), ...]。
+
+    会先导航到 QZone 页面以确保 QZone cookie 被加载。
+    """
+    import websockets.sync.client as ws_client
+
+    cookies: list[tuple[str, str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    msg_id = 0
+
+    def _collect(cookie_list: list[dict]) -> None:
+        for c in cookie_list:
+            key = (c.get("domain", ""), c.get("name", ""))
+            if key not in seen and key[1]:
+                seen.add(key)
+                cookies.append((c.get("domain", ""), c["name"], c.get("value", "")))
+
+    try:
+        with ws_client.connect(ws_url, close_timeout=5) as ws:
+            # 先导航到 QZone 触发 cookie 加载
+            msg_id += 1
+            _cdp_send_and_recv(ws, msg_id, "Page.enable", timeout=2)
+            msg_id += 1
+            _cdp_send_and_recv(ws, msg_id, "Page.navigate",
+                               {"url": "https://user.qzone.qq.com"}, timeout=8)
+            time.sleep(2.0)
+
+            # 获取所有 cookie
+            msg_id += 1
+            result = _cdp_send_and_recv(ws, msg_id, "Network.getAllCookies", timeout=8)
+            _collect(result.get("cookies", []))
+
+            # 补充: getCookies with QZone URLs
+            msg_id += 1
+            result = _cdp_send_and_recv(ws, msg_id, "Network.getCookies", {
+                "urls": ["https://user.qzone.qq.com", "https://qzone.qq.com",
+                         "https://i.qq.com", "https://qq.com"]
+            }, timeout=5)
+            _collect(result.get("cookies", []))
+
+    except Exception as exc:
+        _log.debug("CDP getAllCookies 错误: %s", exc)
+
+    return cookies
 
 
 def extract_douyin_cookie(browser: str = "edge", auto_close: bool = False) -> str:
@@ -733,6 +1533,54 @@ def extract_kuaishou_cookie(browser: str = "edge", auto_close: bool = False) -> 
     if not cookies:
         return ""
     return "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+
+def extract_qzone_cookies(browser: str = "edge", auto_close: bool = False) -> str:
+    """从浏览器提取 QQ空间 cookie，返回 cookie 字符串。
+
+    需要合并 .qq.com 和 .qzone.qq.com 两个域的 cookie。
+    关键字段: p_skey / skey, uin, p_uin
+
+    策略:
+      1. 分域提取 (.qq.com + .i.qq.com + .qzone.qq.com) 并合并
+      2. 如果分域提取缺少关键 cookie，尝试 smart_extract 一次性提取
+    """
+    # ── 策略 1: 分域提取 ──
+    qq_cookies = extract_browser_cookies(browser, ".qq.com", auto_close=auto_close)
+    iqq_cookies = extract_browser_cookies(browser, ".i.qq.com", auto_close=auto_close)
+    qzone_cookies = extract_browser_cookies(browser, ".qzone.qq.com", auto_close=auto_close)
+    merged = {**qq_cookies, **iqq_cookies, **qzone_cookies}
+
+    # ── 策略 2: 分域不够时，用 smart_extract 一次性 CDP 提取 ──
+    if not (merged.get("p_skey") or merged.get("skey")):
+        _log.debug("qzone 分域提取缺少关键 cookie，尝试 smart_extract_no_restart")
+        try:
+            all_result = smart_extract_all_cookies_no_restart(
+                browser=browser,
+                domains=[".qq.com", ".qzone.qq.com", ".i.qq.com"],
+            )
+            for domain_cookies in all_result.values():
+                if isinstance(domain_cookies, dict):
+                    # 不覆盖已有值，只补充缺失的
+                    for k, v in domain_cookies.items():
+                        if k not in merged or not merged[k]:
+                            merged[k] = v
+        except Exception as exc:
+            _log.debug("smart_extract_no_restart 失败: %s", exc)
+
+    if not (merged.get("p_skey") or merged.get("skey")):
+        return ""
+
+    # 只保留关键 cookie
+    important = ["p_skey", "p_uin", "uin", "skey", "pt2gguin"]
+    parts = []
+    for key in important:
+        if key in merged:
+            parts.append(f"{key}={merged[key]}")
+    for k, v in merged.items():
+        if k not in important:
+            parts.append(f"{k}={v}")
+    return "; ".join(parts)
 
 
 def extract_bilibili_cookies(browser: str = "edge", auto_close: bool = False) -> dict[str, str]:
@@ -770,7 +1618,7 @@ def _pick_browser() -> str:
         marker = " *" if i == 0 else ""
         print(f"    {i + 1}. {_BROWSER_DISPLAY.get(b, b)}{marker}")
 
-    val = input(f"  选择 [1-{len(available)}，默认 1]: ").strip()
+    val = _safe_input(f"  选择 [1-{len(available)}，默认 1]: ")
     try:
         idx = int(val) - 1
         if 0 <= idx < len(available):
@@ -791,16 +1639,16 @@ def _ask_auto_close_for_running_browser(browser: str) -> bool:
         return False
 
     if foreground <= 0:
-        answer = input(
+        answer = _safe_input(
             f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 后台进程，是否自动关闭后继续提取? (Y/n): "
-        ).strip().lower()
+        ).lower()
         if not answer:
             return True
         return answer not in {"n", "no", "0"}
 
-    answer = input(
+    answer = _safe_input(
         f"  检测到 {_BROWSER_DISPLAY.get(browser, browser)} 正在运行，是否自动关闭后继续提取? (y/N): "
-    ).strip().lower()
+    ).lower()
     return answer in {"y", "yes", "1"}
 
 
@@ -812,7 +1660,7 @@ def interactive_bilibili_cookie() -> dict[str, str]:
     print("    3. 手动输入")
     print("    4. 跳过")
 
-    choice = input("  选择 [1-4，默认 1]: ").strip()
+    choice = _safe_input("  选择 [1-4，默认 1]: ")
     if not choice or choice == "1":
         result = bilibili_qr_login_sync()
         if result and result.get("sessdata"):
@@ -822,18 +1670,24 @@ def interactive_bilibili_cookie() -> dict[str, str]:
 
     elif choice == "2":
         browser = _pick_browser()
-        auto_close = _ask_auto_close_for_running_browser(browser)
-        result = extract_bilibili_cookies(browser, auto_close=auto_close)
+        result = extract_bilibili_cookies(browser, auto_close=False)
         if result.get("sessdata"):
             print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
             return result
+        # 无关闭模式失败，询问是否关闭浏览器重试
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            result = extract_bilibili_cookies(browser, auto_close=True)
+            if result.get("sessdata"):
+                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                return result
         print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到 B站登录信息。")
         print("  请确保已在该浏览器中登录 bilibili.com")
         return {"sessdata": "", "bili_jct": ""}
 
     elif choice == "3":
-        sessdata = input("  SESSDATA: ").strip()
-        bili_jct = input("  bili_jct: ").strip()
+        sessdata = _safe_input("  SESSDATA: ")
+        bili_jct = _safe_input("  bili_jct: ")
         return {"sessdata": sessdata, "bili_jct": bili_jct}
 
     return {"sessdata": "", "bili_jct": ""}
@@ -846,19 +1700,25 @@ def interactive_douyin_cookie() -> str:
     print("    2. 手动输入")
     print("    3. 跳过")
 
-    choice = input("  选择 [1-3，默认 1]: ").strip()
+    choice = _safe_input("  选择 [1-3，默认 1]: ")
     if not choice or choice == "1":
         browser = _pick_browser()
-        auto_close = _ask_auto_close_for_running_browser(browser)
-        cookie = extract_douyin_cookie(browser, auto_close=auto_close)
+        cookie = extract_douyin_cookie(browser, auto_close=False)
         if cookie:
             print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
             return cookie
+        # 无关闭模式失败，询问是否关闭浏览器重试
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            cookie = extract_douyin_cookie(browser, auto_close=True)
+            if cookie:
+                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                return cookie
         print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到抖音登录信息。")
         return ""
 
     elif choice == "2":
-        return input("  抖音 Cookie 字符串: ").strip()
+        return _safe_input("  抖音 Cookie 字符串: ")
 
     return ""
 
@@ -870,26 +1730,62 @@ def interactive_kuaishou_cookie() -> str:
     print("    2. 手动输入")
     print("    3. 跳过")
 
-    choice = input("  选择 [1-3，默认 1]: ").strip()
+    choice = _safe_input("  选择 [1-3，默认 1]: ")
     if not choice or choice == "1":
         browser = _pick_browser()
-        auto_close = _ask_auto_close_for_running_browser(browser)
-        cookie = extract_kuaishou_cookie(browser, auto_close=auto_close)
+        cookie = extract_kuaishou_cookie(browser, auto_close=False)
         if cookie:
             print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
             return cookie
+        # 无关闭模式失败，询问是否关闭浏览器重试
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            cookie = extract_kuaishou_cookie(browser, auto_close=True)
+            if cookie:
+                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                return cookie
         print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到快手登录信息。")
         return ""
 
     elif choice == "2":
-        return input("  快手 Cookie 字符串: ").strip()
+        return _safe_input("  快手 Cookie 字符串: ")
 
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Cookie 有效性验证
-# ---------------------------------------------------------------------------
+def interactive_qzone_cookie() -> str:
+    """交互式获取 QQ空间 cookie。"""
+    print("\n  QQ空间 Cookie 获取方式:")
+    print("    1. 从浏览器自动提取（需已在浏览器登录 QQ空间）")
+    print("    2. 手动输入（p_skey=xxx; uin=xxx; skey=xxx）")
+    print("    3. 跳过")
+    print("\n  【重要提示】")
+    print("    - 请先在浏览器访问 https://qzone.qq.com 并登录你自己的 QQ 账号")
+    print("    - 登录后会自动跳转到你自己的空间（如 https://user.qzone.qq.com/你的QQ号）")
+    print("    - 确保页面完全加载，能看到自己的说说、相册等内容")
+    print("    - 不要只访问别人的空间，必须登录自己的空间才能获取有效 Cookie")
+
+    choice = _safe_input("\n  选择 [1-3，默认 1]: ")
+    if not choice or choice == "1":
+        browser = _pick_browser()
+        cookie = extract_qzone_cookies(browser, auto_close=False)
+        if cookie:
+            print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+            return cookie
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            cookie = extract_qzone_cookies(browser, auto_close=True)
+            if cookie:
+                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                return cookie
+        print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到 QQ空间登录信息。")
+        print("  请确保已在该浏览器中访问 https://qzone.qq.com 并登录你自己的 QQ 账号")
+        return ""
+
+    elif choice == "2":
+        return _safe_input("  QQ空间 Cookie 字符串: ")
+
+    return ""
 
 async def check_bilibili_cookie(sessdata: str) -> bool:
     """验证 B站 sessdata 是否有效。"""
@@ -925,6 +1821,24 @@ async def check_douyin_cookie(cookie: str) -> bool:
         return False
 
 
+async def check_qzone_cookie(cookie_str: str) -> bool:
+    """验证 QZone cookie 是否有效（尝试获取自己的资料）。"""
+    if not cookie_str:
+        return False
+    from core.qzone import QZoneClient, parse_cookie_string
+    cookies = parse_cookie_string(cookie_str)
+    if not (cookies.get("p_skey") or cookies.get("skey")):
+        return False
+    try:
+        client = QZoneClient(cookies, timeout=10)
+        if not client.self_uin:
+            return False
+        profile = await client.get_profile(client.self_uin)
+        return bool(profile.nickname)
+    except Exception:
+        return False
+
+
 async def check_all_cookies(cfg: dict) -> dict[str, bool]:
     """启动时验证所有平台 cookie 有效性，返回 {platform: is_valid}。"""
     va = cfg.get("video_analysis", {}) or {}
@@ -952,5 +1866,15 @@ async def check_all_cookies(cfg: dict) -> dict[str, bool]:
     results["kuaishou"] = bool(ks_cookie)
     if not ks_cookie:
         _log.info("cookie_check | kuaishou | 未配置")
+
+    # QQ空间
+    qz_cfg = va.get("qzone", {}) or {}
+    qz_cookie = str(qz_cfg.get("cookie", "")).strip()
+    if qz_cookie:
+        results["qzone"] = await check_qzone_cookie(qz_cookie)
+        status = "有效" if results["qzone"] else "已失效"
+        _log.info("cookie_check | qzone | %s", status)
+    else:
+        _log.info("cookie_check | qzone | 未配置")
 
     return results

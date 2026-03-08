@@ -106,7 +106,7 @@ class SafetyEngine:
         self._intent_cues: set[str] = {
             "怎么买", "哪里买", "怎么做", "教程", "方法", "步骤",
             "教我", "给我", "渠道", "链接", "网址", "网站",
-            "资源", "发出来", "发给我", "下载", "how to", "where to",
+            "资源", "发送", "发给我", "下载", "how to", "where to",
         }
 
         _log.info("SafetyEngine 初始化: scale=%d (%s), 输出敏感词=%d 条",
@@ -164,23 +164,45 @@ class SafetyEngine:
 
         # scale 1: 违法 + 意图
         if self.scale >= 1:
-            if any(term in content for term in self._illegal_terms) and has_intent:
+            if self._has_risky_term(content, self._illegal_terms) and has_intent:
                 return "illegal"
 
         # scale 2: + 自伤/露骨 + 意图
         if self.scale >= 2:
-            if any(term in content for term in self._self_harm_terms) and has_intent:
+            if self._has_risky_term(content, self._self_harm_terms) and has_intent:
                 return "high_risk"
-            if any(term in content for term in self._explicit_terms) and has_intent:
+            if self._has_risky_term(content, self._explicit_terms) and has_intent:
                 return "high_risk"
 
         # scale 3: 所有敏感词直接拦截，不需要意图
         if self.scale >= 3:
             all_terms = self._illegal_terms | self._self_harm_terms | self._explicit_terms
-            if any(term in content for term in all_terms):
+            if self._has_risky_term(content, all_terms):
                 return "high_risk"
 
         return "safe"
+
+    @staticmethod
+    def _has_risky_term(content: str, terms: set[str]) -> bool:
+        """检查内容是否包含敏感词，排除技术/安全/防御语境的误报。
+
+        例如 "入侵检测系统" 包含 "入侵" 但属于安全技术讨论，不应拦截。
+        """
+        # 敏感词后面紧跟这些词时，视为技术/安全语境，不算命中
+        _tech_suffixes = (
+            "检测", "防御", "防护", "防范", "分析", "研究", "原理",
+            "安全", "测试", "审计", "评估", "报告", "论文", "课程",
+            "防止", "预防", "应对", "响应", "监控", "告警",
+        )
+        for term in terms:
+            idx = content.find(term)
+            if idx < 0:
+                continue
+            after = content[idx + len(term):idx + len(term) + 4]
+            if any(after.startswith(suffix) for suffix in _tech_suffixes):
+                continue
+            return True
+        return False
 
     # ── 输出过滤（QQ 安全）──────────────────────────────────
 

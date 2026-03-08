@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -20,7 +20,10 @@ class BaseLLMClient:
         self.provider = provider
         self.default_env_key = default_env_key
 
-        self.base_url = str(self.config.get("base_url", default_base_url)).rstrip("/")
+        raw_base_url = str(self.config.get("base_url", "")).strip()
+        if not raw_base_url:
+            raw_base_url = str(default_base_url or "").strip()
+        self.base_url = raw_base_url.rstrip("/")
         self.model = str(self.config.get("model", "gpt-4.1"))
         self.temperature = float(self.config.get("temperature", 0.8))
         self.max_tokens = int(self.config.get("max_tokens", 8192))
@@ -57,6 +60,25 @@ class BaseLLMClient:
             return "".join(parts)
         return str(content)
 
+    async def chat_text_with_retry(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int | None = None,
+        retries: int = 2,
+        backoff: float = 1.0,
+    ) -> str:
+        """带重试的 chat_text，适用于关键路径（如 agent loop）。"""
+        import asyncio as _aio
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return await self.chat_text(messages, max_tokens=max_tokens)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    await _aio.sleep(backoff * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
+
     async def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         text = (await self.chat_text(messages)).strip()
         if not text:
@@ -92,8 +114,21 @@ class BaseLLMClient:
 
     def _resolve_api_key(self) -> str:
         raw = str(self.config.get("api_key", "")).strip()
+        if self._looks_masked_secret(raw):
+            raw = ""
         if raw.startswith("${") and raw.endswith("}"):
             raw = os.getenv(raw[2:-1], "")
         if raw:
             return raw
         return os.getenv(self.default_env_key, "").strip()
+
+    @staticmethod
+    def _looks_masked_secret(value: str) -> bool:
+        text = (value or "").strip()
+        if not text:
+            return False
+        if set(text) == {"*"}:
+            return True
+        if text.lower().startswith("sk-") and "*" in text:
+            return True
+        return False

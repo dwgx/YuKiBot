@@ -36,7 +36,7 @@ class TriggerResult:
 
 
 class TriggerEngine:
-    """仅负责会话状态与节流，不做关键词语义判定。"""
+    """负责会话状态、节流与轻量触发语义判定。"""
 
     def __init__(
         self,
@@ -56,12 +56,13 @@ class TriggerEngine:
 
         self.session_timeout = timedelta(minutes=float(trigger_config.get("active_session_timeout_minutes", 8)))
         self.followup_reply_window = timedelta(
-            seconds=max(5, int(trigger_config.get("followup_reply_window_seconds", 30)))
+            seconds=max(5, int(trigger_config.get("followup_reply_window_seconds", 20)))
         )
         self.followup_max_turns = max(1, int(trigger_config.get("followup_max_turns", 2)))
 
         self.busy_window = timedelta(seconds=max(15, int(trigger_config.get("busy_window_seconds", 60))))
 
+        # 默认开启轻度“旁听探测”，配合后续 self_check 高阈值，减少误接话同时保留自然接话能力。
         self.ai_listen_enable = bool(trigger_config.get("ai_listen_enable", True))
         self.ai_listen_interval = timedelta(
             seconds=max(15, int(trigger_config.get("ai_listen_interval_seconds", 45)))
@@ -91,8 +92,42 @@ class TriggerEngine:
             for item in keywords_raw
             if normalize_text(str(item))
         ]
+        explicit_request_cues_raw = trigger_config.get(
+            "explicit_request_cues",
+            [
+                "你帮我",
+                "帮我",
+                "给我",
+                "请你",
+                "麻烦你",
+                "你能",
+                "你可以",
+                "能不能",
+                "可不可以",
+                "行不行",
+                "查一下",
+                "搜一下",
+                "找一下",
+                "分析一下",
+                "解析一下",
+                "总结一下",
+                "推荐一下",
+                "怎么",
+                "如何",
+                "为什么",
+                "是什么",
+                "是谁",
+            ],
+        )
+        if not isinstance(explicit_request_cues_raw, list):
+            explicit_request_cues_raw = []
+        self.explicit_request_cues = tuple(
+            normalize_text(str(item)).lower()
+            for item in explicit_request_cues_raw
+            if normalize_text(str(item))
+        )
         self.ai_listen_min_keyword_hits = max(1, int(trigger_config.get("ai_listen_min_keyword_hits", 1)))
-        self.ai_listen_min_score = max(0.5, float(trigger_config.get("ai_listen_min_score", 2.2)))
+        self.ai_listen_min_score = max(0.5, float(trigger_config.get("ai_listen_min_score", 1.2)))
         self.delegate_undirected_to_ai = bool(trigger_config.get("delegate_undirected_to_ai", True))
 
         self.overload_enable = bool(trigger_config.get("overload_enable", True))
@@ -229,7 +264,24 @@ class TriggerEngine:
                 priority=85,
             )
 
+        if self._looks_like_explicit_memory_declare(payload.text):
+            return TriggerResult(
+                should_handle=True,
+                reason="explicit_memory_fact",
+                active_session=active_session,
+                followup_candidate=True,
+                listen_probe=False,
+                overload_active=False,
+                busy_messages=busy_messages,
+                busy_users=busy_users,
+                ai_gate=True,
+                priority=84,
+            )
+
         if followup_candidate:
+            # 仅在用户消息真正命中 followup 窗口时才消费回合，
+            # 避免“机器人刚发出就把 followup 回合耗尽”。
+            self.consume_followup_turn(payload.conversation_id, payload.user_id, now=now)
             return TriggerResult(
                 should_handle=True,
                 reason="followup_window",
@@ -259,8 +311,9 @@ class TriggerEngine:
 
         if self.delegate_undirected_to_ai:
             return TriggerResult(
-                should_handle=True,
-                reason="ai_router_gate",
+                # 仅作为候选进入 AI 评估，不直接放行回复。
+                should_handle=False,
+                reason="ai_router_candidate",
                 active_session=active_session,
                 followup_candidate=False,
                 listen_probe=False,
@@ -288,15 +341,38 @@ class TriggerEngine:
         content = normalize_text(text).lower()
         if not content:
             return False
-        if any(alias in content for alias in self.bot_aliases):
-            return True
+
+        # 对单字符中文别名做严格匹配：
+        # - 必须是独立出现（不能是 "下雪"、"雪花" 等词的一部分）
+        # - 允许: "雪 你好"、"雪，帮我"、句首/句尾的 "雪"
+        # 对多字符别名保持原有宽松匹配
+        for alias in self.bot_aliases:
+            if not alias:
+                continue
+            if len(alias) == 1 and '\u4e00' <= alias <= '\u9fff':
+                # 单字符中文别名: 要求前后不是中文/字母/数字
+                pattern = rf"(?<![a-z0-9\u4e00-\u9fff]){re.escape(alias)}(?![a-z0-9\u4e00-\u9fff])"
+                if re.search(pattern, content):
+                    return True
+                continue
+            if alias in content:
+                return True
 
         compacted = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", content)
-        if compacted and any(alias and alias in compacted for alias in self.bot_aliases):
-            return True
+        if compacted:
+            for alias in self.bot_aliases:
+                if not alias:
+                    continue
+                # 单字符中文别名不走 compacted 匹配（去掉标点后 "下雪" 仍然包含 "雪"）
+                if len(alias) == 1 and '\u4e00' <= alias <= '\u9fff':
+                    continue
+                if alias in compacted:
+                    return True
 
         for alias in self.bot_aliases:
             if not alias:
+                continue
+            if len(alias) == 1 and '\u4e00' <= alias <= '\u9fff':
                 continue
             if re.fullmatch(r"[a-z0-9_]+", alias):
                 pattern = rf"(?<![a-z0-9_]){re.escape(alias)}(?![a-z0-9_])"
@@ -406,52 +482,122 @@ class TriggerEngine:
             return ""
 
         keyword_hits = self._count_listen_keyword_hits(clean_text)
+        explicit_signal = self._explicit_request_signal(clean_text)
 
         heat_ok = busy_messages >= self.ai_listen_min_messages and busy_users >= self.ai_listen_min_unique_users
         keyword_ok = (
             self.ai_listen_keyword_enable
             and keyword_hits >= self.ai_listen_min_keyword_hits
         )
-        score = self._build_listen_score(clean_text, busy_messages, busy_users, keyword_hits)
+        score = self._build_listen_score(
+            clean_text,
+            busy_messages,
+            busy_users,
+            keyword_hits,
+            explicit_signal=explicit_signal,
+        )
 
         if not heat_ok and not keyword_ok and score < self.ai_listen_min_score:
             return ""
 
         self._last_ai_probe_at[conversation_id] = now
+        if explicit_signal >= 1.35:
+            return "ai_listen_probe_task"
         if keyword_ok:
             return "ai_listen_probe_keyword"
         if heat_ok:
             return "ai_listen_probe_heat"
         return "ai_listen_probe_score"
 
+    def _looks_like_explicit_bot_request(self, text: str) -> bool:
+        return self._explicit_request_signal(text) >= 1.0
+
     @staticmethod
-    def _looks_like_explicit_bot_request(text: str) -> bool:
-        if not text:
+    def _looks_like_explicit_memory_declare(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        # 过滤“我叫什么/你记得我叫什么吗”这类问句，避免误判成写入指令。
+        if any(q in content for q in ("我叫什么", "我叫啥", "你记得我叫什么", "记得我叫什么")):
             return False
         cues = (
-            "你帮我",
-            "帮我",
-            "给我找",
-            "给我发",
-            "请你",
-            "你能",
-            "你可以",
-            "你去",
-            "你来",
-            "你给我",
+            "记住我叫",
+            "永久记忆 我叫",
+            "永久记忆，我叫",
+            "永久记忆,我叫",
+            "叫我",
+            "喊我",
+            "称呼我",
+            "记住我的名字",
         )
-        return any(cue in text for cue in cues)
+        return any(cue in content for cue in cues)
 
     def _count_listen_keyword_hits(self, text: str) -> int:
         if not text or not self.ai_listen_keyword_enable:
             return 0
-        hits = 0
+        matched: set[str] = set()
         for word in self.ai_listen_keywords:
-            if word and word in text:
-                hits += 1
-        return hits
+            if not word:
+                continue
+            # 英文关键词按词边界匹配，避免 "research" 命中 "search" 这类误判。
+            if re.fullmatch(r"[a-z0-9_]+", word):
+                if re.search(rf"(?<![a-z0-9_]){re.escape(word)}(?![a-z0-9_])", text):
+                    matched.add(word)
+                continue
+            if word in text:
+                matched.add(word)
+        return len(matched)
 
-    def _build_listen_score(self, text: str, busy_messages: int, busy_users: int, keyword_hits: int) -> float:
+    @classmethod
+    def _explicit_request_signal_from_cues(cls, text: str, cues: tuple[str, ...]) -> float:
+        if not text:
+            return 0.0
+        score = 0.0
+
+        if any(cue in text for cue in cues):
+            score += 1.2
+
+        # 指令动词 + 任务目标
+        if re.search(
+            r"(?:帮我|给我|替我|请你|麻烦你|你帮我|你给我).{0,10}"
+            r"(?:查|搜|找|看|分析|解析|总结|推荐|整理|解释|翻译|排查|定位|修|改|写|下载|安装)",
+            text,
+        ):
+            score += 0.9
+
+        # 典型疑问句
+        if (
+            "?" in text
+            or "？" in text
+            or re.search(r"(?:怎么|如何|为什么|是什么|是谁|哪|哪里|哪个|是否|是不是|能不能|可不可以|行不行)", text)
+        ):
+            score += 0.6
+
+        # URL + 动作词：高价值任务请求
+        if re.search(r"https?://", text, flags=re.IGNORECASE) and re.search(
+            r"(?:看|查|分析|解析|总结|提取|验证|对比|下载|安装)",
+            text,
+        ):
+            score += 0.7
+
+        if len(text) >= 20:
+            score += 0.2
+
+        return min(score, 3.0)
+
+    def _explicit_request_signal(self, text: str) -> float:
+        clean = normalize_text(text).lower()
+        return self._explicit_request_signal_from_cues(clean, self.explicit_request_cues)
+
+    def _build_listen_score(
+        self,
+        text: str,
+        busy_messages: int,
+        busy_users: int,
+        keyword_hits: int,
+        *,
+        explicit_signal: float = 0.0,
+    ) -> float:
         msg_ratio = busy_messages / max(1, self.ai_listen_min_messages)
         user_ratio = busy_users / max(1, self.ai_listen_min_unique_users)
         score = msg_ratio * 0.9 + user_ratio * 0.9 + float(keyword_hits) * 1.1
@@ -459,6 +605,8 @@ class TriggerEngine:
         # 问句/求助句更可能需要机器人插话。
         if any(cue in text for cue in ("?", "？", "吗", "咋办", "怎么", "为什么", "求助")):
             score += 0.5
+        # 把轻语义信号并入评分，减少“必须命中固定词表”的机械感。
+        score += min(1.6, explicit_signal * 0.9)
         return score
 
     def peek_followup_candidate(self, conversation_id: str, user_id: str, now: datetime) -> bool:

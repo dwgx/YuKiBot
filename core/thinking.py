@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+import re
 from typing import Any
 
+from core import prompt_loader as _pl
 from core.personality import PersonalityEngine
+from core.prompt_policy import PromptPolicy
 from core.system_prompts import SystemPromptRelay
 from services.model_client import ModelClient
 from utils.text import clip_text, normalize_text
@@ -44,6 +48,11 @@ class ThinkingEngine:
         self.default_source_links = max(1, min(3, int(search_cfg.get("default_source_links", 3))))
         self.personality = personality
         self.model_client = model_client
+        self.prompt_policy = PromptPolicy.from_config(config)
+        control_cfg = config.get("control", {}) if isinstance(config, dict) else {}
+        if not isinstance(control_cfg, dict):
+            control_cfg = {}
+        self.memory_recall_level = normalize_text(str(control_cfg.get("memory_recall_level", "light"))).lower() or "light"
 
     _VERBOSITY_MAX_TOKENS = {
         "verbose": 8192,
@@ -73,6 +82,10 @@ class ThinkingEngine:
         interest_keywords: tuple[str, ...] = (),
         conflict_keywords: tuple[str, ...] = (),
         verbosity: str = "medium",
+        output_style_instruction: str = "",
+        current_user_id: str = "",
+        current_user_name: str = "",
+        recent_speakers: list[tuple[str, str, str]] | None = None,
     ) -> str:
         _ = (interest_keywords, conflict_keywords)
         text = normalize_text(user_text)
@@ -81,16 +94,27 @@ class ThinkingEngine:
 
         scene_tag = normalize_text(scene_hint) or "chat"
         style = reply_style if reply_style in {"short", "casual", "serious", "long"} else "short"
+        llm_failed = False
 
         if self.allow_thinking and self.model_client.enabled:
             try:
-                system_prompt = self.personality.system_instruction(bot_name=self.bot_name, language=self.language)
+                system_prompt = self.personality.system_instruction(
+                    bot_name=self.bot_name,
+                    language=self.language,
+                    current_user_id=current_user_id,
+                    current_user_name=current_user_name,
+                    recent_speakers=recent_speakers,
+                )
+                system_prompt = self.prompt_policy.compose_prompt(channel="thinking", base_prompt=system_prompt)
                 style_instruction = self.personality.style_instruction(style)
                 scene_instruction = self.personality.scene_instruction(scene_tag)
                 extra_rules = SystemPromptRelay.thinking_extra_rules()
                 verbosity_instruction = self._VERBOSITY_INSTRUCTIONS.get(verbosity, "")
                 if verbosity_instruction:
                     extra_rules += f"\n输出详细度要求: {verbosity_instruction}"
+                output_style_instruction = clip_text(normalize_text(output_style_instruction), 320)
+                if output_style_instruction:
+                    extra_rules += f"\n输出风格附加要求: {output_style_instruction}"
                 verbosity_max_tokens = self._VERBOSITY_MAX_TOKENS.get(verbosity, 4096)
                 messages = [
                     {
@@ -114,8 +138,13 @@ class ThinkingEngine:
                 output = normalize_text(await self.model_client.chat_text(messages, max_tokens=verbosity_max_tokens))
                 if output:
                     return output
-            except Exception:
-                pass
+            except Exception as exc:
+                import logging as _logging
+                _logging.getLogger("yukiko.thinking").error(
+                    "LLM generate_reply 失败: %s", exc, exc_info=True,
+                )
+                llm_failed = True
+
 
         return self._fallback_reply(
             user_text=text,
@@ -123,6 +152,7 @@ class ThinkingEngine:
             scene_tag=scene_tag,
             search_summary=search_summary,
             trigger_reason=trigger_reason,
+            llm_failed=llm_failed,
         )
 
     def _build_payload(
@@ -136,16 +166,24 @@ class ThinkingEngine:
         user_profile_summary: str,
         scene_tag: str,
     ) -> str:
-        blocks = [f"用户消息:\n{user_text}", f"场景: {scene_tag}"]
+        now_local = datetime.now().astimezone()
+        now_label = now_local.strftime("%Y-%m-%d %H:%M:%S %z")
+        tz_name = now_local.tzname() or "local"
+        blocks = [
+            f"用户消息:\n{user_text}",
+            f"场景: {scene_tag}",
+            f"系统时间: {now_label} ({tz_name})",
+        ]
         if trigger_reason:
             blocks.append(f"触发信息: {trigger_reason}")
-        if user_profile_summary:
+        safe_profile = self._sanitize_profile_summary(user_profile_summary)
+        if safe_profile:
             profile_block = (
                 "用户画像（仅当前发言用户，禁止混淆到其他群成员）:\n"
-                f"{clip_text(user_profile_summary, 400)}"
+                f"{clip_text(safe_profile, 400)}"
             )
             # 根据画像生成自适应回复风格提示
-            style_guide = self._adaptive_style_hint(user_profile_summary)
+            style_guide = self._adaptive_style_hint(safe_profile)
             if style_guide:
                 profile_block += f"\n回复风格建议: {style_guide}"
             blocks.append(profile_block)
@@ -157,6 +195,12 @@ class ThinkingEngine:
             rows = [f"- {clip_text(normalize_text(item), 80)}" for item in related_memories[:5] if normalize_text(item)]
             if rows:
                 blocks.append("相关长期记忆:\n" + "\n".join(rows))
+                if self.memory_recall_level != "off":
+                    blocks.append("当相关且确定时，可自然引用：你上次提到…；不要跨用户混用记忆。")
+        blocks.append(
+            "只有当“最近对话/相关长期记忆”里有明确原文证据时，才允许说“你之前提到过…”。"
+            "没有证据严禁编造用户历史偏好、历史提问或历史结论。"
+        )
         if search_summary:
             # 视频分析结果通常更长，给更大的上下文窗口
             is_video = "关键帧内容描述:" in search_summary or "弹幕热词:" in search_summary
@@ -208,6 +252,20 @@ class ThinkingEngine:
 
         return "；".join(hints) if hints else ""
 
+    @staticmethod
+    def _sanitize_profile_summary(profile_summary: str) -> str:
+        content = normalize_text(profile_summary)
+        if not content:
+            return ""
+        content = re.sub(
+            r"(?:QQ号|qq号|消息数|发言数|发了\d+条消息|凌晨\d+点(?:左右)?活跃|活跃时段|作息规律)[^。；;\n]*[。；;]?",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(r"\s{2,}", " ", content).strip()
+        return content
+
     def _fallback_reply(
         self,
         user_text: str,
@@ -215,10 +273,14 @@ class ThinkingEngine:
         scene_tag: str,
         search_summary: str,
         trigger_reason: str,
+        llm_failed: bool = False,
     ) -> str:
         _ = (user_text, trigger_reason)
         if search_summary:
             return clip_text(search_summary, 220)
+
+        if llm_failed:
+            return normalize_text(_pl.get_message("llm_error_fallback", "666 出问题了哥")) or "666 出问题了哥"
 
         if scene_tag == "conflict_mediation":
             return "先冷静一下，把分歧点说清楚，我帮你们拆开看。"

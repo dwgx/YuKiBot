@@ -2,16 +2,28 @@
 
 每个工具是一个 dict schema + 一个 async handler。
 LLM 看到 schema 列表后，输出 JSON tool_call，Agent loop 执行并把结果喂回 LLM。
+
+插件扩展能力:
+- register_prompt_hint: 插件注入静态提示词到 Agent 系统提示
+- register_context_provider: 插件注入动态上下文（每次构建 prompt 时调用）
 """
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
+import random
 import re
+import shutil
+import tempfile
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
-from utils.text import clip_text, normalize_text
+import httpx
+from utils.text import clip_text, normalize_text, tokenize
 
 _log = logging.getLogger("yukiko.agent_tools")
 
@@ -23,6 +35,7 @@ class ToolSchema:
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     category: str = "general"  # general / napcat / search / media / admin
+    group: str = ""  # 语义分组: core / messaging / group_query / group_manage / social / file / search / knowledge / media / sticker / qzone / utility / admin
 
 
 @dataclass(slots=True)
@@ -33,19 +46,124 @@ class ToolCallResult:
     display: str = ""  # 给 LLM 看的摘要
 
 
+@dataclass(slots=True)
+class PromptHint:
+    """插件注入到 Agent 系统提示的静态文本块。
+
+    section:
+      - "rules": 出现在 ## 规则 区域
+      - "tools_guidance": 出现在 ## 工具使用指南 区域
+      - "context": 出现在 ## 上下文 区域
+    priority: 数字越小越靠前，默认 50
+    """
+    source: str
+    section: str
+    content: str
+    priority: int = 50
+
+
 ToolHandler = Callable[..., Awaitable[ToolCallResult]]
+ContextProvider = Callable[[dict[str, Any]], str | Awaitable[str]]
 
 
 class AgentToolRegistry:
-    """工具注册中心，管理所有可用工具的 schema 和 handler。"""
+    """工具注册中心，管理所有可用工具的 schema、handler、提示词和上下文提供者。"""
+
+    _QQ_ID_PATTERN = re.compile(r"^[1-9]\d{5,11}$")
+    _MESSAGE_ID_PATTERN = re.compile(r"^\d{4,20}$")
+    _STRICT_QQ_FIELDS = {"user_id", "group_id", "target_user_id", "qq", "qq_number", "bot_id"}
+    _STRICT_MESSAGE_FIELDS = {"message_id"}
+    _TOOL_ARG_ALIASES: dict[str, dict[str, str]] = {
+        "send_emoji": {"keyword": "query", "name": "query"},
+        "send_sticker": {"keyword": "query", "name": "query"},
+        "send_face": {"name": "query", "emoji": "query"},
+        "web_search": {"q": "query", "keyword": "query"},
+        "music_play": {"query": "keyword", "song": "keyword", "name": "keyword"},
+        "music_search": {"query": "keyword", "song": "keyword", "name": "keyword"},
+    }
+
+    # ── 三级权限模型 ──
+    # super_admin: 超级管理员，凌驾一切规则之上，无任何限制
+    # group_admin: 群管理员（加白群的群主/管理员），可执行群管理类高级操作
+    # user: 普通用户，只能使用基础工具
+
+    # 仅超级管理员可用 — 影响全局/不可逆/跨群操作
+    _SUPER_ADMIN_TOOLS = {
+        "set_group_leave",
+        "delete_friend",
+        "cli_invoke",
+        "config_update",
+        "admin_command",
+        "clean_cache",
+        "set_qq_avatar",
+        "set_online_status",
+        "set_self_longnick",
+    }
+
+    # 群管理员 + 超级管理员可用 — 群内管理操作
+    _GROUP_ADMIN_TOOLS = {
+        "set_group_ban",
+        "set_group_kick",
+        "set_group_whole_ban",
+        "set_group_admin",
+        "set_group_name",
+        "send_group_notice",
+        "delete_message",
+        "set_group_special_title",
+        "set_essence_msg",
+        "delete_essence_msg",
+        "set_group_card",
+        "set_group_portrait",
+        "delete_group_file",
+        "create_group_file_folder",
+        "del_group_notice",
+    }
+
+    # 向后兼容: 合并集合
+    _ADMIN_ONLY_TOOLS = _SUPER_ADMIN_TOOLS | _GROUP_ADMIN_TOOLS
 
     def __init__(self) -> None:
         self._schemas: dict[str, ToolSchema] = {}
         self._handlers: dict[str, ToolHandler] = {}
+        self._prompt_hints: list[PromptHint] = []
+        self._context_providers: dict[str, tuple[ContextProvider, int]] = {}
 
     def register(self, schema: ToolSchema, handler: ToolHandler) -> None:
         self._schemas[schema.name] = schema
         self._handlers[schema.name] = handler
+
+    def register_prompt_hint(self, hint: PromptHint) -> None:
+        """注册静态提示词块，会被注入到 Agent 系统提示的对应 section。"""
+        self._prompt_hints.append(hint)
+
+    def get_prompt_hints(self, section: str | None = None) -> list[PromptHint]:
+        """获取提示词块，按 priority 排序。"""
+        hints = self._prompt_hints if section is None else [
+            h for h in self._prompt_hints if h.section == section
+        ]
+        return sorted(hints, key=lambda h: h.priority)
+
+    def register_context_provider(
+        self, name: str, provider: ContextProvider, priority: int = 50,
+    ) -> None:
+        """注册动态上下文提供者，每次构建 prompt 时调用。"""
+        self._context_providers[name] = (provider, priority)
+
+    async def gather_dynamic_context(self, runtime_info: dict[str, Any]) -> list[str]:
+        """调用所有上下文提供者，返回按 priority 排序的文本列表。"""
+        results: list[tuple[int, str]] = []
+        for name, (provider, prio) in self._context_providers.items():
+            try:
+                result = provider(runtime_info)
+                if inspect.isawaitable(result):
+                    result = await result
+                text = str(result).strip()
+                if text:
+                    results.append((prio, text))
+            except Exception:
+                _log.warning("context_provider_error | name=%s", name, exc_info=True)
+        results.sort(key=lambda x: x[0])
+        return [text for _, text in results]
 
     def get_schemas(self, categories: list[str] | None = None) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -76,15 +194,337 @@ class AgentToolRegistry:
             lines.append(f"### {s['name']}\n{s['description']}\n参数:\n{param_block}")
         return "\n\n".join(lines)
 
+    def get_prompt_hints_text(self, section: str) -> str:
+        """获取指定 section 的提示词块，拼接为文本。"""
+        hints = self.get_prompt_hints(section)
+        if not hints:
+            return ""
+        return "\n".join(h.content for h in hints if h.content.strip())
+
+    def get_dynamic_context(self, runtime_info: dict[str, Any]) -> str:
+        """同步包装: 调用所有上下文提供者，返回拼接文本。"""
+        parts: list[str] = []
+        for name, (provider, prio) in sorted(self._context_providers.items(), key=lambda x: x[1][1]):
+            try:
+                result = provider(runtime_info)
+                if inspect.isawaitable(result):
+                    continue  # 同步调用跳过 async provider
+                text = str(result).strip()
+                if text:
+                    parts.append(text)
+            except Exception:
+                _log.warning("context_provider_error | name=%s", name, exc_info=True)
+        return "\n".join(parts)
+
+    # ── 智能工具过滤 ──
+
+    # 语义分组 → 意图关键词映射
+    _INTENT_GROUP_MAP: dict[str, list[str]] = {
+        "core": [],  # final_answer, think — 始终包含
+        "messaging": ["发消息", "私聊", "群消息", "转发", "合并转发", "回复", "发送"],
+        "group_query": ["群", "成员", "群信息", "群列表", "群荣誉", "禁言列表", "群文件", "群公告", "精华", "聊天记录", "历史"],
+        "group_manage": ["禁言", "踢", "管理", "群名", "群名片", "头衔", "全员禁言", "精华", "公告", "撤回", "删除"],
+        "social": ["戳", "poke", "点赞", "表情", "好友", "头像", "签到", "状态", "名片"],
+        "file": ["文件", "上传", "下载", "资源", "安装包", "压缩包"],
+        "search": ["搜索", "搜", "查", "找", "热搜", "热榜", "知乎", "百科", "wiki", "github", "网页", "链接", "url", "抓取", "提取", "摘要", "总结这个"],
+        "knowledge": ["知识", "记住", "学习", "知识库", "梗"],
+        "media": ["图片", "图", "视频", "语音", "音频", "识图", "ocr", "分析", "看图", "抖音", "壁纸", "头像"],
+        "sticker": ["表情包", "表情", "emoji", "贴纸", "sticker"],
+        "qzone": ["空间", "qzone", "说说", "相册"],
+        "utility": ["翻译", "缓存", "状态", "版本"],
+        "admin": ["配置", "管理员", "命令", "cli"],
+    }
+
+    # 每个分组始终包含的工具名
+    _ALWAYS_INCLUDE = {"final_answer", "think"}
+
+    def select_tools_for_intent(self, message_text: str, permission_level: str = "user") -> list[str]:
+        """根据用户消息意图，选择相关的工具子集。
+
+        返回工具名列表。始终包含 core 组 + 匹配到的意图组。
+        如果没有匹配到任何意图，返回全量工具（兜底）。
+        """
+        text = message_text.lower()
+        matched_groups: set[str] = {"core"}  # core 始终包含
+
+        for group, keywords in self._INTENT_GROUP_MAP.items():
+            if group == "core":
+                continue
+            for kw in keywords:
+                if kw in text:
+                    matched_groups.add(group)
+                    break
+
+        # 如果没匹配到任何意图组，返回全量
+        if matched_groups == {"core"}:
+            return list(self._schemas.keys())
+
+        # 搜索意图自动带上 knowledge
+        if "search" in matched_groups:
+            matched_groups.add("knowledge")
+        # 媒体意图自动带上 search（可能需要搜图/搜视频）
+        if "media" in matched_groups:
+            matched_groups.add("search")
+        # 文件意图自动带上 search
+        if "file" in matched_groups:
+            matched_groups.add("search")
+        # group_manage 自动带上 group_query
+        if "group_manage" in matched_groups:
+            matched_groups.add("group_query")
+
+        # 权限过滤: 普通用户不展示管理工具
+        if permission_level == "user":
+            matched_groups.discard("group_manage")
+            matched_groups.discard("admin")
+
+        selected: list[str] = []
+        for name, schema in self._schemas.items():
+            if name in self._ALWAYS_INCLUDE:
+                selected.append(name)
+                continue
+            if schema.group and schema.group in matched_groups:
+                selected.append(name)
+                continue
+            # 兼容: 没有 group 标记的工具，用 category 兜底
+            if not schema.group:
+                cat_to_group = {
+                    "general": "core", "search": "search", "media": "media",
+                    "admin": "admin", "napcat": "messaging", "cli": "admin",
+                }
+                fallback_group = cat_to_group.get(schema.category, "")
+                if fallback_group in matched_groups:
+                    selected.append(name)
+
+        return selected
+
+    def get_schemas_for_prompt_filtered(self, tool_names: list[str]) -> str:
+        """只渲染指定工具名的 schema 文档。"""
+        lines: list[str] = []
+        for name in tool_names:
+            schema = self._schemas.get(name)
+            if not schema:
+                continue
+            params = schema.parameters if isinstance(schema.parameters, dict) else {}
+            props = params.get("properties", {})
+            required = params.get("required", [])
+            param_parts: list[str] = []
+            for pname, pinfo in props.items():
+                req_mark = "*" if pname in required else ""
+                ptype = pinfo.get("type", "string")
+                pdesc = pinfo.get("description", "")
+                param_parts.append(f"  - {pname}{req_mark} ({ptype}): {pdesc}")
+            param_block = "\n".join(param_parts) if param_parts else "  (无参数)"
+            lines.append(f"### {schema.name}\n{schema.description}\n参数:\n{param_block}")
+        return "\n\n".join(lines)
+
     def has_tool(self, name: str) -> bool:
         return name in self._handlers
+
+    def get_schema(self, name: str) -> ToolSchema | None:
+        return self._schemas.get(name)
+
+    @classmethod
+    def _coerce_basic_type(cls, value: Any, expected_type: str) -> tuple[Any, bool]:
+        if not expected_type:
+            return value, True
+        if expected_type == "string":
+            return str(value), True
+        if expected_type == "integer":
+            if isinstance(value, bool):
+                return value, False
+            if isinstance(value, int):
+                return value, True
+            if isinstance(value, str):
+                text = normalize_text(value)
+                if re.fullmatch(r"-?\d+", text):
+                    return int(text), True
+            return value, False
+        if expected_type == "number":
+            if isinstance(value, bool):
+                return value, False
+            if isinstance(value, (int, float)):
+                return value, True
+            if isinstance(value, str):
+                text = normalize_text(value)
+                try:
+                    return float(text), True
+                except ValueError:
+                    return value, False
+            return value, False
+        if expected_type == "boolean":
+            if isinstance(value, bool):
+                return value, True
+            if isinstance(value, str):
+                text = normalize_text(value).lower()
+                if text in {"true", "1", "yes", "on"}:
+                    return True, True
+                if text in {"false", "0", "no", "off"}:
+                    return False, True
+            return value, False
+        if expected_type == "array":
+            return value, isinstance(value, list)
+        if expected_type == "object":
+            return value, isinstance(value, dict)
+        return value, True
+
+    @classmethod
+    def _normalize_qq_id(cls, value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            text = str(value)
+        elif isinstance(value, str):
+            text = normalize_text(value)
+        else:
+            return None
+        if not cls._QQ_ID_PATTERN.fullmatch(text):
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    @classmethod
+    def _normalize_message_id(cls, value: Any) -> int | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            text = str(value)
+        elif isinstance(value, str):
+            text = normalize_text(value)
+        else:
+            return None
+        if not cls._MESSAGE_ID_PATTERN.fullmatch(text):
+            return None
+        try:
+            return int(text)
+        except ValueError:
+            return None
+
+    def _sanitize_and_validate_args(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+    ) -> tuple[dict[str, Any], str]:
+        schema = self._schemas.get(tool_name)
+        params = schema.parameters if schema is not None and isinstance(schema.parameters, dict) else {}
+        props = params.get("properties", {}) if isinstance(params.get("properties", {}), dict) else {}
+        required_raw = params.get("required", [])
+        required = [str(item) for item in required_raw] if isinstance(required_raw, list) else []
+
+        alias_map = self._TOOL_ARG_ALIASES.get(tool_name, {})
+        normalized_args: dict[str, Any] = dict(args)
+        if alias_map:
+            for src_key, dst_key in alias_map.items():
+                if src_key not in normalized_args:
+                    continue
+                if dst_key in normalized_args:
+                    continue
+                if props and dst_key not in props:
+                    continue
+                normalized_args[dst_key] = normalized_args[src_key]
+
+        sanitized: dict[str, Any] = {}
+        dropped_keys: list[str] = []
+        if props:
+            for key, value in normalized_args.items():
+                if key in props:
+                    sanitized[key] = value
+                else:
+                    if key in alias_map and alias_map.get(key) in props:
+                        continue
+                    dropped_keys.append(str(key))
+        else:
+            sanitized = dict(normalized_args)
+
+        if dropped_keys:
+            _log.warning(
+                "tool_args_unknown_dropped | tool=%s | dropped=%s",
+                tool_name,
+                ",".join(sorted(set(dropped_keys))),
+            )
+
+        for key in list(sanitized.keys()):
+            expected_type = ""
+            if key in props and isinstance(props.get(key), dict):
+                expected_type = normalize_text(str(props[key].get("type", ""))).lower()
+
+            if key in self._STRICT_QQ_FIELDS:
+                qq_id = self._normalize_qq_id(sanitized[key])
+                if qq_id is None:
+                    return {}, f"invalid_{key}"
+                sanitized[key] = str(qq_id) if expected_type == "string" else qq_id
+                continue
+
+            if key in self._STRICT_MESSAGE_FIELDS:
+                message_id = self._normalize_message_id(sanitized[key])
+                if message_id is None:
+                    return {}, f"invalid_{key}"
+                sanitized[key] = str(message_id) if expected_type == "string" else message_id
+                continue
+
+            coerced, ok = self._coerce_basic_type(sanitized[key], expected_type)
+            if not ok:
+                return {}, f"invalid_type:{key}:{expected_type}"
+            sanitized[key] = coerced
+
+        missing: list[str] = []
+        for key in required:
+            value = sanitized.get(key)
+            if value is None:
+                missing.append(key)
+                continue
+            if isinstance(value, str) and not normalize_text(value):
+                missing.append(key)
+                continue
+            if isinstance(value, list) and not value:
+                missing.append(key)
+                continue
+        if missing:
+            return {}, f"missing_required_args:{','.join(missing)}"
+
+        return sanitized, ""
 
     async def call(self, name: str, args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         handler = self._handlers.get(name)
         if handler is None:
             return ToolCallResult(ok=False, error=f"unknown_tool: {name}")
+
+        # ── 三级权限检查 ──
+        # permission_level: "super_admin" > "group_admin" > "user"
+        perm = str(context.get("permission_level", "user")).strip()
+        is_super = perm == "super_admin"
+        is_group_admin = perm in ("group_admin", "super_admin")
+
+        if name in self._SUPER_ADMIN_TOOLS and not is_super:
+            _log.warning(
+                "tool_permission_denied | tool=%s | actor=%s | level=%s | need=super_admin",
+                name,
+                normalize_text(str(context.get("user_id", ""))) or "?",
+                perm,
+            )
+            return ToolCallResult(ok=False, error="permission_denied:need_super_admin")
+
+        if name in self._GROUP_ADMIN_TOOLS and not is_group_admin:
+            _log.warning(
+                "tool_permission_denied | tool=%s | actor=%s | level=%s | need=group_admin",
+                name,
+                normalize_text(str(context.get("user_id", ""))) or "?",
+                perm,
+            )
+            return ToolCallResult(ok=False, error="permission_denied:need_group_admin")
+        safe_args = args if isinstance(args, dict) else {}
+        sanitized_args, validation_error = self._sanitize_and_validate_args(name, safe_args)
+        if validation_error:
+            _log.warning(
+                "tool_args_rejected | tool=%s | error=%s | args=%s",
+                name,
+                validation_error,
+                json.dumps(safe_args, ensure_ascii=False)[:200],
+            )
+            return ToolCallResult(ok=False, error=f"invalid_args:{validation_error}")
         try:
-            return await handler(args=args, context=context)
+            return await handler(args=sanitized_args, context=context)
         except Exception as exc:
             _log.exception("tool_call_error | tool=%s | error=%s", name, exc)
             return ToolCallResult(ok=False, error=f"tool_exception: {type(exc).__name__}: {exc}")
@@ -112,9 +552,172 @@ def register_builtin_tools(
     _register_media_tools(registry, model_client, config)
     _register_admin_tools(registry)
     _register_utility_tools(registry)
+    _register_crawler_tools(registry)
+    _register_ai_method_tools(registry)
+    _register_qzone_tools(registry, config)
+    _register_scrapy_llm_tools(registry, model_client)
+    _assign_tool_groups(registry)
 
 
-# ── NapCat / OneBot V11 API 工具 ──
+# ── 工具语义分组映射 ──
+
+_TOOL_GROUP_MAP: dict[str, str] = {
+    # core — 始终可用
+    "final_answer": "core",
+    "think": "core",
+    # messaging — 发消息/转发
+    "send_group_message": "messaging",
+    "send_private_message": "messaging",
+    "send_msg": "messaging",
+    "forward_group_single_msg": "messaging",
+    "forward_friend_single_msg": "messaging",
+    "send_group_forward_msg": "messaging",
+    "send_private_forward_msg": "messaging",
+    "send_forward_msg": "messaging",
+    "get_forward_msg": "messaging",
+    # group_query — 群信息查询
+    "get_group_info": "group_query",
+    "get_group_info_ex": "group_query",
+    "get_group_member_list": "group_query",
+    "get_group_member_info": "group_query",
+    "get_group_list": "group_query",
+    "get_group_honor_info": "group_query",
+    "get_group_msg_history": "group_query",
+    "get_group_shut_list": "group_query",
+    "get_group_at_all_remain": "group_query",
+    "get_group_system_msg": "group_query",
+    "get_essence_msg_list": "group_query",
+    "get_group_notice": "group_query",
+    "get_group_root_files": "group_query",
+    "get_group_files_by_folder": "group_query",
+    "get_group_file_system_info": "group_query",
+    "get_group_file_url": "group_query",
+    # group_manage — 群管理操作
+    "set_group_ban": "group_manage",
+    "set_group_kick": "group_manage",
+    "set_group_whole_ban": "group_manage",
+    "set_group_admin": "group_manage",
+    "set_group_name": "group_manage",
+    "set_group_card": "group_manage",
+    "set_group_special_title": "group_manage",
+    "set_group_portrait": "group_manage",
+    "set_group_leave": "group_manage",
+    "send_group_notice": "group_manage",
+    "del_group_notice": "group_manage",
+    "delete_message": "group_manage",
+    "set_essence_msg": "group_manage",
+    "delete_essence_msg": "group_manage",
+    "delete_group_file": "group_manage",
+    "create_group_file_folder": "group_manage",
+    "set_friend_add_request": "group_manage",
+    "set_group_add_request": "group_manage",
+    # social — 社交互动
+    "group_poke": "social",
+    "friend_poke": "social",
+    "send_like": "social",
+    "set_msg_emoji_like": "social",
+    "set_group_sign": "social",
+    "set_input_status": "social",
+    "get_user_info": "social",
+    "get_login_info": "social",
+    "nc_get_user_status": "social",
+    "get_friend_list": "social",
+    "get_friends_with_category": "social",
+    "get_recent_contact": "social",
+    "get_profile_like": "social",
+    "delete_friend": "social",
+    "mark_msg_as_read": "social",
+    "mark_all_as_read": "social",
+    "get_friend_msg_history": "social",
+    # file — 文件操作
+    "upload_group_file": "file",
+    "upload_private_file": "file",
+    "download_file": "file",
+    "smart_download": "file",
+    "search_download_resources": "file",
+    # search — 搜索
+    "web_search": "search",
+    "search_web_media": "search",
+    "fetch_webpage": "search",
+    "github_search": "search",
+    "github_readme": "search",
+    "get_hot_trends": "search",
+    "search_zhihu": "search",
+    "lookup_wiki": "search",
+    # knowledge — 知识库
+    "search_knowledge": "knowledge",
+    "learn_knowledge": "knowledge",
+    # media — 媒体处理
+    "generate_image": "media",
+    "parse_video": "media",
+    "analyze_video": "media",
+    "analyze_local_video": "media",
+    "split_video": "media",
+    "analyze_image": "media",
+    "analyze_voice": "media",
+    "douyin_search": "media",
+    "get_qq_avatar": "media",
+    "ocr_image": "media",
+    "get_ai_characters": "media",
+    "send_group_ai_record": "media",
+    "get_ai_record": "media",
+    "get_image": "media",
+    "get_record": "media",
+    "get_message": "media",
+    # sticker — 表情包
+    "send_face": "sticker",
+    "send_emoji": "sticker",
+    "send_sticker": "sticker",
+    "list_faces": "sticker",
+    "list_emojis": "sticker",
+    "browse_sticker_categories": "sticker",
+    "learn_sticker": "sticker",
+    "scan_stickers": "sticker",
+    "fetch_custom_face": "sticker",
+    "fetch_emoji_like": "sticker",
+    # qzone — QQ空间
+    "get_qzone_profile": "qzone",
+    "get_qzone_moods": "qzone",
+    "get_qzone_albums": "qzone",
+    "analyze_qzone": "qzone",
+    "get_qzone_photos": "qzone",
+    # utility — 杂项
+    "translate_en2zh": "utility",
+    "check_url_safely": "utility",
+    "get_status": "utility",
+    "get_version_info": "utility",
+    "nc_get_packet_status": "utility",
+    "clean_cache": "utility",
+    "create_collection": "utility",
+    "get_collection_list": "utility",
+    "ark_share_peer": "utility",
+    "get_mini_app_ark": "utility",
+    "set_self_longnick": "utility",
+    "set_qq_avatar": "utility",
+    "set_online_status": "utility",
+    "music_play": "utility",
+    # admin — 管理
+    "admin_command": "admin",
+    "config_update": "admin",
+    "cli_invoke": "admin",
+    # scrapy_llm — 智能网页抓取
+    "scrape_extract": "search",
+    "scrape_summarize": "search",
+    "scrape_structured": "search",
+    "scrape_follow_links": "search",
+}
+
+
+def _assign_tool_groups(registry: AgentToolRegistry) -> None:
+    """批量为已注册工具分配语义分组。"""
+    for name, group in _TOOL_GROUP_MAP.items():
+        schema = registry._schemas.get(name)
+        if schema:
+            schema.group = group
+    # 统计
+    grouped = sum(1 for s in registry._schemas.values() if s.group)
+    total = len(registry._schemas)
+    _log.info("tool_groups_assigned | grouped=%d/%d", grouped, total)
 
 def _register_napcat_tools(registry: AgentToolRegistry) -> None:
     """注册 NapCat OneBot V11 API 工具，让 Agent 可以直接操作 QQ。"""
@@ -534,6 +1137,8 @@ async def _handle_send_group_message(args: dict[str, Any], context: dict[str, An
     message = str(args.get("message", ""))
     if not group_id or not message:
         return ToolCallResult(ok=False, error="missing group_id or message")
+    if len(message) > 4000:
+        message = message[:3997] + "..."
     try:
         await api_call("send_group_msg", group_id=group_id, message=message)
         return ToolCallResult(ok=True, display=f"已发送群消息到 {group_id}")
@@ -549,6 +1154,8 @@ async def _handle_send_private_message(args: dict[str, Any], context: dict[str, 
     message = str(args.get("message", ""))
     if not user_id or not message:
         return ToolCallResult(ok=False, error="missing user_id or message")
+    if len(message) > 4000:
+        message = message[:3997] + "..."
     try:
         await api_call("send_private_msg", user_id=user_id, message=message)
         return ToolCallResult(ok=True, display=f"已发送私聊消息到 {user_id}")
@@ -575,6 +1182,26 @@ async def _napcat_api_call(
         return ToolCallResult(ok=True, data=data, display=display_ok)
     except Exception as exc:
         return ToolCallResult(ok=False, error=str(exc))
+
+
+_QQ_ID_SAFE_PATTERN = re.compile(r"^[1-9]\d{5,11}$")
+
+
+def _safe_user_id(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        raw = str(value)
+    elif isinstance(value, str):
+        raw = normalize_text(value)
+    else:
+        return None
+    if not _QQ_ID_SAFE_PATTERN.fullmatch(raw):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
 
 
 async def _handle_get_group_member_list(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
@@ -609,9 +1236,9 @@ async def _handle_get_group_info(args: dict[str, Any], context: dict[str, Any]) 
 
 
 async def _handle_get_user_info(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    user_id = int(args.get("user_id", 0))
-    if not user_id:
-        return ToolCallResult(ok=False, error="missing user_id")
+    user_id = _safe_user_id(args.get("user_id", 0))
+    if user_id is None:
+        return ToolCallResult(ok=False, error="invalid user_id")
     result = await _napcat_api_call(context, "get_stranger_info", f"获取用户 {user_id} 信息成功", user_id=user_id)
     if result.ok and result.data:
         d = result.data
@@ -699,9 +1326,32 @@ async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any
     name = str(args.get("name", ""))
     if not group_id or not file_path or not name:
         return ToolCallResult(ok=False, error="missing group_id, file or name")
+    # 安全: 限制文件路径，防止 LLM 上传任意系统文件
+    resolved = Path(file_path).resolve()
+    # 只允许 storage/ 和 tmp/ 目录下的文件
+    project_root = Path(__file__).resolve().parents[1]
+    allowed_dirs = [
+        project_root / "storage",
+        project_root / "tmp",
+        Path("/tmp"),
+        Path(tempfile.gettempdir()),
+    ]
+    # 兼容 NapCat 常见下载目录
+    home = Path.home()
+    for extra in (
+        home / "OneDrive" / "文档" / "Tencent Files" / "NapCat" / "temp",
+        home / "Documents" / "Tencent Files" / "NapCat" / "temp",
+        home / "Tencent Files" / "NapCat" / "temp",
+        Path(tempfile.gettempdir()) / "NapCat" / "temp",
+    ):
+        allowed_dirs.append(extra)
+    if not any(str(resolved).lower().startswith(str(d.resolve()).lower()) for d in allowed_dirs):
+        return ToolCallResult(ok=False, error="安全限制: 只能上传 storage/tmp 或 NapCat temp 目录下的文件")
+    if not resolved.is_file():
+        return ToolCallResult(ok=False, error=f"文件不存在: {file_path}")
     return await _napcat_api_call(
         context, "upload_group_file", f"已上传文件 {name} 到群 {group_id}",
-        group_id=group_id, file=file_path, name=name,
+        group_id=group_id, file=str(resolved), name=name,
     )
 
 
@@ -870,9 +1520,28 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
          {"user_id": ("integer", "目标用户QQ号"), "event_type": ("integer", "1=正在输入")},
          ["user_id", "event_type"], _handle_set_input_status),
 
-        ("download_file", "下载URL文件到本地缓存，返回本地路径。\n使用场景: 需要先下载文件再上传到群文件时使用",
-         {"url": ("string", "文件下载URL"), "thread_count": ("integer", "下载线程数，默认1")},
+        ("download_file", "下载URL文件到本地缓存，返回本地路径。\n兼容入口：内部会自动走智能下载链路（视频解析/网页提取下载链接）。\n使用场景: 需要先下载文件再上传到群文件时使用",
+         {"url": ("string", "文件下载URL"), "thread_count": ("integer", "下载线程数，默认1"),
+           "kind": ("string", "auto/video/audio/file，默认auto"),
+           "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
+           "query": ("string", "原始用户需求文本(可选，用于下载来源可信度判断)"),
+           "allow_third_party": ("boolean", "是否允许切换到第三方下载源（默认false，需先征得用户同意）"),
+           "upload": ("boolean", "是否下载后直接上传群文件，默认false"),
+           "group_id": ("integer", "upload=true 时目标群号"),
+           "file_name": ("string", "下载后/上传时文件名(可选)")},
          ["url"], _handle_download_file),
+
+        ("smart_download", "母下载方法(统一下载入口)。\n会自动执行：媒体解析 -> 网页提取直链 -> 下载到可上传目录。\n可直接 upload=true 上传群文件。\n使用场景: 用户要你'直接发安装包/视频/音频文件'时优先用这个。",
+         {"url": ("string", "资源链接(网页/视频链接/直链)"),
+           "kind": ("string", "auto/video/audio/file，默认auto"),
+           "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
+           "thread_count": ("integer", "下载线程数，默认1"),
+           "query": ("string", "原始用户需求文本(可选，用于下载来源可信度判断)"),
+           "allow_third_party": ("boolean", "是否允许切换到第三方下载源（默认false，需先征得用户同意）"),
+           "upload": ("boolean", "是否下载后直接上传群文件，默认false"),
+           "group_id": ("integer", "upload=true 时目标群号"),
+           "file_name": ("string", "下载后/上传时文件名(可选)")},
+         ["url"], _handle_smart_download),
 
         ("nc_get_user_status", "查询某QQ用户的在线状态。\n使用场景: 用户问'XX在线吗'时使用",
          {"user_id": ("integer", "目标QQ号")},
@@ -978,6 +1647,97 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
 
         ("get_version_info", "获取NapCat/OneBot版本信息。\n使用场景: 用户问'什么版本'时使用",
          {}, [], _handle_get_version_info),
+
+        # ── 第二批 NapCat 扩展 API ──
+
+        ("set_self_longnick", "设置机器人的个性签名(长昵称)。\n使用场景: 用户说'改签名'、'设置个签'时使用",
+         {"longnick": ("string", "新的个性签名内容")},
+         ["longnick"], _handle_set_self_longnick),
+
+        ("get_recent_contact", "获取最近的聊天联系人列表。\n使用场景: 用户问'最近和谁聊过'、'最近联系人'时使用",
+         {"count": ("integer", "获取数量，默认10")},
+         [], _handle_get_recent_contact),
+
+        ("get_profile_like", "获取谁给机器人点了赞(名片赞列表)。\n使用场景: 用户问'谁给我点赞了'时使用",
+         {}, [], _handle_get_profile_like),
+
+        ("fetch_custom_face", "获取机器人收藏的自定义表情列表。\n使用场景: 用户问'有什么收藏表情'时使用",
+         {"count": ("integer", "获取数量，默认48")},
+         [], _handle_fetch_custom_face),
+
+        ("fetch_emoji_like", "获取某条消息的表情回应详情(谁回应了什么表情)。\n使用场景: 用户问'这条消息谁点了表情'时使用",
+         {"message_id": ("integer", "消息ID"), "emoji_id": ("string", "表情ID(可选)"), "emoji_type": ("string", "表情类型(可选)")},
+         ["message_id"], _handle_fetch_emoji_like),
+
+        ("get_group_info_ex", "获取群的扩展详细信息(比 get_group_info 更详细)。\n返回: 群等级、创建时间、最大成员数等。\n使用场景: 需要群的详细元数据时使用",
+         {"group_id": ("integer", "群号")},
+         ["group_id"], _handle_get_group_info_ex),
+
+        ("get_group_files_by_folder", "获取群文件指定文件夹内的文件列表。\n使用场景: 用户说'看看XX文件夹里有什么'时使用。\nfolder_id 从 get_group_root_files 获取",
+         {"group_id": ("integer", "群号"), "folder_id": ("string", "文件夹ID(从文件列表获取)")},
+         ["group_id", "folder_id"], _handle_get_group_files_by_folder),
+
+        ("delete_group_file", "删除群文件。需要管理员权限。\n使用场景: 用户说'删除群文件XX'时使用",
+         {"group_id": ("integer", "群号"), "file_id": ("string", "文件ID"), "busid": ("integer", "文件业务ID")},
+         ["group_id", "file_id"], _handle_delete_group_file),
+
+        ("create_group_file_folder", "在群文件中创建文件夹。\n使用场景: 用户说'在群文件里建个文件夹'时使用",
+         {"group_id": ("integer", "群号"), "name": ("string", "文件夹名称"), "parent_id": ("string", "父文件夹ID，默认'/'(根目录)")},
+         ["group_id", "name"], _handle_create_group_file_folder),
+
+        ("get_group_system_msg", "获取群系统消息(加群请求、邀请等待处理的通知)。\n使用场景: 用户问'有没有人申请加群'、'群通知'时使用",
+         {}, [], _handle_get_group_system_msg),
+
+        ("send_forward_msg", "通用合并转发消息接口(支持群和私聊)。\n"
+         "使用场景: 需要发送合并转发消息时使用。\n"
+         "messages 是 node 数组，格式同 send_group_forward_msg",
+         {"message_type": ("string", "'group'或'private'"), "group_id": ("integer", "群号(群聊时)"),
+          "user_id": ("integer", "QQ号(私聊时)"), "messages": ("array", "node数组")},
+         ["messages"], _handle_send_forward_msg),
+
+        ("mark_all_as_read", "标记所有消息为已读。\n使用场景: 用户说'全部已读'、'清除未读'时使用",
+         {}, [], _handle_mark_all_as_read),
+
+        ("get_friends_with_category", "获取带分组信息的好友列表。\n使用场景: 用户问'好友分组'、'哪些好友在哪个分组'时使用",
+         {}, [], _handle_get_friends_with_category),
+
+        ("get_image", "获取图片文件信息(本地路径和URL)。\n使用场景: 需要获取图片的实际文件路径或下载URL时使用。\nfile 参数从消息的 image 段获取",
+         {"file": ("string", "图片file标识(从消息段获取)")},
+         ["file"], _handle_get_image),
+
+        ("get_record", "获取语音文件信息(转换格式并返回路径)。\n使用场景: 需要获取语音文件的本地路径时使用。\nfile 参数从消息的 record 段获取",
+         {"file": ("string", "语音file标识(从消息段获取)"), "out_format": ("string", "输出格式: mp3/amr/wma/m4a/spx/ogg/wav/flac，默认mp3")},
+         ["file"], _handle_get_record),
+
+        ("get_ai_record", "生成AI语音(TTS)但不直接发送，返回语音文件信息。\n使用场景: 需要先生成语音再做其他处理时使用。\n先用 get_ai_characters 获取角色ID",
+         {"group_id": ("integer", "群号(用于获取语音权限)"), "character": ("string", "角色ID"), "text": ("string", "要转为语音的文本")},
+         ["group_id", "character", "text"], _handle_get_ai_record),
+
+        ("ark_share_peer", "生成推荐联系人/群的分享卡片(Ark消息)。\n使用场景: 用户说'推荐XX给某人'、'分享群名片'时使用",
+         {"user_id": ("string", "推荐的用户QQ号(可选)"), "group_id": ("string", "推荐的群号(可选)"), "phone_number": ("string", "手机号(可选)")},
+         [], _handle_ark_share_peer),
+
+        ("get_mini_app_ark", "签名小程序卡片(Ark消息)。\n使用场景: 需要发送小程序分享卡片时使用。\ncontent 是小程序的 JSON 配置",
+         {"content": ("string", "小程序JSON配置字符串")},
+         ["content"], _handle_get_mini_app_ark),
+
+        ("create_collection", "创建QQ收藏。\n使用场景: 用户说'收藏这段话'、'帮我收藏'时使用",
+         {"raw_data": ("string", "要收藏的文本内容"), "brief": ("string", "收藏摘要(可选)")},
+         ["raw_data"], _handle_create_collection),
+
+        ("get_collection_list", "获取QQ收藏列表。\n使用场景: 用户问'我的收藏有什么'时使用",
+         {"category": ("integer", "收藏分类，0=全部"), "count": ("integer", "获取数量，默认20")},
+         [], _handle_get_collection_list),
+
+        ("del_group_notice", "删除群公告。需要管理员权限。\n使用场景: 用户说'删除群公告'时使用。\nnotice_id 从 get_group_notice 获取",
+         {"group_id": ("integer", "群号"), "notice_id": ("string", "公告ID(从 get_group_notice 获取)")},
+         ["group_id", "notice_id"], _handle_del_group_notice),
+
+        ("nc_get_packet_status", "获取NapCat PacketServer状态(扩展功能是否可用)。\n使用场景: 需要检查戳一戳、AI语音等扩展功能是否可用时使用",
+         {}, [], _handle_nc_get_packet_status),
+
+        ("clean_cache", "清理NapCat缓存。\n使用场景: 用户说'清理缓存'、'清除缓存'时使用",
+         {}, [], _handle_clean_cache),
     ]
 
     for name, desc, props, required, handler in _ext_tools:
@@ -1196,18 +1956,1075 @@ async def _handle_set_input_status(args: dict[str, Any], context: dict[str, Any]
     )
 
 
-async def _handle_download_file(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    url = str(args.get("url", ""))
-    if not url:
-        return ToolCallResult(ok=False, error="missing url")
-    thread_count = int(args.get("thread_count", 1))
-    result = await _napcat_api_call(
-        context, "download_file", "文件下载成功",
-        url=url, thread_count=thread_count,
+def _guess_download_filename(url: str, fallback: str = "download.bin") -> str:
+    parsed = urlparse(url)
+    name = Path(parsed.path).name.strip()
+    if not name:
+        return fallback
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip()
+    return name or fallback
+
+
+def _normalize_download_http_url(url: str) -> str:
+    """规范化下载 URL，主要修复 path 里未编码空格导致的 404。"""
+    raw = normalize_text(url)
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw
+    if parsed.scheme.lower() not in {"http", "https"}:
+        return raw
+    safe_path = quote(unquote(parsed.path or "/"), safe="/%:@!$&'()*+,;=-._~")
+    safe_query = quote(unquote(parsed.query or ""), safe="=&%:@!$'()*+,;/?-._~")
+    return urlunparse((parsed.scheme, parsed.netloc, safe_path, parsed.params, safe_query, ""))
+
+
+async def _download_file_via_http_fallback(
+    url: str,
+    *,
+    file_name: str = "",
+    max_size_mb: float = 1024.0,
+) -> str:
+    """当 NapCat download_file 失败时，用本地 HTTP 客户端兜底下载。"""
+    normalized_url = _normalize_download_http_url(url)
+    if not normalized_url or not re.match(r"^https?://", normalized_url, flags=re.IGNORECASE):
+        return ""
+    from utils.media import download_file
+
+    guessed_name = normalize_text(file_name) or _guess_download_filename(normalized_url, fallback="download.bin")
+    guessed_name = re.sub(r"[\\/:*?\"<>|]+", "_", guessed_name).strip() or "download.bin"
+    download_dir = Path(tempfile.gettempdir()) / "yukiko_http_downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    temp_name = f"{random.randint(100000, 999999)}_{guessed_name}"
+    out_path = (download_dir / temp_name).resolve()
+    ok = await download_file(
+        normalized_url,
+        out_path,
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=120.0,
+        max_size_mb=max_size_mb,
     )
-    if result.ok and result.data:
-        result.display = f"已下载到: {result.data.get('file', '?')}"
-    return result
+    if not ok:
+        out_path.unlink(missing_ok=True)
+        return ""
+    return str(out_path)
+
+
+def _friendly_download_failure_display(error_text: str, url: str) -> str:
+    err = normalize_text(error_text)
+    lower = err.lower()
+    host = normalize_text(urlparse(url).netloc) or "目标站点"
+    if any(token in lower for token in ("enotfound", "getaddrinfo", "name or service not known", "nodename nor servname")):
+        return f"下载失败：无法解析下载域名 {host}（DNS 解析失败）。请稍后重试，或切换网络/DNS。"
+    if any(token in lower for token in ("connecttimeout", "connect timeout", "timed out", "timeout")):
+        return f"下载失败：连接 {host} 超时，可能是源站不稳定或网络受限。请稍后重试。"
+    if "connection refused" in lower:
+        return f"下载失败：{host} 拒绝连接。"
+    if err:
+        return f"下载失败：{clip_text(err, 160)}"
+    return "下载失败：源站当前不可用，请稍后再试。"
+
+
+_DOWNLOAD_QUERY_STOPWORDS = {
+    "下载", "安装", "安装包", "最新版", "最新", "官网", "官方", "desktop", "windows", "win", "mac", "linux",
+    "android", "ios", "apk", "exe", "msi", "zip", "file", "包", "客户端", "版本", "v",
+}
+
+_TRUSTED_DISTRIBUTION_HOST_HINTS = (
+    "github.com",
+    "githubusercontent.com",
+    "microsoft.com",
+    "apple.com",
+    "google.com",
+    "steampowered.com",
+)
+_OFFICIAL_HOST_FAMILY_HINTS: tuple[tuple[str, ...], ...] = (
+    ("bilibili.com", "hdslb.net", "biligame.com", "bilivideo.com"),
+    ("qq.com", "gtimg.com", "myqcloud.com"),
+    ("douyin.com", "bytedance.com", "byteimg.com"),
+    ("kuaishou.com", "yximgs.com"),
+    ("github.com", "githubusercontent.com", "githubassets.com"),
+)
+
+
+def _extract_download_query_keywords(query: str, *, extra: str = "") -> list[str]:
+    text = normalize_text(f"{query} {extra}").lower()
+    if not text:
+        return []
+    raw_tokens: list[str] = []
+    raw_tokens.extend(re.findall(r"[a-z0-9][a-z0-9._+-]{1,32}", text))
+    raw_tokens.extend(re.findall(r"[\u4e00-\u9fff]{2,10}", text))
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw_tokens:
+        t = token.strip()
+        if not t or t in _DOWNLOAD_QUERY_STOPWORDS:
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out[:12]
+
+
+def _is_trusted_distribution_host(host: str) -> bool:
+    h = normalize_text(host).lower()
+    return bool(h) and any(h == hint or h.endswith(f".{hint}") for hint in _TRUSTED_DISTRIBUTION_HOST_HINTS)
+
+
+def _is_wrapper_like_host(host: str) -> bool:
+    h = normalize_text(host).lower()
+    if not h:
+        return False
+    if _is_trusted_distribution_host(h):
+        return False
+    if h == "pc.qq.com":
+        return True
+    if any(hint in h for hint in ("qqpcmgr", "myapp", "2345", "apkpure", "downkuai", "pc6", "cr173")):
+        return True
+    # Generic mirror-like host cues.
+    return bool(re.search(r"(?:^|[.\-])(down|download|xiazai|soft|apk)(?:[.\-]|$)", h))
+
+
+def _root_domain(host: str) -> str:
+    h = normalize_text(host).lower().strip(".")
+    if not h:
+        return ""
+    parts = [item for item in h.split(".") if item]
+    if len(parts) <= 2:
+        return h
+    return ".".join(parts[-2:])
+
+
+def _same_distribution_family(host_a: str, host_b: str) -> bool:
+    a = normalize_text(host_a).lower()
+    b = normalize_text(host_b).lower()
+    if not a or not b:
+        return False
+    if a == b or a.endswith(f".{b}") or b.endswith(f".{a}"):
+        return True
+    ra = _root_domain(a)
+    rb = _root_domain(b)
+    if ra and rb and ra == rb:
+        return True
+    for family in _OFFICIAL_HOST_FAMILY_HINTS:
+        in_a = any(a == hint or a.endswith(f".{hint}") for hint in family)
+        in_b = any(b == hint or b.endswith(f".{hint}") for hint in family)
+        if in_a and in_b:
+            return True
+    return False
+
+
+def _is_retryable_download_error(error_text: str) -> bool:
+    text = normalize_text(error_text).lower()
+    if not text:
+        return False
+    retry_cues = (
+        "enotfound",
+        "getaddrinfo",
+        "name or service not known",
+        "nodename nor servname",
+        "timeout",
+        "timed out",
+        "connecttimeout",
+        "connection reset",
+        "connection aborted",
+        "connection refused",
+        "temporarily unavailable",
+        "network is unreachable",
+    )
+    return any(cue in text for cue in retry_cues)
+
+
+def _score_download_source_trust(
+    *,
+    url: str,
+    title: str = "",
+    snippet: str = "",
+    query: str = "",
+    extra_hint: str = "",
+) -> tuple[int, list[str]]:
+    parsed = urlparse(normalize_text(url))
+    host = normalize_text(parsed.netloc).lower()
+    path = normalize_text(parsed.path).lower()
+    haystack = normalize_text(f"{title} {snippet}").lower()
+    score = 0
+    reasons: list[str] = []
+
+    if _is_trusted_distribution_host(host):
+        score += 6
+        reasons.append("trusted_distribution_host")
+    elif _is_wrapper_like_host(host):
+        score -= 8
+        reasons.append("wrapper_like_host")
+
+    if any(token in haystack for token in ("官方", "官网", "official", "publisher", "developer")):
+        score += 2
+        reasons.append("official_terms")
+
+    keywords = _extract_download_query_keywords(query, extra=extra_hint)
+    if keywords:
+        host_and_path = f"{host} {path}"
+        matched = sum(1 for kw in keywords if kw in host_and_path or kw in haystack)
+        if matched:
+            score += min(6, matched * 2)
+            reasons.append(f"keyword_match:{matched}")
+
+    return score, reasons
+
+
+def _pick_download_candidates(page_url: str, html_text: str, prefer_ext: str = "") -> list[str]:
+    """从下载页里挑更像“真实可下载入口”的链接，尽量避开导航噪音。"""
+    ext_tokens = (".apk", ".exe", ".msi", ".zip", ".7z", ".rar", ".mp4", ".mp3", ".m4a", ".wav")
+    pref = normalize_text(prefer_ext).lower().strip()
+    if pref and not pref.startswith("."):
+        pref = f".{pref}"
+
+    # 1) 常规 href/src
+    raw_links: list[str] = []
+    for m in re.finditer(r"""(?:href|src)\s*=\s*["']([^"'#]+)["']""", html_text, flags=re.IGNORECASE):
+        raw = normalize_text(m.group(1))
+        if raw:
+            raw_links.append(raw)
+
+    # 2) 兜底: 脚本中常见的协议相对下载地址或完整 URL（例如 "//get.xxx.com/download/123"）
+    for m in re.finditer(r"""["'](//[^"']+/download/[^"']+)["']""", html_text, flags=re.IGNORECASE):
+        raw = normalize_text(m.group(1))
+        if raw:
+            raw_links.append(raw)
+    for m in re.finditer(r"""["'](https?://[^"']+/download/[^"']+)["']""", html_text, flags=re.IGNORECASE):
+        raw = normalize_text(m.group(1))
+        if raw:
+            raw_links.append(raw)
+
+    candidates: list[tuple[int, str]] = []
+    for raw_link in raw_links:
+        lower_raw = raw_link.lower()
+        if lower_raw.startswith(("javascript:", "mailto:", "tel:")):
+            continue
+        link = urljoin(page_url, raw_link)
+        parsed = urlparse(link)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+
+        host = normalize_text(parsed.netloc).lower()
+        path_query = f"{normalize_text(parsed.path).lower()}?{normalize_text(parsed.query).lower()}"
+        lower_link = link.lower()
+        score = 0
+
+        # 强信号: 路径/查询里包含下载入口标识
+        if any(tok in path_query for tok in ("/download/", "download=", "/dl/", "downfile", "getfile", "apk")):
+            score += 8
+        # 次强信号: 域名像下载域名
+        if host.startswith(("get.", "download.", "down.")) or "download" in host:
+            score += 3
+        if _is_trusted_distribution_host(host):
+            score += 2
+        if _is_wrapper_like_host(host):
+            score -= 6
+        # 文件扩展名
+        if any(tok in lower_link for tok in ext_tokens):
+            score += 8
+        if pref and pref in lower_link:
+            score += 10
+        # 下载语义词（仅看 path/query，避免把 downkuai 域名误判）
+        if any(k in path_query for k in ("download", "setup", "installer", "android", "apk")):
+            score += 2
+
+        # 明显噪音路径降权
+        if parsed.path in {"/", ""}:
+            score -= 6
+        if re.search(r"/(game|soft|article|zt|gift|open|company|topdesc)/?$", parsed.path.lower()):
+            score -= 5
+        if re.search(r"\.(css|js|png|jpg|jpeg|gif|svg|webp)(?:$|[?&#])", lower_link):
+            score -= 8
+
+        if score < 4:
+            continue
+        candidates.append((score, link))
+
+    # 按分数优先，其次路径长度（更具体）
+    candidates.sort(key=lambda item: (-item[0], -len(urlparse(item[1]).path), len(item[1])))
+    out: list[str] = []
+    seen: set[str] = set()
+    for _, link in candidates:
+        key = link.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(link)
+        if len(out) >= 8:
+            break
+    return out
+
+
+async def _resolve_redirect_download_url(url: str, referer: str = "") -> str:
+    """解析短下载入口的 30x 链路，尽量拿到最终直链（不下载大文件主体）。"""
+    current = normalize_text(url)
+    if not current:
+        return ""
+    current_ref = normalize_text(referer)
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(5.0, connect=3.5),
+            follow_redirects=False,
+        ) as client:
+            for _ in range(4):
+                headers = {"User-Agent": "Mozilla/5.0", "Accept": "*/*"}
+                if current_ref:
+                    headers["Referer"] = current_ref
+                try:
+                    resp = await client.request("HEAD", current, headers=headers)
+                    status = int(resp.status_code)
+                    resp_url = str(resp.url)
+                    location = normalize_text(str(resp.headers.get("location", "")))
+                except Exception:
+                    status = 0
+                    resp_url = current
+                    location = ""
+
+                # 某些站点禁用 HEAD，回退为只取响应头的 GET（Range 0-0）。
+                if status in {0, 400, 403, 405, 500, 501}:
+                    headers_get = dict(headers)
+                    headers_get["Range"] = "bytes=0-0"
+                    async with client.stream("GET", current, headers=headers_get) as resp2:
+                        status = int(resp2.status_code)
+                        resp_url = str(resp2.url)
+                        location = normalize_text(str(resp2.headers.get("location", "")))
+
+                if status not in {301, 302, 303, 307, 308}:
+                    return resp_url
+                if not location:
+                    return resp_url
+                nxt = urljoin(resp_url, location)
+                current_ref = resp_url
+                current = nxt
+    except Exception:
+        return normalize_text(url)
+    return current
+
+
+def _guess_download_os_hint(prefer_ext: str = "", file_name: str = "") -> str:
+    ext = normalize_text(prefer_ext).lower().strip()
+    if ext and not ext.startswith("."):
+        ext = f".{ext}"
+    if not ext:
+        ext = Path(normalize_text(file_name)).suffix.lower()
+    if ext in {".dmg", ".pkg"}:
+        return "macos"
+    if ext in {".appimage", ".deb", ".rpm", ".tar.gz", ".tgz"}:
+        return "linux"
+    return "windows"
+
+
+def _append_query_param(url: str, key: str, value: str) -> str:
+    parsed = urlparse(url)
+    query_rows = parse_qsl(parsed.query, keep_blank_values=True)
+    if not any(k == key for k, _ in query_rows):
+        query_rows.append((key, value))
+    rebuilt = list(parsed)
+    rebuilt[4] = urlencode(query_rows)
+    return urlunparse(rebuilt)
+
+
+async def _extract_runtime_download_candidates_from_page(
+    page_url: str,
+    html_text: str,
+    *,
+    prefer_ext: str = "",
+    file_name: str = "",
+) -> list[str]:
+    if not html_text:
+        return []
+    page_parsed = urlparse(page_url)
+    page_host = normalize_text(page_parsed.netloc).lower()
+    if not page_host:
+        return []
+
+    script_srcs = re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE)
+    if not script_srcs:
+        inline_patterns = (
+            r"https?://[^\s\"']*download\?[^\s\"']*",
+            r"https?://[^\s\"']+/download/[^\s\"']+",
+            r"https?://[^\s\"']+\.(?:exe|msi|apk|zip|7z|rar|dmg|pkg)(?:\?[^\s\"']*)?",
+            r"//[^\s\"']+/download/[^\s\"']+",
+        )
+        out: list[str] = []
+        seen: set[str] = set()
+        for pattern in inline_patterns:
+            for raw in re.findall(pattern, html_text, flags=re.IGNORECASE):
+                endpoint = normalize_text(raw)
+                if not endpoint:
+                    continue
+                if endpoint.startswith("//"):
+                    endpoint = f"{page_parsed.scheme or 'https'}:{endpoint}"
+                parsed = urlparse(endpoint)
+                if parsed.scheme not in {"http", "https"}:
+                    continue
+                key = endpoint.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(endpoint)
+                if len(out) >= 10:
+                    return out
+        return out
+
+    scored_scripts: list[tuple[int, str]] = []
+    for src in script_srcs:
+        script_url = normalize_text(urljoin(page_url, src))
+        if not script_url:
+            continue
+        parsed = urlparse(script_url)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        if normalize_text(parsed.netloc).lower() != page_host:
+            continue
+        lower = script_url.lower()
+        score = 0
+        if "download" in lower:
+            score += 6
+        if lower.endswith(".js"):
+            score += 2
+        if "/_next/static/" in lower:
+            score += 1
+        scored_scripts.append((score, script_url))
+    if not scored_scripts:
+        return []
+    scored_scripts.sort(key=lambda item: item[0], reverse=True)
+
+    os_hint = _guess_download_os_hint(prefer_ext=prefer_ext, file_name=file_name)
+    endpoint_raw: list[str] = []
+    patterns = (
+        r"https?://[^\s\"']*download\?[^\s\"']*",
+        r"https?://[^\s\"']+/download/[^\s\"']+",
+        r"https?://[^\s\"']+\.(?:exe|msi|apk|zip|7z|rar|dmg|pkg)(?:\?[^\s\"']*)?",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(8.0, connect=5.0), follow_redirects=True) as client:
+            for _, script_url in scored_scripts[:6]:
+                try:
+                    resp = await client.get(script_url, headers={"User-Agent": "Mozilla/5.0", "Referer": page_url})
+                    js_text = normalize_text(resp.text)
+                except Exception:
+                    continue
+                if not js_text:
+                    continue
+                for pattern in patterns:
+                    endpoint_raw.extend(re.findall(pattern, js_text, flags=re.IGNORECASE))
+    except Exception:
+        return []
+
+    if not endpoint_raw:
+        return []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in endpoint_raw:
+        endpoint = normalize_text(raw)
+        if not endpoint:
+            continue
+        parsed = urlparse(endpoint)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        endpoint_try = endpoint
+        query_text = normalize_text(parsed.query).lower()
+        if "download" in endpoint.lower() and "os=" not in query_text:
+            endpoint_try = _append_query_param(endpoint_try, "os", os_hint)
+        try:
+            resolved = await asyncio.wait_for(
+                _resolve_redirect_download_url(endpoint_try, referer=page_url),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            resolved = endpoint_try
+        for candidate in (normalize_text(resolved), normalize_text(endpoint_try)):
+            if not candidate:
+                continue
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+            if len(out) >= 10:
+                return out
+    return out
+
+
+def _extract_github_repo_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    host = normalize_text(parsed.netloc).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host != "github.com":
+        return ""
+    parts = [p for p in normalize_text(parsed.path).split("/") if p]
+    if len(parts) < 2:
+        return ""
+    owner, repo = parts[0], parts[1]
+    reserved = {
+        "features", "topics", "marketplace", "orgs", "organizations", "login", "signup", "about", "explore",
+        "contact", "pricing", "collections", "sponsors", "apps", "settings", "notifications", "new", "search",
+    }
+    if owner.lower() in reserved:
+        return ""
+    repo = repo.removesuffix(".git")
+    return f"{owner}/{repo}" if owner and repo else ""
+
+
+def _score_github_release_asset(name: str, prefer_ext: str = "") -> int:
+    lower = normalize_text(name).lower()
+    ext = normalize_text(prefer_ext).lower().strip()
+    if ext and not ext.startswith("."):
+        ext = f".{ext}"
+    score = 0
+    if ext and lower.endswith(ext):
+        score += 9
+    if re.search(r"\.(exe|msi|zip|7z|rar|apk|dmg|pkg)(?:$|[?&#])", lower):
+        score += 4
+    if any(tok in lower for tok in ("installer", "setup", "portable", "windows", "win", "x64", "amd64")):
+        score += 2
+    if any(tok in lower for tok in ("sha256", "checksum", ".asc", ".sig", ".txt", "source code")):
+        score -= 6
+    return score
+
+
+def _github_asset_matches_prefer_ext(name: str, prefer_ext: str = "") -> bool:
+    ext = normalize_text(prefer_ext).lower().strip()
+    if ext and not ext.startswith("."):
+        ext = f".{ext}"
+    if not ext:
+        return True
+    lower = normalize_text(name).lower()
+    if ext == ".exe":
+        return lower.endswith(".exe") or lower.endswith(".msi")
+    if ext in {".zip", ".7z", ".rar"}:
+        return lower.endswith(".zip") or lower.endswith(".7z") or lower.endswith(".rar")
+    return lower.endswith(ext)
+
+
+def _resolve_github_api_options(config: dict[str, Any] | None) -> tuple[str, dict[str, str]]:
+    api_base = "https://api.github.com"
+    token = ""
+    cfg = config if isinstance(config, dict) else {}
+    tool_iface_cfg: dict[str, Any] = {}
+    if isinstance(cfg.get("tool_interface"), dict):
+        tool_iface_cfg = cfg.get("tool_interface", {})
+    elif isinstance(cfg.get("tools"), dict) and isinstance(cfg.get("tools", {}).get("tool_interface"), dict):
+        tool_iface_cfg = cfg.get("tools", {}).get("tool_interface", {})
+    if isinstance(tool_iface_cfg, dict):
+        api_base = normalize_text(str(tool_iface_cfg.get("github_api_base", api_base))) or api_base
+        token = normalize_text(str(tool_iface_cfg.get("github_token", "")))
+    api_base = api_base.rstrip("/")
+    headers = {
+        "User-Agent": "YukikoBot/1.0 (+https://github.com)",
+        "Accept": "application/vnd.github+json",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return api_base, headers
+
+
+async def _resolve_github_release_direct_url(
+    url: str,
+    *,
+    prefer_ext: str = "",
+    config: dict[str, Any] | None = None,
+) -> str:
+    parsed = urlparse(url)
+    host = normalize_text(parsed.netloc).lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host != "github.com":
+        return ""
+    path_lower = normalize_text(parsed.path).lower()
+    if "/releases/download/" in path_lower:
+        return normalize_text(url)
+
+    repo = _extract_github_repo_from_url(url)
+    if not repo:
+        return ""
+    api_base, headers = _resolve_github_api_options(config)
+
+    def pick_asset_url(release_obj: dict[str, Any]) -> str:
+        assets = release_obj.get("assets")
+        if not isinstance(assets, list):
+            return ""
+        picked_url = ""
+        picked_score = -10_000
+        for asset in assets:
+            if not isinstance(asset, dict):
+                continue
+            asset_url = normalize_text(str(asset.get("browser_download_url", "")))
+            asset_name = normalize_text(str(asset.get("name", "")))
+            if not asset_url:
+                continue
+            if not _github_asset_matches_prefer_ext(asset_name, prefer_ext=prefer_ext):
+                continue
+            score = _score_github_release_asset(asset_name, prefer_ext=prefer_ext)
+            if score > picked_score:
+                picked_score = score
+                picked_url = asset_url
+        return picked_url if picked_score >= 0 else ""
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=6.0), follow_redirects=True) as client:
+            for endpoint in (
+                f"{api_base}/repos/{repo}/releases/latest",
+                f"{api_base}/repos/{repo}/releases?per_page=6",
+            ):
+                try:
+                    resp = await client.get(endpoint, headers=headers)
+                except Exception:
+                    continue
+                if resp.status_code != 200:
+                    continue
+                try:
+                    data = resp.json()
+                except Exception:
+                    continue
+                releases: list[dict[str, Any]] = []
+                if isinstance(data, dict):
+                    releases = [data]
+                elif isinstance(data, list):
+                    releases = [item for item in data if isinstance(item, dict)]
+                for release_obj in releases:
+                    asset_url = pick_asset_url(release_obj)
+                    if asset_url:
+                        return asset_url
+                    zipball = normalize_text(str(release_obj.get("zipball_url", "")))
+                    if zipball and (not prefer_ext or normalize_text(prefer_ext).lower() in {"zip", ".zip"}):
+                        return zipball
+
+            # 没有 release 资产时，回退到默认分支源码 zip（仅当用户没指定可执行扩展）。
+            ext = normalize_text(prefer_ext).lower().strip()
+            if ext and not ext.startswith("."):
+                ext = f".{ext}"
+            if not ext or ext in {".zip", ".7z", ".rar"}:
+                repo_resp = await client.get(f"{api_base}/repos/{repo}", headers=headers)
+                if repo_resp.status_code == 200:
+                    try:
+                        repo_data = repo_resp.json()
+                    except Exception:
+                        repo_data = {}
+                    default_branch = normalize_text(str(repo_data.get("default_branch", ""))) or "main"
+                    return f"https://github.com/{repo}/archive/refs/heads/{default_branch}.zip"
+    except Exception:
+        return ""
+    return ""
+
+
+def _stage_download_file(raw_path: str, source_url: str, file_name: str = "") -> str:
+    src = Path(raw_path).expanduser().resolve()
+    if not src.is_file():
+        return ""
+    project_root = Path(__file__).resolve().parents[1]
+    target_dir = (project_root / "storage" / "tmp" / "downloads").resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    name = normalize_text(file_name) or src.name or _guess_download_filename(source_url)
+    name = re.sub(r"[\\/:*?\"<>|]+", "_", name).strip()
+    if not name:
+        name = _guess_download_filename(source_url)
+    suffix = Path(name).suffix or src.suffix or ".bin"
+    stem = Path(name).stem or "download"
+    dst = target_dir / f"{stem}{suffix}"
+    if dst.exists():
+        dst = target_dir / f"{stem}_{int(random.randint(1000, 9999))}{suffix}"
+    shutil.copy2(src, dst)
+    return str(dst)
+
+
+def _read_file_head(path: str, size: int = 8192) -> bytes:
+    try:
+        with open(path, "rb") as f:
+            return f.read(size)
+    except Exception:
+        return b""
+
+
+def _looks_like_html_payload(head: bytes) -> bool:
+    if not head:
+        return False
+    lower = head.lower().lstrip()
+    if lower.startswith((b"<!doctype html", b"<html", b"<head", b"<body")):
+        return True
+    try:
+        text = head.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return False
+    return "<html" in text and ("<head" in text or "<body" in text or "doctype html" in text)
+
+
+def _guess_expected_ext(prefer_ext: str = "", file_name: str = "", candidate_url: str = "") -> str:
+    ext = normalize_text(prefer_ext).lower().strip()
+    if ext and not ext.startswith("."):
+        ext = f".{ext}"
+    if ext:
+        return ext
+    name_ext = Path(normalize_text(file_name)).suffix.lower()
+    if name_ext:
+        return name_ext
+    url_ext = Path(urlparse(candidate_url).path).suffix.lower()
+    return url_ext
+
+
+def _matches_expected_signature(expected_ext: str, head: bytes) -> bool:
+    if not expected_ext or not head:
+        return True
+    ext = expected_ext.lower()
+    if ext == ".exe" or ext == ".msi":
+        return head.startswith(b"MZ")
+    if ext in {".apk", ".zip"}:
+        return head.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"))
+    if ext == ".rar":
+        return head.startswith(b"Rar!\x1A\x07")
+    if ext == ".7z":
+        return head.startswith(b"7z\xBC\xAF\x27\x1C")
+    if ext == ".pdf":
+        return head.startswith(b"%PDF-")
+    if ext == ".mp3":
+        return head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0)
+    if ext in {".mp4", ".m4a"}:
+        return len(head) >= 12 and b"ftyp" in head[:64]
+    if ext == ".wav":
+        return len(head) >= 12 and head.startswith(b"RIFF") and head[8:12] == b"WAVE"
+    return True
+
+
+def _extract_download_candidates_from_html_file(source_url: str, raw_path: str, prefer_ext: str = "") -> list[str]:
+    try:
+        text = Path(raw_path).read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return []
+    if not text:
+        return []
+    return _pick_download_candidates(source_url, text, prefer_ext=prefer_ext)
+
+
+async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """统一母下载入口：优先解析媒体，再下载并落地到可上传目录。"""
+    original_url = normalize_text(str(args.get("url", "")))
+    if not original_url:
+        return ToolCallResult(ok=False, error="missing url")
+
+    query = normalize_text(str(args.get("query", "")))
+    kind = normalize_text(str(args.get("kind", "auto"))).lower() or "auto"  # auto/video/audio/file
+    prefer_ext = normalize_text(str(args.get("prefer_ext", ""))).lower()
+    upload_after = bool(args.get("upload", False))
+    allow_third_party = bool(args.get("allow_third_party", False))
+    file_name = normalize_text(str(args.get("file_name", "")))
+    group_id = int(args.get("group_id", 0) or context.get("group_id", 0) or 0)
+    try:
+        thread_count = max(1, min(6, int(args.get("thread_count", 1) or 1)))
+    except Exception:
+        thread_count = 1
+
+    tool_executor = context.get("tool_executor")
+    candidate_url = original_url
+    resolve_note = ""
+    candidate_pool: list[str] = []
+    candidate_seen: set[str] = set()
+
+    def _push_candidate(url: str) -> None:
+        clean = normalize_text(url)
+        if not clean:
+            return
+        if re.match(r"^https?://", clean, flags=re.IGNORECASE):
+            clean = _normalize_download_http_url(clean)
+        key = clean.lower()
+        if key in candidate_seen:
+            return
+        candidate_seen.add(key)
+        candidate_pool.append(clean)
+
+    _push_candidate(original_url)
+
+    # 1) 视频/音频优先走解析链，避免直接下到网页壳
+    if kind in {"auto", "video", "audio"} and tool_executor and re.match(r"^https?://", original_url, flags=re.IGNORECASE):
+        try:
+            resolved = await tool_executor._method_browser_resolve_video(
+                method_name="smart_download",
+                method_args={"url": original_url},
+                query=original_url,
+            )
+            payload = resolved.payload or {}
+            if resolved.ok and normalize_text(str(payload.get("video_url", ""))):
+                candidate_url = normalize_text(str(payload.get("video_url", "")))
+                resolve_note = "via_video_resolver"
+                _push_candidate(candidate_url)
+        except Exception as exc:
+            _log.warning("smart_download_resolve_video_error | url=%s | %s", original_url[:120], exc)
+
+    # 2) 如果还是网页链接，尝试抓网页提取真实下载地址
+    parsed = urlparse(candidate_url)
+    path_lower = normalize_text(parsed.path).lower()
+    is_direct_file = bool(re.search(r"\.(apk|exe|msi|zip|7z|rar|mp4|mp3|m4a|wav)(?:$|[?&#])", path_lower))
+    if re.match(r"^https?://", candidate_url, flags=re.IGNORECASE) and not is_direct_file:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=6.0), follow_redirects=True) as client:
+                resp = await asyncio.wait_for(
+                    client.get(candidate_url, headers={"User-Agent": "Mozilla/5.0"}),
+                    timeout=8.0,
+                )
+            ctype = normalize_text(str(resp.headers.get("content-type", ""))).lower()
+            text = resp.text if "text/html" in ctype or "<html" in resp.text[:2000].lower() else ""
+            if text:
+                picks = _pick_download_candidates(str(resp.url), text, prefer_ext=prefer_ext)
+                if picks:
+                    for pick in picks:
+                        _push_candidate(pick)
+                    candidate_url = picks[0]
+                    resolve_note = "via_webpage_extract"
+                else:
+                    runtime_picks = await _extract_runtime_download_candidates_from_page(
+                        str(resp.url),
+                        text,
+                        prefer_ext=prefer_ext,
+                        file_name=file_name,
+                    )
+                    if runtime_picks:
+                        for pick in runtime_picks:
+                            _push_candidate(pick)
+                        candidate_url = runtime_picks[0]
+                        resolve_note = "via_runtime_script_extract"
+        except Exception as exc:
+            _log.warning("smart_download_extract_error | url=%s | %s", candidate_url[:120], exc)
+
+    # 2.5) 典型下载中转链接（如 /download/123）先做重定向链解析，拿最终直链
+    parsed = urlparse(candidate_url)
+    host_lower = normalize_text(parsed.netloc).lower()
+    path_lower = normalize_text(parsed.path).lower()
+    if re.match(r"^https?://", candidate_url, flags=re.IGNORECASE) and (
+        "/download/" in path_lower or host_lower.startswith("get.")
+    ):
+        try:
+            resolved_final = await asyncio.wait_for(
+                _resolve_redirect_download_url(candidate_url, referer=original_url),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            resolved_final = candidate_url
+        resolved_final = normalize_text(resolved_final)
+        if resolved_final and resolved_final != candidate_url:
+            candidate_url = resolved_final
+            resolve_note = "via_redirect_resolver"
+            _push_candidate(candidate_url)
+
+    # 2.6) GitHub 仓库/Release 页面优先走 Release API 拿真实资产链接。
+    if re.match(r"^https?://", candidate_url, flags=re.IGNORECASE):
+        gh_direct_url = await _resolve_github_release_direct_url(
+            candidate_url,
+            prefer_ext=prefer_ext,
+            config=context.get("config"),
+        )
+        gh_direct_url = normalize_text(gh_direct_url)
+        if gh_direct_url and gh_direct_url != candidate_url:
+            candidate_url = gh_direct_url
+            resolve_note = "via_github_release_api"
+            _push_candidate(candidate_url)
+
+    candidate_url = _normalize_download_http_url(candidate_url) if re.match(
+        r"^https?://", candidate_url, flags=re.IGNORECASE
+    ) else candidate_url
+    _push_candidate(candidate_url)
+
+    expected_ext = _guess_expected_ext(prefer_ext=prefer_ext, file_name=file_name, candidate_url=candidate_url)
+    install_exts = {".exe", ".msi", ".apk", ".zip", ".7z", ".rar"}
+    if expected_ext in install_exts:
+        trust_score, trust_reasons = _score_download_source_trust(
+            url=candidate_url,
+            query=query,
+            extra_hint=file_name,
+        )
+        source_score, source_reasons = _score_download_source_trust(
+            url=original_url,
+            query=query,
+            extra_hint=file_name,
+        )
+        worst_score = min(trust_score, source_score)
+        if worst_score <= -5:
+            reason = ",".join(trust_reasons if trust_score <= source_score else source_reasons) or "low_trust_source"
+            return ToolCallResult(
+                ok=False,
+                error=f"download_untrusted_source:{reason}",
+                display=(
+                    "检测到疑似下载中转/分发站，已拦截本次安装包下载。"
+                    f" source={candidate_url}"
+                ),
+            )
+
+    # 3) 用 NapCat 下载，再复制到可上传白名单目录
+    download_attempts: list[str] = [candidate_url]
+    for item in candidate_pool:
+        if item.lower() == candidate_url.lower():
+            continue
+        download_attempts.append(item)
+    download_attempts = download_attempts[:8]
+
+    raw_path = ""
+    last_download_error = ""
+    last_download_display = ""
+    source_host = normalize_text(urlparse(original_url).netloc).lower()
+
+    for idx, attempt_url in enumerate(download_attempts):
+        attempt_host = normalize_text(urlparse(attempt_url).netloc).lower()
+        is_cross_host = bool(source_host and attempt_host and not _same_distribution_family(source_host, attempt_host))
+        if expected_ext in install_exts and is_cross_host and not allow_third_party:
+            return ToolCallResult(
+                ok=False,
+                error=f"download_requires_user_consent:third_party:{attempt_host or '-'}",
+                display=(
+                    "检测到将切换到第三方下载源，已暂停执行。"
+                    f" 当前源: {attempt_host or attempt_url}\n"
+                    "请先征求用户确认是否允许第三方下载；用户明确同意后，重试 smart_download 并传 allow_third_party=true。"
+                ),
+            )
+
+        dl = await _napcat_api_call(
+            context,
+            "download_file",
+            "文件下载成功",
+            url=attempt_url,
+            thread_count=thread_count,
+        )
+        raw_path = normalize_text(str((dl.data or {}).get("file", ""))) if dl.ok else ""
+        if not raw_path:
+            # NapCat 对部分 URL（尤其是包含空格/重定向链复杂的下载链接）会直接失败，走本地 HTTP 兜底。
+            http_fallback_path = await _download_file_via_http_fallback(attempt_url, file_name=file_name)
+            if http_fallback_path:
+                raw_path = http_fallback_path
+                candidate_url = attempt_url
+                resolve_note = "via_http_fallback" if not resolve_note else f"{resolve_note}|via_http_fallback"
+                break
+
+            last_download_error = dl.error or "download_failed"
+            last_download_display = _friendly_download_failure_display(dl.error or dl.display, attempt_url)
+            if idx + 1 < len(download_attempts) and _is_retryable_download_error(last_download_error):
+                _log.info(
+                    "smart_download_retry_next_candidate | from=%s | err=%s | next=%s",
+                    attempt_url[:140],
+                    clip_text(last_download_error, 120),
+                    download_attempts[idx + 1][:140],
+                )
+                continue
+            return ToolCallResult(
+                ok=False,
+                error=last_download_error,
+                display=last_download_display,
+            )
+
+        candidate_url = attempt_url
+        break
+
+    if not raw_path:
+        if last_download_error:
+            return ToolCallResult(ok=False, error=last_download_error, display=last_download_display or "下载失败")
+        return ToolCallResult(ok=False, error="download_path_missing", display="下载成功但没有返回本地路径")
+
+    # 3.5) 安全防线：拦截“HTML 伪装成安装包/可执行文件”，并尝试一次自动纠正。
+    head = _read_file_head(raw_path)
+    is_html_payload = _looks_like_html_payload(head)
+    if is_html_payload:
+        retry_links = _extract_download_candidates_from_html_file(candidate_url, raw_path, prefer_ext=prefer_ext)
+        retry_links = [u for u in retry_links if normalize_text(u) and normalize_text(u) != candidate_url]
+        if retry_links:
+            retry_url = retry_links[0]
+            dl_retry = await _napcat_api_call(
+                context,
+                "download_file",
+                "文件下载成功",
+                url=retry_url,
+                thread_count=thread_count,
+            )
+            if dl_retry.ok:
+                retry_path = normalize_text(str((dl_retry.data or {}).get("file", "")))
+                if retry_path:
+                    candidate_url = retry_url
+                    raw_path = retry_path
+                    head = _read_file_head(raw_path)
+                    is_html_payload = _looks_like_html_payload(head)
+                    resolve_note = "via_downloaded_html_retry"
+
+    if is_html_payload:
+        return ToolCallResult(
+            ok=False,
+            error="download_payload_is_html",
+            display=(
+                "下载到的是网页(HTML)不是文件本体，已拦截。"
+                f" 当前URL: {candidate_url}"
+            ),
+        )
+
+    if expected_ext and not _matches_expected_signature(expected_ext, head):
+        return ToolCallResult(
+            ok=False,
+            error="download_signature_mismatch",
+            display=(
+                f"下载文件头与期望扩展名不匹配 (expected={expected_ext})，已拦截。"
+                f" 当前URL: {candidate_url}"
+            ),
+        )
+
+    staged_path = _stage_download_file(raw_path, candidate_url, file_name=file_name)
+    if not staged_path:
+        return ToolCallResult(ok=False, error="stage_download_file_failed", display=f"下载到 {raw_path}，但整理到上传目录失败")
+
+    payload = {
+        "source_url": original_url,
+        "download_url": candidate_url,
+        "local_file": staged_path,
+        "resolve_note": resolve_note,
+    }
+    display_lines = [
+        f"下载完成: {Path(staged_path).name}",
+        f"下载URL: {candidate_url}",
+        f"本地路径: {staged_path}",
+    ]
+
+    # 4) 可选：直接上传到群文件
+    if upload_after:
+        if not group_id:
+            return ToolCallResult(ok=False, error="missing group_id_for_upload", display="需要 group_id 才能上传群文件")
+        upload_name = file_name or Path(staged_path).name
+        up = await _napcat_api_call(
+            context,
+            "upload_group_file",
+            f"已上传文件 {upload_name} 到群 {group_id}",
+            group_id=group_id,
+            file=staged_path,
+            name=upload_name,
+        )
+        if not up.ok:
+            return ToolCallResult(
+                ok=False,
+                error=up.error or "upload_failed",
+                data=payload,
+                display=f"下载成功但上传失败: {up.error or up.display}",
+            )
+        payload["uploaded"] = True
+        payload["upload_group_id"] = group_id
+        display_lines.append(f"群文件上传成功: group={group_id}")
+
+    return ToolCallResult(ok=True, data=payload, display="\n".join(display_lines))
+
+
+async def _handle_download_file(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """兼容旧接口：内部转到 smart_download。"""
+    compat_args = {
+        "url": args.get("url", ""),
+        "thread_count": args.get("thread_count", 1),
+        "kind": args.get("kind", "auto"),
+        "prefer_ext": args.get("prefer_ext", ""),
+        "query": args.get("query", ""),
+        "upload": bool(args.get("upload", False)),
+        "group_id": args.get("group_id", 0),
+        "file_name": args.get("file_name", ""),
+        "allow_third_party": bool(args.get("allow_third_party", False)),
+    }
+    return await _handle_smart_download(compat_args, context)
 
 
 async def _handle_nc_get_user_status(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
@@ -1468,6 +3285,298 @@ async def _handle_get_version_info(args: dict[str, Any], context: dict[str, Any]
     return result
 
 
+# ── NapCat 扩展 API handlers (第二批) ──
+
+
+async def _handle_set_self_longnick(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    longnick = str(args.get("longnick", "")).strip()
+    if not longnick:
+        return ToolCallResult(ok=False, error="missing longnick")
+    return await _napcat_api_call(context, "set_self_longnick", f"已设置个性签名: {longnick[:30]}", longNick=longnick)
+
+
+async def _handle_get_recent_contact(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    count = int(args.get("count", 10) or 10)
+    result = await _napcat_api_call(context, "get_recent_contact", "获取最近联系人成功", count=count)
+    if result.ok and result.data.get("items"):
+        items = result.data["items"]
+        lines = [f"最近联系人 ({len(items)}个):"]
+        for c in items[:15]:
+            if isinstance(c, dict):
+                ctype = "群" if c.get("chatType") == 2 else "私聊"
+                name = c.get("peerName") or c.get("remark") or str(c.get("peerUin", ""))
+                lines.append(f"  [{ctype}] {name}")
+        result.display = "\n".join(lines)
+    return result
+
+
+async def _handle_get_profile_like(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    result = await _napcat_api_call(context, "get_profile_like", "获取点赞列表成功")
+    if result.ok and result.data:
+        total = result.data.get("total", 0)
+        items = result.data.get("items") or result.data.get("favoriteInfo", {}).get("userInfos", [])
+        if isinstance(items, list):
+            result.display = f"共 {total or len(items)} 人点赞"
+        else:
+            result.display = f"点赞信息: {json.dumps(result.data, ensure_ascii=False)[:200]}"
+    return result
+
+
+async def _handle_fetch_custom_face(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    count = int(args.get("count", 48) or 48)
+    result = await _napcat_api_call(context, "fetch_custom_face", "获取收藏表情成功", count=count)
+    if result.ok and result.data.get("items"):
+        items = result.data["items"]
+        result.display = f"收藏表情共 {len(items)} 个"
+    return result
+
+
+async def _handle_fetch_emoji_like(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    message_id = int(args.get("message_id", 0))
+    if not message_id:
+        return ToolCallResult(ok=False, error="missing message_id")
+    emoji_id = str(args.get("emoji_id", ""))
+    emoji_type = str(args.get("emoji_type", ""))
+    params: dict[str, Any] = {"message_id": message_id}
+    if emoji_id:
+        params["emojiId"] = emoji_id
+    if emoji_type:
+        params["emojiType"] = emoji_type
+    result = await _napcat_api_call(context, "fetch_emoji_like", f"获取消息 {message_id} 的表情回应成功", **params)
+    return result
+
+
+async def _handle_get_group_info_ex(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    if not group_id:
+        return ToolCallResult(ok=False, error="missing group_id")
+    result = await _napcat_api_call(context, "get_group_info_ex", f"获取群 {group_id} 扩展信息成功", group_id=group_id)
+    if result.ok and result.data:
+        d = result.data
+        parts = [f"群 {group_id}"]
+        if d.get("groupName"):
+            parts.append(f"名称: {d['groupName']}")
+        if d.get("memberCount"):
+            parts.append(f"成员: {d['memberCount']}/{d.get('maxMemberCount', '?')}")
+        result.display = " | ".join(parts)
+    return result
+
+
+async def _handle_get_group_files_by_folder(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    folder_id = str(args.get("folder_id", "")).strip()
+    if not group_id:
+        return ToolCallResult(ok=False, error="missing group_id")
+    if not folder_id:
+        return ToolCallResult(ok=False, error="missing folder_id, 请先用 get_group_root_files 获取文件夹ID")
+    result = await _napcat_api_call(
+        context, "get_group_files_by_folder", f"获取群 {group_id} 文件夹内容成功",
+        group_id=group_id, folder_id=folder_id,
+    )
+    if result.ok and result.data:
+        files = result.data.get("files") or result.data.get("items") or []
+        folders = result.data.get("folders") or []
+        lines = [f"文件夹 {folder_id} 内容:"]
+        for f in (folders if isinstance(folders, list) else [])[:10]:
+            if isinstance(f, dict):
+                lines.append(f"  [文件夹] {f.get('folder_name', '?')} (id: {f.get('folder_id', '?')})")
+        for f in (files if isinstance(files, list) else [])[:20]:
+            if isinstance(f, dict):
+                name = f.get("file_name") or f.get("name") or "?"
+                size = f.get("file_size") or f.get("size") or 0
+                size_mb = int(size) / 1024 / 1024 if size else 0
+                lines.append(f"  [文件] {name} ({size_mb:.1f}MB)")
+        result.display = "\n".join(lines)
+    return result
+
+
+async def _handle_delete_group_file(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    file_id = str(args.get("file_id", "")).strip()
+    busid = int(args.get("busid", 0))
+    if not group_id or not file_id:
+        return ToolCallResult(ok=False, error="missing group_id or file_id")
+    return await _napcat_api_call(
+        context, "delete_group_file", f"已删除群 {group_id} 文件 {file_id}",
+        group_id=group_id, file_id=file_id, busid=busid,
+    )
+
+
+async def _handle_create_group_file_folder(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    name = str(args.get("name", "")).strip()
+    parent_id = str(args.get("parent_id", "/")).strip() or "/"
+    if not group_id or not name:
+        return ToolCallResult(ok=False, error="missing group_id or name")
+    return await _napcat_api_call(
+        context, "create_group_file_folder", f"已在群 {group_id} 创建文件夹: {name}",
+        group_id=group_id, name=name, parent_id=parent_id,
+    )
+
+
+async def _handle_get_group_system_msg(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    result = await _napcat_api_call(context, "get_group_system_msg", "获取群系统消息成功")
+    if result.ok and result.data:
+        invited = result.data.get("InvitedRequest") or result.data.get("invited_requests") or []
+        join_req = result.data.get("join_requests") or []
+        lines = []
+        if invited:
+            lines.append(f"邀请请求: {len(invited)} 条")
+        if join_req:
+            lines.append(f"加群请求: {len(join_req)} 条")
+        result.display = " | ".join(lines) if lines else "暂无待处理的群系统消息"
+    return result
+
+
+async def _handle_send_forward_msg(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    messages = args.get("messages", [])
+    if not messages or not isinstance(messages, list):
+        return ToolCallResult(ok=False, error="missing messages array")
+    message_type = str(args.get("message_type", "group"))
+    params: dict[str, Any] = {"messages": messages}
+    if message_type == "private":
+        user_id = int(args.get("user_id", 0))
+        if not user_id:
+            return ToolCallResult(ok=False, error="private forward requires user_id")
+        params["user_id"] = user_id
+        params["message_type"] = "private"
+    else:
+        group_id = int(args.get("group_id", 0))
+        if not group_id:
+            return ToolCallResult(ok=False, error="group forward requires group_id")
+        params["group_id"] = group_id
+        params["message_type"] = "group"
+    return await _napcat_api_call(context, "send_forward_msg", "合并转发消息已发送", **params)
+
+
+async def _handle_mark_all_as_read(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    return await _napcat_api_call(context, "_mark_all_as_read", "已标记所有消息为已读")
+
+
+async def _handle_get_friends_with_category(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    result = await _napcat_api_call(context, "get_friends_with_category", "获取分组好友列表成功")
+    if result.ok and result.data.get("items"):
+        items = result.data["items"]
+        lines = [f"好友分组 ({len(items)} 组):"]
+        for cat in items[:20]:
+            if isinstance(cat, dict):
+                cat_name = cat.get("categoryName") or cat.get("categroyName") or "默认"
+                buddies = cat.get("buddyList") or cat.get("categroyMbCount") or []
+                count = len(buddies) if isinstance(buddies, list) else buddies
+                lines.append(f"  [{cat_name}] {count}人")
+        result.display = "\n".join(lines)
+    return result
+
+
+async def _handle_get_image(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    file = str(args.get("file", "")).strip()
+    if not file:
+        return ToolCallResult(ok=False, error="missing file")
+    result = await _napcat_api_call(context, "get_image", "获取图片信息成功", file=file)
+    if result.ok and result.data:
+        d = result.data
+        result.display = f"图片: {d.get('file', '?')} | 大小: {d.get('file_size', '?')} | URL: {d.get('url', '?')[:80]}"
+    return result
+
+
+async def _handle_get_record(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    file = str(args.get("file", "")).strip()
+    out_format = str(args.get("out_format", "mp3")).strip()
+    if not file:
+        return ToolCallResult(ok=False, error="missing file")
+    result = await _napcat_api_call(context, "get_record", "获取语音文件成功", file=file, out_format=out_format)
+    if result.ok and result.data:
+        d = result.data
+        result.display = f"语音: {d.get('file', '?')} | URL: {d.get('url', '?')[:80]}"
+    return result
+
+
+async def _handle_get_ai_record(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    character = str(args.get("character", "")).strip()
+    text = str(args.get("text", "")).strip()
+    if not group_id or not character or not text:
+        return ToolCallResult(ok=False, error="missing group_id, character, or text")
+    result = await _napcat_api_call(
+        context, "get_ai_record", f"AI语音生成成功",
+        group_id=group_id, character=character, text=text,
+    )
+    if result.ok and result.data:
+        result.display = f"AI语音已生成，可用于发送"
+    return result
+
+
+async def _handle_ark_share_peer(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    user_id = str(args.get("user_id", "")).strip()
+    group_id = str(args.get("group_id", "")).strip()
+    phone_number = str(args.get("phone_number", "")).strip()
+    if not user_id and not group_id:
+        return ToolCallResult(ok=False, error="需要 user_id 或 group_id")
+    params: dict[str, Any] = {}
+    if user_id:
+        params["user_id"] = user_id
+    if group_id:
+        params["group_id"] = group_id
+    if phone_number:
+        params["phoneNumber"] = phone_number
+    result = await _napcat_api_call(context, "ArkSharePeer", "推荐联系人/群卡片已生成", **params)
+    return result
+
+
+async def _handle_get_mini_app_ark(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    content = str(args.get("content", "")).strip()
+    if not content:
+        return ToolCallResult(ok=False, error="missing content (JSON string of mini app)")
+    return await _napcat_api_call(context, "get_mini_app_ark", "小程序卡片已签名", content=content)
+
+
+async def _handle_create_collection(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    raw_data = str(args.get("raw_data", "")).strip()
+    brief = str(args.get("brief", "")).strip()
+    if not raw_data:
+        return ToolCallResult(ok=False, error="missing raw_data")
+    return await _napcat_api_call(
+        context, "create_collection", f"已创建收藏: {brief[:30] if brief else raw_data[:30]}",
+        rawData=raw_data, brief=brief or raw_data[:50],
+    )
+
+
+async def _handle_get_collection_list(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    category = int(args.get("category", 0))
+    count = int(args.get("count", 20) or 20)
+    result = await _napcat_api_call(
+        context, "get_collection_list", "获取收藏列表成功",
+        category=category, count=count,
+    )
+    if result.ok and result.data.get("items"):
+        items = result.data["items"]
+        result.display = f"收藏列表共 {len(items)} 条"
+    return result
+
+
+async def _handle_del_group_notice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    group_id = int(args.get("group_id", 0))
+    notice_id = str(args.get("notice_id", "")).strip()
+    if not group_id or not notice_id:
+        return ToolCallResult(ok=False, error="missing group_id or notice_id")
+    return await _napcat_api_call(
+        context, "_del_group_notice", f"已删除群 {group_id} 公告",
+        group_id=group_id, notice_id=notice_id,
+    )
+
+
+async def _handle_nc_get_packet_status(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    result = await _napcat_api_call(context, "nc_get_packet_status", "获取PacketServer状态成功")
+    if result.ok and result.data:
+        status = result.data.get("status") or result.data.get("available")
+        result.display = f"PacketServer 状态: {'可用' if status else '不可用'}"
+    return result
+
+
+async def _handle_clean_cache(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    return await _napcat_api_call(context, "clean_cache", "缓存已清理")
+
+
 # ── 搜索工具 ──
 
 def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> None:
@@ -1490,6 +3599,47 @@ def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> N
         _make_search_handler(search_engine),
     )
 
+    registry.register(
+        ToolSchema(
+            name="search_web_media",
+            description=(
+                "检索图片/视频/GIF候选，并返回可读的编号列表。\n"
+                "适用于“给我找图/视频/GIF”场景，先给候选再让用户选。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "检索关键词"},
+                    "media_type": {"type": "string", "description": "类型: image/video/gif"},
+                    "limit": {"type": "integer", "description": "返回数量，默认5，最大8"},
+                },
+                "required": ["query"],
+            },
+            category="search",
+        ),
+        _make_search_web_media_handler(search_engine),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="search_download_resources",
+            description=(
+                "检索可下载资源候选（压缩包/安装包/数据集/模组等），返回编号列表供用户选择。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "资源关键词"},
+                    "file_type": {"type": "string", "description": "可选: zip/exe/msi/pdf/apk/mod 等"},
+                    "limit": {"type": "integer", "description": "返回数量，默认6，最大10"},
+                },
+                "required": ["query"],
+            },
+            category="search",
+        ),
+        _make_search_download_resources_handler(search_engine),
+    )
+
 
 def _make_search_handler(search_engine: Any) -> ToolHandler:
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
@@ -1498,7 +3648,13 @@ def _make_search_handler(search_engine: Any) -> ToolHandler:
         if not query:
             return ToolCallResult(ok=False, error="empty query")
         try:
-            results = await search_engine.search(query=query, mode=mode)
+            # 根据 mode 路由到对应的搜索方法
+            if mode == "image":
+                results = await search_engine.search_images(query=query)
+            elif mode == "video":
+                results = await search_engine.search_bilibili_videos(query=query)
+            else:
+                results = await search_engine.search(query=query)
             if not results:
                 return ToolCallResult(ok=True, data={"results": []}, display=f"搜索 '{query}' 无结果")
             items = []
@@ -1506,18 +3662,132 @@ def _make_search_handler(search_engine: Any) -> ToolHandler:
             for i, r in enumerate(results[:8]):
                 item = {
                     "title": getattr(r, "title", ""),
-                    "url": getattr(r, "url", ""),
+                    "url": getattr(r, "url", getattr(r, "source_url", "")),
                     "snippet": getattr(r, "snippet", ""),
                 }
+                # 图片模式额外带上 image_url
+                if mode == "image":
+                    item["image_url"] = getattr(r, "image_url", "")
                 items.append(item)
-                display_lines.append(f"{i+1}. {item['title']}: {clip_text(item['snippet'], 120)}")
+                display_lines.append(f"{i+1}. {item['title']}: {clip_text(item['snippet'] or item['url'], 120)}")
             return ToolCallResult(
                 ok=True,
                 data={"results": items, "query": query, "mode": mode},
                 display="\n".join(display_lines),
             )
         except Exception as exc:
-            return ToolCallResult(ok=False, error=f"search_error: {exc}")
+            _log.warning("web_search failed | query=%s mode=%s err=%s", query, mode, exc)
+            return ToolCallResult(ok=False, error=f"search_error: {exc}", display=f"搜索失败: {exc}")
+    return handler
+
+
+def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        query = normalize_text(str(args.get("query", "")))
+        media_type = normalize_text(str(args.get("media_type", "image"))).lower() or "image"
+        limit = max(1, min(8, int(args.get("limit", 5) or 5)))
+        if not query:
+            return ToolCallResult(ok=False, error="missing query", display="缺少 query")
+
+        try:
+            if media_type == "video":
+                rows = await search_engine.search_bilibili_videos(query=query, limit=limit)
+                items = []
+                lines = [f"【视频候选: {query}】"]
+                for i, row in enumerate(rows[:limit], 1):
+                    title = normalize_text(getattr(row, "title", "")) or f"候选{i}"
+                    url = normalize_text(getattr(row, "url", "")) or normalize_text(getattr(row, "source_url", ""))
+                    snippet = clip_text(normalize_text(getattr(row, "snippet", "")) or url, 120)
+                    items.append({"index": i, "title": title, "url": url, "snippet": snippet, "media_type": "video"})
+                    lines.append(f"{i}. {title} | {snippet}")
+                return ToolCallResult(
+                    ok=True,
+                    data={"query": query, "media_type": media_type, "items": items},
+                    display="\n".join(lines),
+                )
+
+            # image / gif 都走图片检索，gif 会补关键词
+            image_query = query
+            if media_type == "gif" and "gif" not in query.lower():
+                image_query = f"{query} gif"
+            rows = await search_engine.search_images(query=image_query, max_results=limit)
+            items = []
+            lines = [f"【{media_type.upper()}候选: {query}】"]
+            for i, row in enumerate(rows[:limit], 1):
+                title = normalize_text(getattr(row, "title", "")) or f"候选{i}"
+                image_url = normalize_text(getattr(row, "image_url", ""))
+                thumbnail_url = normalize_text(getattr(row, "thumbnail_url", ""))
+                source_url = normalize_text(getattr(row, "source_url", "")) or image_url
+                snippet = clip_text(normalize_text(getattr(row, "snippet", "")) or source_url, 120)
+                items.append(
+                    {
+                        "index": i,
+                        "title": title,
+                        "image_url": image_url,
+                        "thumbnail_url": thumbnail_url,
+                        "url": source_url,
+                        "snippet": snippet,
+                        "media_type": media_type,
+                    }
+                )
+                lines.append(f"{i}. {title} | {snippet}")
+            return ToolCallResult(
+                ok=True,
+                data={"query": query, "media_type": media_type, "items": items},
+                display="\n".join(lines),
+            )
+        except Exception as exc:
+            _log.warning("search_web_media_error | query=%s | type=%s | err=%s", query, media_type, exc)
+            return ToolCallResult(ok=False, error=f"search_web_media_error:{exc}", display=f"媒体检索失败: {exc}")
+
+    return handler
+
+
+def _make_search_download_resources_handler(search_engine: Any) -> ToolHandler:
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        query = normalize_text(str(args.get("query", "")))
+        file_type = normalize_text(str(args.get("file_type", ""))).lower()
+        limit = max(1, min(10, int(args.get("limit", 6) or 6)))
+        if not query:
+            return ToolCallResult(ok=False, error="missing query", display="缺少 query")
+
+        search_query = query
+        if file_type:
+            search_query = f"{query} {file_type} 下载"
+        try:
+            rows = await search_engine.search(search_query)
+            ranked_rows: list[tuple[int, str, str, str]] = []
+            for row in rows:
+                title = normalize_text(getattr(row, "title", "")) or ""
+                url = normalize_text(getattr(row, "url", "")) or normalize_text(getattr(row, "source_url", ""))
+                snippet = clip_text(normalize_text(getattr(row, "snippet", "")) or url, 140)
+                score, reasons = _score_download_source_trust(
+                    url=url,
+                    title=title,
+                    snippet=snippet,
+                    query=query,
+                )
+                # Minor boost for explicit official words in title/snippet.
+                if any(token in f"{title} {snippet}".lower() for token in ("官网", "官方", "official")):
+                    score += 2
+                ranked_rows.append((score, title, url, snippet + (f" | trust={','.join(reasons)}" if reasons else "")))
+            ranked_rows.sort(key=lambda item: item[0], reverse=True)
+
+            items = []
+            lines = [f"【资源候选: {query}】"]
+            for i, (score, title, url, snippet) in enumerate(ranked_rows[:limit], 1):
+                title = title or f"候选{i}"
+                items.append({"index": i, "title": title, "url": url, "snippet": snippet, "source_score": score})
+                lines.append(f"{i}. [score={score}] {title} | {snippet}")
+            return ToolCallResult(
+                ok=True,
+                data={"query": query, "file_type": file_type, "items": items},
+                display="\n".join(lines),
+            )
+        except Exception as exc:
+            _log.warning("search_download_resources_error | query=%s | err=%s", query, exc)
+            return ToolCallResult(ok=False, error=f"search_download_resources_error:{exc}", display=f"资源检索失败: {exc}")
+
     return handler
 
 
@@ -1543,8 +3813,158 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
         _make_image_gen_handler(model_client),
     )
 
+    # ── 视频解析工具 ──
+    registry.register(
+        ToolSchema(
+            name="parse_video",
+            description=(
+                "解析短视频链接，返回可发送的视频URL。\n"
+                "支持平台: 抖音(douyin/v.douyin.com)、快手(kuaishou)、B站(bilibili/b23.tv)、AcFun、直链视频(.mp4等)。\n"
+                "使用场景: 用户发了视频链接让你解析/下载/发送时使用。\n"
+                "返回 video_url 可直接通过 final_answer 的 video_url 参数发送。\n"
+                "同时返回 qq_safety 安全度评估(safe/risky/blocked)。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "视频链接(支持短链接如 v.douyin.com/xxx)"},
+                },
+                "required": ["url"],
+            },
+            category="media",
+        ),
+        _handle_parse_video,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="analyze_video",
+            description=(
+                "深度分析视频内容: 提取标题、作者、时长、标签、弹幕热词、热评、字幕等。\n"
+                "B站视频可获取弹幕热词和热评，抖音可获取详情数据。\n"
+                "有本地视频+ffmpeg时还能提取关键帧用AI识别画面内容。\n"
+                "使用场景: 用户要求分析、评价、解说、总结视频内容时使用。\n"
+                "同时返回 qq_safety 安全度评估。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "视频链接"},
+                },
+                "required": ["url"],
+            },
+            category="media",
+        ),
+        _handle_analyze_video,
+    )
+
+    # ── 图片识别工具 ──
+    registry.register(
+        ToolSchema(
+            name="analyze_image",
+            description=(
+                "识别/分析图片内容（AI视觉识别）。\n"
+                "可指定 url 参数传入图片链接，未指定时自动从当前消息中提取图片。\n"
+                "使用场景: 用户发图片问'这是什么'、'看看这张图'、'识别一下'、'图里写了什么'时使用。\n"
+                "也可用于识别表情包内容、截图文字、商品图片等。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "图片URL（可选，不传则从消息中自动提取）"},
+                    "question": {"type": "string", "description": "针对图片的具体问题（可选，如'图里的文字是什么'）"},
+                },
+                "required": [],
+            },
+            category="media",
+        ),
+        _handle_analyze_image,
+    )
+
+    # ── 语音分析工具 ──
+    registry.register(
+        ToolSchema(
+            name="analyze_voice",
+            description=(
+                "转录语音/音频消息为文字（本地 Whisper 模型）。\n"
+                "自动从当前消息或引用消息中提取语音文件进行转录。\n"
+                "使用场景: 用户发了语音消息、或引用了一条语音消息并问内容时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "语音文件URL（可选，不传则从消息中自动提取）"},
+                },
+                "required": [],
+            },
+            category="media",
+        ),
+        _handle_analyze_voice,
+    )
+
+    # ── 本地视频内容分析工具 ──
+    registry.register(
+        ToolSchema(
+            name="analyze_local_video",
+            description=(
+                "深度分析本地视频内容: 提取关键帧画面描述 + 音频转文字。\n"
+                "自动从当前消息或引用消息中提取视频文件。\n"
+                "使用场景: 用户发了视频文件并问'这视频讲了什么'、'分析这个视频'时使用。\n"
+                "与 analyze_video 的区别: 此工具处理用户直接发送的视频文件，analyze_video 处理视频链接。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "视频文件URL（可选，不传则从消息中自动提取）"},
+                },
+                "required": [],
+            },
+            category="media",
+        ),
+        _handle_analyze_local_video,
+    )
+
+    # ── 视频处理工具（切片 / 音频 / 封面 / 关键帧）──
+    registry.register(
+        ToolSchema(
+            name="split_video",
+            description=(
+                "对视频做媒体处理：切片、导出音频、提取封面或关键帧。\n"
+                "可处理用户直接发送的视频，或传入视频链接 URL。\n"
+                "mode=clip: 输出视频片段（返回 video_url）\n"
+                "mode=audio: 导出音频（返回 audio_file，可直接发语音）\n"
+                "mode=cover: 提取单张封面（返回 image_url）\n"
+                "mode=frames: 提取多张关键帧（返回 image_urls）"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "视频URL（可选，不传则从消息/引用中自动提取）"},
+                    "mode": {
+                        "type": "string",
+                        "description": "处理模式：clip / audio / cover / frames（默认 clip）",
+                    },
+                    "start_seconds": {"type": "number", "description": "起始秒（clip/audio 可选）"},
+                    "end_seconds": {"type": "number", "description": "结束秒（clip/audio 可选）"},
+                    "duration_seconds": {"type": "number", "description": "持续秒数（与 start_seconds 搭配，可替代 end_seconds）"},
+                    "max_audio_seconds": {
+                        "type": "integer",
+                        "description": "audio 模式的默认导出上限秒数（仅未指定 end/duration 时生效，0 表示不限制）",
+                    },
+                    "frame_time_seconds": {"type": "number", "description": "封面时间点秒数（cover 模式，默认 1）"},
+                    "max_frames": {"type": "integer", "description": "关键帧数量上限（frames 模式，默认 6）"},
+                    "interval_seconds": {"type": "number", "description": "关键帧提取间隔秒（frames 模式，可选）"},
+                },
+                "required": [],
+            },
+            category="media",
+        ),
+        _handle_split_video,
+    )
+
 
 def _make_image_gen_handler(model_client: Any) -> ToolHandler:
+    """创建图片生成工具的 handler。"""
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         prompt = str(args.get("prompt", "")).strip()
         size = str(args.get("size", "1024x1024")).strip()
@@ -1560,7 +3980,1030 @@ def _make_image_gen_handler(model_client: Any) -> ToolHandler:
     return handler
 
 
-# ── 管理指令工具 ──
+# ── QQ 视频安全度预估 ──
+
+_QQ_VIDEO_SIZE_LIMIT_MB = 100
+_QQ_VIDEO_DURATION_LIMIT_SEC = 300  # 5分钟以内较安全
+
+_RISKY_DOMAINS = {
+    "xvideos", "pornhub", "xhamster", "xnxx", "redtube",
+    "youporn", "tube8", "spankbang", "hentai",
+}
+
+_RISKY_KEYWORDS = {
+    "porn", "nsfw", "r18", "18禁", "成人", "无码", "av",
+    "hentai", "里番", "黄色", "色情",
+}
+
+
+def _estimate_qq_safety(
+    url: str,
+    title: str = "",
+    duration: int = 0,
+    file_size_mb: float = 0,
+    platform: str = "",
+) -> dict[str, Any]:
+    """预估视频能否安全发到QQ。
+
+    返回:
+        level: "safe" | "risky" | "blocked"
+        reasons: list[str]
+        suggestion: str
+    """
+    reasons: list[str] = []
+    lower_url = url.lower()
+    lower_title = title.lower()
+
+    # 1. 域名黑名单
+    for domain in _RISKY_DOMAINS:
+        if domain in lower_url:
+            return {
+                "level": "blocked",
+                "reasons": [f"域名命中黑名单: {domain}"],
+                "suggestion": "该视频来源不适合在QQ发送",
+            }
+
+    # 2. 标题关键词
+    for kw in _RISKY_KEYWORDS:
+        if kw in lower_title or kw in lower_url:
+            return {
+                "level": "blocked",
+                "reasons": [f"内容关键词命中: {kw}"],
+                "suggestion": "该视频内容可能违规，不建议在QQ发送",
+            }
+
+    # 3. 文件大小
+    if file_size_mb > _QQ_VIDEO_SIZE_LIMIT_MB:
+        reasons.append(f"文件过大({file_size_mb:.0f}MB > {_QQ_VIDEO_SIZE_LIMIT_MB}MB)")
+
+    # 4. 时长
+    if duration > _QQ_VIDEO_DURATION_LIMIT_SEC:
+        reasons.append(f"时长较长({duration}s > {_QQ_VIDEO_DURATION_LIMIT_SEC}s)")
+
+    # 5. 平台可信度
+    trusted_platforms = {"bilibili", "douyin", "kuaishou", "acfun"}
+    if platform and platform not in trusted_platforms:
+        reasons.append(f"非主流平台({platform})，QQ可能拦截外链")
+
+    # 6. 直链检查
+    if re.search(r"\.(?:mp4|flv|mkv|avi|mov|webm)(?:\?|$)", lower_url, re.IGNORECASE):
+        if not any(trusted in lower_url for trusted in (
+            "bilibili", "douyin", "kuaishou", "acfun", "douyinvod", "bilivideo",
+        )):
+            reasons.append("非平台CDN直链，QQ可能无法预览")
+
+    if not reasons:
+        return {
+            "level": "safe",
+            "reasons": [],
+            "suggestion": "可以安全发送到QQ",
+        }
+
+    level = "risky" if len(reasons) <= 1 else "blocked"
+    suggestion = "建议" + ("谨慎发送" if level == "risky" else "不要发送") + "，" + "；".join(reasons)
+    return {"level": level, "reasons": reasons, "suggestion": suggestion}
+
+
+# ── 视频解析 handler ──
+
+async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """解析短视频链接，返回可发送的 video_url + 安全度评估。"""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return ToolCallResult(ok=False, error="missing url")
+
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="video_parser_unavailable", display="视频解析模块未初始化")
+
+    # URL 类型硬校验：避免把 pixiv/artwork 等非视频链接误送入 parse_video。
+    is_supported_video = False
+    try:
+        is_supported_video = bool(
+            callable(getattr(tool_executor, "_is_supported_platform_video_url", None))
+            and tool_executor._is_supported_platform_video_url(url)
+        ) or bool(
+            callable(getattr(tool_executor, "_is_direct_video_url", None))
+            and tool_executor._is_direct_video_url(url)
+        )
+    except Exception:
+        is_supported_video = False
+    if not is_supported_video:
+        return ToolCallResult(
+            ok=False,
+            error="invalid_args:not_supported_video_url",
+            display="parse_video 只支持抖音/快手/B站/AcFun/直链视频，不支持该链接类型。",
+        )
+
+    query = url  # 用 URL 作为 query
+    try:
+        result = await tool_executor._method_browser_resolve_video(
+            method_name="parse_video",
+            method_args={"url": url},
+            query=query,
+        )
+    except Exception as exc:
+        _log.warning("parse_video_error | url=%s | %s", url[:80], exc)
+        return ToolCallResult(ok=False, error=f"parse_video_error: {exc}", display=f"视频解析失败: {exc}")
+
+    video_url = str((result.payload or {}).get("video_url", ""))
+    image_url = str((result.payload or {}).get("image_url", ""))
+    image_urls = (result.payload or {}).get("image_urls", [])
+    post_type = str((result.payload or {}).get("post_type", ""))
+    text = str((result.payload or {}).get("text", ""))
+    platform = ""
+    try:
+        from core.video_analyzer import VideoAnalyzer
+        platform = VideoAnalyzer.detect_platform(url)
+    except Exception:
+        pass
+
+    # 安全度预估
+    safety = _estimate_qq_safety(url=video_url or url, title=text, platform=platform)
+
+    if result.ok and video_url:
+        display_parts = [f"解析成功: {text}"]
+        display_parts.append(f"安全度: {safety['level']}")
+        if safety["reasons"]:
+            display_parts.append(f"注意: {'; '.join(safety['reasons'])}")
+        return ToolCallResult(
+            ok=True,
+            data={
+                "video_url": video_url,
+                "text": text,
+                "platform": platform,
+                "qq_safety": safety,
+            },
+            display="\n".join(display_parts),
+        )
+
+    # 图文作品：有图片但没有视频
+    if result.ok and post_type == "image_text" and (image_url or image_urls):
+        display = text or "识别到图文作品"
+        return ToolCallResult(
+            ok=True,
+            data={
+                "image_url": image_url,
+                "image_urls": image_urls if isinstance(image_urls, list) else [],
+                "text": text,
+                "platform": platform,
+                "post_type": "image_text",
+                "qq_safety": safety,
+            },
+            display=display,
+        )
+
+    error_text = result.error or "解析失败"
+    display = text or f"视频解析失败: {error_text}"
+    return ToolCallResult(ok=False, error=error_text, display=display)
+
+
+async def _handle_analyze_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """深度分析视频内容，返回结构化分析结果 + 安全度评估。"""
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return ToolCallResult(ok=False, error="missing url")
+
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="video_analyzer_unavailable", display="视频分析模块未初始化")
+
+    message_text = str(context.get("message_text", url))
+    raw_segments = context.get("raw_segments", [])
+    conversation_id = str(context.get("conversation_id", ""))
+
+    try:
+        result = await tool_executor._method_video_analyze(
+            method_name="analyze_video",
+            method_args={"url": url},
+            query=url,
+            message_text=message_text,
+            raw_segments=raw_segments if isinstance(raw_segments, list) else [],
+            conversation_id=conversation_id,
+        )
+    except Exception as exc:
+        _log.warning("analyze_video_error | url=%s | %s", url[:80], exc)
+        return ToolCallResult(ok=False, error=f"analyze_video_error: {exc}", display=f"视频分析失败: {exc}")
+
+    payload = result.payload or {}
+    video_url = str(payload.get("video_url", ""))
+    text = str(payload.get("text", ""))
+    platform = ""
+    duration = 0
+    title = ""
+
+    try:
+        from core.video_analyzer import VideoAnalyzer
+        platform = VideoAnalyzer.detect_platform(url)
+    except Exception:
+        pass
+
+    # 从 analysis context 提取元数据
+    analysis_context = str(payload.get("analysis_context", text))
+    for line in analysis_context.split("\n"):
+        if line.startswith("时长:"):
+            try:
+                parts = line.split(":")[1].strip().split(":")
+                if len(parts) == 3:
+                    duration = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                elif len(parts) == 2:
+                    duration = int(parts[0]) * 60 + int(parts[1])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("标题:"):
+            title = line.split(":", 1)[1].strip()
+
+    # 安全度预估
+    safety = _estimate_qq_safety(
+        url=video_url or url,
+        title=title or text,
+        duration=duration,
+        platform=platform,
+    )
+
+    if result.ok:
+        display_parts = [clip_text(text, 500)]
+        display_parts.append(f"安全度: {safety['level']} - {safety.get('suggestion', '')}")
+        data = {
+            "text": text,
+            "platform": platform,
+            "qq_safety": safety,
+        }
+        if video_url:
+            data["video_url"] = video_url
+        return ToolCallResult(ok=True, data=data, display="\n".join(display_parts))
+
+    error_text = result.error or "分析失败"
+    return ToolCallResult(ok=False, error=error_text, display=text or f"视频分析失败: {error_text}")
+
+
+async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """识别/分析图片内容，委托给 ToolExecutor 的视觉识别能力。"""
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="vision_unavailable", display="图片识别模块未初始化")
+
+    url = str(args.get("url", "")).strip()
+    question = str(args.get("question", "")).strip()
+    message_text = str(context.get("message_text", ""))
+    raw_segments = context.get("raw_segments", [])
+    reply_media_segments = context.get("reply_media_segments", [])
+    conversation_id = str(context.get("conversation_id", ""))
+
+    def _image_count(segments: Any) -> int:
+        if not isinstance(segments, list):
+            return 0
+        count = 0
+        for seg in segments:
+            if isinstance(seg, dict) and normalize_text(str(seg.get("type", ""))).lower() == "image":
+                count += 1
+        return count
+
+    current_image_count = _image_count(raw_segments)
+    reply_image_count = _image_count(reply_media_segments)
+
+    # 构建 query: 优先用用户的具体问题，否则用消息文本
+    query = question or message_text or "请描述这张图片的内容"
+    query_norm = normalize_text(query).lower()
+
+    method_args: dict[str, Any] = {}
+    selected_source = "none"
+    selected_segments: list[dict[str, Any]] = []
+    if url:
+        method_args["url"] = url
+        selected_source = "explicit_url"
+    else:
+        current_segments = list(raw_segments) if isinstance(raw_segments, list) else []
+        reply_segments = list(reply_media_segments) if isinstance(reply_media_segments, list) else []
+        message_id = normalize_text(str(context.get("message_id", "")))
+        reply_to_message_id = normalize_text(str(context.get("reply_to_message_id", "")))
+        forced_target_message_id = normalize_text(str(args.get("target_message_id", "")))
+
+        # 没有显式图片时，不默认“盲猜最近一张图”。
+        # 仅用户明确指向“这张/引用那张/刚才那张”时才允许最近图兜底，并且仅在最近唯一时使用。
+        reference_cues = (
+            "这张",
+            "这个图",
+            "这图",
+            "引用那张",
+            "回复那张",
+            "刚才那张",
+            "刚刚那张",
+            "前面那张",
+            "刚发的图",
+        )
+        prefer_reply_cues = ("引用那张", "回复那张", "刚才那张", "刚刚那张", "前面那张")
+        prefer_current_cues = ("这张", "这个图", "这图", "当前这张", "这张图")
+        explicit_reply_ref = any(cue in query_norm for cue in prefer_reply_cues)
+        explicit_current_ref = any(cue in query_norm for cue in prefer_current_cues)
+        explicit_reference = any(cue in query_norm for cue in reference_cues)
+        has_direct_image_context = current_image_count > 0 or reply_image_count > 0
+        if forced_target_message_id:
+            if message_id and forced_target_message_id == message_id and current_image_count > 0:
+                selected_source = "current_message"
+                selected_segments = current_segments
+                method_args["target_message_id"] = message_id
+            elif reply_to_message_id and forced_target_message_id == reply_to_message_id and reply_image_count > 0:
+                selected_source = "reply_message"
+                selected_segments = reply_segments
+                method_args["target_message_id"] = reply_to_message_id
+            else:
+                return ToolCallResult(
+                    ok=False,
+                    error="target_message_not_found",
+                    display="你指定的目标消息里没有图片，请直接回复那张图再问我。",
+                )
+        elif current_image_count > 0 and reply_image_count > 0:
+            if explicit_reply_ref:
+                selected_source = "reply_message"
+                selected_segments = reply_segments
+                if reply_to_message_id:
+                    method_args["target_message_id"] = reply_to_message_id
+            elif explicit_current_ref:
+                selected_source = "current_message"
+                selected_segments = current_segments
+                if message_id:
+                    method_args["target_message_id"] = message_id
+            else:
+                return ToolCallResult(
+                    ok=False,
+                    error="image_context_ambiguous",
+                    display="你这条消息和引用里都有图片。请说“分析这张图”或“分析引用的图”，或者直接回复目标图片。",
+                )
+        elif current_image_count > 0:
+            selected_source = "current_message"
+            selected_segments = current_segments
+            if message_id:
+                method_args["target_message_id"] = message_id
+        elif reply_image_count > 0:
+            selected_source = "reply_message"
+            selected_segments = reply_segments
+            if reply_to_message_id:
+                method_args["target_message_id"] = reply_to_message_id
+        else:
+            if not explicit_reference:
+                return ToolCallResult(
+                    ok=False,
+                    error="image_context_missing",
+                    display="我现在拿不到你要问的那张图。请直接发图，或回复那张图片再问我。",
+                )
+            selected_source = "recent_cache_fallback"
+            method_args["allow_recent_fallback"] = True
+            method_args["recent_only_when_unique"] = True
+            selected_segments = current_segments + reply_segments
+
+        method_args.setdefault("allow_recent_fallback", False)
+        method_args.setdefault("recent_only_when_unique", True)
+        if selected_source:
+            method_args["target_source"] = selected_source
+
+        _log.info(
+            "analyze_image_target | source=%s | current_images=%d | reply_images=%d | message_id=%s | reply_to=%s",
+            selected_source,
+            current_image_count,
+            reply_image_count,
+            message_id or "-",
+            reply_to_message_id or "-",
+        )
+
+    try:
+        result = await tool_executor._method_media_analyze_image(
+            method_name="analyze_image",
+            method_args=method_args,
+            query=query,
+            message_text=message_text,
+            raw_segments=selected_segments if selected_segments else (list(raw_segments) if isinstance(raw_segments, list) else []),
+            conversation_id=conversation_id,
+        )
+    except Exception as exc:
+        _log.warning("analyze_image_error | %s", exc)
+        return ToolCallResult(ok=False, error=f"analyze_image_error: {exc}", display=f"图片识别失败: {exc}")
+
+    payload = result.payload or {}
+    text = str(payload.get("text", ""))
+    analysis = str(payload.get("analysis", text))
+
+    if result.ok and (text or analysis):
+        display = clip_text(analysis or text, 600)
+        return ToolCallResult(
+            ok=True,
+            data={"analysis": analysis, "source": str(payload.get("source", ""))},
+            display=display,
+        )
+
+    error_text = result.error or "识别失败"
+    return ToolCallResult(ok=False, error=error_text, display=text or f"图片识别失败: {error_text}")
+
+
+# ── 语音分析 handler ──
+
+async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """处理语音转文字请求。"""
+    import tempfile
+    from pathlib import Path as _Path
+
+    explicit_url = normalize_text(str(args.get("url", "")))
+    raw_segments = context.get("raw_segments", [])
+    reply_media_segments = context.get("reply_media_segments", [])
+    api_call = context.get("api_call")
+
+    # 收集所有语音 URL
+    voice_url = explicit_url
+    voice_file_id = ""
+    if not voice_url:
+        for segs in (raw_segments, reply_media_segments):
+            for seg in (segs or []):
+                if not isinstance(seg, dict):
+                    continue
+                seg_type = normalize_text(str(seg.get("type", ""))).lower()
+                if seg_type not in ("record", "audio"):
+                    continue
+                data = seg.get("data", {}) or {}
+                url = normalize_text(str(data.get("url", "")))
+                fid = normalize_text(str(data.get("file", "") or data.get("file_id", "")))
+                if url:
+                    voice_url = url
+                    break
+                if fid:
+                    voice_file_id = fid
+                    break
+            if voice_url or voice_file_id:
+                break
+
+    if not voice_url and not voice_file_id:
+        return ToolCallResult(
+            ok=False,
+            error="voice_not_found",
+            display="没有找到语音消息。请发送语音或回复一条语音消息再试。",
+        )
+
+    # 尝试通过 NapCat API 获取语音文件
+    if not voice_url and voice_file_id and api_call:
+        try:
+            result = await api_call("get_record", file=voice_file_id, out_format="mp3")
+            if isinstance(result, dict):
+                # 某些实现直接返回转录文本
+                text = str(result.get("text", "")).strip()
+                if text:
+                    return ToolCallResult(ok=True, data={"text": text, "source": "napcat_stt"}, display=f"语音内容: {text}")
+                voice_url = str(result.get("url", "") or result.get("file", "")).strip()
+        except Exception as exc:
+            _log.warning("voice_get_record_error | %s", exc)
+
+    if not voice_url:
+        return ToolCallResult(ok=False, error="voice_url_unavailable", display="无法获取语音文件地址")
+
+    # 下载语音文件
+    try:
+        from utils.media import download_file, extract_audio, transcribe_audio
+
+        cache_dir = _Path("storage/cache/voice")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        import hashlib
+        fname = hashlib.md5(voice_url.encode()).hexdigest()
+        voice_path = cache_dir / f"{fname}.mp3"
+
+        if not voice_path.is_file():
+            ok = await download_file(voice_url, voice_path, timeout=20.0)
+            if not ok:
+                return ToolCallResult(ok=False, error="voice_download_failed", display="语音文件下载失败")
+
+        # 转换为 WAV
+        wav_path = await extract_audio(voice_path, voice_path.with_suffix(".wav"))
+        if not wav_path:
+            wav_path = str(voice_path)  # 尝试直接用 mp3
+
+        # Whisper 转录
+        text = await transcribe_audio(wav_path, language="zh")
+        if not text:
+            return ToolCallResult(ok=False, error="whisper_transcribe_empty", display="语音转录结果为空，可能是静音或无法识别")
+
+        return ToolCallResult(
+            ok=True,
+            data={"text": text, "source": "whisper"},
+            display=f"语音内容: {text}",
+        )
+    except ImportError:
+        return ToolCallResult(ok=False, error="whisper_not_installed", display="语音转录功能需要安装 openai-whisper: pip install openai-whisper")
+    except Exception as exc:
+        _log.warning("analyze_voice_error | %s", exc)
+        return ToolCallResult(ok=False, error=f"voice_error: {exc}", display=f"语音分析失败: {exc}")
+
+
+def _resolve_video_url_from_args_or_context(args: dict[str, Any], context: dict[str, Any]) -> str:
+    """优先显式 url，否则从当前消息/引用消息里提取视频 url。"""
+    explicit_url = normalize_text(str(args.get("url", "")))
+    if explicit_url:
+        return explicit_url
+
+    raw_segments = context.get("raw_segments", []) or []
+    reply_media_segments = context.get("reply_media_segments", []) or []
+    for segs in (raw_segments, reply_media_segments):
+        for seg in segs:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            if seg_type != "video":
+                continue
+            data = seg.get("data", {}) or {}
+            if not isinstance(data, dict):
+                continue
+            url = normalize_text(str(data.get("url", "")))
+            if url:
+                return url
+    return ""
+
+
+def _to_non_negative_float(value: Any, default: float = 0.0) -> float:
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        return default
+    if val < 0:
+        return 0.0
+    return val
+
+
+def _resolve_local_path_from_uri(value: str) -> Path | None:
+    text = normalize_text(value)
+    if not text:
+        return None
+    if text.startswith("file://"):
+        parsed = urlparse(text)
+        local_raw = unquote(parsed.path or "")
+        if re.match(r"^/[A-Za-z]:/", local_raw):
+            local_raw = local_raw[1:]
+        path = Path(local_raw)
+    else:
+        path = Path(text)
+    if path.exists() and path.is_file():
+        return path
+    return None
+
+
+def _probe_stream_flags_fallback(video_path: Path) -> tuple[bool, bool]:
+    """ffprobe 不可用时，尽力从 ffmpeg -i 输出判断是否有音视频流。"""
+    try:
+        from utils.media import get_ffmpeg
+        ffmpeg = get_ffmpeg()
+    except Exception:
+        ffmpeg = None
+    if not ffmpeg:
+        # 最保守：默认有视频、音频未知（按无音频处理）
+        return True, False
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(video_path)],
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
+        )
+        text = normalize_text((proc.stdout or "") + "\n" + (proc.stderr or ""))
+        has_video = bool(re.search(r"\bvideo\b", text, flags=re.IGNORECASE))
+        has_audio = bool(re.search(r"\baudio\b", text, flags=re.IGNORECASE))
+        if has_video:
+            return has_video, has_audio
+    except Exception:
+        pass
+    suffix = video_path.suffix.lower()
+    return suffix in {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".flv", ".avi"}, False
+
+
+async def _handle_split_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """视频处理：切片、提取音频、封面、关键帧。"""
+    import hashlib
+    from pathlib import Path as _Path
+
+    video_url = _resolve_video_url_from_args_or_context(args, context)
+    if not video_url:
+        return ToolCallResult(
+            ok=False,
+            error="video_not_found",
+            display="没有找到视频。请发送视频或回复一条视频消息，或者传入视频链接 URL。",
+        )
+
+    mode_raw = normalize_text(str(args.get("mode", "clip"))).lower()
+    mode_alias = {
+        "clip": "clip",
+        "split": "clip",
+        "segment": "clip",
+        "切片": "clip",
+        "分割": "clip",
+        "片段": "clip",
+        "audio": "audio",
+        "extract_audio": "audio",
+        "音频": "audio",
+        "导出音频": "audio",
+        "cover": "cover",
+        "thumbnail": "cover",
+        "封面": "cover",
+        "截图": "cover",
+        "画面": "cover",
+        "frames": "frames",
+        "keyframes": "frames",
+        "关键帧": "frames",
+    }
+    mode = mode_alias.get(mode_raw, "")
+    if not mode:
+        return ToolCallResult(
+            ok=False,
+            error="invalid_mode",
+            display="mode 只支持 clip / audio / cover / frames。",
+        )
+
+    try:
+        from utils.media import (
+            download_file,
+            extract_audio,
+            extract_keyframes,
+            get_media_info,
+            run_ffmpeg,
+            run_ffprobe_json,
+        )
+    except ImportError as exc:
+        return ToolCallResult(ok=False, error=f"missing_dependency: {exc}", display=f"缺少依赖: {exc}")
+
+    cache_root = _Path("storage/cache/videos/split")
+    cache_root.mkdir(parents=True, exist_ok=True)
+
+    source_path: _Path | None = _resolve_local_path_from_uri(video_url)
+    source_tag = hashlib.md5(video_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    if source_path is None:
+        parsed = urlparse(video_url)
+        suffix = _Path(parsed.path or "").suffix.lower()
+        if suffix not in {".mp4", ".m4v", ".mov", ".webm", ".mkv", ".flv", ".avi"}:
+            suffix = ".mp4"
+        source_path = cache_root / f"{source_tag}.source{suffix}"
+        if not source_path.exists():
+            ok = await download_file(video_url, source_path, timeout=80.0, max_size_mb=128.0)
+            if not ok:
+                return ToolCallResult(ok=False, error="video_download_failed", display="视频下载失败（可能链接失效或体积过大）")
+
+    probe = await run_ffprobe_json(source_path)
+    info = get_media_info(probe) if isinstance(probe, dict) and probe else {}
+    if not info:
+        has_video, has_audio = _probe_stream_flags_fallback(source_path)
+        info = {"duration": 0.0, "has_video": has_video, "has_audio": has_audio}
+    if not bool(info.get("has_video")):
+        return ToolCallResult(ok=False, error="not_video", display="目标文件不是有效视频。")
+
+    duration = float(info.get("duration", 0.0) or 0.0)
+    source_has_audio = bool(info.get("has_audio"))
+
+    start_seconds = _to_non_negative_float(args.get("start_seconds", 0.0), 0.0)
+    end_input = args.get("end_seconds", None)
+    duration_input = args.get("duration_seconds", None)
+    end_seconds = 0.0
+    if end_input not in (None, ""):
+        end_seconds = _to_non_negative_float(end_input, 0.0)
+    elif duration_input not in (None, ""):
+        span = _to_non_negative_float(duration_input, 0.0)
+        if span > 0:
+            end_seconds = start_seconds + span
+
+    if duration > 0:
+        start_seconds = min(start_seconds, max(duration - 0.1, 0.0))
+        if end_seconds > 0:
+            end_seconds = min(end_seconds, duration)
+            if end_seconds <= start_seconds + 0.02:
+                end_seconds = 0.0
+
+    if mode == "clip":
+        if end_seconds <= 0:
+            if duration > 0:
+                end_seconds = min(duration, start_seconds + 30.0)
+            else:
+                end_seconds = start_seconds + 30.0
+        clip_duration = max(0.5, end_seconds - start_seconds)
+        out_name = f"{source_tag}_{int(start_seconds * 1000)}_{int(end_seconds * 1000)}.clip.mp4"
+        out_path = cache_root / out_name
+        cmd = [
+            "-ss",
+            f"{start_seconds:.3f}",
+            "-i",
+            str(source_path),
+            "-t",
+            f"{clip_duration:.3f}",
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
+        ok, err = await run_ffmpeg(cmd, timeout=180.0)
+        if not ok or not out_path.exists() or out_path.stat().st_size <= 1024:
+            out_path.unlink(missing_ok=True)
+            return ToolCallResult(
+                ok=False,
+                error=f"clip_failed:{err}",
+                display=f"视频切片失败: {clip_text(err, 180) if err else 'unknown error'}",
+            )
+
+        out_probe = await run_ffprobe_json(out_path)
+        out_info = get_media_info(out_probe) if isinstance(out_probe, dict) and out_probe else {}
+        if not out_info:
+            has_video_out, has_audio_out = _probe_stream_flags_fallback(out_path)
+            out_info = {"has_video": has_video_out, "has_audio": has_audio_out}
+        if source_has_audio and not bool(out_info.get("has_audio")):
+            out_path.unlink(missing_ok=True)
+            return ToolCallResult(
+                ok=False,
+                error="clip_audio_missing",
+                display="切片结果丢失音轨，已中止发送。建议改短一点再试。",
+            )
+        return ToolCallResult(
+            ok=True,
+            data={
+                "mode": "clip",
+                "video_url": str(out_path.resolve()),
+                "start_seconds": round(start_seconds, 3),
+                "end_seconds": round(end_seconds, 3),
+                "duration_seconds": round(clip_duration, 3),
+            },
+            display=f"切片完成: {start_seconds:.1f}s ~ {end_seconds:.1f}s",
+        )
+
+    if mode == "audio":
+        if not source_has_audio:
+            return ToolCallResult(ok=False, error="video_no_audio", display="原视频没有音轨，无法导出音频。")
+
+        # 默认不在工具层裁剪，交给发送层按平台能力做“整段/分段/兜底”。
+        default_max_audio_seconds = 0
+
+        max_audio_seconds_raw = args.get("max_audio_seconds", default_max_audio_seconds)
+        try:
+            max_audio_seconds = max(0, int(max_audio_seconds_raw or 0))
+        except Exception:
+            max_audio_seconds = default_max_audio_seconds
+
+        # 若未显式指定 end/duration，默认导出语音友好长度，提升 QQ 发送成功率。
+        auto_trimmed = False
+        if end_seconds <= start_seconds + 0.02 and max_audio_seconds > 0:
+            if duration > 0:
+                end_seconds = min(duration, start_seconds + float(max_audio_seconds))
+            else:
+                end_seconds = start_seconds + float(max_audio_seconds)
+            auto_trimmed = end_seconds > start_seconds + 0.02
+
+        out_name = f"{source_tag}_{int(start_seconds * 1000)}_{int(end_seconds * 1000)}.audio.mp3"
+        out_path = cache_root / out_name
+        cmd = []
+        if start_seconds > 0:
+            cmd.extend(["-ss", f"{start_seconds:.3f}"])
+        cmd.extend(["-i", str(source_path)])
+        if end_seconds > start_seconds + 0.02:
+            cmd.extend(["-t", f"{(end_seconds - start_seconds):.3f}"])
+        cmd.extend(
+            [
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "64k",
+                "-ar",
+                "24000",
+                "-ac",
+                "1",
+                str(out_path),
+            ]
+        )
+        ok, err = await run_ffmpeg(cmd, timeout=120.0)
+        if not ok or not out_path.exists() or out_path.stat().st_size <= 512:
+            out_path.unlink(missing_ok=True)
+            # 兜底输出 wav，至少保证“可导出音频”
+            wav_name = f"{source_tag}_{int(start_seconds * 1000)}_{int(end_seconds * 1000)}.audio.wav"
+            wav_path = cache_root / wav_name
+            wav_result = await extract_audio(source_path, wav_path)
+            if not wav_result:
+                return ToolCallResult(
+                    ok=False,
+                    error=f"audio_extract_failed:{err}",
+                    display=f"音频导出失败: {clip_text(err, 180) if err else 'unknown error'}",
+                )
+            out_path = _Path(wav_result)
+
+        out_duration = 0.0
+        out_probe = await run_ffprobe_json(out_path)
+        out_info = get_media_info(out_probe) if isinstance(out_probe, dict) and out_probe else {}
+        if isinstance(out_info, dict):
+            out_duration = float(out_info.get("duration", 0.0) or 0.0)
+        if out_duration <= 0 and end_seconds > start_seconds + 0.02:
+            out_duration = max(0.0, end_seconds - start_seconds)
+
+        display = "音频导出完成"
+        if auto_trimmed and out_duration > 0:
+            display = f"音频导出完成（已裁剪至 {out_duration:.1f}s）"
+
+        return ToolCallResult(
+            ok=True,
+            data={
+                "mode": "audio",
+                "audio_file": str(out_path.resolve()),
+                "start_seconds": round(start_seconds, 3),
+                "end_seconds": round(end_seconds, 3) if end_seconds > 0 else 0,
+                "duration_seconds": round(out_duration, 3) if out_duration > 0 else 0,
+                "auto_trimmed": auto_trimmed,
+            },
+            display=display,
+        )
+
+    if mode == "cover":
+        frame_time = _to_non_negative_float(args.get("frame_time_seconds", 1.0), 1.0)
+        if duration > 0:
+            frame_time = min(frame_time, max(duration - 0.05, 0.0))
+        out_name = f"{source_tag}_{int(frame_time * 1000)}.cover.jpg"
+        out_path = cache_root / out_name
+        ok, err = await run_ffmpeg(
+            [
+                "-ss",
+                f"{frame_time:.3f}",
+                "-i",
+                str(source_path),
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+                str(out_path),
+            ],
+            timeout=80.0,
+        )
+        if not ok or not out_path.exists() or out_path.stat().st_size <= 512:
+            out_path.unlink(missing_ok=True)
+            return ToolCallResult(
+                ok=False,
+                error=f"cover_extract_failed:{err}",
+                display=f"封面提取失败: {clip_text(err, 180) if err else 'unknown error'}",
+            )
+        return ToolCallResult(
+            ok=True,
+            data={"mode": "cover", "image_url": str(out_path.resolve()), "image_urls": [str(out_path.resolve())]},
+            display=f"封面提取完成（{frame_time:.1f}s）",
+        )
+
+    # mode == "frames"
+    max_frames = int(_to_non_negative_float(args.get("max_frames", 6), 6))
+    max_frames = max(1, min(max_frames, 12))
+    interval_seconds = _to_non_negative_float(args.get("interval_seconds", 0), 0)
+    frame_dir = cache_root / f"{source_tag}_frames_{max_frames}"
+    if frame_dir.exists():
+        for stale in frame_dir.glob("frame_*.jpg"):
+            stale.unlink(missing_ok=True)
+    frames = await extract_keyframes(
+        source_path,
+        frame_dir,
+        max_frames=max_frames,
+        interval_seconds=interval_seconds if interval_seconds > 0 else 0,
+        timeout=120.0,
+    )
+    if not frames:
+        return ToolCallResult(ok=False, error="frames_extract_failed", display="关键帧提取失败。")
+
+    abs_frames = [str(_Path(item).resolve()) for item in frames if _Path(item).is_file()]
+    if not abs_frames:
+        return ToolCallResult(ok=False, error="frames_extract_empty", display="关键帧提取结果为空。")
+    return ToolCallResult(
+        ok=True,
+        data={
+            "mode": "frames",
+            "image_url": abs_frames[0],
+            "image_urls": abs_frames,
+            "frame_count": len(abs_frames),
+        },
+        display=f"关键帧提取完成，共 {len(abs_frames)} 张",
+    )
+
+
+# ── 本地视频内容分析 handler ──
+
+async def _handle_analyze_local_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """处理本地视频文件的深度内容分析（关键帧 + 音频转文字）。"""
+    from pathlib import Path as _Path
+
+    explicit_url = normalize_text(str(args.get("url", "")))
+    raw_segments = context.get("raw_segments", [])
+    reply_media_segments = context.get("reply_media_segments", [])
+    tool_executor = context.get("tool_executor")
+
+    # 收集视频 URL
+    video_url = explicit_url
+    if not video_url:
+        for segs in (raw_segments, reply_media_segments):
+            for seg in (segs or []):
+                if not isinstance(seg, dict):
+                    continue
+                seg_type = normalize_text(str(seg.get("type", ""))).lower()
+                if seg_type != "video":
+                    continue
+                data = seg.get("data", {}) or {}
+                url = normalize_text(str(data.get("url", "")))
+                if url:
+                    video_url = url
+                    break
+            if video_url:
+                break
+
+    if not video_url:
+        return ToolCallResult(
+            ok=False,
+            error="video_not_found",
+            display="没有找到视频。请发送视频或回复一条视频消息再试。",
+        )
+
+    try:
+        from utils.media import (
+            download_file, extract_audio, extract_keyframes,
+            transcribe_audio, run_ffprobe_json, get_media_info,
+        )
+
+        cache_dir = _Path("storage/cache/videos")
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        import hashlib
+        fname = hashlib.md5(video_url.encode()).hexdigest()
+        video_path = cache_dir / f"{fname}.mp4"
+
+        # 下载视频
+        if not video_path.is_file():
+            ok = await download_file(video_url, video_path, timeout=50.0, max_size_mb=64.0)
+            if not ok:
+                return ToolCallResult(ok=False, error="video_download_failed", display="视频下载失败（可能超过64MB限制）")
+
+        # 获取视频信息
+        probe = await run_ffprobe_json(video_path)
+        info = get_media_info(probe)
+        duration = info.get("duration", 0)
+
+        results: dict[str, Any] = {"duration": duration, "info": info}
+        display_parts: list[str] = []
+        if duration > 0:
+            display_parts.append(f"时长: {int(duration)}秒")
+
+        # 提取关键帧
+        keyframe_dir = cache_dir / "keyframes" / fname
+        frames = await extract_keyframes(video_path, keyframe_dir, max_frames=6)
+        results["keyframe_count"] = len(frames)
+
+        # 用 Vision API 分析关键帧
+        frame_descriptions: list[str] = []
+        if frames and tool_executor and hasattr(tool_executor, "_method_media_analyze_image"):
+            for i, frame_path in enumerate(frames[:4]):
+                try:
+                    img_result = await tool_executor._method_media_analyze_image(
+                        method_name="analyze_image",
+                        method_args={"url": f"file://{frame_path}"},
+                        query="简要描述这个视频画面的内容",
+                        message_text="",
+                        raw_segments=[],
+                        conversation_id="",
+                    )
+                    if img_result.ok:
+                        desc = str((img_result.payload or {}).get("analysis", ""))
+                        if desc:
+                            frame_descriptions.append(f"画面{i+1}: {clip_text(desc, 100)}")
+                except Exception:
+                    pass
+        if frame_descriptions:
+            results["frame_descriptions"] = frame_descriptions
+            display_parts.append("关键帧分析:\n" + "\n".join(frame_descriptions))
+
+        # 提取音频并转录
+        if info.get("has_audio"):
+            wav_path = await extract_audio(video_path)
+            if wav_path:
+                transcript = await transcribe_audio(wav_path, language="zh", timeout=180.0)
+                if transcript:
+                    results["transcript"] = transcript
+                    display_parts.append(f"音频内容: {clip_text(transcript, 400)}")
+
+        if not display_parts:
+            display_parts.append("视频分析完成，但未能提取有效内容")
+
+        return ToolCallResult(
+            ok=True,
+            data=results,
+            display="\n".join(display_parts),
+        )
+    except ImportError as exc:
+        return ToolCallResult(ok=False, error=f"missing_dependency: {exc}", display=f"缺少依赖: {exc}")
+    except Exception as exc:
+        _log.warning("analyze_local_video_error | %s", exc)
+        return ToolCallResult(ok=False, error=f"video_analysis_error: {exc}", display=f"视频分析失败: {exc}")
 
 def _register_admin_tools(registry: AgentToolRegistry) -> None:
     """注册管理指令工具，让 Agent 可以执行 /yuki 系列命令。"""
@@ -1581,7 +5024,7 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
                 "- poke <QQ>: 戳一戳\n"
                 "- dice: 骰子\n"
                 "- rps: 猜拳\n"
-                "- music_card <歌名>: 音乐卡片\n"
+                "- music_card <歌名>: 音乐卡片（仅发送QQ音乐卡片，不是语音；如需语音播放请用 music_play 工具）\n"
                 "- json <JSON>: 发送JSON卡片\n"
                 "- 定海神针 [行数] [段数] [延迟秒]: 刷屏定海神针\n"
                 "- behavior [冷漠|安静|活跃|默认]: 切换行为模式\n"
@@ -1598,6 +5041,130 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
             category="admin",
         ),
         _handle_admin_command,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="config_update",
+            description=(
+                "仅超级管理员可用：修改机器人配置并立即生效。\n"
+                "参数 patch 是对 config.yml 的最小补丁对象，示例:\n"
+                "{\"patch\":{\"bot\":{\"allow_non_to_me\":false}}}\n"
+                "或 {\"patch\":{\"output\":{\"verbosity\":\"short\"}}}\n"
+                "规则：\n"
+                "- 只改用户明确要求的字段\n"
+                "- 不要传整份配置\n"
+                "- 改完后再用 final_answer 告知变更结果"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "object", "description": "config.yml 的增量补丁对象"},
+                    "reason": {"type": "string", "description": "变更原因摘要（可选）"},
+                    "dry_run": {"type": "boolean", "description": "是否仅预检不写入（可选）"},
+                },
+                "required": ["patch"],
+            },
+            category="admin",
+        ),
+        _handle_config_update,
+    )
+
+    # 音乐搜索工具（返回搜索结果列表）
+    registry.register(
+        ToolSchema(
+            name="music_search",
+            description=(
+                "搜索歌曲，返回搜索结果列表供选择。\n"
+                "使用场景: 用户说'点歌 XXX'、'放歌 XXX'、'来首 XXX' 时先调用此工具搜索。\n"
+                "返回结果包含歌曲 ID、歌名、歌手、专辑等信息。\n"
+                "重要：你需要仔细分析用户的真实意图，从搜索结果中选择最符合用户需求的歌曲：\n"
+                "- 如果用户指定了歌手名，优先选择该歌手的原版歌曲\n"
+                "- 避免选择翻唱版、柔情版、女声版、男声版等改编版本，除非用户明确要求\n"
+                "- 如果用户只说歌名，选择最知名的原唱版本\n"
+                "- 注意歌曲的完整性，避免选择铃声版、片段版\n"
+                "选择后使用 music_play_by_id 工具播放。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "歌曲检索词，直接使用用户提供的关键词，不要自行修改或添加额外限定词"},
+                    "title": {"type": "string", "description": "歌曲名（可选，建议与 artist 分开传）"},
+                    "artist": {"type": "string", "description": "歌手名（可选）"},
+                },
+                "required": [],
+            },
+            category="utility",
+        ),
+        _handle_music_search,
+    )
+
+    # 音乐播放工具（按关键词自动选可播版本）
+    registry.register(
+        ToolSchema(
+            name="music_play",
+            description=(
+                "按关键词直接点歌并播放（优先 Alger API，自动下载可播音频并发送语音）。\n"
+                "使用场景: 用户说“点歌 XXX”“来首 XXX”“放歌 XXX”时优先使用本工具。\n"
+                "注意：如果用户明确指定歌手/版本，请把歌手和版本一起放进 keyword。\n"
+                "仅当本工具返回 preview_only/no_url/play_failed/download_failed 且用户同意第三方来源时，才考虑 B 站回退。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "歌曲关键词（建议包含歌手+歌名）"},
+                    "title": {"type": "string", "description": "歌曲名（可选）"},
+                    "artist": {"type": "string", "description": "歌手名（可选）"},
+                },
+                "required": [],
+            },
+            category="utility",
+        ),
+        _handle_music_play,
+    )
+
+    # 音乐播放工具（根据 ID 播放）
+    registry.register(
+        ToolSchema(
+            name="music_play_by_id",
+            description=(
+                "根据歌曲 ID 播放歌曲（发送 SILK 语音消息）。\n"
+                "使用场景: 在 music_search 返回结果后，选择合适的歌曲 ID 调用此工具播放。\n"
+                "你需要根据用户需求（如要原版、不要 DJ 版等）从搜索结果中选择最合适的歌曲。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "song_id": {"type": "integer", "description": "歌曲 ID（从 music_search 结果中获取）"},
+                    "song_name": {"type": "string", "description": "歌曲名称（用于显示）"},
+                    "artist": {"type": "string", "description": "歌手名称（用于显示）"},
+                },
+                "required": ["song_id"],
+            },
+            category="admin",
+        ),
+        _handle_music_play_by_id,
+    )
+
+    # Bilibili 音频提取工具（音乐回退方案）
+    registry.register(
+        ToolSchema(
+            name="bilibili_audio_extract",
+            description=(
+                "从 Bilibili 视频中提取音频作为音乐播放的回退方案。\n"
+                "使用场景: 仅在 music_play / music_play_by_id 明确失败后，再尝试从 B 站搜索并提取音频。\n"
+                "适用于用户点歌但网易云音乐版权受限的情况。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "搜索关键词（歌曲名+歌手）"},
+                },
+                "required": ["keyword"],
+            },
+            category="utility",
+        ),
+        _handle_bilibili_audio_extract,
     )
 
 
@@ -1633,7 +5200,289 @@ async def _handle_admin_command(args: dict[str, Any], context: dict[str, Any]) -
     )
 
 
-# ── 实用工具 ──
+async def _handle_config_update(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    patch = args.get("patch", {})
+    reason = normalize_text(str(args.get("reason", "")))
+    dry_run = bool(args.get("dry_run", False))
+    if not isinstance(patch, dict) or not patch:
+        return ToolCallResult(ok=False, error="invalid_patch")
+
+    # 轻量安全护栏：限制体积，防止模型误把整份上下文塞进配置。
+    try:
+        patch_size = len(json.dumps(patch, ensure_ascii=False))
+    except Exception:
+        return ToolCallResult(ok=False, error="patch_serialize_failed")
+    if patch_size > 20000:
+        return ToolCallResult(ok=False, error="patch_too_large")
+
+    config_patch_handler = context.get("config_patch_handler")
+    if not config_patch_handler:
+        return ToolCallResult(ok=False, error="config_patch_handler_unavailable")
+
+    actor_user_id = str(context.get("user_id", "")).strip()
+    try:
+        result = config_patch_handler(
+            patch=patch,
+            actor_user_id=actor_user_id,
+            reason=reason,
+            dry_run=dry_run,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"config_update_error:{exc}")
+
+    ok = False
+    message = ""
+    merged_preview: dict[str, Any] = {}
+    if isinstance(result, tuple) and len(result) >= 2:
+        ok = bool(result[0])
+        message = str(result[1] or "")
+        if len(result) >= 3 and isinstance(result[2], dict):
+            merged_preview = result[2]
+    elif isinstance(result, dict):
+        ok = bool(result.get("ok", False))
+        message = str(result.get("message", ""))
+        if isinstance(result.get("config"), dict):
+            merged_preview = result.get("config", {})
+    else:
+        return ToolCallResult(ok=False, error="config_update_handler_invalid_result")
+
+    top_keys = sorted(str(k) for k in patch.keys())
+    mode = "预检" if dry_run else "更新"
+    if not ok:
+        return ToolCallResult(
+            ok=False,
+            error=f"config_update_failed:{message or 'unknown'}",
+            display=f"配置{mode}失败: {message or 'unknown'}",
+        )
+    return ToolCallResult(
+        ok=True,
+        data={
+            "updated_keys": top_keys,
+            "dry_run": dry_run,
+            "message": message,
+            "config_preview": merged_preview if dry_run else {},
+        },
+        display=f"配置{mode}成功: {', '.join(top_keys) or '(empty)'}",
+    )
+
+
+
+
+async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """搜索歌曲，返回结果列表。"""
+    keyword = normalize_text(str(args.get("keyword", "")))
+    title = normalize_text(str(args.get("title", "")))
+    artist = normalize_text(str(args.get("artist", "")))
+    if not keyword and title:
+        keyword = f"{title} {artist}".strip()
+    if not keyword:
+        return ToolCallResult(ok=False, error="missing keyword")
+
+    tool_executor = context.get("tool_executor")
+    if tool_executor is None:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+
+    try:
+        result = await tool_executor.execute(
+            action="music_search",
+            tool_name="music_search",
+            tool_args={"keyword": keyword, "limit": 8},  # 增加到8条，给Agent更多选择
+            message_text=keyword,
+            conversation_id=str(context.get("conversation_id", "")),
+            user_id=str(context.get("user_id", "")),
+            user_name=str(context.get("user_name", "")),
+            group_id=int(context.get("group_id", 0) or 0),
+            api_call=context.get("api_call"),
+        )
+        if not result.ok:
+            return ToolCallResult(ok=False, error=result.error or "search_failed")
+
+        # 返回搜索结果列表
+        results = result.payload.get("results", [])
+        if not results:
+            return ToolCallResult(ok=False, error="no_results", display="没找到相关歌曲")
+
+        # 格式化结果供 Agent 选择
+        lines = [f"找到 {len(results)} 首歌曲："]
+        for i, r in enumerate(results, 1):
+            lines.append(f"{i}. {r['name']} - {r['artist']} (ID: {r['id']})")
+
+        return ToolCallResult(
+            ok=True,
+            data={"results": results},
+            display="\n".join(lines),
+        )
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"music_search_error: {exc}")
+
+
+async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """根据歌曲 ID 播放音乐。"""
+    song_id = int(args.get("song_id", 0) or 0)
+    if song_id <= 0:
+        return ToolCallResult(ok=False, error="invalid song_id")
+
+    song_name = normalize_text(str(args.get("song_name", "")))
+    artist = normalize_text(str(args.get("artist", "")))
+
+    tool_executor = context.get("tool_executor")
+    group_id = int(context.get("group_id", 0) or 0)
+    api_call = context.get("api_call")
+
+    if tool_executor is None:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+
+    try:
+        result = await tool_executor.execute(
+            action="music_play_by_id",
+            tool_name="music_play_by_id",
+            tool_args={"song_id": song_id, "song_name": song_name, "artist": artist},
+            message_text="",
+            conversation_id=str(context.get("conversation_id", "")),
+            user_id=str(context.get("user_id", "")),
+            user_name=str(context.get("user_name", "")),
+            group_id=group_id,
+            api_call=api_call,
+        )
+        if not result.ok:
+            return ToolCallResult(ok=False, error=result.error or "play_failed")
+
+        # 返回音频信息
+        display_name = song_name if song_name else result.payload.get("text", "")
+        return ToolCallResult(
+            ok=True,
+            data={
+                "audio_file": result.payload.get("audio_file"),
+                "audio_file_silk": result.payload.get("audio_file_silk"),
+                "record_b64": result.payload.get("record_b64"),
+            },
+            display=display_name,
+        )
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"music_play_error: {exc}")
+
+
+async def _handle_bilibili_audio_extract(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """从 Bilibili 提取音频作为音乐回退方案。"""
+    keyword = normalize_text(str(args.get("keyword", "")))
+    if not keyword:
+        return ToolCallResult(ok=False, error="missing keyword")
+
+    tool_executor = context.get("tool_executor")
+    group_id = int(context.get("group_id", 0) or 0)
+    api_call = context.get("api_call")
+
+    if tool_executor is None:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+
+    try:
+        result = await tool_executor.execute(
+            action="bilibili_audio_extract",
+            tool_name="bilibili_audio_extract",
+            tool_args={"keyword": keyword},
+            message_text=keyword,
+            conversation_id=str(context.get("conversation_id", "")),
+            user_id=str(context.get("user_id", "")),
+            user_name=str(context.get("user_name", "")),
+            group_id=group_id,
+            api_call=api_call,
+        )
+        if not result.ok:
+            return ToolCallResult(ok=False, error=result.error or "extract_failed")
+
+        # 返回音频信息
+        return ToolCallResult(
+            ok=True,
+            data={
+                "audio_file": result.payload.get("audio_file"),
+                "audio_file_silk": result.payload.get("audio_file_silk"),
+                "record_b64": result.payload.get("record_b64"),
+                "text": result.payload.get("text", ""),
+            },
+            display=result.payload.get("text", "已从 B 站提取音频"),
+        )
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"bilibili_audio_extract_error: {exc}")
+
+
+async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """通过 tool_executor 播放音乐，返回音频信息让 app.py 统一发送。
+
+    不在此处直接发送语音，避免与 app.py 发送层重复发送。
+    音频文件路径通过 data 字段传递，由 engine → app.py 的 send_response 统一处理。
+    """
+    keyword = normalize_text(str(args.get("keyword", "")))
+    title = normalize_text(str(args.get("title", "")))
+    artist = normalize_text(str(args.get("artist", "")))
+    if not keyword and title:
+        keyword = f"{title} {artist}".strip()
+    if not keyword:
+        return ToolCallResult(ok=False, error="missing keyword")
+
+    tool_executor = context.get("tool_executor")
+    group_id = int(context.get("group_id", 0) or 0)
+    api_call = context.get("api_call")
+
+    if tool_executor is None:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+
+    try:
+        result = await tool_executor.execute(
+            action="music_play",
+            tool_name="music_play",
+            tool_args={"keyword": keyword},
+            message_text=keyword,
+            conversation_id=str(context.get("conversation_id", "")),
+            user_id=str(context.get("user_id", "")),
+            user_name=str(context.get("user_name", "")),
+            group_id=group_id,
+            api_call=api_call,
+            trace_id=str(context.get("trace_id", "")),
+        )
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"music_play_error: {exc}")
+
+    if result is None or not result.ok:
+        error_msg = getattr(result, "error", "unknown") if result else "no_result"
+        text = ""
+        if result and hasattr(result, "payload"):
+            text = str(result.payload.get("text", ""))
+        # 提供更详细的错误信息
+        if not text:
+            if error_msg == "no_results":
+                text = f"没找到 {keyword} 相关的歌曲"
+            elif error_msg == "play_failed":
+                text = f"{keyword} 暂时无法播放，可能是版权限制"
+            else:
+                text = f"播放失败: {error_msg}"
+        return ToolCallResult(ok=False, error=error_msg, display=text)
+
+    payload = result.payload if result and isinstance(result.payload, dict) else {}
+    text = str(payload.get("text", ""))
+    audio_file = str(payload.get("audio_file", ""))
+    audio_file_silk = str(payload.get("audio_file_silk", ""))
+    record_b64 = str(payload.get("record_b64", ""))
+    data: dict[str, Any] = {}
+    if audio_file:
+        data["audio_file"] = audio_file
+    if audio_file_silk:
+        data["audio_file_silk"] = audio_file_silk
+    if record_b64:
+        data["record_b64"] = record_b64
+    if text:
+        data["text"] = text
+    if data.get("audio_file"):
+        data["media_prepared"] = "audio_file"
+    elif data.get("record_b64"):
+        data["media_prepared"] = "record_b64"
+
+    if text:
+        return ToolCallResult(ok=True, data=data, display=text)
+    if audio_file or record_b64:
+        return ToolCallResult(ok=True, data=data, display="语音已准备好")
+    return ToolCallResult(ok=False, error="voice_prepare_failed", display="语音准备失败")
 
 def _register_utility_tools(registry: AgentToolRegistry) -> None:
     """注册实用工具。"""
@@ -1646,8 +5495,10 @@ def _register_utility_tools(registry: AgentToolRegistry) -> None:
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "回复给用户的文本内容"},
-                    "image_url": {"type": "string", "description": "可选，附带的图片URL"},
+                    "image_url": {"type": "string", "description": "可选，附带的单张图片URL"},
+                    "image_urls": {"type": "array", "items": {"type": "string"}, "description": "可选，多张图片URL列表（图文作品等需要发送多张图时使用）"},
                     "video_url": {"type": "string", "description": "可选，附带的视频URL"},
+                    "audio_file": {"type": "string", "description": "可选，本地音频文件路径（用于发送语音）"},
                 },
                 "required": ["text"],
             },
@@ -1677,9 +5528,26 @@ async def _handle_final_answer(args: dict[str, Any], context: dict[str, Any]) ->
     text = str(args.get("text", "")).strip()
     image_url = str(args.get("image_url", "")).strip()
     video_url = str(args.get("video_url", "")).strip()
+    audio_file = str(args.get("audio_file", "")).strip()
+    raw_image_urls = args.get("image_urls", [])
+    image_urls: list[str] = []
+    if isinstance(raw_image_urls, list):
+        image_urls = [str(u).strip() for u in raw_image_urls if str(u).strip()]
+    # 如果有 image_url 但不在 image_urls 中，合并
+    if image_url and image_url not in image_urls:
+        image_urls.insert(0, image_url)
+    if image_urls and not image_url:
+        image_url = image_urls[0]
     return ToolCallResult(
         ok=True,
-        data={"text": text, "image_url": image_url, "video_url": video_url, "is_final": True},
+        data={
+            "text": text,
+            "image_url": image_url,
+            "image_urls": image_urls,
+            "video_url": video_url,
+            "audio_file": audio_file,
+            "is_final": True,
+        },
         display=text,
     )
 
@@ -1687,3 +5555,1751 @@ async def _handle_final_answer(args: dict[str, Any], context: dict[str, Any]) ->
 async def _handle_think(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     thought = str(args.get("thought", "")).strip()
     return ToolCallResult(ok=True, data={"thought": thought}, display=f"[思考] {clip_text(thought, 200)}")
+
+
+# ── Sticker / Face tools ──
+
+async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """Send a classic QQ face by emotion/description query."""
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return ToolCallResult(ok=False, data={}, display="缺少 query 参数")
+
+    sticker_mgr = context.get("sticker_manager")
+    if not sticker_mgr:
+        return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+    faces = sticker_mgr.find_face(query)
+    if not faces:
+        return ToolCallResult(ok=False, data={}, display=f"没有找到匹配 '{query}' 的表情")
+
+    face = faces[0]
+    seg = sticker_mgr.get_face_segment(face.face_id)
+    api_call = context.get("api_call")
+    if not api_call:
+        return ToolCallResult(ok=False, data={}, display="api_call 不可用")
+
+    group_id = context.get("group_id", 0)
+    user_id = context.get("user_id", "")
+
+    try:
+        if group_id:
+            await api_call("send_group_msg", group_id=group_id, message=[seg])
+        elif user_id:
+            await api_call("send_private_msg", user_id=int(user_id), message=[seg])
+        else:
+            return ToolCallResult(ok=False, data={}, display="无法确定发送目标")
+        return ToolCallResult(
+            ok=True,
+            data={"face_id": face.face_id, "desc": face.desc},
+            display=f"已发送表情 [{face.desc}] (id={face.face_id})",
+        )
+    except Exception as e:
+        return ToolCallResult(ok=False, data={}, display=f"发送失败: {e}")
+
+
+async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """Send a local emoji image. Supports keyword search or random."""
+    query = normalize_text(str(args.get("query", ""))).strip()
+    if not query:
+        query = normalize_text(str(args.get("keyword", ""))).strip()
+    if not query:
+        query = normalize_text(str(args.get("name", ""))).strip()
+    if not query:
+        query = "随机"
+    config = context.get("config", {})
+    if not isinstance(config, dict):
+        config = {}
+    control = config.get("control", {})
+    if not isinstance(control, dict):
+        control = {}
+    emoji_level = normalize_text(str(control.get("emoji_level", "medium"))).lower() or "medium"
+    if emoji_level == "off":
+        return ToolCallResult(ok=False, data={}, display="emoji_disabled_by_control")
+    if query.lower() in {"随机", "random"}:
+        prob_map = {"low": 0.2, "medium": 0.45, "high": 0.75}
+        p = float(prob_map.get(emoji_level, 0.45))
+        if random.random() > p:
+            return ToolCallResult(ok=False, data={}, display="当前语境不适合发表情")
+
+    sticker_mgr = context.get("sticker_manager")
+    if not sticker_mgr:
+        return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+    if sticker_mgr.learned_count == 0:
+        return ToolCallResult(ok=False, data={}, display="表情包库为空，还没有学习任何表情包")
+
+    q = normalize_text(query).lower()
+    q_compact = re.sub(r"\s+", "", q)
+    latest_cues = (
+        "最近",
+        "最新",
+        "刚学",
+        "刚刚学",
+        "刚才学",
+        "刚学的",
+        "刚刚学的",
+        "刚刚学习",
+        "刚学习",
+        "刚学会",
+        "刚刚学会",
+        "刚才那张",
+        "上一个",
+    )
+    latest_mode = any(cue in q or cue in q_compact for cue in latest_cues)
+    # “刚刚学习的表情包”优先走最后学习结果，避免被“最近文件”误命中。
+    prefer_last_learned = any(
+        cue in q_compact
+        for cue in ("刚刚学习", "刚学习", "刚学会", "刚刚学会", "刚学的", "刚刚学的", "刚才那张")
+    )
+    key = ""
+    e = None
+    if latest_mode:
+        source_user = str(context.get("user_id", "")).strip()
+        if prefer_last_learned and hasattr(sticker_mgr, "last_learned_emoji"):
+            latest_exact = sticker_mgr.last_learned_emoji(source_user=source_user)
+            if latest_exact is None:
+                latest_exact = sticker_mgr.last_learned_emoji()
+            if latest_exact:
+                key, e = latest_exact
+        latest = sticker_mgr.latest_emoji(source_user=source_user, count=1)
+        if (not e or not key) and not latest:
+            latest = sticker_mgr.latest_emoji(count=1)
+        if not e and not latest:
+            return ToolCallResult(ok=False, data={}, display="还没有可发送的最近表情包")
+        if not e:
+            key, e = latest[0]
+    else:
+        emojis = sticker_mgr.find_emoji(query, strict=True)
+        if not emojis:
+            return ToolCallResult(ok=False, data={}, display=f"没有找到匹配的表情包 (共{sticker_mgr.learned_count}张)")
+        e = emojis[0]
+        key = sticker_mgr.emoji_key(e) or ""
+    if not e or not key:
+        return ToolCallResult(ok=False, data={}, display="表情包 key 丢失")
+    seg = sticker_mgr.get_emoji_segment(key)
+    if not seg:
+        return ToolCallResult(ok=False, data={}, display="表情包文件不存在")
+
+    api_call = context.get("api_call")
+    if not api_call:
+        return ToolCallResult(ok=False, data={}, display="api_call 不可用")
+
+    group_id = context.get("group_id", 0)
+    user_id = context.get("user_id", "")
+
+    try:
+        if group_id:
+            await api_call("send_group_msg", group_id=group_id, message=[seg])
+        elif user_id:
+            await api_call("send_private_msg", user_id=int(user_id), message=[seg])
+        else:
+            return ToolCallResult(ok=False, data={}, display="无法确定发送目标")
+        desc = e.description or key.split("/")[-1]
+        # 返回空 display，让 Agent 根据 ok=True 自己组织回复
+        return ToolCallResult(
+            ok=True,
+            data={"key": key, "desc": desc},
+            display="",
+        )
+    except Exception as e_err:
+        return ToolCallResult(ok=False, data={}, display=f"发送失败: {e_err}")
+
+
+async def _handle_list_faces(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """List available QQ faces matching a query, without sending."""
+    query = str(args.get("query", "")).strip()
+    sticker_mgr = context.get("sticker_manager")
+    if not sticker_mgr:
+        return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+    if query:
+        faces = sticker_mgr.find_face(query)
+    else:
+        faces = [sticker_mgr._faces[fid] for fid in [13, 14, 5, 9, 11, 76, 179, 271, 264, 182]
+                 if fid in sticker_mgr._faces]
+
+    lines = [f"id={f.face_id} {f.desc}" for f in faces]
+    return ToolCallResult(
+        ok=True,
+        data={"faces": [{"id": f.face_id, "desc": f.desc} for f in faces]},
+        display="\n".join(lines) if lines else "没有匹配的表情",
+    )
+
+
+async def _handle_list_emojis(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """List emoji stats and sample available emojis."""
+    sticker_mgr = context.get("sticker_manager")
+    if not sticker_mgr:
+        return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+    total = sticker_mgr.emoji_count
+    registered = sticker_mgr.registered_count
+    cat_stats = sticker_mgr.category_stats()
+
+    # 随机取几张已注册的展示
+    samples = sticker_mgr.random_emoji(5)
+    sample_lines = [f"  {k} ({e.description or '无描述'})" for k, e in samples]
+
+    cat_lines = [f"  {cat}: {cnt}张" for cat, cnt in sorted(cat_stats.items(), key=lambda x: -x[1])]
+    cat_block = "\n".join(cat_lines) if cat_lines else "  暂无分类数据"
+
+    display = (
+        f"表情包库: 共{total}张, 已注册{registered}张\n"
+        f"分类:\n{cat_block}\n"
+        f"示例:\n" + "\n".join(sample_lines)
+    )
+    return ToolCallResult(
+        ok=True,
+        data={"total": total, "registered": registered, "categories": cat_stats},
+        display=display,
+    )
+
+
+async def _handle_browse_categories(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """Browse sticker categories and their counts."""
+    sticker_mgr = context.get("sticker_manager")
+    if not sticker_mgr:
+        return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+    category = str(args.get("category", "")).strip()
+    if category:
+        emojis = sticker_mgr.find_emoji_by_category(category)
+        if not emojis:
+            return ToolCallResult(ok=True, data={}, display=f"分类'{category}'没有表情包")
+        lines = [f"  {e.description} [{','.join(e.tags[:3])}]" for e in emojis[:10]]
+        return ToolCallResult(
+            ok=True,
+            data={"category": category, "count": len(emojis)},
+            display=f"分类'{category}' ({len(emojis)}张):\n" + "\n".join(lines),
+        )
+
+    cat_stats = sticker_mgr.category_stats()
+    if not cat_stats:
+        return ToolCallResult(ok=True, data={}, display="暂无分类数据，表情包正在自动注册中")
+    lines = [f"  {cat}: {cnt}张" for cat, cnt in sorted(cat_stats.items(), key=lambda x: -x[1])]
+    return ToolCallResult(
+        ok=True,
+        data={"categories": cat_stats},
+        display="表情包分类:\n" + "\n".join(lines),
+    )
+
+
+def _make_learn_sticker_handler(model_client: Any) -> ToolHandler:
+    """创建 learn_sticker 工具的 handler (闭包持有 model_client)。"""
+
+    async def _handle_learn_sticker(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        """用户发图片+要求学习 → 下载+LLM审核+存入表情包库。"""
+        sticker_mgr = context.get("sticker_manager")
+        if not sticker_mgr:
+            return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+        # 从参数或 raw_segments 提取图片 URL / file 标识
+        image_url = str(args.get("image_url", "")).strip()
+        image_file = str(args.get("image_file", "")).strip()
+        image_sub_type = str(args.get("image_sub_type", "")).strip()
+        if not image_url or not image_file or not image_sub_type:
+            for seg in context.get("raw_segments") or []:
+                if isinstance(seg, dict) and seg.get("type") == "image":
+                    data = seg.get("data") or {}
+                    if not image_url:
+                        image_url = str(data.get("url", "")).strip()
+                    if not image_file:
+                        image_file = str(data.get("file", "")).strip()
+                    if not image_sub_type:
+                        image_sub_type = str(data.get("sub_type", "")).strip()
+                    if image_url and image_file and image_sub_type:
+                        break
+        if not image_url and not image_file:
+            return ToolCallResult(ok=False, data={}, display="没有找到图片，请用户发送图片并说'学习表情包'")
+
+        user_id = str(context.get("user_id", ""))
+
+        async def _llm_call(messages: list) -> str:
+            return await model_client.chat_text(messages=messages, max_tokens=300)
+
+        ok, msg = await sticker_mgr.learn_from_chat(
+            image_url=image_url,
+            image_file=image_file,
+            image_sub_type=image_sub_type,
+            user_id=user_id,
+            llm_call=_llm_call,
+            api_call=context.get("api_call"),
+        )
+        return ToolCallResult(ok=ok, data={"learned": ok}, display=msg)
+
+    return _handle_learn_sticker
+
+
+def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = None) -> None:
+    """Register sticker/face tools into the agent tool registry."""
+
+    registry.register(
+        ToolSchema(
+            name="send_face",
+            description=(
+                "发送QQ经典表情。使用场景: 当你想表达情绪时，发送一个QQ原生表情。"
+                "参数query填写情绪关键词如'开心','哭','doge','吃瓜','赞'等。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "情绪或表情描述"},
+                },
+                "required": ["query"],
+            },
+            category="napcat",
+        ),
+        _handle_send_face,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="send_emoji",
+            description=(
+                "发送本地表情包图片。库里有大量表情包可用。"
+                "query填写情绪关键词匹配，或填'随机'/'random'随机发一张。"
+                "支持按分类搜索(如'搞笑','可爱')，按标签搜索(如'#猫','#无语')。"
+                "如果不确定有什么表情包，直接填'随机'即可。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "情绪/描述关键词，或'随机'随机发送",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "兼容字段：等价于 query",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "兼容字段：等价于 query",
+                    },
+                },
+                "required": [],
+            },
+            category="napcat",
+        ),
+        _handle_send_emoji,
+    )
+
+    # send_sticker — send_emoji 的兼容别名，避免旧提示词调用失败
+    registry.register(
+        ToolSchema(
+            name="send_sticker",
+            description=(
+                "兼容别名：等价于 send_emoji。"
+                "用于发送本地表情包图片，query 可填关键词或'随机'。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "情绪/描述关键词，或'随机'随机发送",
+                    },
+                    "keyword": {
+                        "type": "string",
+                        "description": "兼容字段：等价于 query",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "兼容字段：等价于 query",
+                    },
+                },
+                "required": [],
+            },
+            category="napcat",
+        ),
+        _handle_send_emoji,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="list_faces",
+            description=(
+                "查询可用的QQ经典表情列表。使用场景: 当你不确定有哪些表情可用时，"
+                "先查询再决定发哪个。参数query可选，留空返回常用表情。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词(可选)"},
+                },
+                "required": [],
+            },
+            category="napcat",
+        ),
+        _handle_list_faces,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="list_emojis",
+            description=(
+                "查看表情包库状态、分类统计和示例。了解有多少表情包可用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+            category="napcat",
+        ),
+        _handle_list_emojis,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="browse_sticker_categories",
+            description=(
+                "浏览表情包分类。不传category返回所有分类及数量，"
+                "传category返回该分类下的表情包列表。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "category": {
+                        "type": "string",
+                        "description": "分类名(可选): 搞笑/可爱/嘲讽/日常/动漫/反应/文字/其他",
+                    },
+                },
+                "required": [],
+            },
+            category="napcat",
+        ),
+        _handle_browse_categories,
+    )
+
+    # learn_sticker — 需要 model_client
+    if model_client is not None:
+        registry.register(
+            ToolSchema(
+                name="learn_sticker",
+                description=(
+                    "学习/添加用户发送的表情包到表情包库。"
+                    "当用户发送图片并说'学习表情包'、'添加表情包'、'收录这张'等时使用。"
+                    "会自动下载图片、用AI审核内容合法性、生成描述和分类，然后存入表情包库。"
+                    "图片URL会自动从用户消息中提取，通常不需要手动填写image_url。"
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "image_url": {
+                            "type": "string",
+                            "description": "图片URL(可选，通常自动从消息中提取)",
+                        },
+                    },
+                    "required": [],
+                },
+                category="napcat",
+            ),
+            _make_learn_sticker_handler(model_client),
+        )
+
+    # scan_stickers — 重新扫描表情包目录
+    async def _handle_scan_stickers(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        sticker_mgr = context.get("sticker_manager")
+        if not sticker_mgr:
+            return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+        result = sticker_mgr.scan()
+        return ToolCallResult(
+            ok=True, data=result,
+            display=(
+                f"扫描完成: {result.get('faces', 0)} 经典表情, "
+                f"{result.get('emojis', 0)} 本地表情包, "
+                f"{result.get('registry', 0)} 手动注册覆盖"
+            ),
+        )
+
+    registry.register(
+        ToolSchema(
+            name="scan_stickers",
+            description=(
+                "重新扫描表情包目录，刷新表情包库。"
+                "当用户说'扫描表情包'或你需要刷新表情包列表时使用。"
+            ),
+            parameters={"type": "object", "properties": {}, "required": []},
+            category="napcat",
+        ),
+        _handle_scan_stickers,
+    )
+
+
+# ── 爬虫 / 知识库工具 ──
+
+def _register_crawler_tools(registry: AgentToolRegistry) -> None:
+    """注册知乎/百科/热搜/知识库工具。"""
+
+    registry.register(
+        ToolSchema(
+            name="get_hot_trends",
+            description=(
+                "获取全网热搜热榜: 微博热搜、B站热门、抖音热榜、百度热搜。\n"
+                "可指定平台(weibo/bilibili/douyin/baidu)或不指定获取全部。\n"
+                "使用场景: 用户问最近有什么热点/新闻/热搜时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "platform": {
+                        "type": "string",
+                        "description": "平台(可选): weibo/bilibili/douyin/baidu，不填获取全部",
+                    },
+                    "limit": {"type": "integer", "description": "每个平台返回条数(默认10)"},
+                },
+                "required": [],
+            },
+            category="search",
+        ),
+        _handle_get_hot_trends,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="search_zhihu",
+            description=(
+                "搜索知乎内容或获取知乎热榜。\n"
+                "mode=hot 获取热榜，mode=search 搜索内容，mode=answers 获取问题高赞回答。\n"
+                "使用场景: 用户问知乎相关问题、想了解某个话题的讨论时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "description": "模式: hot(热榜)/search(搜索)/answers(回答)"},
+                    "query": {"type": "string", "description": "搜索关键词(search/answers模式必填)"},
+                    "question_id": {"type": "string", "description": "知乎问题ID(answers模式)"},
+                },
+                "required": ["mode"],
+            },
+            category="search",
+        ),
+        _handle_search_zhihu,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="lookup_wiki",
+            description=(
+                "查询百科知识: 同时搜索百度百科和维基百科。\n"
+                "使用场景: 用户问某个概念/人物/事件的定义或背景知识时使用。\n"
+                "返回百度百科和维基百科的摘要。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "keyword": {"type": "string", "description": "要查询的关键词"},
+                },
+                "required": ["keyword"],
+            },
+            category="search",
+        ),
+        _handle_lookup_wiki,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="search_knowledge",
+            description=(
+                "搜索知识库: 查找已学习的知识、热梗、百科、事实。\n"
+                "知识库独立于对话记忆，存储持久化知识。\n"
+                "category可选: fact(事实)/meme(热梗)/wiki(百科)/trend(热搜)/learned(学习)"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "category": {"type": "string", "description": "分类(可选)"},
+                },
+                "required": ["query"],
+            },
+            category="search",
+        ),
+        _handle_search_knowledge,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="learn_knowledge",
+            description=(
+                "学习新知识: 将信息存入知识库。\n"
+                "使用场景: 用户教你新知识、新梗、新概念时使用。\n"
+                "category: fact(事实)/meme(热梗)/learned(学习到的)"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "知识标题/名称"},
+                    "content": {"type": "string", "description": "知识内容"},
+                    "category": {"type": "string", "description": "分类: fact/meme/learned"},
+                    "tags": {"type": "string", "description": "标签(逗号分隔)"},
+                },
+                "required": ["title", "content"],
+            },
+            category="search",
+        ),
+        _handle_learn_knowledge,
+    )
+
+
+async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    crawler_hub = context.get("crawler_hub")
+    if not crawler_hub:
+        return ToolCallResult(ok=False, error="crawler_unavailable", display="爬虫模块未初始化")
+
+    platform = str(args.get("platform", "")).strip().lower()
+    limit = min(20, max(3, int(args.get("limit", 10) or 10)))
+
+    try:
+        if platform:
+            method_map = {
+                "weibo": crawler_hub.trends.weibo_hot,
+                "bilibili": crawler_hub.trends.bilibili_hot,
+                "douyin": crawler_hub.trends.douyin_hot,
+                "baidu": crawler_hub.trends.baidu_hot,
+            }
+            func = method_map.get(platform)
+            if not func:
+                return ToolCallResult(ok=False, error=f"unknown_platform: {platform}")
+            items = await func(limit)
+            lines = [f"【{platform}热搜 Top{len(items)}】"]
+            for i, item in enumerate(items, 1):
+                heat = f" ({item.heat})" if item.heat else ""
+                lines.append(f"{i}. {item.title}{heat}")
+            return ToolCallResult(ok=True, data={"platform": platform, "count": len(items)},
+                                  display="\n".join(lines))
+        else:
+            trends = await crawler_hub.get_trends_cached()
+            text = crawler_hub.format_trends_text(trends, limit=limit)
+            # 同时存入知识库
+            kb = context.get("knowledge_base")
+            if kb:
+                for plat, items in trends.items():
+                    for item in items[:limit]:
+                        kb.add("trend", item.title, item.snippet or "", source=plat,
+                               tags=[plat], extra={"heat": item.heat, "url": item.url})
+            return ToolCallResult(ok=True, data={"platforms": list(trends.keys())}, display=text)
+    except Exception as e:
+        _log.warning("get_hot_trends_error | %s", e)
+        return ToolCallResult(ok=False, error=f"trends_error: {e}")
+
+
+async def _handle_search_zhihu(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    crawler_hub = context.get("crawler_hub")
+    if not crawler_hub:
+        return ToolCallResult(ok=False, error="crawler_unavailable")
+
+    mode = str(args.get("mode", "hot")).strip().lower()
+    query = str(args.get("query", "")).strip()
+    question_id = str(args.get("question_id", "")).strip()
+
+    try:
+        if mode == "hot":
+            items = await crawler_hub.zhihu.hot_list(limit=15)
+            lines = ["【知乎热榜】"]
+            for i, item in enumerate(items, 1):
+                heat = f" ({item.heat})" if item.heat else ""
+                lines.append(f"{i}. {item.title}{heat}")
+            return ToolCallResult(ok=True, data={"count": len(items)}, display="\n".join(lines))
+
+        elif mode == "search" and query:
+            items = await crawler_hub.zhihu.search(query, limit=8)
+            lines = [f"【知乎搜索: {query}】"]
+            for i, item in enumerate(items, 1):
+                lines.append(f"{i}. {item.title}")
+                if item.snippet:
+                    lines.append(f"   {clip_text(item.snippet, 100)}")
+            return ToolCallResult(ok=True, data={"count": len(items)}, display="\n".join(lines))
+
+        elif mode == "answers" and question_id:
+            items = await crawler_hub.zhihu.get_top_answers(question_id, limit=3)
+            lines = [f"【知乎问题 {question_id} 高赞回答】"]
+            for i, item in enumerate(items, 1):
+                lines.append(f"{i}. {item.title}")
+                lines.append(f"   {clip_text(item.snippet, 300)}")
+            return ToolCallResult(ok=True, data={"count": len(items)}, display="\n".join(lines))
+
+        return ToolCallResult(ok=False, error="invalid mode or missing query")
+    except Exception as e:
+        _log.warning("search_zhihu_error | %s", e)
+        return ToolCallResult(ok=False, error=f"zhihu_error: {e}")
+
+
+async def _handle_lookup_wiki(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    crawler_hub = context.get("crawler_hub")
+    if not crawler_hub:
+        return ToolCallResult(ok=False, error="crawler_unavailable")
+
+    keyword = str(args.get("keyword", "")).strip()
+    if not keyword:
+        return ToolCallResult(ok=False, error="missing keyword")
+
+    try:
+        results = await crawler_hub.wiki.lookup(keyword)
+        if not results:
+            return ToolCallResult(ok=False, error="not_found", display=f"未找到 '{keyword}' 的百科信息")
+
+        lines: list[str] = []
+        for r in results:
+            source_name = "百度百科" if r.source == "baike" else "维基百科"
+            lines.append(f"【{source_name}: {r.title}】")
+            lines.append(clip_text(r.snippet, 400))
+            if r.url:
+                lines.append(f"来源: {r.url}")
+            lines.append("")
+
+        # 存入知识库
+        kb = context.get("knowledge_base")
+        if kb:
+            for r in results:
+                kb.add("wiki", r.title, r.snippet, source=r.source, tags=[keyword])
+
+        return ToolCallResult(ok=True, data={"results": len(results)}, display="\n".join(lines))
+    except Exception as e:
+        _log.warning("lookup_wiki_error | %s", e)
+        return ToolCallResult(ok=False, error=f"wiki_error: {e}")
+
+
+async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    kb = context.get("knowledge_base")
+    if not kb:
+        return ToolCallResult(ok=False, error="knowledge_base_unavailable")
+
+    query = str(args.get("query", "")).strip()
+    category = str(args.get("category", "")).strip()
+    if not query:
+        return ToolCallResult(ok=False, error="missing query")
+
+    def _build_query_variants(raw_query: str) -> list[str]:
+        base = normalize_text(raw_query)
+        if not base:
+            return []
+
+        variants: list[str] = []
+        seen: set[str] = set()
+
+        def _add(item: str) -> None:
+            text = normalize_text(item)
+            if not text:
+                return
+            key = text.lower()
+            if key in seen:
+                return
+            seen.add(key)
+            variants.append(text)
+
+        _add(base)
+
+        compact = re.sub(r"[，。！？!?,.;；:：\"'“”‘’（）()【】\[\]<>]+", " ", base)
+        compact = normalize_text(compact)
+        _add(compact)
+
+        stop_words = {
+            "喜欢",
+            "最喜欢",
+            "歌曲",
+            "音乐",
+            "听",
+            "听歌",
+            "查询",
+            "搜索",
+            "查",
+            "查下",
+            "查一下",
+            "相关",
+            "内容",
+            "信息",
+            "什么",
+            "哪个",
+            "是谁",
+            "有吗",
+            "一下",
+            "给我",
+            "帮我",
+            "用户",
+            "user",
+        }
+
+        user_id = normalize_text(str(context.get("user_id", "")))
+        user_name_tokens = set(tokenize(normalize_text(str(context.get("user_name", "")))))
+
+        core_terms: list[str] = []
+        for token in tokenize(compact):
+            if token in stop_words:
+                continue
+            if token in user_name_tokens:
+                continue
+            if user_id and token == user_id:
+                continue
+            if token.isdigit() and len(token) < 4:
+                continue
+            core_terms.append(token)
+            if len(core_terms) >= 6:
+                break
+
+        if core_terms:
+            _add(" ".join(core_terms))
+            for term in core_terms[:4]:
+                _add(term)
+
+        if user_id:
+            # 配合 user:<id> 标签做用户画像类检索。
+            _add(f"user:{user_id}")
+            if core_terms:
+                _add(f"user:{user_id} {' '.join(core_terms[:3])}")
+
+        return variants[:10]
+
+    try:
+        query_variants = _build_query_variants(query)
+        category_variants: list[str] = [category] if category else [""]
+        if category:
+            category_variants.append("")  # category 限制命不中时自动放宽到全库
+
+        entries: list[Any] = []
+        seen_ids: set[int] = set()
+        for cat in category_variants:
+            for q in query_variants:
+                try:
+                    rows = kb.search(q, category=cat, limit=8)
+                except Exception:
+                    rows = []
+                for row in rows:
+                    rid = int(getattr(row, "id", 0) or 0)
+                    if rid and rid in seen_ids:
+                        continue
+                    if rid:
+                        seen_ids.add(rid)
+                    entries.append(row)
+                if len(entries) >= 8:
+                    break
+            if len(entries) >= 8:
+                break
+
+        if not entries:
+            return ToolCallResult(
+                ok=True,
+                data={"count": 0, "query_variants": query_variants},
+                display=f"知识库中未找到 '{query}' 相关内容",
+            )
+
+        lines = [f"【知识库搜索: {query}】"]
+        result_rows: list[dict[str, Any]] = []
+        for e in entries:
+            cat_tag = f"[{e.category}]" if e.category else ""
+            lines.append(f"- {cat_tag} {e.title}")
+            if e.content:
+                lines.append(f"  {clip_text(e.content, 200)}")
+            result_rows.append(
+                {
+                    "id": int(getattr(e, "id", 0) or 0),
+                    "category": normalize_text(str(getattr(e, "category", ""))),
+                    "title": normalize_text(str(getattr(e, "title", ""))),
+                    "content": normalize_text(str(getattr(e, "content", ""))),
+                    "source": normalize_text(str(getattr(e, "source", ""))),
+                }
+            )
+        return ToolCallResult(
+            ok=True,
+            data={"count": len(entries), "results": result_rows, "query_variants": query_variants},
+            display="\n".join(lines),
+        )
+    except Exception as e:
+        _log.warning("search_knowledge_error | %s", e)
+        return ToolCallResult(ok=False, error=f"knowledge_error: {e}")
+
+
+async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    kb = context.get("knowledge_base")
+    if not kb:
+        return ToolCallResult(ok=False, error="knowledge_base_unavailable")
+
+    def _infer_title_from_content(text: str) -> str:
+        body = normalize_text(text)
+        if not body:
+            return ""
+        m = re.match(r"([^，。！？\n:：]{1,40})(?:是|指|叫|一般是|通常是)", body)
+        if m:
+            return normalize_text(m.group(1))[:40]
+        m2 = re.match(r"([^，。！？\n]{1,40})[:：]", body)
+        if m2:
+            return normalize_text(m2.group(1))[:40]
+        fallback = normalize_text(body.split("，", 1)[0].split("。", 1)[0])
+        return fallback[:40]
+
+    title = normalize_text(str(args.get("title", "")))
+    content = normalize_text(str(args.get("content", "")))
+    if not content:
+        content = normalize_text(str(args.get("text", "")))
+    category = str(args.get("category", "learned")).strip()
+    tags_value = args.get("tags", "")
+    tags: list[str] = []
+    if isinstance(tags_value, str):
+        tags = [t.strip() for t in tags_value.split(",") if t.strip()]
+    elif isinstance(tags_value, list):
+        tags = [normalize_text(str(t)) for t in tags_value if normalize_text(str(t))]
+
+    if not title and content:
+        title = _infer_title_from_content(content)
+        if title:
+            tags = list(dict.fromkeys(tags + ["auto_title"]))
+
+    if not title:
+        return ToolCallResult(ok=False, error="missing title")
+    if not content:
+        return ToolCallResult(ok=False, error="missing content")
+    merged_text = normalize_text(f"{title} {content}")
+    if _looks_like_harmful_knowledge_payload(merged_text):
+        return ToolCallResult(ok=False, error="unsafe_knowledge_content")
+    if category not in ("fact", "meme", "learned"):
+        category = "learned"
+
+    try:
+        entry_id = kb.add(category=category, title=title, content=content,
+                          source="chat", tags=tags)
+        return ToolCallResult(
+            ok=True,
+            data={"id": entry_id, "category": category},
+            display=f"已学习: [{category}] {title}",
+        )
+    except Exception as e:
+        _log.warning("learn_knowledge_error | %s", e)
+        return ToolCallResult(ok=False, error=f"learn_error: {e}")
+
+
+def _looks_like_harmful_knowledge_payload(text: str) -> bool:
+    content = normalize_text(text).lower()
+    if not content:
+        return True
+    abusive_tokens = (
+        "大便",
+        "傻逼",
+        "弱智",
+        "智障",
+        "脑残",
+        "废物",
+        "狗东西",
+        "滚",
+    )
+    if any(token in content for token in abusive_tokens):
+        return True
+    # 阻断“以后你叫XX叫YY”这类强制羞辱称呼写入。
+    if "以后你叫" in content and "叫他" in content:
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────
+# AI Method 桥接工具 — 将 tools.py 的 AI method 暴露给 Agent
+# ─────────────────────────────────────────────
+
+def _register_ai_method_tools(registry: AgentToolRegistry) -> None:
+    """注册 tools.py AI method 的 Agent 桥接工具。"""
+
+    registry.register(
+        ToolSchema(
+            name="fetch_webpage",
+            description=(
+                "访问指定URL网页，返回页面标题、状态码和内容摘要。\n"
+                "使用场景: 用户给了一个链接让你看看内容、总结网页、查看文章时使用。\n"
+                "注意: 不能访问内网地址，有超时限制"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要访问的网页URL"},
+                },
+                "required": ["url"],
+            },
+            category="search",
+        ),
+        _handle_fetch_webpage,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="github_search",
+            description=(
+                "在GitHub搜索开源仓库，返回仓库名、星标数、简介和链接。\n"
+                "使用场景: 用户问'有什么好用的XX库'、'搜一下GitHub上的XX'时使用"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                    "language": {"type": "string", "description": "编程语言过滤(可选，如python/rust/go)"},
+                },
+                "required": ["query"],
+            },
+            category="search",
+        ),
+        _handle_github_search,
+    )
+    registry.register(
+        ToolSchema(
+            name="github_readme",
+            description=(
+                "读取指定GitHub仓库的README摘要。\n"
+                "使用场景: 用户说'看看这个仓库'、'这个项目是干什么的'时使用。\n"
+                "支持 owner/repo 格式或完整GitHub URL"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "repo": {"type": "string", "description": "仓库，格式: owner/repo 或 GitHub URL"},
+                },
+                "required": ["repo"],
+            },
+            category="search",
+        ),
+        _handle_github_readme,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="douyin_search",
+            description=(
+                "在抖音搜索视频，返回视频标题、作者和链接。\n"
+                "使用场景: 用户说'搜一下抖音上的XX'、'找个抖音视频'时使用"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                },
+                "required": ["query"],
+            },
+            category="media",
+        ),
+        _handle_douyin_search,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="get_qq_avatar",
+            description=(
+                "获取QQ用户的头像图片URL。\n"
+                "使用场景: 用户说'看看XX的头像'、'发一下我的头像'时使用。\n"
+                "不传qq参数时获取当前用户头像"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "qq": {"type": "string", "description": "QQ号(可选，不传则取当前用户)"},
+                },
+                "required": [],
+            },
+            category="media",
+        ),
+        _handle_get_qq_avatar,
+    )
+
+
+# ── AI Method 桥接 handlers ──
+
+async def _handle_fetch_webpage(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+    url = str(args.get("url", "")).strip()
+    if not url:
+        return ToolCallResult(ok=False, error="missing url")
+    try:
+        result = await tool_executor._method_browser_fetch_url(
+            "browser.fetch_url", {"url": url}, url,
+        )
+        text = str((result.payload or {}).get("text", ""))
+        return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"fetch_error: {exc}")
+
+
+async def _handle_github_search(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return ToolCallResult(ok=False, error="missing query")
+    method_args: dict[str, Any] = {"query": query}
+    lang = str(args.get("language", "")).strip()
+    if lang:
+        method_args["language"] = lang
+    try:
+        result = await tool_executor._method_browser_github_search(
+            "browser.github_search", method_args, query,
+        )
+        text = str((result.payload or {}).get("text", ""))
+        return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"github_search_error: {exc}")
+
+
+async def _handle_github_readme(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+    repo = str(args.get("repo", "")).strip()
+    if not repo:
+        return ToolCallResult(ok=False, error="missing repo")
+    method_args: dict[str, Any] = {}
+    if "/" in repo and not repo.startswith("http"):
+        method_args["repo"] = repo
+    else:
+        method_args["url"] = repo
+    try:
+        result = await tool_executor._method_browser_github_readme(
+            "browser.github_readme", method_args, repo,
+        )
+        text = str((result.payload or {}).get("text", ""))
+        return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"github_readme_error: {exc}")
+
+
+async def _handle_douyin_search(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="tool_executor unavailable")
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return ToolCallResult(ok=False, error="missing query")
+    try:
+        result = await tool_executor._method_douyin_search_video(
+            "douyin.search_video", {"query": query}, query,
+        )
+        text = str((result.payload or {}).get("text", ""))
+        return ToolCallResult(ok=result.ok, display=clip_text(text, 800), error=result.error)
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"douyin_search_error: {exc}")
+
+
+async def _handle_get_qq_avatar(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    qq = str(args.get("qq", "")).strip()
+    if not qq:
+        qq = str(context.get("user_id", ""))
+    if not qq:
+        return ToolCallResult(ok=False, error="missing qq")
+    # QQ 头像直链
+    avatar_url = f"https://q1.qlogo.cn/g?b=qq&nk={qq}&s=640"
+    return ToolCallResult(
+        ok=True,
+        data={"image_url": avatar_url, "qq": qq},
+        display=f"QQ {qq} 的头像",
+    )
+
+
+# ── QQ空间 (QZone) 工具 ──
+
+def _safe_int(value: Any, default: int, *, min_value: int, max_value: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+def _resolve_qzone_config(base_config: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    runtime_cfg = context.get("config")
+    source_cfg = runtime_cfg if isinstance(runtime_cfg, dict) else base_config
+    if not isinstance(source_cfg, dict):
+        source_cfg = {}
+    va = source_cfg.get("video_analysis", {}) if isinstance(source_cfg.get("video_analysis", {}), dict) else {}
+    qz_cfg = va.get("qzone", {}) if isinstance(va.get("qzone", {}), dict) else {}
+    return qz_cfg
+
+
+def _normalize_qzone_tool_error(exc: Exception) -> str:
+    msg = normalize_text(str(exc))
+    if "cookie 已过期" in msg:
+        return "qzone_cookie_expired:QZone cookie 已过期，请重新配置"
+    if "访问权限" in msg:
+        return f"qzone_permission_denied:{msg}"
+    if not msg:
+        return f"qzone_request_failed:{type(exc).__name__}"
+    return f"qzone_request_failed:{msg}"
+
+
+def _qzone_profile_payload(profile: Any) -> dict[str, Any]:
+    return {
+        "uin": str(getattr(profile, "uin", "")),
+        "nickname": str(getattr(profile, "nickname", "")),
+        "gender": str(getattr(profile, "gender", "")),
+        "location": str(getattr(profile, "location", "")),
+        "level": int(getattr(profile, "level", 0) or 0),
+        "vip_info": str(getattr(profile, "vip_info", "")),
+        "signature": str(getattr(profile, "signature", "")),
+        "avatar_url": str(getattr(profile, "avatar_url", "")),
+        "birthday": str(getattr(profile, "birthday", "")),
+        "age": int(getattr(profile, "age", 0) or 0),
+        "constellation": str(getattr(profile, "constellation", "")),
+    }
+
+
+def _qzone_mood_payload(mood: Any) -> dict[str, Any]:
+    return {
+        "tid": str(getattr(mood, "tid", "")),
+        "content": str(getattr(mood, "content", "")),
+        "create_time": str(getattr(mood, "create_time", "")),
+        "comment_count": int(getattr(mood, "comment_count", 0) or 0),
+        "like_count": int(getattr(mood, "like_count", 0) or 0),
+        "pic_urls": list(getattr(mood, "pic_urls", []) or []),
+        "video_url": str(getattr(mood, "video_url", "")),
+        "video_cover_url": str(getattr(mood, "video_cover_url", "")),
+    }
+
+
+def _qzone_album_payload(album: Any) -> dict[str, Any]:
+    return {
+        "album_id": str(getattr(album, "album_id", "")),
+        "name": str(getattr(album, "name", "")),
+        "desc": str(getattr(album, "desc", "")),
+        "photo_count": int(getattr(album, "photo_count", 0) or 0),
+        "create_time": str(getattr(album, "create_time", "")),
+    }
+
+
+def _register_qzone_tools(registry: AgentToolRegistry, config: dict[str, Any]) -> None:
+    """注册 QQ空间查询工具。"""
+
+    registry.register(
+        ToolSchema(
+            name="get_qzone_profile",
+            description=(
+                "查询QQ用户的QQ空间详细资料: 昵称、性别、所在地、等级、VIP状态、个性签名等。\n"
+                "比 get_user_info 返回更丰富的信息。\n"
+                "使用场景: 用户说'查一下XX的空间'、'看看XX的QQ资料'、'XX的签名是什么'时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "qq_number": {"type": "string", "description": "目标用户的QQ号"},
+                },
+                "required": ["qq_number"],
+            },
+            category="napcat",
+        ),
+        _make_qzone_handler("profile", config),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="get_qzone_moods",
+            description=(
+                "获取QQ用户的QQ空间说说(动态)列表。\n"
+                "返回最近的说说内容、发布时间、评论数等。\n"
+                "使用场景: 用户说'看看XX的说说'、'XX最近发了什么'、'查一下XX的动态'时使用。\n"
+                "需要对方空间对你可见。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "qq_number": {"type": "string", "description": "目标用户的QQ号"},
+                    "count": {"type": "integer", "description": "获取条数，默认10，最多20"},
+                },
+                "required": ["qq_number"],
+            },
+            category="napcat",
+        ),
+        _make_qzone_handler("moods", config),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="get_qzone_albums",
+            description=(
+                "获取QQ用户的QQ空间相册列表（仅列表，不含照片）。\n"
+                "返回相册名称、描述、照片数量等。\n"
+                "使用场景: 用户说'看看XX的相册'、'XX有哪些相册'时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "qq_number": {"type": "string", "description": "目标用户的QQ号"},
+                },
+                "required": ["qq_number"],
+            },
+            category="napcat",
+        ),
+        _make_qzone_handler("albums", config),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="analyze_qzone",
+            description=(
+                "分析QQ空间公开信息，聚合资料 + 最近说说 + 相册统计。\n"
+                "优先用于'分析XX空间'、'看看XX空间什么风格'、'总结一下XX空间动态'这类请求。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "qq_number": {"type": "string", "description": "目标用户的QQ号"},
+                    "mood_count": {"type": "integer", "description": "分析最近说说条数，默认8，最多20"},
+                    "include_moods": {"type": "boolean", "description": "是否包含说说分析，默认true"},
+                    "include_albums": {"type": "boolean", "description": "是否包含相册分析，默认true"},
+                },
+                "required": ["qq_number"],
+            },
+            category="napcat",
+        ),
+        _make_qzone_handler("analyze", config),
+    )
+
+    # ── QZone 相册照片列表 ──
+    registry.register(
+        ToolSchema(
+            name="get_qzone_photos",
+            description=(
+                "获取QQ空间指定相册中的照片列表（含原图URL）。\n"
+                "需要先用 get_qzone_albums 获取相册ID。\n"
+                "使用场景: 用户说'看看XX相册里的照片'、'下载XX的照片'时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "qq_number": {"type": "string", "description": "目标用户的QQ号"},
+                    "album_id": {"type": "string", "description": "相册ID（从 get_qzone_albums 获取）"},
+                    "count": {"type": "integer", "description": "获取照片数，默认30，最多100"},
+                },
+                "required": ["qq_number", "album_id"],
+            },
+            category="napcat",
+        ),
+        _make_qzone_handler("photos", config),
+    )
+
+
+def _make_qzone_handler(mode: str, config: dict[str, Any]) -> ToolHandler:
+    """创建 QZone 工具 handler，优先使用 runtime config，兼容热重载。"""
+
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        from core.qzone import QZoneClient, parse_cookie_string
+
+        qz_cfg = _resolve_qzone_config(config, context)
+        if not qz_cfg.get("enable", True):
+            return ToolCallResult(ok=False, error="QZone 功能未启用")
+
+        cookie_str = str(qz_cfg.get("cookie", "")).strip()
+        if not cookie_str:
+            return ToolCallResult(ok=False, error="未配置 QZone cookie，请在 config.yml 的 video_analysis.qzone.cookie 中配置")
+
+        cookies = parse_cookie_string(cookie_str)
+        if not (cookies.get("p_skey") or cookies.get("skey")):
+            return ToolCallResult(ok=False, error="QZone cookie 缺少 p_skey/skey，请重新配置")
+
+        qq_number = str(args.get("qq_number", "")).strip()
+        if not qq_number or not qq_number.isdigit():
+            return ToolCallResult(ok=False, error="无效的QQ号")
+
+        try:
+            client = QZoneClient(cookies)
+
+            if mode == "profile":
+                profile = await client.get_profile(qq_number)
+                lines = [f"QQ空间资料 — {qq_number}"]
+                if profile.nickname:
+                    lines.append(f"昵称: {profile.nickname}")
+                if profile.gender and profile.gender != "未知":
+                    lines.append(f"性别: {profile.gender}")
+                if profile.age:
+                    lines.append(f"年龄: {profile.age}")
+                if profile.location:
+                    lines.append(f"所在地: {profile.location}")
+                if profile.level:
+                    lines.append(f"等级: {profile.level}")
+                if profile.vip_info:
+                    lines.append(f"会员: {profile.vip_info}")
+                if profile.signature:
+                    lines.append(f"个性签名: {profile.signature}")
+                if profile.birthday:
+                    lines.append(f"生日: {profile.birthday}")
+                if profile.constellation:
+                    lines.append(f"星座: {profile.constellation}")
+                display = "\n".join(lines)
+                return ToolCallResult(
+                    ok=True,
+                    data={"profile": _qzone_profile_payload(profile)},
+                    display=display,
+                )
+
+            elif mode == "moods":
+                count = _safe_int(args.get("count", 10), 10, min_value=1, max_value=20)
+                moods = await client.get_moods(qq_number, count=count)
+                if not moods:
+                    return ToolCallResult(ok=True, data={"count": 0}, display=f"QQ {qq_number} 的说说为空或不可见")
+                lines = [f"QQ {qq_number} 的最近说说 ({len(moods)}条):"]
+                for i, m in enumerate(moods, 1):
+                    content = m.content[:100] + ("..." if len(m.content) > 100 else "")
+                    lines.append(f"\n[{i}] {m.create_time}")
+                    lines.append(f"  {content}")
+                    if m.pic_urls:
+                        lines.append(f"  [含{len(m.pic_urls)}张图片]")
+                    lines.append(f"  评论:{m.comment_count} 转发:{m.like_count}")
+                display = "\n".join(lines)
+                return ToolCallResult(
+                    ok=True,
+                    data={"count": len(moods), "moods": [_qzone_mood_payload(item) for item in moods]},
+                    display=display,
+                )
+
+            elif mode == "albums":
+                albums = await client.get_albums(qq_number)
+                if not albums:
+                    return ToolCallResult(ok=True, data={"count": 0}, display=f"QQ {qq_number} 的相册为空或不可见")
+                lines = [f"QQ {qq_number} 的相册列表 ({len(albums)}个):"]
+                for a in albums:
+                    desc = f" — {a.desc}" if a.desc else ""
+                    lines.append(f"  {a.name} ({a.photo_count}张){desc}")
+                display = "\n".join(lines)
+                return ToolCallResult(
+                    ok=True,
+                    data={"count": len(albums), "albums": [_qzone_album_payload(item) for item in albums]},
+                    display=display,
+                )
+
+            elif mode == "analyze":
+                mood_count = _safe_int(args.get("mood_count", 8), 8, min_value=1, max_value=20)
+                include_moods = bool(args.get("include_moods", True))
+                include_albums = bool(args.get("include_albums", True))
+                analysis = await client.analyze_space(
+                    qq_number,
+                    mood_count=mood_count,
+                    include_moods=include_moods,
+                    include_albums=include_albums,
+                )
+                lines = [f"QQ空间分析 — {qq_number}"]
+                if analysis.profile.nickname:
+                    lines.append(f"昵称: {analysis.profile.nickname}")
+                if analysis.profile.gender and analysis.profile.gender != "未知":
+                    lines.append(f"性别: {analysis.profile.gender}")
+                if analysis.profile.location:
+                    lines.append(f"所在地: {analysis.profile.location}")
+                if analysis.profile.signature:
+                    lines.append(f"签名: {clip_text(analysis.profile.signature, 120)}")
+                if include_moods:
+                    lines.append(
+                        f"最近说说: {len(analysis.moods)} 条"
+                        + (f"（最近一条: {analysis.latest_mood_time}）" if analysis.latest_mood_time else "")
+                    )
+                    if analysis.avg_mood_length > 0:
+                        lines.append(f"说说平均长度: {analysis.avg_mood_length} 字")
+                    if analysis.moods:
+                        lines.append(f"图文说说占比: {int(round(analysis.image_post_ratio * 100, 0))}%")
+                    if analysis.mood_keywords:
+                        lines.append(f"高频关键词: {', '.join(analysis.mood_keywords[:6])}")
+                if include_albums:
+                    lines.append(
+                        f"相册: {len(analysis.albums)} 个 / 总照片约 {analysis.total_album_photos} 张"
+                    )
+                    if analysis.albums:
+                        top_album_lines = []
+                        for item in analysis.albums[:3]:
+                            if item.name:
+                                top_album_lines.append(f"{item.name}({item.photo_count})")
+                        if top_album_lines:
+                            lines.append(f"相册示例: {', '.join(top_album_lines)}")
+                display = "\n".join(lines)
+                return ToolCallResult(
+                    ok=True,
+                    data={
+                        "qq_number": qq_number,
+                        "profile": _qzone_profile_payload(analysis.profile),
+                        "moods": [_qzone_mood_payload(item) for item in analysis.moods],
+                        "albums": [_qzone_album_payload(item) for item in analysis.albums],
+                        "summary": {
+                            "mood_keywords": analysis.mood_keywords,
+                            "image_post_ratio": analysis.image_post_ratio,
+                            "avg_mood_length": analysis.avg_mood_length,
+                            "total_album_photos": analysis.total_album_photos,
+                            "latest_mood_time": analysis.latest_mood_time,
+                        },
+                    },
+                    display=display,
+                )
+
+            elif mode == "photos":
+                album_id = str(args.get("album_id", "")).strip()
+                if not album_id:
+                    return ToolCallResult(ok=False, error="缺少 album_id 参数，请先用 get_qzone_albums 获取相册ID")
+                count = _safe_int(args.get("count", 30), 30, min_value=1, max_value=100)
+                photos = await client.get_photos(qq_number, album_id, count=count)
+                if not photos:
+                    return ToolCallResult(ok=True, data={"count": 0}, display=f"相册 {album_id} 为空或不可见")
+                lines = [f"QQ {qq_number} 相册照片 ({len(photos)}张):"]
+                for i, p in enumerate(photos[:10], 1):
+                    desc = f" — {p.desc}" if p.desc else ""
+                    size = f" {p.width}x{p.height}" if p.width and p.height else ""
+                    lines.append(f"  [{i}] {p.create_time}{size}{desc}")
+                if len(photos) > 10:
+                    lines.append(f"  ... 共 {len(photos)} 张")
+                display = "\n".join(lines)
+                photo_data = [
+                    {
+                        "photo_id": p.photo_id, "url": p.url, "thumb_url": p.thumb_url,
+                        "name": p.name, "desc": p.desc, "create_time": p.create_time,
+                        "width": p.width, "height": p.height,
+                    }
+                    for p in photos
+                ]
+                return ToolCallResult(
+                    ok=True,
+                    data={"count": len(photos), "album_id": album_id, "photos": photo_data},
+                    display=display,
+                )
+
+            return ToolCallResult(ok=False, error=f"unknown_qzone_mode: {mode}")
+
+        except PermissionError as exc:
+            return ToolCallResult(ok=False, error=_normalize_qzone_tool_error(exc))
+        except Exception as exc:
+            _log.warning("qzone_tool_error | mode=%s | qq=%s | %s", mode, qq_number, exc)
+            return ToolCallResult(ok=False, error=_normalize_qzone_tool_error(exc))
+
+    return handler
+
+
+# ── ScrapyLLM 智能网页抓取工具 ──
+
+def _register_scrapy_llm_tools(registry: AgentToolRegistry, model_client: Any) -> None:
+    """注册 ScrapyLLM 智能网页抓取 + LLM 提取工具。"""
+
+    registry.register(
+        ToolSchema(
+            name="scrape_extract",
+            description=(
+                "智能网页抓取+LLM提取: 抓取指定URL网页，用AI按你的指令提取结构化信息。\n"
+                "使用场景: 用户说'帮我看看这个网页里的XX信息'、'提取这个页面的价格/标题/列表'时使用。\n"
+                "比 fetch_webpage 更强: 不只是返回原文，而是按指令智能提取关键信息。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要抓取的网页URL"},
+                    "instruction": {"type": "string", "description": "提取指令，描述你想从网页中提取什么信息"},
+                },
+                "required": ["url", "instruction"],
+            },
+            category="search",
+        ),
+        _make_scrape_extract_handler(model_client),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="scrape_summarize",
+            description=(
+                "智能网页摘要: 抓取网页并用AI生成中文摘要。\n"
+                "使用场景: 用户说'总结一下这个链接'、'这篇文章讲了什么'时使用。\n"
+                "可指定关注重点，如'重点关注技术细节'。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要摘要的网页URL"},
+                    "focus": {"type": "string", "description": "关注重点(可选)，如'技术细节'、'价格信息'"},
+                },
+                "required": ["url"],
+            },
+            category="search",
+        ),
+        _make_scrape_summarize_handler(model_client),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="scrape_structured",
+            description=(
+                "结构化数据提取: 抓取网页并按指定格式提取JSON数据。\n"
+                "使用场景: 需要从网页提取表格、列表、商品信息等结构化数据时使用。\n"
+                "schema_desc 描述你想要的JSON格式，如 '{\"title\": \"文章标题\", \"price\": \"价格\"}'"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "要提取的网页URL"},
+                    "schema_desc": {"type": "string", "description": "期望的JSON结构描述"},
+                },
+                "required": ["url", "schema_desc"],
+            },
+            category="search",
+        ),
+        _make_scrape_structured_handler(model_client),
+    )
+
+    registry.register(
+        ToolSchema(
+            name="scrape_follow_links",
+            description=(
+                "智能链接跟踪: 抓取页面，AI选择相关链接，跟进抓取并提取信息。\n"
+                "使用场景: 用户说'帮我从这个页面找到XX的详情'、'看看这个列表页里哪些符合XX条件'时使用。\n"
+                "两步操作: 先从首页选链接，再从子页面提取信息。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "起始页面URL"},
+                    "link_instruction": {"type": "string", "description": "选择链接的指令，如'选择与Python相关的链接'"},
+                    "extract_instruction": {"type": "string", "description": "从子页面提取信息的指令"},
+                },
+                "required": ["url", "link_instruction", "extract_instruction"],
+            },
+            category="search",
+        ),
+        _make_scrape_follow_links_handler(model_client),
+    )
+
+
+def _make_scrape_extract_handler(model_client: Any) -> ToolHandler:
+    def _build_scrapy_engine(context: dict[str, Any]) -> Any:
+        from utils.scrapy_llm import ScrapyLLM
+        cfg = context.get("config", {}) if isinstance(context, dict) else {}
+        search_cfg = cfg.get("search", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(search_cfg, dict):
+            search_cfg = {}
+        scrape_cfg = search_cfg.get("scrape", {})
+        if not isinstance(scrape_cfg, dict):
+            scrape_cfg = {}
+        timeout_seconds = float(scrape_cfg.get("timeout_seconds", 14.0))
+        max_text_len = int(scrape_cfg.get("max_text_len", 7000))
+        llm_max_tokens = int(scrape_cfg.get("llm_max_tokens", 1200))
+        return ScrapyLLM(
+            model_client=model_client,
+            timeout=max(6.0, min(45.0, timeout_seconds)),
+            max_text_len=max(2000, min(20000, max_text_len)),
+            llm_max_tokens=max(300, min(2400, llm_max_tokens)),
+        )
+
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        url = str(args.get("url", "")).strip()
+        instruction = str(args.get("instruction", "")).strip()
+        if not url or not instruction:
+            return ToolCallResult(ok=False, error="missing url or instruction")
+        engine = _build_scrapy_engine(context)
+        try:
+            result = await engine.scrape_and_extract(
+                url,
+                instruction,
+                system_hint=(
+                    "你是网页信息提取助手。"
+                    "必须使用简体中文输出，不要英文套话。"
+                    "只给与提取指令直接相关的结论，控制在 220 字以内。"
+                ),
+            )
+            if not result.ok:
+                return ToolCallResult(ok=False, error=result.error, display=f"抓取失败: {result.error}")
+            return ToolCallResult(
+                ok=True,
+                data={"url": url, "raw_len": result.raw_text_len},
+                display=clip_text(result.extracted, 260),
+            )
+        finally:
+            await engine.close()
+    return handler
+
+
+def _make_scrape_summarize_handler(model_client: Any) -> ToolHandler:
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        url = str(args.get("url", "")).strip()
+        focus = str(args.get("focus", "")).strip()
+        if not url:
+            return ToolCallResult(ok=False, error="missing url")
+        cfg = context.get("config", {}) if isinstance(context, dict) else {}
+        search_cfg = cfg.get("search", {}) if isinstance(cfg, dict) else {}
+        scrape_cfg = search_cfg.get("scrape", {}) if isinstance(search_cfg, dict) else {}
+        timeout_seconds = float(scrape_cfg.get("timeout_seconds", 14.0)) if isinstance(scrape_cfg, dict) else 14.0
+        max_text_len = int(scrape_cfg.get("max_text_len", 7000)) if isinstance(scrape_cfg, dict) else 7000
+        llm_max_tokens = int(scrape_cfg.get("llm_max_tokens", 1200)) if isinstance(scrape_cfg, dict) else 1200
+        from utils.scrapy_llm import ScrapyLLM
+        engine = ScrapyLLM(
+            model_client=model_client,
+            timeout=max(6.0, min(45.0, timeout_seconds)),
+            max_text_len=max(2000, min(20000, max_text_len)),
+            llm_max_tokens=max(300, min(2400, llm_max_tokens)),
+        )
+        try:
+            result = await engine.smart_summarize(url, focus)
+            if not result.ok:
+                return ToolCallResult(ok=False, error=result.error, display=f"摘要失败: {result.error}")
+            return ToolCallResult(
+                ok=True,
+                data={"url": url, "raw_len": result.raw_text_len},
+                display=clip_text(result.extracted, 1200),
+            )
+        finally:
+            await engine.close()
+    return handler
+
+
+def _make_scrape_structured_handler(model_client: Any) -> ToolHandler:
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        url = str(args.get("url", "")).strip()
+        schema_desc = str(args.get("schema_desc", "")).strip()
+        if not url or not schema_desc:
+            return ToolCallResult(ok=False, error="missing url or schema_desc")
+        cfg = context.get("config", {}) if isinstance(context, dict) else {}
+        search_cfg = cfg.get("search", {}) if isinstance(cfg, dict) else {}
+        scrape_cfg = search_cfg.get("scrape", {}) if isinstance(search_cfg, dict) else {}
+        timeout_seconds = float(scrape_cfg.get("timeout_seconds", 14.0)) if isinstance(scrape_cfg, dict) else 14.0
+        max_text_len = int(scrape_cfg.get("max_text_len", 7000)) if isinstance(scrape_cfg, dict) else 7000
+        llm_max_tokens = int(scrape_cfg.get("llm_max_tokens", 1200)) if isinstance(scrape_cfg, dict) else 1200
+        from utils.scrapy_llm import ScrapyLLM
+        engine = ScrapyLLM(
+            model_client=model_client,
+            timeout=max(6.0, min(45.0, timeout_seconds)),
+            max_text_len=max(2000, min(20000, max_text_len)),
+            llm_max_tokens=max(300, min(2400, llm_max_tokens)),
+        )
+        try:
+            result = await engine.extract_structured(url, schema_desc)
+            if not result.ok:
+                return ToolCallResult(ok=False, error=result.error)
+            return ToolCallResult(
+                ok=True,
+                data={"url": url, "raw_len": result.raw_text_len},
+                display=clip_text(result.extracted, 1500),
+            )
+        finally:
+            await engine.close()
+    return handler
+
+
+def _make_scrape_follow_links_handler(model_client: Any) -> ToolHandler:
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        url = str(args.get("url", "")).strip()
+        link_inst = str(args.get("link_instruction", "")).strip()
+        extract_inst = str(args.get("extract_instruction", "")).strip()
+        if not url or not link_inst or not extract_inst:
+            return ToolCallResult(ok=False, error="missing url, link_instruction or extract_instruction")
+        cfg = context.get("config", {}) if isinstance(context, dict) else {}
+        search_cfg = cfg.get("search", {}) if isinstance(cfg, dict) else {}
+        scrape_cfg = search_cfg.get("scrape", {}) if isinstance(search_cfg, dict) else {}
+        timeout_seconds = float(scrape_cfg.get("timeout_seconds", 14.0)) if isinstance(scrape_cfg, dict) else 14.0
+        max_text_len = int(scrape_cfg.get("max_text_len", 7000)) if isinstance(scrape_cfg, dict) else 7000
+        llm_max_tokens = int(scrape_cfg.get("llm_max_tokens", 1200)) if isinstance(scrape_cfg, dict) else 1200
+        from utils.scrapy_llm import ScrapyLLM
+        engine = ScrapyLLM(
+            model_client=model_client,
+            timeout=max(6.0, min(45.0, timeout_seconds)),
+            max_text_len=max(2000, min(20000, max_text_len)),
+            llm_max_tokens=max(300, min(2400, llm_max_tokens)),
+        )
+        try:
+            results = await engine.find_and_follow(url, link_inst, extract_inst)
+            parts = []
+            for r in results:
+                if r.ok:
+                    parts.append(f"[{r.url}]\n{clip_text(r.extracted, 600)}")
+                else:
+                    parts.append(f"[{r.url}] 失败: {r.error}")
+            display = "\n---\n".join(parts) if parts else "未提取到信息"
+            return ToolCallResult(
+                ok=True,
+                data={"url": url, "sub_pages": len(results)},
+                display=clip_text(display, 2000),
+            )
+        finally:
+            await engine.close()
+    return handler

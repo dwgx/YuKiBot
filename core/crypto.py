@@ -39,22 +39,26 @@ class SecretManager:
         if not self._fernet:
             raise RuntimeError("cryptography 库未安装，无法加密。pip install cryptography")
         token = self._fernet.encrypt(plaintext.encode("utf-8"))
-        return f"{_ENC_PREFIX}{base64.urlsafe_b64encode(token).decode('ascii')}{_ENC_SUFFIX}"
+        # Fernet token 本身已是 url-safe base64，直接存储即可
+        return f"{_ENC_PREFIX}{token.decode('ascii')}{_ENC_SUFFIX}"
 
     def decrypt(self, value: str) -> str:
-        """解密 ENC(...) 字符串；非加密值原样返回。"""
+        """解密 ENC(...) 字符串；非加密值原样返回。兼容新旧两种格式。"""
         if not self.is_encrypted(value):
             return value
         if not self._fernet:
             _log.error("发现 ENC() 加密值但 cryptography 未安装，请 pip install cryptography")
             return ""
         inner = value[len(_ENC_PREFIX):-len(_ENC_SUFFIX)]
-        try:
-            token = base64.urlsafe_b64decode(inner.encode("ascii"))
-            return self._fernet.decrypt(token).decode("utf-8")
-        except (InvalidToken, Exception) as exc:
-            _log.error("ENC() 解密失败: %s", str(exc)[:120])
-            return ""
+        # 新格式: inner 直接是 Fernet token (gAAAAA... 开头)
+        # 旧格式: inner 是 base64(Fernet token)，需要先 decode 一层
+        for candidate in (inner.encode("ascii"), base64.urlsafe_b64decode(inner.encode("ascii"))):
+            try:
+                return self._fernet.decrypt(candidate).decode("utf-8")
+            except (InvalidToken, Exception):
+                continue
+        _log.error("ENC() 解密失败: 新旧格式均无法解密")
+        return ""
 
     @staticmethod
     def is_encrypted(value: object) -> bool:

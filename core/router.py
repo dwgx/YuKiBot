@@ -7,10 +7,14 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from core import prompt_loader as _pl
 from core.personality import PersonalityEngine
+from core.prompt_policy import PromptPolicy
 from core.system_prompts import SystemPromptRelay
 from services.model_client import ModelClient
-from utils.text import normalize_text
+# 已移除本地关键词判断，完全依赖 AI
+# from utils.intent import ...
+from utils.text import clip_text, normalize_text
 
 
 @dataclass(slots=True)
@@ -26,6 +30,8 @@ class RouterInput:
     at_other_user_ids: list[str] = field(default_factory=list)
     reply_to_message_id: str = ""
     reply_to_user_id: str = ""
+    reply_to_user_name: str = ""
+    reply_to_text: str = ""
     raw_segments: list[dict[str, Any]] = field(default_factory=list)
     media_summary: list[str] = field(default_factory=list)
     recent_messages: list[str] = field(default_factory=list)
@@ -64,14 +70,16 @@ class RouterEngine:
         personality: PersonalityEngine,
         model_client: ModelClient,
     ):
+        self.config = config if isinstance(config, dict) else {}
         routing_cfg = config.get("routing", {}) if isinstance(config, dict) else {}
         bot_cfg = config.get("bot", {}) if isinstance(config, dict) else {}
         self.mode = str(routing_cfg.get("mode", "ai_full")).strip() or "ai_full"
         self.min_confidence = float(routing_cfg.get("min_confidence", 0.58))
         self.max_tool_hops = max(1, int(routing_cfg.get("max_tool_hops", 1)))
         self.failover_mode = str(routing_cfg.get("failover_mode", "mention_or_private_only")).strip()
-        self.trust_ai_fully = bool(routing_cfg.get("trust_ai_fully", False))
-        self.followup_fast_path_enable = bool(routing_cfg.get("followup_fast_path_enable", True))
+        self.trust_ai_fully = bool(routing_cfg.get("trust_ai_fully", True))  # 默认完全信任 AI
+        self.followup_fast_path_enable = bool(routing_cfg.get("followup_fast_path_enable", False))  # 禁用快速路径
+        self.enable_keyword_heuristics = bool(routing_cfg.get("enable_keyword_heuristics", False))  # 禁用关键词
         self.passive_multimodal_followup_min_confidence = max(
             0.0,
             min(1.0, float(routing_cfg.get("passive_multimodal_followup_min_confidence", 0.72))),
@@ -110,6 +118,7 @@ class RouterEngine:
 
         self.personality = personality
         self.model_client = model_client
+        self.prompt_policy = PromptPolicy.from_config(config)
         self._log = logging.getLogger("yukiko.router")
 
     async def route(
@@ -131,11 +140,11 @@ class RouterEngine:
 
         # 最小本地兜底：仅@他人且未@机器人，默认不处理；
         # 但如果语句明显在问机器人（例如"你觉得这个人怎么样 @某人"），允许继续走 AI。
+        # 注意：followup_candidate / active_session 不应覆盖此判断——
+        # 用户显式 @了别人说明这条消息不是对机器人说的。
         if (
             payload.at_other_user_only
             and not payload.mentioned
-            and not payload.followup_candidate
-            and not payload.active_session
             and not self._looks_like_bot_address(payload.text)
         ):
             return RouterDecision(
@@ -196,6 +205,8 @@ class RouterEngine:
             "at_other_user_ids": payload.at_other_user_ids[:6],
             "reply_to_message_id": payload.reply_to_message_id,
             "reply_to_user_id": payload.reply_to_user_id,
+            "reply_to_user_name": payload.reply_to_user_name,
+            "reply_to_text": clip_text(payload.reply_to_text, 400),
             "recent_messages": payload.recent_messages[-recent_limit:],
             "recent_bot_replies": payload.recent_bot_replies[-2:],
             "user_profile_summary": "" if self.token_saving else payload.user_profile_summary,
@@ -257,11 +268,12 @@ class RouterEngine:
         plugin_schema: list[dict[str, Any]],
         method_schema: list[dict[str, Any]],
     ) -> str:
-        return SystemPromptRelay.router_system_prompt(
+        base = SystemPromptRelay.router_system_prompt(
             allow_actions=self.allow_actions,
             plugin_schema=plugin_schema,
             method_schema=method_schema,
         )
+        return self.prompt_policy.compose_prompt(channel="router", base_prompt=base)
 
     def _parse_decision(
         self,
@@ -330,6 +342,7 @@ class RouterEngine:
         method_name_raw = normalize_text(str(tool_args.get("method", "")))
         method_name = self._canonicalize_method_name(method_name_raw)
         if method_name and action != "search":
+            self._log.debug("router_override | method_force_search | method=%s | was=%s", method_name, action)
             action = "search"
             should_handle = True
         if method_name:
@@ -378,7 +391,7 @@ class RouterEngine:
         keyword_override_enabled = not self.trust_ai_fully and confidence < 0.5
 
         # 纯"系统拼接的多模态占位文本"默认不触发业务动作，避免用户随手发图被误接话。
-        # 但如果同条消息里有明确指令（如"这是什么/识图/把图发出来"），允许继续处理。
+        # 但如果同条消息里有明确指令（如"这是什么/识图/把图发送过来"），允许继续处理。
         if (
             self._is_passive_multimodal_event(user_text)
             and not payload.mentioned
@@ -417,6 +430,7 @@ class RouterEngine:
             )
 
         if passive_multimodal_followup_allowed and action in {"ignore", "reply", "search"}:
+            self._log.debug("router_override | passive_multimodal_followup | was=%s", action)
             action = "search"
             should_handle = True
             tool_args = dict(tool_args)
@@ -432,6 +446,7 @@ class RouterEngine:
             and not self._contains_explicit_adult_intent(media_user_text)
             and action in {"ignore", "reply", "search"}
         ):
+            self._log.debug("router_override | media_instruction_force_search | was=%s", action)
             action = "search"
             should_handle = True
             tool_args = dict(tool_args)
@@ -523,11 +538,7 @@ class RouterEngine:
                 tool_args["query"] = normalize_text(user_text)
 
         if payload.at_other_user_only and not payload.mentioned and should_handle and action != "ignore":
-            if (
-                not payload.followup_candidate
-                and not payload.active_session
-                and not self._looks_like_bot_address(user_text)
-            ):
+            if not self._looks_like_bot_address(user_text):
                 return RouterDecision(
                     should_handle=False,
                     action="ignore",
@@ -589,6 +600,8 @@ class RouterEngine:
         return None
 
     def _looks_like_bot_address(self, text: str) -> bool:
+        if not self.enable_keyword_heuristics:  # 纯 AI 模式：禁用关键词
+            return False
         content = normalize_text(text).lower()
         if not content:
             return False
@@ -599,68 +612,14 @@ class RouterEngine:
 
     @staticmethod
     def _looks_like_image_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "图",
-            "图片",
-            "壁纸",
-            "头像",
-            "插画",
-            "发图",
-            "搜图",
-            "二次元",
-            "pixiv",
-            "image",
-            "picture",
-            "wallpaper",
-            "illustration",
-        )
-        return any(cue in content for cue in cues)
+        return False  # 纯 AI 模式：禁用关键词判断
 
-    @staticmethod
-    def _looks_like_video_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "视频",
-            "影片",
-            "发视频",
-            "找视频",
-            "video",
-            "clip",
-            "mv",
-            ".mp4",
-            ".webm",
-            "抖音",
-            "快手",
-            "b站",
-            "哔哩",
-            "bilibili",
-            "acfun",
-            "a站",
-        )
-        return any(cue in content for cue in cues)
+    def _looks_like_video_request(self, text: str) -> bool:
+        return False  # 纯 AI 模式：禁用关键词判断
 
     @staticmethod
     def _looks_like_safe_beauty_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "美女",
-            "帅哥",
-            "颜值",
-            "人像",
-            "写真",
-            "舞蹈",
-            "小姐姐",
-            "小哥哥",
-        )
-        media_cues = ("视频", "图", "图片", "壁纸", "发我", "找", "搜")
-        return any(cue in content for cue in cues) and any(cue in content for cue in media_cues)
+        return False  # 纯 AI 模式：禁用关键词判断
 
     @staticmethod
     def _contains_explicit_adult_intent(text: str) -> bool:
@@ -727,100 +686,21 @@ class RouterEngine:
 
     @classmethod
     def _looks_like_media_instruction(cls, text: str) -> bool:
-        content = cls._extract_multimodal_user_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "识图",
-            "看图",
-            "这是什么",
-            "图里",
-            "图片里",
-            "分析",
-            "解释",
-            "描述",
-            "识别",
-            "ocr",
-            "发出来",
-            "发给我",
-            "转发",
-            "帮我",
-            "给我",
-            "找",
-            "搜",
-            "评价",
-            "看看",
-        )
-        if any(cue in content for cue in cues):
-            return True
-        return False
+        return False  # 纯 AI 模式：禁用关键词判断
 
-    @staticmethod
-    def _looks_like_github_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "github",
-            "git hub",
-            "开源",
-            "仓库",
-            "repo",
-            "repository",
-            "源码",
-            "source code",
-        )
-        if any(cue in content for cue in cues):
-            return True
-        return bool(re.search(r"https?://(?:www\.)?github\.com/[^\s]+", content, flags=re.IGNORECASE))
+    def _looks_like_github_request(self, text: str) -> bool:
+        return False  # 纯 AI 模式：禁用关键词判断
 
     @staticmethod
     def _looks_like_summary_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = (
-            "总结",
-            "概括",
-            "简述",
-            "用语言说",
-            "语言给我总结",
-            "给我讲讲",
-            "说人话",
-            "别发链接",
-            "直接说结论",
-        )
-        return any(cue in content for cue in cues)
+        return False  # 纯 AI 模式：禁用关键词判断
 
     @staticmethod
     def _looks_like_group_open_question(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        open_cues = (
-            "有没有人知道",
-            "谁懂",
-            "有人会",
-            "求助",
-            "请教",
-            "怎么弄",
-            "怎么办",
-            "为什么",
-            "咋办",
-            "有人知道吗",
-            "有无大佬",
-        )
-        if any(cue in content for cue in open_cues):
-            return True
-        return bool(content.endswith(("?", "？")) and ("怎么" in content or "为什么" in content))
+        return False  # 纯 AI 模式：禁用关键词判断
 
-    @staticmethod
-    def _looks_like_repo_readme_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = ("readme", "文档", "学习", "分析", "怎么用", "怎么跑", "看下这个仓库", "看这个项目")
-        return any(cue in content for cue in cues)
+    def _looks_like_repo_readme_request(self, text: str) -> bool:
+        return False  # 纯 AI 模式：禁用关键词判断
 
     @staticmethod
     def _extract_github_repo_from_text(text: str) -> str:
