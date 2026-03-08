@@ -586,8 +586,11 @@ class MusicEngine:
         for row in rows:
             if not isinstance(row, dict):
                 continue
-            url = normalize_text(str(row.get("url", "")))
-            if not url:
+            raw_url = row.get("url")
+            if not isinstance(raw_url, str):
+                continue
+            url = normalize_text(raw_url)
+            if not url or not re.match(r"^https?://", url, flags=re.IGNORECASE):
                 continue
             try:
                 duration_ms = int(row.get("time", 0) or 0)
