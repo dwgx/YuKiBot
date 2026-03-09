@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 REM WebUI 快速构建脚本
 echo ========================================
 echo YuKiKo WebUI 构建工具
@@ -36,7 +37,7 @@ if errorlevel 1 (
     echo ========================================
     echo.
     echo 现在可以刷新浏览器查看更新
-    echo WebUI 地址: http://127.0.0.1:8081/webui/config
+    echo WebUI 地址: http://127.0.0.1:8080/webui/config
     echo.
     timeout /t 3
 )

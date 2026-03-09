@@ -51,6 +51,67 @@ _GROUP_SEND_BLOCK_DEFAULT_SECONDS = 180
 _BOT_SEND_SUSPEND_UNTIL: dict[str, datetime] = {}
 _BOT_SEND_SUSPEND_REASON: dict[str, str] = {}
 _BOT_ONLINE_STATE: dict[str, bool] = {}
+_RUNTIME_WEBUI_BRIDGE: dict[str, Any] = {
+    "queue": None,
+    "latest_ctx": {},
+}
+
+
+def get_runtime_agent_states(limit: int = 200) -> list[dict[str, Any]]:
+    """供 WebUI 查询当前队列运行状态。"""
+    queue = _RUNTIME_WEBUI_BRIDGE.get("queue")
+    if queue is None or not hasattr(queue, "list_conversation_states"):
+        return []
+    try:
+        rows = queue.list_conversation_states(limit=max(1, int(limit)))
+    except Exception:
+        return []
+    latest_ctx = _RUNTIME_WEBUI_BRIDGE.get("latest_ctx")
+    if not isinstance(latest_ctx, dict):
+        latest_ctx = {}
+    enriched: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cid = normalize_text(str(row.get("conversation_id", "")))
+        ctx = latest_ctx.get(cid, {}) if cid else {}
+        if not isinstance(ctx, dict):
+            ctx = {}
+        item = dict(row)
+        item["last_trace_id"] = normalize_text(str(ctx.get("trace_id", ""))) or normalize_text(str(row.get("latest_trace_id", "")))
+        item["last_user_id"] = normalize_text(str(ctx.get("user_id", "")))
+        item["last_text_preview"] = clip_text(normalize_text(str(ctx.get("text", ""))), 120)
+        item["last_update"] = normalize_text(str(ctx.get("timestamp", "")))
+        enriched.append(item)
+    return enriched
+
+
+async def interrupt_runtime_conversation(conversation_id: str, reason: str = "cancelled_by_webui") -> dict[str, int]:
+    """供 WebUI 主动中断会话任务。"""
+    cid = normalize_text(conversation_id)
+    if not cid:
+        return {"cancelled": 0, "skipped_non_interruptible": 0, "skipped_running": 0, "skipped_finished": 0}
+    queue = _RUNTIME_WEBUI_BRIDGE.get("queue")
+    if queue is None or not hasattr(queue, "cancel_conversation"):
+        return {"cancelled": 0, "skipped_non_interruptible": 0, "skipped_running": 0, "skipped_finished": 0}
+    try:
+        result = await queue.cancel_conversation(
+            cid,
+            reason=normalize_text(reason) or "cancelled_by_webui",
+            include_running=True,
+            interruptible_only=True,
+        )
+    except Exception:
+        return {"cancelled": 0, "skipped_non_interruptible": 0, "skipped_running": 0, "skipped_finished": 0}
+    latest_ctx = _RUNTIME_WEBUI_BRIDGE.get("latest_ctx")
+    if isinstance(latest_ctx, dict):
+        latest_ctx.pop(cid, None)
+    return result if isinstance(result, dict) else {
+        "cancelled": 0,
+        "skipped_non_interruptible": 0,
+        "skipped_running": 0,
+        "skipped_finished": 0,
+    }
 
 
 class _TokenBucket:
@@ -657,6 +718,11 @@ def create_engine() -> YukikoEngine:
 def register_handlers(engine: YukikoEngine) -> None:
     dispatcher = GroupQueueDispatcher(engine.config.get("queue", {}))
     _latest_queue_task_ctx: dict[str, dict[str, Any]] = {}
+    _RUNTIME_WEBUI_BRIDGE["queue"] = dispatcher
+    _RUNTIME_WEBUI_BRIDGE["latest_ctx"] = _latest_queue_task_ctx
+    # 暴露给 WebUI: 运行中会话状态 + 主动中断能力
+    setattr(engine, "runtime_agent_state_provider", get_runtime_agent_states)
+    setattr(engine, "runtime_agent_interrupt", interrupt_runtime_conversation)
     router = on_message(priority=90, block=False)
     meta_router = on_metaevent(priority=90, block=False)
     notice_router = on_notice(priority=90, block=False)
@@ -770,6 +836,56 @@ def register_handlers(engine: YukikoEngine) -> None:
         aliases = sorted(set(aliases), key=len, reverse=True)
         return any(content.startswith(alias) for alias in aliases)
 
+    def _parse_private_chat_whitelist(raw: Any) -> set[str]:
+        values: list[str] = []
+        if isinstance(raw, list):
+            values = [normalize_text(str(item)) for item in raw]
+        elif isinstance(raw, str):
+            values = [normalize_text(item) for item in re.split(r"[\n,，;；\s]+", raw)]
+        return {item for item in values if item}
+
+    def _allow_private_chat_for_user(bot_cfg_any: dict[str, Any], user_id: str) -> bool:
+        mode = normalize_text(str(bot_cfg_any.get("private_chat_mode", "off"))).lower() or "off"
+        if mode == "all":
+            return True
+        if mode == "whitelist":
+            return normalize_text(user_id) in _parse_private_chat_whitelist(
+                bot_cfg_any.get("private_chat_whitelist", [])
+            )
+        return False
+
+    _SELF_NAME_PATTERNS = (
+        re.compile(r"(?:^|[\s，,。.!！？?])(?:以后|今后|之后|从现在开始)?(?:请)?(?:就)?(?:叫我|喊我|称呼我)(?:做|为|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
+        re.compile(r"(?:^|[\s，,。.!！？?])我(?:的名字|叫)\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
+    )
+    _CROSS_NAME_PATTERNS = (
+        re.compile(r"(?:^|[\s，,。.!！？?])(?:以后|今后|之后|从现在开始)(?:请)?(?:就)?(?:叫他|叫她|叫ta|叫TA|叫这个人|叫这位|称呼他|称呼她|称呼ta|称呼TA)(?:做|为|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
+        re.compile(r"(?:^|[\s，,。.!！？?])(?:给|帮)?(?:他|她|ta|TA|这位|这个人)(?:改名|改称呼)(?:叫|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
+    )
+
+    def _extract_name_by_patterns(text: str, patterns: tuple[re.Pattern[str], ...]) -> str:
+        raw = normalize_text(text)
+        if not raw:
+            return ""
+        for pattern in patterns:
+            matched = pattern.search(raw)
+            if not matched:
+                continue
+            candidate = normalize_text(matched.group(1))
+            if candidate:
+                return candidate
+        return ""
+
+    def _is_group_admin_sender(*, user_id: str, group_id: int, sender_role: str) -> bool:
+        if engine.admin.is_super_admin(user_id):
+            return True
+        role = normalize_text(sender_role).lower()
+        if group_id <= 0:
+            return False
+        if role not in {"owner", "admin"}:
+            return False
+        return bool(engine.admin.is_group_whitelisted(group_id))
+
     # ── 消息去重：同一用户短时间内发送完全相同的消息只处理一次 ──
     _recent_msg_hashes: dict[str, tuple[str, float]] = {}  # key=conv:uid → (hash, timestamp)
     _DEDUP_WINDOW_SECONDS = 5.0
@@ -778,6 +894,345 @@ def register_handlers(engine: YukikoEngine) -> None:
             return int(value)
         except Exception:
             return default
+
+    _LOGIN_BACKLOG_STATE_FILE = Path(__file__).resolve().parent / "storage" / "runtime" / "login_backlog_state.json"
+    _login_backlog_lock = asyncio.Lock()
+    _login_backlog_last_run = 0.0
+
+    def _unwrap_onebot_payload(payload: Any) -> Any:
+        if isinstance(payload, dict) and "data" in payload and ("retcode" in payload or "status" in payload):
+            return payload.get("data")
+        return payload
+
+    def _load_login_backlog_state() -> dict[str, Any]:
+        try:
+            if not _LOGIN_BACKLOG_STATE_FILE.exists():
+                return {}
+            parsed = json.loads(_LOGIN_BACKLOG_STATE_FILE.read_text(encoding="utf-8"))
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_login_backlog_state(state: dict[str, Any]) -> None:
+        try:
+            _LOGIN_BACKLOG_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = _LOGIN_BACKLOG_STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(_LOGIN_BACKLOG_STATE_FILE)
+        except Exception as exc:
+            _log.debug("login_backlog_state_save_failed | %s", exc)
+
+    def _resolve_login_backlog_options() -> dict[str, Any]:
+        cfg = engine.config if isinstance(engine.config, dict) else {}
+        control = cfg.get("control", {})
+        if not isinstance(control, dict):
+            control = {}
+        return {
+            "enable": bool(control.get("login_backlog_import_enable", False)),
+            "llm_summary_enable": bool(control.get("login_backlog_llm_summary_enable", False)),
+            "include_private": bool(control.get("login_backlog_import_include_private", True)),
+            "only_unread": bool(control.get("login_backlog_import_only_unread", True)),
+            "max_conversations": max(1, _as_int(control.get("login_backlog_import_max_conversations", 30), 30)),
+            "max_messages_per_conversation": max(
+                1,
+                _as_int(control.get("login_backlog_import_max_messages_per_conversation", 40), 40),
+            ),
+            "max_pages_per_conversation": max(
+                1,
+                _as_int(control.get("login_backlog_import_max_pages_per_conversation", 3), 3),
+            ),
+            "lookback_hours": max(1, _as_int(control.get("login_backlog_import_lookback_hours", 72), 72)),
+            "min_interval_seconds": max(10, _as_int(control.get("login_backlog_import_min_interval_seconds", 20), 20)),
+        }
+
+    def _render_history_message_text(raw_message: Any, segments: Any) -> str:
+        text = normalize_text(str(raw_message))
+        if text:
+            return text
+        if not isinstance(segments, list):
+            return ""
+        parts: list[str] = []
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            data = seg.get("data", {}) or {}
+            if seg_type == "text":
+                part = normalize_text(str(data.get("text", "")))
+                if part:
+                    parts.append(part)
+            elif seg_type in {"image", "video", "record", "audio", "file"}:
+                parts.append(f"[{seg_type}]")
+            elif seg_type == "at":
+                qq = normalize_text(str(data.get("qq", "")))
+                parts.append(f"@{qq or 'someone'}")
+            elif seg_type:
+                parts.append(f"[{seg_type}]")
+        return normalize_text(" ".join(parts))
+
+    def _extract_history_rows(payload: Any) -> list[dict[str, Any]]:
+        body = _unwrap_onebot_payload(payload)
+        rows = body.get("messages", []) if isinstance(body, dict) else body
+        if isinstance(body, dict) and not rows:
+            rows = body.get("items", [])
+        if not isinstance(rows, list):
+            return []
+        return [item for item in rows if isinstance(item, dict)]
+
+    def _safe_int_or_zero(raw: Any) -> int:
+        try:
+            return int(raw)
+        except Exception:
+            return 0
+
+    async def _fetch_contact_history(
+        bot: Bot,
+        *,
+        chat_type: str,
+        peer_id: str,
+        max_messages: int,
+        max_pages: int,
+    ) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        seen_keys: set[str] = set()
+        next_seq: int | None = None
+        page_limit = max(1, int(max_pages))
+        per_page = max(1, min(80, int(max_messages)))
+        for _ in range(page_limit):
+            kwargs: dict[str, Any] = {}
+            try:
+                peer_num = int(peer_id)
+            except Exception:
+                break
+            if chat_type == "group":
+                kwargs["group_id"] = peer_num
+            else:
+                kwargs["user_id"] = peer_num
+                kwargs["count"] = per_page
+            if next_seq is not None and next_seq > 0:
+                kwargs["message_seq"] = int(next_seq)
+
+            api_name = "get_group_msg_history" if chat_type == "group" else "get_friend_msg_history"
+            try:
+                payload = await bot.call_api(api_name, **kwargs)
+            except Exception as exc:
+                _log.debug("login_backlog_fetch_history_failed | api=%s | peer=%s | err=%s", api_name, peer_id, exc)
+                break
+            page_rows = _extract_history_rows(payload)
+            if not page_rows:
+                break
+
+            min_seq = 0
+            new_count = 0
+            for row in page_rows:
+                message_id = normalize_text(
+                    str(row.get("message_id", "") or row.get("real_id", "") or row.get("id", ""))
+                )
+                seq = normalize_text(str(row.get("message_seq", "") or row.get("real_seq", "")))
+                sender = row.get("sender", {}) if isinstance(row.get("sender"), dict) else {}
+                sender_id = normalize_text(str(sender.get("user_id", "")))
+                ts = _safe_int_or_zero(row.get("time", 0))
+                dedup_key = f"{message_id}|{seq}|{sender_id}|{ts}"
+                if dedup_key in seen_keys:
+                    continue
+                seen_keys.add(dedup_key)
+                rows.append(row)
+                new_count += 1
+                seq_value = _safe_int_or_zero(row.get("message_seq", row.get("real_seq", 0)))
+                if seq_value > 0 and (min_seq <= 0 or seq_value < min_seq):
+                    min_seq = seq_value
+
+            if len(rows) >= max_messages:
+                break
+            if new_count <= 0 or min_seq <= 1:
+                break
+            if next_seq is not None and min_seq >= next_seq:
+                break
+            next_seq = min_seq - 1
+
+        rows.sort(key=lambda item: _safe_int_or_zero(item.get("time", 0)))
+        return rows[-max_messages:]
+
+    async def _import_login_backlog_for_bot(bot: Bot, *, reason: str, opts: dict[str, Any]) -> None:
+        state = _load_login_backlog_state()
+        per_bot = state.get("by_bot", {})
+        if not isinstance(per_bot, dict):
+            per_bot = {}
+        bot_id = normalize_text(str(getattr(bot, "self_id", "")))
+        bot_state = per_bot.get(bot_id, {})
+        if not isinstance(bot_state, dict):
+            bot_state = {}
+        conv_state = bot_state.get("conversations", {})
+        if not isinstance(conv_state, dict):
+            conv_state = {}
+
+        try:
+            recent_raw = await bot.call_api("get_recent_contact", count=int(opts["max_conversations"]))
+        except Exception as exc:
+            _log.debug("login_backlog_recent_contact_failed | bot=%s | err=%s", bot_id or "-", exc)
+            return
+
+        recent_body = _unwrap_onebot_payload(recent_raw)
+        recent_items = recent_body.get("items", []) if isinstance(recent_body, dict) else recent_body
+        if not isinstance(recent_items, list):
+            return
+
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        fallback_since = now_ts - int(opts["lookback_hours"]) * 3600
+        imported_count = 0
+        imported_lines: list[str] = []
+
+        for item in recent_items:
+            if not isinstance(item, dict):
+                continue
+            chat_type = "group" if int(item.get("chatType", 0) or 0) == 2 else "private"
+            if chat_type == "private" and not opts["include_private"]:
+                continue
+            unread_count = _safe_int_or_zero(item.get("unreadCnt", 0))
+            if opts["only_unread"] and unread_count <= 0:
+                continue
+            peer_id = normalize_text(str(item.get("peerUin", "") or item.get("peerUid", "") or item.get("peer_id", "")))
+            if not peer_id or not peer_id.isdigit():
+                continue
+
+            conversation_id = f"{chat_type}:{peer_id}"
+            since_ts = max(_safe_int_or_zero(conv_state.get(conversation_id, 0)), fallback_since)
+            rows = await _fetch_contact_history(
+                bot,
+                chat_type=chat_type,
+                peer_id=peer_id,
+                max_messages=int(opts["max_messages_per_conversation"]),
+                max_pages=int(opts["max_pages_per_conversation"]),
+            )
+            if not rows:
+                conv_state[conversation_id] = max(since_ts, _safe_int_or_zero(item.get("msgTime", 0)))
+                continue
+
+            newest_ts = since_ts
+            for row in rows:
+                ts = _safe_int_or_zero(row.get("time", 0))
+                if ts <= since_ts:
+                    continue
+                newest_ts = max(newest_ts, ts)
+                sender = row.get("sender", {}) if isinstance(row.get("sender"), dict) else {}
+                sender_id = normalize_text(str(sender.get("user_id", "")))
+                if sender_id and sender_id == bot_id:
+                    continue
+                sender_name = (
+                    normalize_text(str(sender.get("card", "")))
+                    or normalize_text(str(sender.get("nickname", "")))
+                    or sender_id
+                    or "unknown"
+                )
+                segments = row.get("message", [])
+                if not isinstance(segments, list):
+                    segments = []
+                content = _render_history_message_text(row.get("raw_message", ""), segments)
+                if not content:
+                    continue
+                try:
+                    engine.memory.add_message(
+                        conversation_id=conversation_id,
+                        user_id=sender_id or f"peer:{peer_id}",
+                        role="user",
+                        content=content,
+                        timestamp=datetime.fromtimestamp(ts if ts > 0 else now_ts, tz=timezone.utc),
+                        user_name=sender_name,
+                    )
+                    imported_count += 1
+                    imported_lines.append(f"[{conversation_id}] {sender_name}: {clip_text(content, 120)}")
+                except Exception as exc:
+                    _log.debug(
+                        "login_backlog_add_memory_failed | conv=%s | sender=%s | err=%s",
+                        conversation_id,
+                        sender_id or "-",
+                        exc,
+                    )
+            conv_state[conversation_id] = max(_safe_int_or_zero(conv_state.get(conversation_id, 0)), newest_ts)
+
+        bot_state["conversations"] = conv_state
+        bot_state["last_sync_ts"] = now_ts
+        per_bot[bot_id] = bot_state
+        state["by_bot"] = per_bot
+        _save_login_backlog_state(state)
+
+        if imported_count <= 0:
+            _log.info("login_backlog_import | bot=%s | reason=%s | imported=0", bot_id or "-", reason)
+            return
+
+        if opts["llm_summary_enable"]:
+            try:
+                sample_lines = imported_lines[-80:]
+                summary_prompt = "\n".join(sample_lines)
+                summary = normalize_text(
+                    await engine.model_client.chat_text(
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "你是离线聊天归档助手。请把输入聊天记录提炼成简短中文要点，不要虚构，不要给建议。",
+                            },
+                            {
+                                "role": "user",
+                                "content": (
+                                    "请总结这批离线期间的新消息（最多6条要点，尽量提取人名/偏好/计划/待办）：\n"
+                                    f"{summary_prompt}"
+                                ),
+                            },
+                        ],
+                        max_tokens=320,
+                    )
+                )
+                if summary:
+                    engine.memory.add_message(
+                        conversation_id=f"system:login_backlog:{bot_id or 'default'}",
+                        user_id=bot_id or "system",
+                        role="system",
+                        content=f"离线消息摘要（{reason}）：{summary}",
+                        timestamp=datetime.now(timezone.utc),
+                        user_name="system",
+                    )
+            except Exception as exc:
+                _log.debug("login_backlog_summary_failed | bot=%s | err=%s", bot_id or "-", exc)
+
+        _log.info(
+            "login_backlog_import | bot=%s | reason=%s | imported=%d",
+            bot_id or "-",
+            reason,
+            imported_count,
+        )
+
+    async def _run_login_backlog_import(reason: str, bot: Bot | None = None) -> None:
+        nonlocal _login_backlog_last_run
+        opts = _resolve_login_backlog_options()
+        if not opts["enable"]:
+            return
+        now_mono = time.monotonic()
+        if now_mono - _login_backlog_last_run < float(opts["min_interval_seconds"]):
+            return
+        if _login_backlog_lock.locked():
+            return
+        async with _login_backlog_lock:
+            now_mono = time.monotonic()
+            if now_mono - _login_backlog_last_run < float(opts["min_interval_seconds"]):
+                return
+            _login_backlog_last_run = now_mono
+
+            targets: list[Bot] = []
+            if bot is not None:
+                targets = [bot]
+            else:
+                bots_map = nonebot.get_bots()
+                targets = [item for item in bots_map.values() if isinstance(item, Bot)]
+            for target in targets:
+                try:
+                    await _import_login_backlog_for_bot(target, reason=reason, opts=opts)
+                except Exception as exc:
+                    _log.warning(
+                        "login_backlog_import_failed | bot=%s | reason=%s | err=%s",
+                        normalize_text(str(getattr(target, "self_id", ""))) or "-",
+                        reason,
+                        exc,
+                    )
 
     def _resolve_runtime_send_options() -> dict[str, Any]:
         cfg = engine.config if isinstance(engine.config, dict) else {}
@@ -796,9 +1251,9 @@ def register_handlers(engine: YukikoEngine) -> None:
         voice_limit_default = _as_int(music_cfg_rt.get("max_voice_duration_seconds", 60), 60)
         voice_limit_raw = bot_cfg_rt.get("voice_send_max_seconds", voice_limit_default)
         voice_send_max_seconds = max(0, _as_int(voice_limit_raw, voice_limit_default))
-        # QQ/NapCat 语音常见 60s 限制，默认先分段，避免“整段发送看似成功但被平台截断”。
-        voice_send_try_full_first = bool(bot_cfg_rt.get("voice_send_try_full_first", False))
-        voice_send_split_enable = bool(bot_cfg_rt.get("voice_send_split_enable", True))
+        # 默认策略：优先整段发送，分段作为可选兜底能力（默认关闭）。
+        voice_send_try_full_first = bool(bot_cfg_rt.get("voice_send_try_full_first", True))
+        voice_send_split_enable = bool(bot_cfg_rt.get("voice_send_split_enable", False))
         voice_send_split_max_segments = max(1, min(20, _as_int(bot_cfg_rt.get("voice_send_split_max_segments", 8), 8)))
         # 点歌语音默认优先整段直发，不走分段切片。
         voice_send_music_force_full = bool(bot_cfg_rt.get("voice_send_music_force_full", True))
@@ -849,6 +1304,8 @@ def register_handlers(engine: YukikoEngine) -> None:
                     _log.warning("cookie_expired | %s | 建议重新登录: /yuki cookie %s", platform, platform)
         except Exception as e:
             _log.debug("cookie_check_skip | %s", e)
+        # 登录离线消息回填：只读导入 memory，不做任何自动回复。
+        asyncio.create_task(_run_login_backlog_import(reason="startup"))
 
     @nonebot.get_driver().on_shutdown
     async def _flush_memory_on_shutdown():
@@ -862,6 +1319,9 @@ def register_handlers(engine: YukikoEngine) -> None:
                 _log.info("memory_flush_on_shutdown | ok")
         except Exception as e:
             _log.warning("memory_flush_on_shutdown_failed | %s", e)
+        finally:
+            _RUNTIME_WEBUI_BRIDGE["queue"] = None
+            _RUNTIME_WEBUI_BRIDGE["latest_ctx"] = {}
 
     @router.handle()
     async def handle_message(bot: Bot, event: MessageEvent) -> None:
@@ -892,12 +1352,35 @@ def register_handlers(engine: YukikoEngine) -> None:
 
         conversation_id = _dedup_conv
         at_targets = _extract_at_targets(event)
-        is_group_message = str(getattr(event, "message_type", "")) == "group"
+        msg_type = str(getattr(event, "message_type", ""))
+        is_group_message = msg_type == "group"
+        is_private_message = msg_type == "private"
         event_group_id = int(getattr(event, "group_id", 0) or 0)
+
+        # 预缓存入站媒体：即使当前消息被门禁跳过，也保留“先发图后提问”的上下文。
+        if _has_media_segments(raw_segments):
+            try:
+                remember_media = getattr(getattr(engine, "tools", None), "remember_incoming_media", None)
+                if callable(remember_media):
+                    remember_media(conversation_id, raw_segments)
+                    if is_group_message and event_group_id > 0:
+                        scoped_conversation = f"group:{event_group_id}:user:{event.get_user_id()}"
+                        if scoped_conversation != conversation_id:
+                            remember_media(scoped_conversation, raw_segments)
+            except Exception as exc:
+                _log.debug("pre_gate_media_cache_failed | conv=%s | err=%s", conversation_id, exc)
+
         allow_non_to_me_rt, runtime_bot_cfg, _, _ = _resolve_runtime_matcher_flags()
         raw_text = _extract_text_segments(raw_segments) or event.get_plaintext().strip()
         admin_command = engine.admin.is_admin_command(raw_text)
         alias_prefix_call = _starts_with_bot_alias(raw_text, runtime_bot_cfg)
+
+        # 私聊开关：off | whitelist | all（管理员命令保留兜底入口）。
+        if is_private_message and not admin_command:
+            sender_uid = str(event.get_user_id())
+            if not _allow_private_chat_for_user(runtime_bot_cfg, sender_uid):
+                _log.debug("private_chat_blocked | user=%s | mode=%s", sender_uid, runtime_bot_cfg.get("private_chat_mode", "off"))
+                return
 
         # 最外层 matcher 硬门禁：非 @ 群消息不进入 agent/queue（除非显式开启 allow_non_to_me）。
         if is_group_message and not allow_non_to_me_rt and not admin_command:
@@ -980,6 +1463,78 @@ def register_handlers(engine: YukikoEngine) -> None:
                         bool(getattr(event, "to_me", False)),
                     )
                 conversation_id = scoped_conversation
+
+        # 昵称记忆治理：
+        # - “叫我XX”自动更新本人偏好称呼；
+        # - 群聊里“叫他/她XX”仅超级管理员或本群管理员可改，避免跨用户串改。
+        memory = getattr(engine, "memory", None)
+        if memory is not None and hasattr(memory, "set_preferred_name"):
+            sender_uid = str(event.get_user_id())
+            sender_name = _extract_user_name(event)
+            sender_role = _extract_sender_role(event)
+            has_question_mark = ("?" in text) or ("？" in text)
+            self_name_candidate = "" if has_question_mark else _extract_name_by_patterns(text, _SELF_NAME_PATTERNS)
+            cross_name_candidate = "" if has_question_mark else _extract_name_by_patterns(text, _CROSS_NAME_PATTERNS)
+            cross_target_uid = ""
+            if at_other_user_ids:
+                cross_target_uid = normalize_text(str(at_other_user_ids[0]))
+            elif reply_to_user_id and str(reply_to_user_id) != str(bot.self_id):
+                cross_target_uid = normalize_text(str(reply_to_user_id))
+
+            # 自己改自己：允许直接生效
+            if self_name_candidate:
+                ok, message, payload = memory.set_preferred_name(
+                    target_user_id=sender_uid,
+                    preferred_name=self_name_candidate,
+                    actor=f"{sender_name}({sender_uid})",
+                    conversation_id=conversation_id,
+                    note="用户主动设置称呼",
+                    reason="self_preferred_name_request",
+                )
+                if ok:
+                    preferred = normalize_text(str((payload or {}).get("preferred_name", ""))) or self_name_candidate
+                    await _safe_send(
+                        bot=bot,
+                        event=event,
+                        message=Message(f"记住了，以后我会叫你“{preferred}”。"),
+                    )
+                    return
+                await _safe_send(bot=bot, event=event, message=Message(f"这个称呼我没法保存：{message}"))
+                return
+
+            # 改别人：必须是超级管理员，或白名单群里的 owner/admin
+            if cross_name_candidate and cross_target_uid and cross_target_uid != sender_uid:
+                is_allowed = _is_group_admin_sender(
+                    user_id=sender_uid,
+                    group_id=event_group_id,
+                    sender_role=sender_role,
+                )
+                if not is_allowed:
+                    await _safe_send(
+                        bot=bot,
+                        event=event,
+                        message=Message("跨用户改称呼需要群管理员或超级管理员权限。"),
+                    )
+                    return
+                ok, message, payload = memory.set_preferred_name(
+                    target_user_id=cross_target_uid,
+                    preferred_name=cross_name_candidate,
+                    actor=f"{sender_name}({sender_uid})",
+                    conversation_id=conversation_id,
+                    note="管理员跨用户设置称呼",
+                    reason="admin_cross_user_preferred_name_request",
+                )
+                if ok:
+                    target_name = normalize_text(str((payload or {}).get("display_name", ""))) or f"用户{cross_target_uid[-4:]}"
+                    preferred = normalize_text(str((payload or {}).get("preferred_name", ""))) or cross_name_candidate
+                    await _safe_send(
+                        bot=bot,
+                        event=event,
+                        message=Message(f"已记录：以后称呼 {target_name} 为“{preferred}”。"),
+                    )
+                    return
+                await _safe_send(bot=bot, event=event, message=Message(f"称呼更新失败：{message}"))
+                return
 
         async def api_call(api: str, **kwargs: Any) -> Any:
             return await bot.call_api(api, **kwargs)
@@ -1796,6 +2351,11 @@ def register_handlers(engine: YukikoEngine) -> None:
     @meta_router.handle()
     async def handle_meta(bot: Bot, event: Event) -> None:
         _log_qq_generic_event(kind="qq_meta", event=event, bot_id=str(bot.self_id))
+        payload = _event_to_dict(event)
+        meta_event_type = normalize_text(str(payload.get("meta_event_type", ""))).lower()
+        sub_type = normalize_text(str(payload.get("sub_type", ""))).lower()
+        if meta_event_type == "lifecycle" and sub_type == "connect":
+            asyncio.create_task(_run_login_backlog_import(reason="meta_connect", bot=bot))
 
 
 def _event_timestamp(event: MessageEvent) -> datetime:
@@ -1972,75 +2532,13 @@ def _build_trace_id(conversation_id: str, seq: int) -> str:
 
 
 def _looks_like_video_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
-    for seg in raw_segments or []:
-        if not isinstance(seg, dict):
-            continue
-        if normalize_text(str(seg.get("type", ""))).lower() == "video":
-            return True
-
-    content = normalize_text(text).lower()
-    if not content:
-        return False
-    if re.search(r"(?:\bbv[0-9a-z]{8,}\b|\bav\d{5,}\b)", content, flags=re.IGNORECASE):
-        return True
-    if re.search(r"https?://[^\s]+", content, flags=re.IGNORECASE):
-        platform_cues = ("bilibili.com", "b23.tv", "douyin.com", "kuaishou.com", "acfun")
-        if any(cue in content for cue in platform_cues):
-            return True
-
-    cues = (
-        "视频",
-        "发送",
-        "发视频",
-        "转发视频",
-        "解析这个视频",
-        "解析视频",
-        "下载这个视频",
-        "找视频",
-        "搜视频",
-        "b站",
-        "哔哩",
-        "抖音",
-        "快手",
-        "acfun",
-        "video",
-    )
-    return any(cue in content for cue in cues)
+    _ = (text, raw_segments)
+    return False
 
 
 def _looks_like_download_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
-    for seg in raw_segments or []:
-        if not isinstance(seg, dict):
-            continue
-        seg_type = normalize_text(str(seg.get("type", ""))).lower()
-        if seg_type in {"video", "file"}:
-            return True
-
-    content = normalize_text(text).lower()
-    if not content:
-        return False
-    if re.search(r"https?://[^\s]+", content, flags=re.IGNORECASE) and any(
-        cue in content for cue in ("download", "release", "releases", "安装包", "下载")
-    ):
-        return True
-
-    cues = (
-        "下载",
-        "下载安装",
-        "安装包",
-        "官方安装包",
-        "发我安装包",
-        "发文件",
-        "上传群文件",
-        "exe",
-        "msi",
-        "apk",
-        "zip",
-        "7z",
-        "rar",
-        "github release",
-    )
-    return any(cue in content for cue in cues)
+    _ = (text, raw_segments)
+    return False
 
 
 def _looks_like_sticker_learning_request(
@@ -2048,65 +2546,13 @@ def _looks_like_sticker_learning_request(
     raw_segments: list[dict[str, Any]],
     reply_media_segments: list[dict[str, Any]] | None = None,
 ) -> bool:
-    all_segments = list(raw_segments or [])
-    if isinstance(reply_media_segments, list) and reply_media_segments:
-        all_segments.extend(reply_media_segments)
-    has_image = any(
-        normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
-        for seg in all_segments
-        if isinstance(seg, dict)
-    )
-    if not has_image:
-        content_for_media = normalize_text(text).lower()
-        has_image = bool("multimodal_event" in content_for_media and "image:" in content_for_media)
-    if not has_image:
-        return False
-
-    content = normalize_text(text).lower()
-    if not content:
-        return False
-
-    direct_cues = (
-        "学习表情包",
-        "学表情包",
-        "学习这个表情",
-        "学习这张表情",
-        "记住这个表情",
-        "学这张图",
-    )
-    if any(cue in content for cue in direct_cues):
-        return True
-    return ("学习" in content or "学会" in content) and ("表情" in content or "表情包" in content)
+    _ = (text, raw_segments, reply_media_segments)
+    return False
 
 
 def _looks_like_cancel_previous_request(text: str) -> bool:
-    content = normalize_text(text).lower()
-    if not content:
-        return False
-    if re.search(r"^/(?:cancel|stop|abort|interrupt)\b", content):
-        return True
-    cues = (
-        "取消",
-        "打断",
-        "中断",
-        "终止",
-        "停止",
-        "停一下",
-        "先停",
-        "别回了",
-        "不用回了",
-        "不用继续",
-        "算了别",
-        "结束这条",
-        "换个问题",
-        "重来",
-        "skip",
-        "cancel",
-        "stop",
-        "abort",
-        "interrupt",
-    )
-    return any(cue in content for cue in cues)
+    _ = text
+    return False
 
 
 def _extract_at_targets(event: MessageEvent) -> list[str]:

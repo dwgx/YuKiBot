@@ -315,6 +315,30 @@ class MemoryEngine:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_embeddings_conversation_id ON embeddings(conversation_id);"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER,
+                    action TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    note TEXT,
+                    reason TEXT,
+                    before_content TEXT,
+                    after_content TEXT,
+                    conversation_id TEXT,
+                    user_id TEXT,
+                    role TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_audit_record_id ON memory_audit_log(record_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_memory_audit_created_at ON memory_audit_log(created_at);"
+            )
 
     def _embed(self, text: str) -> list[float]:
         vec = [0.0] * self.vector_dim
@@ -985,6 +1009,87 @@ class MemoryEngine:
                 return display
         return self._user_display_names.get(uid, "")
 
+    def normalize_preferred_name_candidate(self, value: str) -> str:
+        """规范化称呼候选值，返回可落库文本；非法则返回空。"""
+        candidate = normalize_text(value)
+        if not candidate:
+            return ""
+        candidate = re.sub(r"^[\s\"'“”‘’《》〈〉【】\[\]\(\)（）、,，。:：;；!！?？~～]+", "", candidate)
+        candidate = re.sub(r"[\s\"'“”‘’《》〈〉【】\[\]\(\)（）、,，。:：;；!！?？~～]+$", "", candidate)
+        candidate = normalize_text(candidate)
+        if not candidate:
+            return ""
+        if len(candidate) > 24:
+            return ""
+        if any(part in candidate for part in self.preferred_name_invalid_parts):
+            return ""
+        if any(part and part in candidate for part in self.preferred_name_blocklist):
+            return ""
+        if any(p.search(candidate) for p in self.preferred_name_block_patterns):
+            return ""
+        return candidate
+
+    def set_preferred_name(
+        self,
+        *,
+        target_user_id: str,
+        preferred_name: str,
+        actor: str = "system",
+        conversation_id: str = "",
+        note: str = "",
+        reason: str = "",
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """手动设置用户偏好称呼（支持审计）。"""
+        uid = normalize_text(target_user_id)
+        if not uid:
+            return False, "缺少 target_user_id", {}
+        name = self.normalize_preferred_name_candidate(preferred_name)
+        if not name:
+            return False, "称呼不合法或为空", {}
+
+        profile = self._user_profiles.get(uid, {})
+        if not isinstance(profile, dict):
+            profile = {"user_id": uid}
+        before_name = normalize_text(str(profile.get("preferred_name", "")))
+        if before_name == name:
+            payload = {
+                "user_id": uid,
+                "display_name": normalize_text(str(profile.get("display_name", ""))) or self._user_display_names.get(uid, uid),
+                "preferred_name": before_name,
+                "preferred_name_updated_at": normalize_text(str(profile.get("preferred_name_updated_at", ""))),
+            }
+            return True, "称呼未变化", payload
+
+        now = datetime.now(timezone.utc).isoformat()
+        if not normalize_text(str(profile.get("display_name", ""))):
+            profile["display_name"] = self._user_display_names.get(uid, "")
+        profile["preferred_name"] = name
+        profile["preferred_name_updated_at"] = now
+        self._user_profiles[uid] = profile
+        if normalize_text(str(profile.get("display_name", ""))):
+            self._user_display_names[uid] = normalize_text(str(profile.get("display_name", "")))
+        self._save_user_profiles_immediate()
+        self._write_memory_audit(
+            record_id=None,
+            action="set_preferred_name",
+            actor=normalize_text(actor) or "system",
+            note=normalize_text(note) or "更新偏好称呼",
+            reason=normalize_text(reason) or "manual_preferred_name_update",
+            before_content=before_name,
+            after_content=name,
+            conversation_id=normalize_text(conversation_id),
+            user_id=uid,
+            role="profile",
+        )
+
+        payload = {
+            "user_id": uid,
+            "display_name": normalize_text(str(profile.get("display_name", ""))) or self._user_display_names.get(uid, uid),
+            "preferred_name": name,
+            "preferred_name_updated_at": now,
+        }
+        return True, "称呼已更新", payload
+
     def get_agent_policies(self, user_id: str) -> dict[str, Any]:
         profile = self._user_profiles.get(str(user_id), {})
         if not isinstance(profile, dict):
@@ -1147,6 +1252,587 @@ class MemoryEngine:
         state = self._thread_state.get(conversation_id, {})
         return state if isinstance(state, dict) else {}
 
+    def _fetch_embedding_record(self, record_id: int) -> dict[str, Any] | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, conversation_id, user_id, role, content, created_at
+                FROM embeddings
+                WHERE id = ?;
+                """,
+                (int(record_id),),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "id": int(row[0]),
+            "conversation_id": str(row[1] or ""),
+            "user_id": str(row[2] or ""),
+            "role": str(row[3] or ""),
+            "content": str(row[4] or ""),
+            "created_at": str(row[5] or ""),
+        }
+
+    def _append_history_entry(self, conversation_id: str, user_id: str, role: str, content: str, timestamp: datetime | None = None) -> None:
+        text = normalize_text(content)
+        if not text:
+            return
+        uid = normalize_text(user_id)
+        conv = normalize_text(conversation_id)
+        if not conv:
+            return
+        user_name = self.get_display_name(uid) if uid else ""
+        self._history[conv].append(
+            MemoryMessage(
+                role=normalize_text(role) or "user",
+                user_id=uid,
+                user_name=user_name,
+                content=text,
+                timestamp=timestamp or datetime.now(timezone.utc),
+            )
+        )
+
+    def _update_history_entry(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        role: str,
+        old_content: str,
+        new_content: str,
+    ) -> None:
+        rows = self._history.get(conversation_id)
+        if not rows:
+            return
+        target_uid = normalize_text(user_id)
+        target_role = normalize_text(role)
+        before = normalize_text(old_content)
+        after = normalize_text(new_content)
+        if not before or not after:
+            return
+        for idx in range(len(rows) - 1, -1, -1):
+            item = rows[idx]
+            if normalize_text(str(item.user_id)) != target_uid:
+                continue
+            if normalize_text(str(item.role)) != target_role:
+                continue
+            if normalize_text(str(item.content)) != before:
+                continue
+            item.content = after
+            rows[idx] = item
+            break
+
+    def _remove_history_entry(self, *, conversation_id: str, user_id: str, role: str, content: str) -> None:
+        rows = self._history.get(conversation_id)
+        if not rows:
+            return
+        target_uid = normalize_text(user_id)
+        target_role = normalize_text(role)
+        target_content = normalize_text(content)
+        if not target_content:
+            return
+        for idx in range(len(rows) - 1, -1, -1):
+            item = rows[idx]
+            if normalize_text(str(item.user_id)) != target_uid:
+                continue
+            if normalize_text(str(item.role)) != target_role:
+                continue
+            if normalize_text(str(item.content)) != target_content:
+                continue
+            del rows[idx]
+            break
+
+    def _write_memory_audit(
+        self,
+        *,
+        record_id: int | None,
+        action: str,
+        actor: str,
+        note: str = "",
+        reason: str = "",
+        before_content: str = "",
+        after_content: str = "",
+        conversation_id: str = "",
+        user_id: str = "",
+        role: str = "",
+    ) -> None:
+        if not self.enable_vector_memory:
+            return
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO memory_audit_log (
+                    record_id, action, actor, note, reason, before_content, after_content,
+                    conversation_id, user_id, role, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    int(record_id) if record_id is not None else None,
+                    normalize_text(action) or "unknown",
+                    normalize_text(actor) or "system",
+                    normalize_text(note),
+                    normalize_text(reason),
+                    normalize_text(before_content),
+                    normalize_text(after_content),
+                    normalize_text(conversation_id),
+                    normalize_text(user_id),
+                    normalize_text(role),
+                    ts,
+                ),
+            )
+
+    @staticmethod
+    def _format_conversation_label(conversation_id: str) -> str:
+        conv = normalize_text(conversation_id)
+        if not conv:
+            return "-"
+        if conv.startswith("group:"):
+            parts = conv.split(":")
+            if len(parts) >= 4 and parts[2] == "user":
+                return f"群聊 {parts[1]}（按用户隔离）"
+            if len(parts) >= 2:
+                return f"群聊 {parts[1]}"
+            return "群聊"
+        if conv.startswith("private:"):
+            return "私聊"
+        return conv
+
+    def list_memory_records(
+        self,
+        *,
+        conversation_id: str = "",
+        user_id: str = "",
+        role: str = "",
+        keyword: str = "",
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not self.enable_vector_memory:
+            return [], 0
+
+        limit = max(1, min(200, int(limit or 50)))
+        offset = max(0, int(offset or 0))
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        conv = normalize_text(conversation_id)
+        uid = normalize_text(user_id)
+        role_value = normalize_text(role).lower()
+        kw = normalize_text(keyword)
+
+        if conv:
+            clauses.append("conversation_id = ?")
+            params.append(conv)
+        if uid:
+            clauses.append("user_id = ?")
+            params.append(uid)
+        if role_value:
+            clauses.append("role = ?")
+            params.append(role_value)
+        if kw:
+            clauses.append("content LIKE ?")
+            params.append(f"%{kw}%")
+
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) FROM embeddings {where_sql};",
+                tuple(params),
+            ).fetchone()
+            total = int(total_row[0]) if total_row else 0
+            rows = conn.execute(
+                f"""
+                SELECT id, conversation_id, user_id, role, content, created_at
+                FROM embeddings
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?;
+                """,
+                tuple(params + [limit, offset]),
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            row_conv = str(row[1] or "")
+            row_uid = str(row[2] or "")
+            profile = self._user_profiles.get(row_uid, {})
+            display_name = (
+                normalize_text(str(profile.get("display_name", "")))
+                or self._user_display_names.get(row_uid, row_uid)
+            )
+            out.append(
+                {
+                    "id": int(row[0]),
+                    "conversation_id": row_conv,
+                    "conversation_label": self._format_conversation_label(row_conv),
+                    "user_id": row_uid,
+                    "display_name": display_name,
+                    "role": str(row[3] or ""),
+                    "content": str(row[4] or ""),
+                    "created_at": str(row[5] or ""),
+                }
+            )
+        return out, total
+
+    def add_memory_record(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        role: str,
+        content: str,
+        actor: str = "system",
+        note: str = "",
+        reason: str = "",
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if not self.enable_vector_memory:
+            return False, "memory_disabled", {}
+
+        conv = normalize_text(conversation_id)
+        uid = normalize_text(user_id)
+        role_value = normalize_text(role).lower() or "user"
+        text = normalize_text(content)
+        if not conv:
+            return False, "conversation_id 不能为空", {}
+        if not uid:
+            return False, "user_id 不能为空", {}
+        if role_value not in {"user", "assistant", "system"}:
+            return False, "role 必须是 user/assistant/system", {}
+        if not text:
+            return False, "content 不能为空", {}
+
+        created_at = datetime.now(timezone.utc).isoformat()
+        emb = json.dumps(self._embed(text), ensure_ascii=False)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO embeddings (conversation_id, user_id, role, content, embedding, created_at)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
+                (conv, uid, role_value, text, emb, created_at),
+            )
+            record_id = int(cursor.lastrowid or 0)
+
+        self._append_history_entry(conversation_id=conv, user_id=uid, role=role_value, content=text)
+        self._write_memory_audit(
+            record_id=record_id,
+            action="add",
+            actor=actor,
+            note=note,
+            reason=reason,
+            after_content=text,
+            conversation_id=conv,
+            user_id=uid,
+            role=role_value,
+        )
+
+        profile = self._user_profiles.get(uid, {})
+        display_name = (
+            normalize_text(str(profile.get("display_name", "")))
+            or self._user_display_names.get(uid, uid)
+        )
+        payload = {
+            "id": record_id,
+            "conversation_id": conv,
+            "conversation_label": self._format_conversation_label(conv),
+            "user_id": uid,
+            "display_name": display_name,
+            "role": role_value,
+            "content": text,
+            "created_at": created_at,
+        }
+        return True, "memory_added", payload
+
+    def update_memory_record(
+        self,
+        *,
+        record_id: int,
+        content: str,
+        actor: str = "system",
+        note: str = "",
+        reason: str = "",
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if not self.enable_vector_memory:
+            return False, "memory_disabled", {}
+        note_text = normalize_text(note)
+        if not note_text:
+            return False, "修改记忆必须填写备注 note", {}
+
+        before = self._fetch_embedding_record(record_id)
+        if not before:
+            return False, "memory_not_found", {}
+        new_text = normalize_text(content)
+        if not new_text:
+            return False, "content 不能为空", {}
+        if new_text == normalize_text(before.get("content", "")):
+            return False, "内容未变化", before
+
+        emb = json.dumps(self._embed(new_text), ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE embeddings
+                SET content = ?, embedding = ?
+                WHERE id = ?;
+                """,
+                (new_text, emb, int(record_id)),
+            )
+
+        self._update_history_entry(
+            conversation_id=str(before.get("conversation_id", "")),
+            user_id=str(before.get("user_id", "")),
+            role=str(before.get("role", "")),
+            old_content=str(before.get("content", "")),
+            new_content=new_text,
+        )
+        self._write_memory_audit(
+            record_id=int(record_id),
+            action="update",
+            actor=actor,
+            note=note_text,
+            reason=reason,
+            before_content=str(before.get("content", "")),
+            after_content=new_text,
+            conversation_id=str(before.get("conversation_id", "")),
+            user_id=str(before.get("user_id", "")),
+            role=str(before.get("role", "")),
+        )
+
+        after = self._fetch_embedding_record(record_id) or {}
+        conv = normalize_text(str(after.get("conversation_id", "")))
+        uid = normalize_text(str(after.get("user_id", "")))
+        profile = self._user_profiles.get(uid, {})
+        display_name = (
+            normalize_text(str(profile.get("display_name", "")))
+            or self._user_display_names.get(uid, uid)
+        )
+        after["conversation_label"] = self._format_conversation_label(conv)
+        after["display_name"] = display_name
+        return True, "memory_updated", after
+
+    def delete_memory_record(
+        self,
+        *,
+        record_id: int,
+        actor: str = "system",
+        note: str = "",
+        reason: str = "",
+    ) -> tuple[bool, str, dict[str, Any]]:
+        if not self.enable_vector_memory:
+            return False, "memory_disabled", {}
+        note_text = normalize_text(note)
+        if not note_text:
+            return False, "删除记忆必须填写备注 note", {}
+
+        before = self._fetch_embedding_record(record_id)
+        if not before:
+            return False, "memory_not_found", {}
+
+        with self._connect() as conn:
+            conn.execute("DELETE FROM embeddings WHERE id = ?;", (int(record_id),))
+
+        self._remove_history_entry(
+            conversation_id=str(before.get("conversation_id", "")),
+            user_id=str(before.get("user_id", "")),
+            role=str(before.get("role", "")),
+            content=str(before.get("content", "")),
+        )
+        self._write_memory_audit(
+            record_id=int(record_id),
+            action="delete",
+            actor=actor,
+            note=note_text,
+            reason=reason,
+            before_content=str(before.get("content", "")),
+            after_content="",
+            conversation_id=str(before.get("conversation_id", "")),
+            user_id=str(before.get("user_id", "")),
+            role=str(before.get("role", "")),
+        )
+        conv = normalize_text(str(before.get("conversation_id", "")))
+        uid = normalize_text(str(before.get("user_id", "")))
+        profile = self._user_profiles.get(uid, {})
+        before["conversation_label"] = self._format_conversation_label(conv)
+        before["display_name"] = (
+            normalize_text(str(profile.get("display_name", "")))
+            or self._user_display_names.get(uid, uid)
+        )
+        return True, "memory_deleted", before
+
+    def list_memory_audit_logs(
+        self,
+        *,
+        record_id: int | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not self.enable_vector_memory:
+            return [], 0
+        limit = max(1, min(500, int(limit or 100)))
+        offset = max(0, int(offset or 0))
+        params: list[Any] = []
+        where_sql = ""
+        if record_id is not None:
+            where_sql = "WHERE record_id = ?"
+            params.append(int(record_id))
+
+        with self._connect() as conn:
+            total_row = conn.execute(
+                f"SELECT COUNT(*) FROM memory_audit_log {where_sql};",
+                tuple(params),
+            ).fetchone()
+            total = int(total_row[0]) if total_row else 0
+            rows = conn.execute(
+                f"""
+                SELECT id, record_id, action, actor, note, reason, before_content, after_content,
+                       conversation_id, user_id, role, created_at
+                FROM memory_audit_log
+                {where_sql}
+                ORDER BY id DESC
+                LIMIT ? OFFSET ?;
+                """,
+                tuple(params + [limit, offset]),
+            ).fetchall()
+
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            out.append(
+                {
+                    "id": int(row[0]),
+                    "record_id": int(row[1]) if row[1] is not None else None,
+                    "action": str(row[2] or ""),
+                    "actor": str(row[3] or ""),
+                    "note": str(row[4] or ""),
+                    "reason": str(row[5] or ""),
+                    "before_content": str(row[6] or ""),
+                    "after_content": str(row[7] or ""),
+                    "conversation_id": str(row[8] or ""),
+                    "user_id": str(row[9] or ""),
+                    "role": str(row[10] or ""),
+                    "created_at": str(row[11] or ""),
+                }
+            )
+        return out, total
+
+    def compact_memory_records(
+        self,
+        *,
+        conversation_id: str = "",
+        user_id: str = "",
+        role: str = "",
+        actor: str = "system",
+        note: str = "",
+        reason: str = "",
+        dry_run: bool = True,
+        keep_latest: int = 1,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """按“相同会话+用户+角色+归一化内容”去重记忆记录。"""
+        if not self.enable_vector_memory:
+            return False, "memory_disabled", {}
+
+        keep_latest = max(1, int(keep_latest or 1))
+        conv = normalize_text(conversation_id)
+        uid = normalize_text(user_id)
+        role_value = normalize_text(role).lower()
+        note_text = normalize_text(note)
+        reason_text = normalize_text(reason)
+        if not dry_run and not note_text:
+            return False, "执行整理必须填写备注 note", {}
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        if conv:
+            clauses.append("conversation_id = ?")
+            params.append(conv)
+        if uid:
+            clauses.append("user_id = ?")
+            params.append(uid)
+        if role_value:
+            clauses.append("role = ?")
+            params.append(role_value)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, conversation_id, user_id, role, content
+                FROM embeddings
+                {where_sql}
+                ORDER BY id DESC;
+                """,
+                tuple(params),
+            ).fetchall()
+
+        groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+        for row in rows:
+            item = {
+                "id": int(row[0]),
+                "conversation_id": str(row[1] or ""),
+                "user_id": str(row[2] or ""),
+                "role": str(row[3] or ""),
+                "content": str(row[4] or ""),
+            }
+            key = (
+                normalize_text(item["conversation_id"]),
+                normalize_text(item["user_id"]),
+                normalize_text(item["role"]).lower(),
+                normalize_text(item["content"]),
+            )
+            groups[key].append(item)
+
+        delete_items: list[dict[str, Any]] = []
+        for dup_rows in groups.values():
+            if len(dup_rows) <= keep_latest:
+                continue
+            # rows 已按 id DESC，保留最新 keep_latest 条。
+            delete_items.extend(dup_rows[keep_latest:])
+        delete_items.sort(key=lambda item: int(item["id"]))
+
+        payload = {
+            "dry_run": bool(dry_run),
+            "scanned": len(rows),
+            "duplicates": len(delete_items),
+            "keep_latest": keep_latest,
+            "filters": {
+                "conversation_id": conv,
+                "user_id": uid,
+                "role": role_value,
+            },
+            "deleted_ids": [int(item["id"]) for item in delete_items],
+        }
+
+        if dry_run or not delete_items:
+            return True, "memory_compact_preview", payload
+
+        with self._connect() as conn:
+            conn.executemany(
+                "DELETE FROM embeddings WHERE id = ?;",
+                [(int(item["id"]),) for item in delete_items],
+            )
+
+        actor_text = normalize_text(actor) or "system"
+        for item in delete_items:
+            self._remove_history_entry(
+                conversation_id=str(item.get("conversation_id", "")),
+                user_id=str(item.get("user_id", "")),
+                role=str(item.get("role", "")),
+                content=str(item.get("content", "")),
+            )
+            self._write_memory_audit(
+                record_id=int(item["id"]),
+                action="compact_delete",
+                actor=actor_text,
+                note=note_text,
+                reason=reason_text or "memory_compact",
+                before_content=str(item.get("content", "")),
+                after_content="",
+                conversation_id=str(item.get("conversation_id", "")),
+                user_id=str(item.get("user_id", "")),
+                role=str(item.get("role", "")),
+            )
+        return True, "memory_compacted", payload
+
     @staticmethod
     def _topic_from_text(text: str) -> str:
         tokens = MemoryEngine._extract_profile_keywords(text or "")
@@ -1242,6 +1928,42 @@ class MemoryEngine:
         if any(word in lower for word in cold):
             return "冷淡"
         return "中性"
+
+    @classmethod
+    def _is_effective_daily_summary_item(cls, text: str) -> bool:
+        content = cls._normalize_profile_text(text)
+        if not content:
+            return False
+        if len(content) < 2:
+            return False
+        if cls._is_system_noise_keyword(content):
+            return False
+        if re.fullmatch(r"[\W_]+", content):
+            return False
+        if re.fullmatch(r"\d+", content):
+            return False
+        cjk = len(re.findall(r"[\u4e00-\u9fff]", content))
+        latin = len(re.findall(r"[A-Za-z]", content))
+        if (cjk + latin) < 2:
+            return False
+        return True
+
+    @classmethod
+    def _select_daily_important_messages(
+        cls,
+        user_messages: list[str],
+        limit: int = 8,
+    ) -> list[str]:
+        filtered: list[str] = []
+        for raw in user_messages:
+            content = cls._normalize_profile_text(raw)
+            if not cls._is_effective_daily_summary_item(content):
+                continue
+            if filtered and filtered[-1] == content:
+                continue
+            filtered.append(content)
+        return filtered[-max(1, limit):]
+
     def write_daily_snapshot(self, day_key: str | None = None) -> None:
         if not self.enable_daily_log:
             return
@@ -1252,9 +1974,22 @@ class MemoryEngine:
         emotion_counter = self._daily_emotions.get(key, Counter())
 
         user_messages = [text for role, _, _, text in records if role == "user"]
-        important_candidates = [msg for msg in user_messages if len(msg) >= 10]
-        important = important_candidates[-8:] if important_candidates else user_messages[-5:]
-        top_keywords = keyword_counter.most_common(10)
+        important = self._select_daily_important_messages(user_messages, limit=8)
+        raw_top_keywords = keyword_counter.most_common(20)
+        top_keywords: list[tuple[str, int]] = []
+        for word, count in raw_top_keywords:
+            token = normalize_text(str(word))
+            if not token:
+                continue
+            if self._is_system_noise_keyword(token):
+                continue
+            if re.fullmatch(r"\d+", token):
+                continue
+            top_keywords.append((token, int(count)))
+            if len(top_keywords) >= 10:
+                break
+        if top_keywords and max((c for _, c in top_keywords), default=0) <= 1 and len(user_messages) < 5:
+            top_keywords = []
 
         dominant_emotion = "中性"
         if emotion_counter:
@@ -1274,7 +2009,7 @@ class MemoryEngine:
         if important:
             lines.extend(f"- {item}" for item in important)
         else:
-            lines.append("- 暂无足够对话数据。")
+            lines.append("- 暂无足够有效摘要。")
 
         lines.append("")
         lines.append("## 当日主题")
@@ -1326,7 +2061,7 @@ class MemoryEngine:
                     style_hint += "、常追问细节"
 
                 lines.append(
-                    f"- {display_name}({user_id})：今日 {count} 条；常聊 {kw_text}；习惯 {style_hint}"
+                    f"- {display_name}：今日 {count} 条；常聊 {kw_text}；习惯 {style_hint}"
                 )
         else:
             lines.append("- 今日暂无用户习惯数据。")
@@ -1346,7 +2081,7 @@ class MemoryEngine:
                     or self._user_display_names.get(user_id, user_id)
                 )
                 intents = "、".join(f"{name}:{count}" for name, count in counter.most_common(4)) or "暂无"
-                lines.append(f"- {display_name}({user_id})：{intents}")
+                lines.append(f"- {display_name}：{intents}")
         else:
             lines.append("- 今日暂无触发意图数据。")
 

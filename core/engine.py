@@ -40,13 +40,6 @@ from core.tools import ToolExecutor
 from core.trigger import TriggerEngine, TriggerInput
 from services.logger import get_logger
 from services.model_client import ModelClient
-from utils.intent import (
-    looks_like_github_request as _shared_github_request,
-    looks_like_qq_avatar_intent as _shared_qq_avatar_intent,
-    looks_like_qq_profile_analysis_request as _shared_qq_profile_intent,
-    looks_like_repo_readme_request as _shared_repo_readme_request,
-    looks_like_video_request as _shared_video_request,
-)
 from utils.text import (
     clip_text,
     normalize_kaomoji_style,
@@ -55,32 +48,6 @@ from utils.text import (
     replace_emoji_with_kaomoji,
     tokenize,
 )
-
-_ENGINE_HEURISTIC_CUES_ENABLED = False
-
-
-def _set_engine_heuristic_cues_enabled(enabled: bool) -> None:
-    global _ENGINE_HEURISTIC_CUES_ENABLED
-    _ENGINE_HEURISTIC_CUES_ENABLED = bool(enabled)
-
-
-def _prompt_cues(key: str, defaults: tuple[str, ...], lowercase: bool = True) -> tuple[str, ...]:
-    """Load cue list from prompts.yml.
-
-    In LLM-first mode, keyword/regex cue routing is disabled globally.
-    """
-    _ = defaults
-    if not _ENGINE_HEURISTIC_CUES_ENABLED:
-        return ()
-    raw = _pl.get_list(key)
-    items = raw if isinstance(raw, list) else []
-    normalized: list[str] = []
-    for item in items:
-        value = normalize_text(str(item))
-        if not value:
-            continue
-        normalized.append(value.lower() if lowercase else value)
-    return tuple(normalized)
 
 
 @dataclass(slots=True)
@@ -396,6 +363,7 @@ class YukikoEngine:
 
         # ── Agent 系统 ──
         self.agent_tool_registry = AgentToolRegistry()
+        self.agent_tool_registry.set_intent_keyword_routing_enabled(False)
         register_builtin_tools(
             registry=self.agent_tool_registry,
             search_engine=self.search,
@@ -662,8 +630,8 @@ class YukikoEngine:
         control_cfg = self.config.get("control", {})
         if not isinstance(control_cfg, dict):
             control_cfg = {}
-        self.control_heuristic_rules_enable = bool(control_cfg.get("heuristic_rules_enable", False))
-        _set_engine_heuristic_cues_enabled(self.control_heuristic_rules_enable)
+        if hasattr(self, "agent_tool_registry"):
+            self.agent_tool_registry.set_intent_keyword_routing_enabled(False)
         self.control_chat_mode = normalize_text(str(control_cfg.get("chat_mode", "balanced"))).lower() or "balanced"
         self.control_undirected_policy = normalize_text(
             str(control_cfg.get("undirected_policy", "high_confidence_only"))
@@ -1118,6 +1086,17 @@ class YukikoEngine:
                 user_id=message.user_id,
                 limit=10,
             )
+            reply_target_uid = normalize_text(str(message.reply_to_user_id))
+            bot_uid = normalize_text(str(message.bot_id))
+            current_uid = normalize_text(str(message.user_id))
+            if reply_target_uid and reply_target_uid not in {bot_uid, current_uid}:
+                reply_target_recent = self._build_recent_user_lines_by_user_id(
+                    recent_messages=recent_messages,
+                    user_id=reply_target_uid,
+                    limit=4,
+                )
+                if reply_target_recent:
+                    memory_context = (memory_context + [f"[引用对象近期]{item}" for item in reply_target_recent])[-16:]
             if not memory_context:
                 memory_context = self.memory.get_recent_texts(message.conversation_id, limit=8)
         else:
@@ -1939,6 +1918,7 @@ class YukikoEngine:
                 tool_executor=self.tools if hasattr(self, "tools") else None,
                 crawler_hub=self.crawler_hub if hasattr(self, "crawler_hub") else None,
                 knowledge_base=self.knowledge_base if hasattr(self, "knowledge_base") else None,
+                memory_engine=self.memory if hasattr(self, "memory") else None,
                 trace_id=message.trace_id,
                 memory_context=memory_context,
                 related_memories=related_memories,
@@ -2263,28 +2243,6 @@ class YukikoEngine:
                 tool_args={"mode": mode, "query": query},
             )
 
-        # 超时/解析失败时，如果文本包含明确搜索意图关键词，仍然执行搜索
-        if reason in {"router_timeout", "router_parse_error"}:
-            text_lower = normalize_text(payload.text).lower()
-            explicit_search_cues = _prompt_cues(
-                "router_failover_search_cues",
-                (
-                    "搜索", "互联网搜索", "网上搜", "帮我查", "帮我搜", "百度",
-                    "谷歌", "google", "bing", "查一下", "搜一下", "找一下",
-                    "在网上", "在网络上", "联网搜", "上网搜", "网页搜索",
-                    "下载", "发给我", "安装包", "启动器", "客户端", "官网",
-                ),
-            )
-            if any(cue in text_lower for cue in explicit_search_cues):
-                return RouterDecision(
-                    should_handle=True,
-                    action="search",
-                    reason=f"{reason}_explicit_search_fallback",
-                    confidence=0.78,
-                    reply_style="casual",
-                    tool_args={"query": payload.text, "mode": "text"},
-                )
-
         if self.failover_mode == "mention_or_private_only":
             if payload.mentioned or payload.is_private or self._looks_like_bot_call(payload.text):
                 return RouterDecision(
@@ -2393,91 +2351,7 @@ class YukikoEngine:
         return decision
 
     def _infer_forced_tool_plan(self, message: EngineMessage, text: str) -> tuple[str, dict[str, Any], str]:
-        content = normalize_text(text)
-        if not content:
-            return "", {}, ""
-
-        all_segments: list[dict[str, Any]] = []
-        for segment_group in (message.raw_segments, message.reply_media_segments):
-            if not isinstance(segment_group, list):
-                continue
-            all_segments.extend(seg for seg in segment_group if isinstance(seg, dict))
-
-        has_image = any(
-            normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
-            for seg in all_segments
-        )
-        has_video = any(
-            normalize_text(str((seg or {}).get("type", ""))).lower() == "video"
-            for seg in all_segments
-        )
-
-        if self._looks_like_image_analyze_intent(content) and (has_image or self._extract_first_image_url_from_text(content)):
-            image_url = self._extract_first_image_url_from_text(content)
-            method_args: dict[str, Any] = {"url": image_url} if image_url else {}
-            return "media.analyze_image", method_args, "local_force_image_analyze"
-
-        if self._looks_like_video_resolve_intent(content):
-            video_url = self._extract_first_video_url_from_text(content)
-            if video_url:
-                return "browser.resolve_video", {"url": video_url}, "local_force_video_resolve"
-            preferred_platform = "douyin.com" if re.search(r"(抖音|douyin)", content, re.IGNORECASE) else ""
-            cached_video_url = self._pick_recent_video_source_url(
-                message=message,
-                preferred_platform=preferred_platform,
-            )
-            if cached_video_url:
-                return (
-                    "browser.resolve_video",
-                    {"url": cached_video_url},
-                    "local_force_video_resolve_from_cache",
-                )
-            if has_video:
-                return "media.pick_video_from_message", {}, "local_force_pick_video"
-
-        if self._looks_like_video_analysis_intent(content):
-            video_url = self._extract_first_video_url_from_text(content)
-            if video_url:
-                return "video.analyze", {"url": video_url}, "local_force_video_analyze"
-            if has_video:
-                return "video.analyze", {}, "local_force_video_analyze_from_message"
-
-        candidate_qq = self._extract_candidate_qq_target(message=message, text=content)
-        if candidate_qq:
-            if self._looks_like_qq_avatar_intent(content):
-                return "media.qq_avatar", {"qq": candidate_qq}, "local_force_qq_avatar"
-            if self._looks_like_qq_profile_intent(content):
-                # 旧管线可用方法里没有 QZone 细分方法，先拿头像作为稳定锚点，再由回复层补充说明。
-                return "media.qq_avatar", {"qq": candidate_qq}, "local_force_qq_profile_seed"
-
-        local_path = self._pick_local_path_candidate(content)
-        # 如果文本包含 URL，local_path 可能是 URL 路径的误提取，跳过
-        if local_path and self._looks_like_local_file_request(content) and not re.search(r"https?://", content, re.IGNORECASE):
-            if self._looks_like_local_media_request(content) or self._looks_like_local_media_path(local_path):
-                return "local.media_from_path", {"path": local_path}, "local_force_local_media"
-            return "local.read_text", {"path": local_path}, "local_force_local_read"
-
-        if self._looks_like_github_request(content):
-            # 如果文本同时包含其他平台关键词（哔哩哔哩/B站/抖音/快手等），
-            # 说明用户有多个意图，不要强制覆盖为 github_search，让 router 决定
-            multi_intent_cues = _prompt_cues(
-                "github_multi_intent_block_cues",
-                ("哔哩哔哩", "b站", "bilibili", "抖音", "douyin", "快手", "kuaishou", "搜索", "视频"),
-            )
-            has_other_intent = any(cue in content.lower() for cue in multi_intent_cues)
-            if has_other_intent:
-                return "", {}, ""
-            if not (
-                self._looks_like_repo_readme_request(content)
-                or self._looks_like_explicit_request(content)
-                or bool(self._extract_github_repo_from_text(content))
-            ):
-                return "", {}, ""
-            repo = self._extract_github_repo_from_text(content)
-            if repo and self._looks_like_repo_readme_request(content):
-                return "browser.github_readme", {"repo": repo}, "local_force_github_readme"
-            return "browser.github_search", {"query": content}, "local_force_github_search"
-
+        _ = (message, text)
         return "", {}, ""
 
     async def _retry_tool_after_failure(
@@ -2953,29 +2827,6 @@ class YukikoEngine:
         aliases = self._get_bot_aliases()
         if any(alias in content for alias in aliases):
             return True
-
-        # 即使没叫机器人名字，明显"问机器人"的句式也视作指向机器人。
-        direct_cues = _prompt_cues(
-            "bot_call_direct_cues",
-            (
-                "你觉得",
-                "你怎么看",
-                "你认为",
-                "你能",
-                "你可以",
-                "你帮我",
-                "请你",
-                "问你",
-                "评价",
-                "分析",
-                "说说",
-                "总结",
-                "帮我",
-            ),
-        )
-        if any(cue in content for cue in direct_cues):
-            return True
-
         if ("?" in content or "？" in content) and "你" in content:
             return True
         return False
@@ -3078,22 +2929,7 @@ class YukikoEngine:
         content = normalize_text(text).lower()
         if not content:
             return False
-        cues = _prompt_cues(
-            "explicit_request_cues",
-            (
-                "你帮我", "帮我", "给我找", "给我发", "请你", "你能", "你可以",
-                "你去", "你来", "你给我", "帮忙", "麻烦你", "能不能",
-                "搜索", "搜一下", "查一下", "找一下", "查查", "搜搜",
-                "互联网搜索", "网上搜", "帮我查", "帮我搜",
-                "是什么", "是谁", "怎么", "如何", "为什么",
-                "记住我叫", "叫我", "喊我", "称呼我", "永久记忆",
-                "推荐", "有没有", "有什么",
-            ),
-        )
-        if any(cue in content for cue in cues):
-            return True
-
-        # 兜底：中文问句也视作显式请求，避免“正常提问却被当闲聊忽略”。
+        # 本地词表已移除，仅保留结构化“问句/请求”信号。
         if "?" in content or "？" in content:
             return True
         if re.search(r"(吗|呢|嘛|咋办|咋整|是否|是不是|行不行|可不可以)$", content):
@@ -3102,13 +2938,8 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_media_instruction(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = [normalize_text(cue).lower() for cue in _pl.get_list("media_instruction_cues") if normalize_text(cue)]
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     def _has_recent_reply_to_user(self, message: EngineMessage, within_seconds: int = 120) -> bool:
         state = self._last_reply_state.get(message.conversation_id, {})
@@ -3272,100 +3103,30 @@ class YukikoEngine:
         # BV/av 号识别
         if re.search(r"(?:bv|av)\w{6,}", content, flags=re.IGNORECASE):
             return True
-        cues = _prompt_cues(
-            "media_request_cues",
-            (
-                "图片", "图", "头像", "发送", "发图", "壁纸", "pixiv", "image", "photo",
-                "视频", "影片", "video", "clip", "mv", "动画", "番剧", "解析",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        return False
 
     def _looks_like_video_request(self, text: str) -> bool:
-        return _shared_video_request(text, config=self.config)
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if re.search(r"https?://[^\s]+", content):
+            return True
+        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", content, flags=re.IGNORECASE):
+            return True
+        return bool(re.search(r"\.(mp4|webm|mov|m4v)\b", content))
 
     @staticmethod
     def _looks_like_image_analyze_intent(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     def _looks_like_video_resolve_intent(self, text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        send_or_resolve_cues = _prompt_cues(
-            "video_resolve_action_cues",
-            (
-                "解析",
-                "解析链接",
-                "解析这个视频",
-                "解析视频",
-                "发送",
-                "发给我",
-                "发我",
-                "給我",
-                "给我",
-                "发视频",
-                "转发这个视频",
-                "下载这个视频",
-                "把视频发我",
-                "随便发我一个",
-                "隨便發我一個",
-            ),
-        )
-        has_action_cue = any(cue in content for cue in send_or_resolve_cues)
-        if not has_action_cue:
-            return False
-        # 允许“解析发我”这类省略“视频”字样的追发口语。
-        if self._looks_like_video_request(content):
-            return True
-        short_followup = _prompt_cues(
-            "video_resolve_short_followup_cues",
-            (
-                "发我",
-                "給我",
-                "给我",
-                "都可以",
-                "随便发我一个",
-                "隨便發我一個",
-            ),
-        )
-        if content in short_followup or any(content.startswith(cue) for cue in short_followup):
-            return True
-        return bool(re.search(r"(解析|parse)", content, flags=re.IGNORECASE))
+        _ = text
+        return False
 
     def _looks_like_video_analysis_intent(self, text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        if not self._looks_like_video_request(content):
-            return False
-        cues = _prompt_cues(
-            "video_analysis_cues",
-            (
-                "分析视频",
-                "解读视频",
-                "评价视频",
-                "总结视频",
-                "视频讲了啥",
-                "视频讲了什么",
-                "这个视频讲了啥",
-                "这个视频讲了什么",
-                "文字总结",
-                "讲讲这个视频",
-                "内容总结",
-                "深度分析",
-                "关键帧",
-                "字幕",
-                "逐帧",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_low_info_group_chitchat(text: str) -> bool:
@@ -3387,103 +3148,25 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_video_text_only_intent(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        plain = re.sub(r"\s+", "", content)
-        cues = _prompt_cues(
-            "video_text_only_cues",
-            (
-                "不需要本地下载发我",
-                "不需要下载发我",
-                "不用下载发我",
-                "不要发视频",
-                "只要总结",
-                "只要文字总结",
-                "只要文本总结",
-                "不需要本地下載發我",
-                "不需要下載發我",
-                "不要發視頻",
-                "只要文字總結",
-            ),
-        )
-        if any(cue in plain for cue in cues):
-            return True
-        patterns = (
-            r"不(?:需要|用|要)?(?:本地)?(?:下载|下載).{0,8}(?:发我|發我|给我|給我|发送|發送)",
-            r"(?:不要|别|別|不需要|不用).{0,4}(?:发|發|发送|發送).{0,4}(?:视频|視頻|影片)",
-            r"(?:只要|只需|仅要|僅要|仅需|僅需).{0,4}(?:文字|文本|总结|總結|结论|結論)",
-        )
-        return any(re.search(pattern, content) for pattern in patterns)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_download_task_intent(text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
-        cues = _prompt_cues(
-            "download_task_cues",
-            (
-                "下载",
-                "下載",
-                "安装包",
-                "安裝包",
-                "installer",
-                "setup",
-                ".exe",
-                ".apk",
-                ".ipa",
-                ".msi",
-                "上传群文件",
-                "發我",
-                "发我",
-                "给我文件",
-                "給我文件",
-                "desktop",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        return bool(re.search(r"\.(exe|apk|ipa|msi|zip|rar|7z)\b", content))
 
     @staticmethod
     def _looks_like_music_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = _prompt_cues(
-            "music_request_cues",
-            (
-                "点歌",
-                "听歌",
-                "放歌",
-                "搜歌",
-                "来首歌",
-                "来一首歌",
-                "播放歌曲",
-                "播放音乐",
-                "music",
-                "song",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_music_search_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = _prompt_cues(
-            "music_search_request_cues",
-            (
-                "搜歌",
-                "找歌",
-                "查歌",
-                "有什么歌",
-                "歌曲列表",
-                "歌单",
-                "music search",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _extract_music_keyword(text: str) -> str:
@@ -3581,10 +3264,18 @@ class YukikoEngine:
         return hit >= required
 
     def _looks_like_github_request(self, text: str) -> bool:
-        return _shared_github_request(text, config=self.config)
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if "github.com/" in content or re.search(r"\bgithub\b", content):
+            return True
+        return bool(re.search(r"\b[a-z0-9_.-]+/[a-z0-9_.-]+\b", content))
 
     def _looks_like_repo_readme_request(self, text: str) -> bool:
-        return _shared_repo_readme_request(text, config=self.config)
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        return bool(re.search(r"\breadme\b|文档|文檔|使用说明|使用說明|docs?", content, flags=re.IGNORECASE))
 
     @staticmethod
     def _extract_github_repo_from_text(text: str) -> str:
@@ -3603,10 +3294,20 @@ class YukikoEngine:
         return f"{owner}/{repo}"
 
     def _looks_like_qq_avatar_intent(self, text: str) -> bool:
-        return _shared_qq_avatar_intent(text, config=self.config)
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        has_avatar_token = ("头像" in content) or ("avatar" in content)
+        has_qq_target = bool(re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content)) or ("qq" in content)
+        return has_avatar_token and has_qq_target
 
     def _looks_like_qq_profile_intent(self, text: str) -> bool:
-        return _shared_qq_profile_intent(text, config=self.config)
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if not (re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content) or "qq" in content):
+            return False
+        return bool(re.search(r"(资料|資料|信息|信息|是谁|头像|空间|qzone|\?|？)", content))
 
     @staticmethod
     def _extract_candidate_qq_target(message: EngineMessage, text: str) -> str:
@@ -3689,37 +3390,13 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_local_file_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = _prompt_cues(
-            "local_file_request_cues",
-            (
-                "本地",
-                "文件",
-                "路径",
-                "读一下",
-                "读取",
-                "打开",
-                "看看这个文件",
-                "分析这个文件",
-                "学习这个文件",
-                "local",
-                "read",
-                "path",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_local_media_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = [normalize_text(cue).lower() for cue in _pl.get_list("local_media_request_cues") if normalize_text(cue)]
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_local_media_path(path: str) -> bool:
@@ -4220,19 +3897,13 @@ class YukikoEngine:
         content = normalize_text(text).lower()
         if not content:
             return False
-        cues = _prompt_cues(
-            "video_send_negative_claim_cues",
-            (
-                "没法直接下载",
-                "不能发视频",
-                "无法发送视频",
-                "不能直发",
-                "没法发送",
-                "无法下载发出",
-                "只能给链接",
-            ),
+        return bool(
+            re.search(
+                r"(没法|无法|不能).{0,8}(发|发送|下载).{0,6}(视频|影片)|只能.{0,4}(给|发).{0,4}(链接)",
+                content,
+                flags=re.IGNORECASE,
+            )
         )
-        return any(cue in content for cue in cues)
 
     @staticmethod
     def _inject_user_name(reply_text: str, user_name: str, should_address: bool) -> str:
@@ -4637,23 +4308,8 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_summary_followup(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = _prompt_cues(
-            "summary_followup_cues",
-            (
-                "总结",
-                "概括",
-                "简短说",
-                "说重点",
-                "一句话说",
-                "提炼",
-                "给我总结",
-                "简要总结",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_resend_followup(text: str) -> bool:
@@ -4813,41 +4469,13 @@ class YukikoEngine:
         return False
 
     def _looks_like_resend_media_followup(self, text: str) -> bool:
-        content = normalize_text(text)
-        if not content:
-            return False
-        cues = tuple(getattr(self, "search_followup_resend_media_cues", ()))
-        if not cues:
-            return False
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_source_trace_followup(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = _prompt_cues(
-            "source_trace_followup_cues",
-            (
-                "点的什么链接",
-                "點的什麼連結",
-                "什么链接",
-                "什麼連結",
-                "什么网站",
-                "什麼網站",
-                "哪个网站",
-                "哪個網站",
-                "你找的",
-                "你搜的",
-                "来源",
-                "來源",
-                "你确定",
-                "你確定",
-                "为什么又发一遍",
-                "為什麼又發一遍",
-            ),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     def _build_cached_source_trace_result(self, cached: dict[str, Any], text: str) -> dict[str, Any] | None:
         if not isinstance(cached, dict):
@@ -4904,14 +4532,8 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_sticker_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        cues = _prompt_cues(
-            "sticker_request_cues",
-            ("表情包", "表情", "emoji", "emote", "动图", "動圖", "gif", "贴纸", "貼紙"),
-        )
-        return any(cue in content for cue in cues)
+        _ = text
+        return False
 
     @staticmethod
     def _looks_like_choice_prompt_text(text: str) -> bool:
@@ -5336,6 +4958,24 @@ class YukikoEngine:
             rel_rows = rel_filtered
             return mem_rows[-18:], rel_rows[:8]
 
+        # 群聊短追问 + reply 他人时，收敛到当前用户/引用对象上下文，避免跨用户串台。
+        reply_uid = normalize_text(str(message.reply_to_user_id))
+        current_uid = normalize_text(str(message.user_id))
+        bot_uid = normalize_text(str(message.bot_id))
+        if (
+            reply_uid
+            and reply_uid not in {current_uid, bot_uid}
+            and self._looks_like_short_context_sensitive_query(text)
+        ):
+            focused_rows = [
+                row
+                for row in mem_rows
+                if row.startswith("[当前用户近期]") or row.startswith("[引用对象近期]")
+            ]
+            if focused_rows:
+                mem_rows = focused_rows[-18:]
+            rel_rows = []
+
         # 用户只说“还记得链接吗”这类模糊追问时，不把历史 URL 喂给模型，避免串题误召回。
         if self._looks_like_ambiguous_link_memory_query(text):
             if not self._extract_urls_from_text(message.reply_to_text):
@@ -5421,17 +5061,42 @@ class YukikoEngine:
             return False
         if re.search(r"https?://", content, flags=re.IGNORECASE):
             return False
-        link_topic_cues = _prompt_cues("ambiguous_link_topic_cues", ("链接", "連結", "网址", "網址", "url"))
-        if not any(cue in content for cue in link_topic_cues):
+        if not any(token in content for token in ("链接", "連結", "网址", "網址", "url")):
             return False
         # 只要能提取到具体话题锚点，就不算模糊链接追问。
         if YukikoEngine._extract_topic_terms_for_memory(content, max_terms=3):
             return False
-        recall_cues = _prompt_cues(
-            "ambiguous_link_recall_cues",
-            ("还记得", "记得", "那个", "这个", "上次", "之前", "发过", "给我的", "那条", "这条", "第一个"),
+        return bool(re.search(r"(还记得|记得|那个|这个|上次|之前|发过|给我的|那条|这条|第一个)", content))
+
+    @staticmethod
+    def _looks_like_short_context_sensitive_query(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if re.search(r"https?://", content, flags=re.IGNORECASE):
+            return False
+        if len(content) <= 6:
+            return True
+        if len(content) > 24:
+            return False
+        cues = (
+            "怎么没",
+            "怎么不",
+            "咋没",
+            "咋不",
+            "哪呢",
+            "在哪",
+            "发出来",
+            "没发",
+            "这张",
+            "那张",
+            "这个",
+            "那个",
+            "刚才",
+            "上面",
+            "你说的",
         )
-        return any(cue in content for cue in recall_cues)
+        return any(cue in content for cue in cues)
 
     def _remember_agent_followup_cache(self, message: EngineMessage, agent_result: AgentResult) -> None:
         """将 Agent 的候选/媒体结果写入会话缓存。"""
@@ -5870,10 +5535,6 @@ class YukikoEngine:
             "扯淡",
             "这不对",
         )
-        feedback_cues = _prompt_cues(
-            "fragment_feedback_cues",
-            feedback_cues,
-        )
         if any(cue in content for cue in feedback_cues):
             return False
 
@@ -5897,35 +5558,6 @@ class YukikoEngine:
         if content in {"?", "？", "??", "？？"}:
             return True
 
-        cues = _prompt_cues(
-            "fragment_continuation_cues",
-            (
-                "是谁",
-                "是什么",
-                "什么意思",
-                "什么来历",
-                "来历",
-                "谁",
-                "哪位",
-                "哪来的",
-                "怎么说",
-                "怎么写",
-                "总结",
-                "简短说",
-                "快点说",
-                "详细说",
-                "分段说",
-                "分析一下",
-                "介绍一下",
-                "给我总结",
-                "上网搜",
-                "你去搜",
-            ),
-            lowercase=False,
-        )
-        if any(cue in content for cue in cues):
-            return True
-
         # "是谁/是什么/怎么..."这类疑问尾句默认视作补句。
         if re.search(r"(谁|什么|哪里|哪位|怎么|为何|为什么|呢|嘛|吗)\s*$", content):
             return True
@@ -5936,11 +5568,7 @@ class YukikoEngine:
         content = normalize_text(text).lower()
         if not content:
             return False
-        timeout_cues = _prompt_cues(
-            "fragment_timeout_nudge_cues",
-            ("?", "？", "??", "？？", "人呢", "在吗", "快点", "说话", "回复", "还在吗"),
-        )
-        if content in set(timeout_cues):
+        if content in {"?", "？", "??", "？？", "人呢", "在吗", "快点", "说话", "回复", "还在吗"}:
             return True
         if re.fullmatch(r"[?？!！]+", content):
             return True

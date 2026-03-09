@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from utils.text import normalize_text
+
 _log = logging.getLogger("yukiko.sticker")
 
 _QQ_DATA_ROOTS = [
@@ -469,6 +471,100 @@ class StickerManager:
             if emoji and emoji.learned:
                 return key, emoji
         return None
+
+    def update_emoji_metadata(
+        self,
+        key: str = "",
+        source_user: str = "",
+        description: str = "",
+        category: str = "",
+        tags: list[str] | None = None,
+        emotions: list[str] | None = None,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """手动纠正表情包元数据（用户纠偏入口）。"""
+        target_key = normalize_text(str(key))
+        source = normalize_text(str(source_user))
+        latest_aliases = {"latest", "last", "recent", "最近", "最新", "刚学", "刚学的", "刚刚学"}
+
+        chosen_key = target_key
+        chosen_emoji: EmojiInfo | None = None
+        if not chosen_key or chosen_key.lower() in latest_aliases:
+            latest = self.last_learned_emoji(source_user=source) or self.last_learned_emoji()
+            if latest:
+                chosen_key, chosen_emoji = latest
+        else:
+            chosen_emoji = self._emojis.get(chosen_key)
+            if not chosen_emoji:
+                for k, e in self._emojis.items():
+                    if k.endswith(chosen_key) or normalize_text(e.description) == chosen_key:
+                        chosen_key, chosen_emoji = k, e
+                        break
+
+        if not chosen_key or not chosen_emoji:
+            return False, "未找到要纠正的表情包，请先学习/扫描后再试", {}
+
+        updated = False
+        desc = normalize_text(description)
+        if desc:
+            chosen_emoji.description = desc
+            updated = True
+
+        cat = normalize_text(category)
+        if cat:
+            if cat == "其它":
+                cat = "其他"
+            chosen_emoji.category = cat if cat in _VALID_CATEGORIES else "其他"
+            updated = True
+
+        if tags is not None:
+            cleaned_tags: list[str] = []
+            seen_tags: set[str] = set()
+            for item in tags:
+                t = normalize_text(str(item)).lstrip("#")
+                if not t or t in seen_tags:
+                    continue
+                seen_tags.add(t)
+                cleaned_tags.append(t)
+                if len(cleaned_tags) >= 16:
+                    break
+            chosen_emoji.tags = cleaned_tags
+            updated = True
+
+        if emotions is not None:
+            cleaned_emotions: list[str] = []
+            seen_emotions: set[str] = set()
+            for item in emotions:
+                t = normalize_text(str(item))
+                if not t or t in seen_emotions:
+                    continue
+                seen_emotions.add(t)
+                cleaned_emotions.append(t)
+                if len(cleaned_emotions) >= 12:
+                    break
+            chosen_emoji.emotions = cleaned_emotions
+            updated = True
+
+        if not updated:
+            return False, "没有可更新的字段，请至少提供描述/分类/标签/情绪之一", {}
+
+        chosen_emoji.learned = True
+        chosen_emoji.registered = True
+        chosen_emoji.manual_override = True
+        if source:
+            self._last_learned_by_user[source] = chosen_key
+        self._last_learned_global = chosen_key
+        self._save_knowledge()
+
+        payload = {
+            "key": chosen_key,
+            "description": chosen_emoji.description,
+            "category": chosen_emoji.category,
+            "tags": list(chosen_emoji.tags),
+            "emotions": list(chosen_emoji.emotions),
+            "manual_override": chosen_emoji.manual_override,
+        }
+        _log.info("sticker_corrected | key=%s | source=%s", chosen_key, source or "-")
+        return True, "已更新表情包描述并写入知识库", payload
 
     async def learn_from_chat(
         self,

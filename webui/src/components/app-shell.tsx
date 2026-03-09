@@ -3,7 +3,7 @@ import { Button } from "@heroui/react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   LayoutDashboard, Settings, FileText, Terminal,
-  RefreshCw, LogOut, ChevronLeft, ChevronRight, MoonStar, SunMedium, Database, Cookie, Puzzle,
+  RefreshCw, LogOut, ChevronLeft, ChevronRight, MoonStar, SunMedium, Database, Cookie, Puzzle, Brain, MessageSquare,
 } from "lucide-react";
 import { api } from "../api/client";
 import { useState } from "react";
@@ -16,6 +16,8 @@ const NAV_ITEMS = [
   { path: "/plugins", icon: Puzzle, label: "插件" },
   { path: "/logs", icon: Terminal, label: "日志" },
   { path: "/database", icon: Database, label: "数据库" },
+  { path: "/chat", icon: MessageSquare, label: "聊天控制台" },
+  { path: "/memory", icon: Brain, label: "记忆库" },
   { path: "/cookies", icon: Cookie, label: "Cookie" },
 ];
 
@@ -35,7 +37,8 @@ export default function AppShell() {
 
   const handleLogout = () => { api.clearToken(); navigate("/login"); };
   const currentPath = location.pathname;
-  const contentMaxWidth = (currentPath.startsWith("/config") || currentPath.startsWith("/database"))
+  const contentMaxWidth = (currentPath.startsWith("/config") || currentPath.startsWith("/database") || currentPath.startsWith("/chat"))
+    || currentPath.startsWith("/memory")
     ? "max-w-[1600px]"
     : "max-w-[1000px]";
 

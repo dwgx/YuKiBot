@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import copy
 import inspect
@@ -15,23 +16,31 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from starlette.requests import Request
 
+from core.recalled_messages import (
+    build_conversation_id as _build_recall_conversation_id,
+    list_recalled_messages as _list_recalled_messages,
+    record_recalled_message as _record_recalled_message,
+)
 from core.config_templates import (
     deep_merge_dict as _deep_merge_template,
     ensure_prompts_file as _ensure_prompts_file_from_template,
     load_config_template,
     load_prompts_template,
 )
+from core.image_gen import ImageGenEngine
 from core import prompt_loader as _pl
-from utils.text import normalize_text
+from utils.text import clip_text, normalize_text
 
 _log = logging.getLogger("yukiko.webui")
 router = APIRouter(prefix="/api/webui", tags=["webui"])
@@ -301,6 +310,11 @@ def _open_sqlite_readonly(db_path: Path) -> sqlite3.Connection:
     return sqlite3.connect(uri, uri=True)
 
 
+def _open_sqlite_readwrite(db_path: Path) -> sqlite3.Connection:
+    """以读写模式打开 SQLite 数据库。"""
+    return sqlite3.connect(str(db_path))
+
+
 def _quote_ident(name: str) -> str:
     """安全引用 SQL 标识符。"""
     if _SQL_IDENT_RE.match(name):
@@ -531,6 +545,61 @@ def _apply_control_mapping(config: dict) -> dict:
         config["output"]["token_saving"] = bool(controls["token_saving"])
 
     return config
+
+
+def _strip_deprecated_local_paths_config(config: dict) -> dict:
+    """清理已废弃的本地关键词/本地方法相关配置键。"""
+    payload = copy.deepcopy(config) if isinstance(config, dict) else {}
+
+    control = payload.get("control")
+    if isinstance(control, dict):
+        control.pop("heuristic_rules_enable", None)
+        control.pop("disable_local_keyword_paths", None)
+
+    routing = payload.get("routing")
+    if isinstance(routing, dict):
+        routing.pop("enable_keyword_heuristics", None)
+        mode = normalize_text(str(routing.get("mode", ""))).lower()
+        if mode and mode != "ai_full":
+            routing["mode"] = "ai_full"
+
+    search = payload.get("search")
+    if isinstance(search, dict):
+        tool_interface = search.get("tool_interface")
+        if isinstance(tool_interface, dict):
+            tool_interface.pop("local_enable", None)
+            tool_interface.pop("local_allowed_roots", None)
+            tool_interface.pop("local_allow_project_root", None)
+            tool_interface.pop("local_allow_sensitive_files", None)
+            tool_interface.pop("local_read_max_chars", None)
+
+    # 纯 AI 路由后废弃的本地 cue/intent 配置键
+    payload.pop("intent", None)
+
+    memory = payload.get("memory")
+    if isinstance(memory, dict):
+        memory.pop("agent_directive_cues", None)
+        memory.pop("agent_directive_target_cues", None)
+
+    knowledge = payload.get("knowledge_update")
+    if isinstance(knowledge, dict):
+        knowledge.pop("explicit_fact_cues", None)
+        knowledge.pop("speculative_cues", None)
+        knowledge.pop("fragment_short_cues", None)
+        knowledge.pop("question_prefixes", None)
+        knowledge.pop("question_tokens", None)
+
+    agent = payload.get("agent")
+    if isinstance(agent, dict):
+        high_risk = agent.get("high_risk_control")
+        if isinstance(high_risk, dict):
+            high_risk.pop("confirm_cues", None)
+            high_risk.pop("cancel_cues", None)
+
+    followup = payload.get("search_followup")
+    if isinstance(followup, dict):
+        followup.pop("resend_media_cues", None)
+    return payload
 
 
 def _normalize_plugin_rules(raw: Any) -> list[str]:
@@ -779,6 +848,7 @@ async def get_config():
 
     raw = getattr(e.config_manager, "raw", {})
     masked = _mask_sensitive(raw if isinstance(raw, dict) else {})
+    masked = _strip_deprecated_local_paths_config(masked)
     masked = _inject_webui_config_defaults(masked)
 
     # 注入 admin 相关信息
@@ -814,6 +884,7 @@ async def put_config(request: Request):
     new_config = body.get("config", {})
     if not isinstance(new_config, dict):
         raise HTTPException(400, "config 必须是对象")
+    new_config = _strip_deprecated_local_paths_config(new_config)
 
     # 应用控制面板映射
     new_config = _apply_control_mapping(new_config)
@@ -846,6 +917,7 @@ async def get_prompts():
     """获取提示词配置。"""
     text, parsed, generated = _read_prompts_payload()
     return {
+        "content": text,
         "yaml_text": text,
         "parsed": parsed,
         "generated_default": generated,
@@ -855,11 +927,30 @@ async def get_prompts():
 @router.put("/prompts", dependencies=[Depends(_check_auth)])
 async def put_prompts(request: Request):
     """完整替换提示词配置。"""
-    body = await request.json()
-    yaml_text = body.get("yaml_text", "")
+    raw_body = await request.body()
+    body: Any = {}
+    if raw_body:
+        try:
+            body = json.loads(raw_body.decode("utf-8"))
+        except Exception:
+            body = {}
+
+    yaml_text = ""
+    if isinstance(body, str):
+        yaml_text = body
+    elif isinstance(body, dict):
+        yaml_text = body.get("yaml_text", "")
+        if not isinstance(yaml_text, str) or not yaml_text.strip():
+            yaml_text = body.get("content", "")
+    elif raw_body:
+        with contextlib.suppress(Exception):
+            yaml_text = raw_body.decode("utf-8")
+
+    if not isinstance(yaml_text, str):
+        yaml_text = ""
 
     if not yaml_text.strip():
-        raise HTTPException(400, "yaml_text 不能为空")
+        raise HTTPException(400, "yaml_text/content 不能为空")
 
     # 验证 YAML 格式
     try:
@@ -877,7 +968,7 @@ async def put_prompts(request: Request):
     _pl.reload()
     _log.info("提示词已更新并重载")
 
-    return {"ok": True, "message": "提示词已保存并重载"}
+    return {"ok": True, "message": "提示词已保存并重载", "parsed": parsed}
 
 
 @router.patch("/prompts", dependencies=[Depends(_check_auth)])
@@ -904,7 +995,7 @@ async def patch_prompts(request: Request):
     _pl.reload()
     _log.info("提示词已部分更新并重载")
 
-    return {"ok": True, "message": "提示词已更新并重载"}
+    return {"ok": True, "message": "提示词已更新并重载", "parsed": merged}
 
 
 @router.post("/reload", dependencies=[Depends(_check_auth)])
@@ -1173,6 +1264,1037 @@ async def db_rows(
     }
 
 
+@router.post("/db/{db_name}/clear", dependencies=[Depends(_check_auth)])
+async def db_clear_rows(request: Request, db_name: str):
+    """清空指定表的全部数据。"""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    table = normalize_text(str(body.get("table", "")))
+    if not table:
+        raise HTTPException(400, "table 不能为空")
+    if table.lower().startswith("sqlite_"):
+        raise HTTPException(400, "不允许清空系统表")
+
+    db_path = _resolve_webui_db_path(db_name)
+    conn = _open_sqlite_readwrite(db_path)
+    try:
+        tables = _list_tables(conn, include_system=False)
+        if table not in tables:
+            raise HTTPException(404, f"表 {table} 不存在")
+
+        quoted_table = _quote_ident(table)
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT COUNT(*) FROM {quoted_table}")
+        before_count = int(cursor.fetchone()[0] or 0)
+        cursor.execute(f"DELETE FROM {quoted_table}")
+        with contextlib.suppress(Exception):
+            cursor.execute("DELETE FROM sqlite_sequence WHERE name = ?", (table,))
+        conn.commit()
+        return {
+            "ok": True,
+            "message": f"已清空 {table}",
+            "db": db_name,
+            "table": table,
+            "deleted": before_count,
+        }
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as exc:
+        conn.rollback()
+        raise HTTPException(500, f"清空失败: {exc}") from exc
+    finally:
+        conn.close()
+
+
+def _unwrap_onebot_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        if "data" in payload and ("retcode" in payload or "status" in payload):
+            return payload.get("data")
+    return payload
+
+
+def _normalize_chat_type(value: str) -> str:
+    raw = normalize_text(str(value)).lower()
+    if raw in {"group", "group_chat", "2", "grp"}:
+        return "group"
+    if raw in {"private", "friend", "dm", "1", "single"}:
+        return "private"
+    return ""
+
+
+async def _get_onebot_runtime(bot_id: str = "") -> Any:
+    try:
+        import nonebot
+    except Exception as exc:
+        raise HTTPException(503, f"NoneBot 不可用: {exc}") from exc
+
+    bots = nonebot.get_bots()
+    if not isinstance(bots, dict) or not bots:
+        raise HTTPException(503, "未检测到在线 OneBot 实例")
+
+    prefer_id = normalize_text(str(bot_id))
+    if prefer_id and prefer_id in bots:
+        return bots[prefer_id]
+    for _, bot in bots.items():
+        return bot
+    raise HTTPException(503, "未检测到在线 OneBot 实例")
+
+
+async def _onebot_call(api: str, *, bot_id: str = "", **kwargs: Any) -> Any:
+    bot = await _get_onebot_runtime(bot_id=bot_id)
+    try:
+        payload = await bot.call_api(api, **kwargs)
+    except Exception as exc:
+        tail = clip_text(normalize_text(str(exc)), 220)
+        raise HTTPException(502, f"调用 {api} 失败: {tail}") from exc
+    return _unwrap_onebot_payload(payload)
+
+
+def _render_message_text(raw_message: Any, segments: Any) -> str:
+    text = normalize_text(str(raw_message))
+    if text:
+        return text
+    if not isinstance(segments, list):
+        return ""
+    parts: list[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        data = seg.get("data", {}) or {}
+        if seg_type == "text":
+            part = normalize_text(str(data.get("text", "")))
+            if part:
+                parts.append(part)
+        elif seg_type in {"image", "video", "record", "audio", "file"}:
+            parts.append(f"[{seg_type}]")
+        elif seg_type == "at":
+            qq = normalize_text(str(data.get("qq", "")))
+            parts.append(f"@{qq or 'someone'}")
+        elif seg_type:
+            parts.append(f"[{seg_type}]")
+    return normalize_text(" ".join(parts))
+
+
+def _format_chat_message_item(item: dict[str, Any], *, bot_self_id: str) -> dict[str, Any]:
+    sender = item.get("sender", {}) if isinstance(item, dict) else {}
+    if not isinstance(sender, dict):
+        sender = {}
+    sender_id = normalize_text(str(sender.get("user_id", "")))
+    sender_name = (
+        normalize_text(str(sender.get("card", "")))
+        or normalize_text(str(sender.get("nickname", "")))
+        or sender_id
+    )
+    role = normalize_text(str(sender.get("role", ""))).lower()
+    segments = item.get("message", [])
+    if not isinstance(segments, list):
+        segments = []
+    text = _render_message_text(item.get("raw_message", ""), segments)
+    ts = int(item.get("time", 0) or 0)
+    return {
+        "message_id": normalize_text(str(item.get("message_id", "") or item.get("real_id", "") or item.get("id", ""))),
+        "seq": normalize_text(str(item.get("message_seq", "") or item.get("real_seq", ""))),
+        "timestamp": ts,
+        "time_iso": (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) if ts > 0 else ""),
+        "sender_id": sender_id,
+        "sender_name": sender_name or "未知用户",
+        "sender_role": role,
+        "is_self": bool(sender_id and sender_id == normalize_text(bot_self_id)),
+        "is_essence": False,
+        "is_recalled": False,
+        "recalled_at": 0,
+        "recalled_source": "",
+        "text": text,
+        "segments": segments,
+    }
+
+
+async def _resolve_group_bot_role(group_id: int, *, bot_id: str = "") -> str:
+    """查询当前机器人在群内的角色（owner/admin/member）。"""
+    bot = await _get_onebot_runtime(bot_id=bot_id)
+    self_id = normalize_text(str(getattr(bot, "self_id", "")))
+    if not self_id.isdigit():
+        return ""
+    try:
+        info = await _onebot_call(
+            "get_group_member_info",
+            bot_id=bot_id,
+            group_id=int(group_id),
+            user_id=int(self_id),
+            no_cache=True,
+        )
+    except Exception:
+        return ""
+    if not isinstance(info, dict):
+        return ""
+    return normalize_text(str(info.get("role", ""))).lower()
+
+
+async def _resolve_group_essence_message_ids(group_id: int, *, bot_id: str = "") -> set[str]:
+    try:
+        raw = await _onebot_call("get_essence_msg_list", bot_id=bot_id, group_id=int(group_id))
+    except Exception:
+        return set()
+    items = raw.get("items", []) if isinstance(raw, dict) else raw
+    if not isinstance(items, list):
+        return set()
+
+    ids: set[str] = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in ("message_id", "msg_id", "id", "messageId"):
+            value = normalize_text(str(item.get(key, "")))
+            if value:
+                ids.add(value)
+        for key in ("message_seq", "msg_seq", "seq"):
+            value = normalize_text(str(item.get(key, "")))
+            if value:
+                ids.add(f"seq:{value}")
+    return ids
+
+
+def _chat_message_item_key(item: dict[str, Any]) -> str:
+    message_id = normalize_text(str(item.get("message_id", "")))
+    if message_id:
+        return message_id
+    seq = normalize_text(str(item.get("seq", "")))
+    return f"seq:{seq}" if seq else ""
+
+
+def _unwrap_onebot_message_payload(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        data = raw.get("data")
+        if isinstance(data, dict) and (
+            data.get("message_id")
+            or data.get("real_id")
+            or data.get("message")
+            or data.get("raw_message")
+        ):
+            return data
+        return raw
+    return {}
+
+
+def _resolve_message_scope_from_raw(item: dict[str, Any]) -> tuple[str, str]:
+    message_type = normalize_text(str(item.get("message_type", ""))).lower()
+    group_id = normalize_text(str(item.get("group_id", "")))
+    user_id = normalize_text(str(item.get("user_id", "")))
+    sender = item.get("sender", {}) if isinstance(item.get("sender"), dict) else {}
+    sender_id = normalize_text(str(sender.get("user_id", "")))
+    if message_type == "group" or group_id:
+        return "group", group_id
+    if message_type in {"private", "friend"}:
+        peer_id = user_id or sender_id
+        return "private", peer_id
+    return "", ""
+
+
+def _build_recall_payload_from_message(
+    item: dict[str, Any],
+    *,
+    bot_self_id: str,
+    chat_type: str,
+    peer_id: str,
+    bot_id: str = "",
+    operator_id: str = "",
+    operator_name: str = "",
+    source: str = "",
+    note: str = "",
+) -> dict[str, Any]:
+    mapped = _format_chat_message_item(item, bot_self_id=bot_self_id)
+    mapped.update(
+        {
+            "conversation_id": _build_recall_conversation_id(chat_type, peer_id),
+            "chat_type": chat_type,
+            "peer_id": peer_id,
+            "bot_id": bot_id,
+            "operator_id": operator_id,
+            "operator_name": operator_name,
+            "source": source,
+            "note": note,
+        }
+    )
+    return mapped
+
+
+def _format_recalled_record_item(item: dict[str, Any]) -> dict[str, Any]:
+    ts = int(item.get("timestamp", 0) or 0)
+    recalled_at = int(item.get("recalled_at", 0) or 0)
+    segments = item.get("segments", [])
+    return {
+        "message_id": normalize_text(str(item.get("message_id", ""))),
+        "seq": normalize_text(str(item.get("seq", ""))),
+        "timestamp": ts,
+        "time_iso": (time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(ts)) if ts > 0 else ""),
+        "sender_id": normalize_text(str(item.get("sender_id", ""))),
+        "sender_name": normalize_text(str(item.get("sender_name", ""))) or "未知用户",
+        "sender_role": normalize_text(str(item.get("sender_role", ""))).lower(),
+        "is_self": bool(item.get("is_self")),
+        "is_essence": False,
+        "is_recalled": True,
+        "recalled_at": recalled_at,
+        "recalled_source": normalize_text(str(item.get("source", ""))),
+        "text": str(item.get("text", "") or _render_message_text("", segments)),
+        "segments": segments if isinstance(segments, list) else [],
+    }
+
+
+def _normalize_message_segments(message: Any) -> list[dict[str, Any]]:
+    if isinstance(message, list):
+        items: list[dict[str, Any]] = []
+        for seg in message:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            raw_data = seg.get("data", {}) or {}
+            seg_data = raw_data if isinstance(raw_data, dict) else {}
+            if seg_type:
+                items.append({"type": seg_type, "data": seg_data})
+        return items
+
+    if not isinstance(message, str) or not message:
+        return []
+
+    items: list[dict[str, Any]] = []
+    for m in re.finditer(r"\[CQ:([a-zA-Z0-9_]+)(?:,([^\]]*))?\]", message):
+        seg_type = normalize_text(m.group(1)).lower()
+        raw_data = m.group(2) or ""
+        seg_data: dict[str, Any] = {}
+        if raw_data:
+            for pair in raw_data.split(","):
+                if "=" not in pair:
+                    continue
+                key, value = pair.split("=", 1)
+                seg_data[normalize_text(key)] = normalize_text(value)
+        if seg_type:
+            items.append({"type": seg_type, "data": seg_data})
+    return items
+
+
+def _resolve_local_path_from_file_uri(raw: str) -> Path | None:
+    value = normalize_text(raw)
+    if not value:
+        return None
+    if value.lower().startswith("file://"):
+        path_text = unquote(value[7:])
+        if re.match(r"^/[A-Za-z]:/", path_text):
+            path_text = path_text[1:]
+        return Path(path_text)
+    return Path(unquote(value))
+
+
+def _decode_base64_payload(value: str) -> bytes | None:
+    raw = normalize_text(value)
+    if not raw:
+        return None
+    if raw.startswith("base64://"):
+        raw = raw[len("base64://") :]
+    if raw.startswith("data:"):
+        _, _, tail = raw.partition(",")
+        raw = tail
+    if not raw:
+        return None
+    with contextlib.suppress(Exception):
+        return base64.b64decode(raw)
+    return None
+
+
+async def _download_image_bytes(url: str) -> tuple[bytes | None, str]:
+    target = normalize_text(url)
+    if not target:
+        return None, "empty_url"
+
+    if target.startswith("base64://") or target.startswith("data:"):
+        blob = _decode_base64_payload(target)
+        if blob:
+            return blob, "base64"
+        return None, "invalid_base64"
+
+    local_candidate = _resolve_local_path_from_file_uri(target)
+    if local_candidate is not None and (target.lower().startswith("file://") or local_candidate.exists()):
+        with contextlib.suppress(Exception):
+            data = local_candidate.read_bytes()
+            if data:
+                return data, "local_file"
+
+    if target.startswith("http://") or target.startswith("https://"):
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
+                resp = await client.get(target)
+            if resp.status_code >= 400:
+                return None, f"http_{resp.status_code}"
+            if resp.content:
+                return resp.content, "http"
+            return None, "empty_http_body"
+        except Exception as exc:
+            return None, f"http_error:{normalize_text(str(exc))}"
+
+    return None, "unsupported_url"
+
+
+async def _extract_image_bytes_from_message(payload: dict[str, Any], *, bot_id: str = "") -> tuple[bytes | None, str]:
+    if not isinstance(payload, dict):
+        return None, "invalid_message_payload"
+
+    segments = _normalize_message_segments(payload.get("message"))
+    if not segments:
+        segments = _normalize_message_segments(payload.get("raw_message"))
+
+    image_seg = next((seg for seg in segments if normalize_text(str(seg.get("type", ""))).lower() == "image"), None)
+    if not image_seg:
+        return None, "message_has_no_image_segment"
+
+    data = image_seg.get("data", {}) if isinstance(image_seg, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+
+    url_value = normalize_text(str(data.get("url", "") or data.get("image_url", "")))
+    if url_value:
+        blob, source = await _download_image_bytes(url_value)
+        if blob:
+            return blob, f"segment_{source}"
+
+    file_value = normalize_text(str(data.get("file", "")))
+    if file_value:
+        blob, source = await _download_image_bytes(file_value)
+        if blob:
+            return blob, f"segment_file_{source}"
+
+        get_image_payload = None
+        if file_value:
+            with contextlib.suppress(Exception):
+                get_image_payload = await _onebot_call("get_image", bot_id=bot_id, file=file_value)
+        if isinstance(get_image_payload, dict):
+            for key in ("path", "file", "file_path", "local_path", "filename"):
+                local_path = normalize_text(str(get_image_payload.get(key, "")))
+                if not local_path:
+                    continue
+                local_file = _resolve_local_path_from_file_uri(local_path)
+                if local_file is None:
+                    continue
+                with contextlib.suppress(Exception):
+                    bytes_data = local_file.read_bytes()
+                    if bytes_data:
+                        return bytes_data, f"get_image_{key}"
+            for key in ("url", "image_url", "download_url"):
+                remote = normalize_text(str(get_image_payload.get(key, "")))
+                if not remote:
+                    continue
+                blob, source = await _download_image_bytes(remote)
+                if blob:
+                    return blob, f"get_image_{key}_{source}"
+
+    return None, "image_download_failed"
+
+
+async def _get_onebot_message_detail(message_id: str, *, bot_id: str = "") -> dict[str, Any]:
+    mid = normalize_text(message_id)
+    if not mid:
+        raise HTTPException(400, "message_id 不能为空")
+    try:
+        result = await _onebot_call("get_msg", bot_id=bot_id, message_id=int(mid))
+    except Exception:
+        result = await _onebot_call("get_msg", bot_id=bot_id, message_id=mid)
+    if not isinstance(result, dict):
+        raise HTTPException(502, "get_msg 返回异常")
+    return result
+
+
+def _resolve_sticker_manager() -> Any:
+    sticker = getattr(_engine, "sticker", None) if _engine is not None else None
+    if sticker is None:
+        raise HTTPException(503, "表情包系统未初始化")
+    saver = getattr(sticker, "_save_chat_emoji", None)
+    if not callable(saver):
+        raise HTTPException(503, "表情包系统不支持快捷添加")
+    return sticker
+
+
+@router.get("/chat/conversations", dependencies=[Depends(_check_auth)])
+async def chat_conversations(
+    limit: int = Query(100, ge=1, le=500),
+    bot_id: str = Query(""),
+):
+    recent_raw = await _onebot_call("get_recent_contact", bot_id=bot_id, count=int(limit))
+    recent = recent_raw.get("items", []) if isinstance(recent_raw, dict) else recent_raw
+    if not isinstance(recent, list):
+        recent = []
+
+    rows: list[dict[str, Any]] = []
+    for item in recent:
+        if not isinstance(item, dict):
+            continue
+        chat_type = "group" if int(item.get("chatType", 0) or 0) == 2 else "private"
+        peer_id = normalize_text(str(item.get("peerUin", "") or item.get("peerUid", "") or item.get("peer_id", "")))
+        if not peer_id:
+            continue
+        peer_name = (
+            normalize_text(str(item.get("peerName", "")))
+            or normalize_text(str(item.get("remark", "")))
+            or peer_id
+        )
+        ts = int(item.get("msgTime", 0) or 0)
+        rows.append(
+            {
+                "conversation_id": f"{chat_type}:{peer_id}",
+                "chat_type": chat_type,
+                "peer_id": peer_id,
+                "peer_name": peer_name,
+                "last_time": ts,
+                "unread_count": int(item.get("unreadCnt", 0) or 0),
+                "last_message": _render_message_text(item.get("lastMsg", ""), item.get("lastMsgSegs", [])),
+            }
+        )
+
+    rows.sort(key=lambda item: int(item.get("last_time", 0) or 0), reverse=True)
+    return {"items": rows[: int(limit)], "total": len(rows)}
+
+
+@router.get("/chat/history", dependencies=[Depends(_check_auth)])
+async def chat_history(
+    chat_type: str = Query(...),
+    peer_id: str = Query(...),
+    limit: int = Query(30, ge=1, le=120),
+    message_seq: str = Query(""),
+    bot_id: str = Query(""),
+):
+    resolved_type = _normalize_chat_type(chat_type)
+    target_id = normalize_text(peer_id)
+    conversation_id = _build_recall_conversation_id(resolved_type, target_id)
+    if resolved_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+    if not target_id:
+        raise HTTPException(400, "peer_id 不能为空")
+
+    kwargs: dict[str, Any] = {}
+    if normalize_text(message_seq):
+        with contextlib.suppress(Exception):
+            kwargs["message_seq"] = int(str(message_seq))
+
+    if resolved_type == "group":
+        try:
+            kwargs["group_id"] = int(target_id)
+        except Exception as exc:
+            raise HTTPException(400, "group peer_id 必须是数字") from exc
+        raw = await _onebot_call("get_group_msg_history", bot_id=bot_id, **kwargs)
+    else:
+        try:
+            kwargs["user_id"] = int(target_id)
+        except Exception as exc:
+            raise HTTPException(400, "private peer_id 必须是数字") from exc
+        kwargs["count"] = int(limit)
+        raw = await _onebot_call("get_friend_msg_history", bot_id=bot_id, **kwargs)
+
+    bot = await _get_onebot_runtime(bot_id=bot_id)
+    items = raw.get("messages", []) if isinstance(raw, dict) else raw
+    if isinstance(raw, dict) and not items:
+        items = raw.get("items", [])
+    if not isinstance(items, list):
+        items = []
+    mapped = [_format_chat_message_item(row, bot_self_id=str(getattr(bot, "self_id", ""))) for row in items if isinstance(row, dict)]
+    mapped.sort(key=lambda item: int(item.get("timestamp", 0) or 0))
+    permission = {
+        "bot_role": "",
+        "can_recall": False,
+        "can_set_essence": False,
+    }
+    if resolved_type == "group":
+        role = await _resolve_group_bot_role(int(target_id), bot_id=bot_id)
+        can_group_manage = role in {"owner", "admin"}
+        essence_ids = await _resolve_group_essence_message_ids(int(target_id), bot_id=bot_id)
+        if essence_ids:
+            for item in mapped:
+                message_id = normalize_text(str(item.get("message_id", "")))
+                seq = normalize_text(str(item.get("seq", "")))
+                item["is_essence"] = bool(
+                    (message_id and message_id in essence_ids)
+                    or (seq and f"seq:{seq}" in essence_ids)
+                )
+        permission = {
+            "bot_role": role,
+            "can_recall": can_group_manage,
+            "can_set_essence": can_group_manage,
+        }
+    recalled_items = _list_recalled_messages(conversation_id, limit=max(120, int(limit) * 3))
+    if recalled_items:
+        existing: dict[str, dict[str, Any]] = {}
+        for item in mapped:
+            key = _chat_message_item_key(item)
+            if key:
+                existing[key] = item
+        for raw in recalled_items:
+            recalled = _format_recalled_record_item(raw)
+            key = _chat_message_item_key(recalled)
+            current = existing.get(key)
+            if current is not None:
+                current["is_recalled"] = True
+                current["recalled_at"] = int(raw.get("recalled_at", 0) or 0)
+                current["recalled_source"] = normalize_text(str(raw.get("source", "")))
+                if not normalize_text(str(current.get("text", ""))) and normalize_text(str(recalled.get("text", ""))):
+                    current["text"] = recalled["text"]
+                if not isinstance(current.get("segments"), list) or not current.get("segments"):
+                    current["segments"] = recalled["segments"]
+                continue
+            mapped.append(recalled)
+            if key:
+                existing[key] = recalled
+        mapped.sort(key=lambda item: int(item.get("timestamp", 0) or 0))
+    return {
+        "conversation_id": conversation_id,
+        "chat_type": resolved_type,
+        "peer_id": target_id,
+        "items": mapped[-int(limit):],
+        "permission": permission,
+    }
+
+
+@router.post("/chat/send-text", dependencies=[Depends(_check_auth)])
+async def chat_send_text(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    resolved_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    text = str(body.get("text", ""))
+    reply_to_message_id = normalize_text(str(body.get("reply_to_message_id", "")))
+    if resolved_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+    if not peer_id:
+        raise HTTPException(400, "peer_id 不能为空")
+    if not normalize_text(text):
+        raise HTTPException(400, "text 不能为空")
+    if reply_to_message_id and not reply_to_message_id.isdigit():
+        raise HTTPException(400, "reply_to_message_id 必须是数字")
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+
+    try:
+        peer_num = int(peer_id)
+    except Exception as exc:
+        raise HTTPException(400, "peer_id 必须是数字") from exc
+
+    message_text = text
+    if reply_to_message_id:
+        message_text = f"[CQ:reply,id={reply_to_message_id}] {text}"
+
+    if resolved_type == "group":
+        result = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=message_text)
+    else:
+        result = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=message_text)
+    message_id = ""
+    if isinstance(result, dict):
+        message_id = normalize_text(str(result.get("message_id", "") or result.get("id", "")))
+    elif isinstance(result, int):
+        message_id = str(result)
+    return {"ok": True, "message_id": message_id}
+
+
+@router.post("/chat/send-image", dependencies=[Depends(_check_auth)])
+async def chat_send_image(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    resolved_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    image_url = normalize_text(str(body.get("image_url", "")))
+    image_base64 = normalize_text(str(body.get("image_base64", "")))
+
+    if resolved_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+    if not peer_id:
+        raise HTTPException(400, "peer_id 不能为空")
+
+    file_value = ""
+    if image_url:
+        file_value = image_url
+    elif image_base64:
+        file_value = image_base64 if image_base64.startswith("base64://") else f"base64://{image_base64}"
+    if not file_value:
+        raise HTTPException(400, "image_url 或 image_base64 至少提供一个")
+
+    try:
+        peer_num = int(peer_id)
+    except Exception as exc:
+        raise HTTPException(400, "peer_id 必须是数字") from exc
+
+    cq = f"[CQ:image,file={file_value}]"
+    if resolved_type == "group":
+        result = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+    else:
+        result = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
+    message_id = ""
+    if isinstance(result, dict):
+        message_id = normalize_text(str(result.get("message_id", "") or result.get("id", "")))
+    elif isinstance(result, int):
+        message_id = str(result)
+    return {"ok": True, "message_id": message_id}
+
+
+@router.post("/chat/message/recall", dependencies=[Depends(_check_auth)])
+async def chat_message_recall(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    message_id = normalize_text(str(body.get("message_id", "")))
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    chat_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    if not message_id:
+        raise HTTPException(400, "message_id 不能为空")
+    if chat_type and chat_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+
+    if chat_type == "group" and peer_id:
+        if not peer_id.isdigit():
+            raise HTTPException(400, "group peer_id 必须是数字")
+        role = await _resolve_group_bot_role(int(peer_id), bot_id=bot_id)
+        if role not in {"owner", "admin"}:
+            raise HTTPException(403, "当前机器人不是群管理员/群主，不能在 WebUI 执行撤回")
+
+    message_id_arg: Any = int(message_id) if message_id.isdigit() else message_id
+    bot = await _get_onebot_runtime(bot_id=bot_id)
+    bot_self_id = normalize_text(str(getattr(bot, "self_id", "")))
+    raw_message = {}
+    with contextlib.suppress(Exception):
+        raw_message = _unwrap_onebot_message_payload(
+            await _onebot_call("get_msg", bot_id=bot_id, message_id=message_id_arg)
+        )
+
+    resolved_type = chat_type
+    resolved_peer_id = peer_id
+    if raw_message and (not resolved_type or not resolved_peer_id):
+        inferred_type, inferred_peer_id = _resolve_message_scope_from_raw(raw_message)
+        resolved_type = resolved_type or inferred_type
+        resolved_peer_id = resolved_peer_id or inferred_peer_id
+
+    if raw_message and resolved_type in {"group", "private"} and resolved_peer_id:
+        with contextlib.suppress(Exception):
+            _record_recalled_message(
+                _build_recall_payload_from_message(
+                    raw_message,
+                    bot_self_id=bot_self_id,
+                    chat_type=resolved_type,
+                    peer_id=resolved_peer_id,
+                    bot_id=bot_id,
+                    operator_id=bot_self_id,
+                    operator_name="WebUI",
+                    source="webui",
+                    note="webui recall",
+                )
+            )
+
+    await _onebot_call("delete_msg", bot_id=bot_id, message_id=message_id_arg)
+    return {"ok": True, "message": "撤回成功", "message_id": message_id}
+
+
+@router.post("/chat/message/essence", dependencies=[Depends(_check_auth)])
+async def chat_message_essence(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    message_id = normalize_text(str(body.get("message_id", "")))
+    chat_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    if not message_id:
+        raise HTTPException(400, "message_id 不能为空")
+    if chat_type and chat_type != "group":
+        raise HTTPException(400, "设为精华仅支持群聊")
+    if peer_id and not peer_id.isdigit():
+        raise HTTPException(400, "group peer_id 必须是数字")
+    if peer_id:
+        role = await _resolve_group_bot_role(int(peer_id), bot_id=bot_id)
+        if role not in {"owner", "admin"}:
+            raise HTTPException(403, "当前机器人不是群管理员/群主，不能在 WebUI 设置精华")
+
+    message_id_arg: Any = int(message_id) if message_id.isdigit() else message_id
+    await _onebot_call("set_essence_msg", bot_id=bot_id, message_id=message_id_arg)
+    return {"ok": True, "message": "已设为群精华", "message_id": message_id}
+
+
+@router.post("/chat/message/essence/remove", dependencies=[Depends(_check_auth)])
+async def chat_message_remove_essence(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    message_id = normalize_text(str(body.get("message_id", "")))
+    chat_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    if not message_id:
+        raise HTTPException(400, "message_id 不能为空")
+    if chat_type and chat_type != "group":
+        raise HTTPException(400, "移除精华仅支持群聊")
+    if peer_id and not peer_id.isdigit():
+        raise HTTPException(400, "group peer_id 必须是数字")
+    if peer_id:
+        role = await _resolve_group_bot_role(int(peer_id), bot_id=bot_id)
+        if role not in {"owner", "admin"}:
+            raise HTTPException(403, "当前机器人不是群管理员/群主，不能在 WebUI 移除精华")
+
+    message_id_arg: Any = int(message_id) if message_id.isdigit() else message_id
+    await _onebot_call("delete_essence_msg", bot_id=bot_id, message_id=message_id_arg)
+    return {"ok": True, "message": "已移除群精华", "message_id": message_id}
+
+
+@router.post("/chat/message/add-sticker", dependencies=[Depends(_check_auth)])
+async def chat_message_add_sticker(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    message_id = normalize_text(str(body.get("message_id", "")))
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    prefer_source_user = normalize_text(str(body.get("source_user_id", "")))
+    description = normalize_text(str(body.get("description", "")))
+    if not message_id:
+        raise HTTPException(400, "message_id 不能为空")
+
+    detail = await _get_onebot_message_detail(message_id, bot_id=bot_id)
+    sender = detail.get("sender", {}) if isinstance(detail.get("sender"), dict) else {}
+    sender_id = normalize_text(str(sender.get("user_id", "")))
+    sender_name = (
+        normalize_text(str(sender.get("card", "")))
+        or normalize_text(str(sender.get("nickname", "")))
+        or sender_id
+        or "用户"
+    )
+
+    img_bytes, source = await _extract_image_bytes_from_message(detail, bot_id=bot_id)
+    if not img_bytes:
+        raise HTTPException(400, f"该消息没有可提取的图片（{source}）")
+    if len(img_bytes) > 8 * 1024 * 1024:
+        raise HTTPException(400, "图片超过 8MB，无法加入表情包")
+
+    sticker = _resolve_sticker_manager()
+    save_owner = prefer_source_user or sender_id or "webui"
+    final_desc = description or f"{sender_name} 的聊天表情"
+    saver = getattr(sticker, "_save_chat_emoji")
+    key = saver(
+        user_id=save_owner,
+        img_data=img_bytes,
+        description=final_desc,
+        emotions=[],
+        category="其他",
+        tags=["webui", "右键添加"],
+        registered=True,
+    )
+    return {
+        "ok": True,
+        "message": "已添加到表情包",
+        "key": key,
+        "owner": save_owner,
+        "source": source,
+        "description": final_desc,
+    }
+
+
+@router.post("/chat/interrupt", dependencies=[Depends(_check_auth)])
+async def chat_interrupt(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    conversation_id = normalize_text(str(body.get("conversation_id", "")))
+    if not conversation_id:
+        raise HTTPException(400, "conversation_id 不能为空")
+
+    runtime_interrupt = getattr(_engine, "runtime_agent_interrupt", None) if _engine is not None else None
+    if not callable(runtime_interrupt):
+        return {"ok": False, "message": "当前运行时不支持会话中断", "result": {}}
+    result = runtime_interrupt(conversation_id, "cancelled_by_webui_interrupt")
+    if inspect.isawaitable(result):
+        result = await result
+    if not isinstance(result, dict):
+        result = {}
+    return {"ok": True, "message": "中断请求已提交", "result": result}
+
+
+@router.get("/chat/agent-state", dependencies=[Depends(_check_auth)])
+async def chat_agent_state(
+    conversation_id: str = Query(""),
+    limit: int = Query(200, ge=1, le=500),
+):
+    provider = getattr(_engine, "runtime_agent_state_provider", None) if _engine is not None else None
+    if not callable(provider):
+        return {"items": [], "total": 0}
+    rows = provider(limit=max(1, int(limit)))
+    if inspect.isawaitable(rows):
+        rows = await rows
+    if not isinstance(rows, list):
+        rows = []
+    target = normalize_text(conversation_id)
+    if target:
+        rows = [item for item in rows if normalize_text(str((item or {}).get("conversation_id", ""))) == target]
+    return {"items": rows, "total": len(rows)}
+
+
+@router.get("/memory/records", dependencies=[Depends(_check_auth)])
+async def get_memory_records(
+    conversation_id: str = Query(""),
+    user_id: str = Query(""),
+    role: str = Query(""),
+    keyword: str = Query(""),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+
+    offset = (int(page) - 1) * int(page_size)
+    items, total = memory.list_memory_records(
+        conversation_id=normalize_text(conversation_id),
+        user_id=normalize_text(user_id),
+        role=normalize_text(role).lower(),
+        keyword=normalize_text(keyword),
+        limit=int(page_size),
+        offset=offset,
+    )
+    return {"items": items, "total": total, "page": int(page), "page_size": int(page_size)}
+
+
+@router.post("/memory/records", dependencies=[Depends(_check_auth)])
+async def add_memory_record(request: Request):
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    ok, message, payload = memory.add_memory_record(
+        conversation_id=normalize_text(str(body.get("conversation_id", ""))),
+        user_id=normalize_text(str(body.get("user_id", ""))),
+        role=normalize_text(str(body.get("role", "user"))).lower() or "user",
+        content=normalize_text(str(body.get("content", ""))),
+        actor=f"webui:{normalize_text(str(body.get('actor', 'admin'))) or 'admin'}",
+        note=normalize_text(str(body.get("note", ""))),
+        reason=normalize_text(str(body.get("reason", ""))),
+    )
+    if not ok:
+        raise HTTPException(400, message)
+    return {"ok": True, "message": "记忆已新增", "item": payload}
+
+
+@router.put("/memory/records/{record_id}", dependencies=[Depends(_check_auth)])
+async def update_memory_record(record_id: int, request: Request):
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    ok, message, payload = memory.update_memory_record(
+        record_id=int(record_id),
+        content=normalize_text(str(body.get("content", ""))),
+        actor=f"webui:{normalize_text(str(body.get('actor', 'admin'))) or 'admin'}",
+        note=normalize_text(str(body.get("note", ""))),
+        reason=normalize_text(str(body.get("reason", ""))),
+    )
+    if not ok:
+        raise HTTPException(400, message)
+    return {"ok": True, "message": "记忆已更新", "item": payload}
+
+
+@router.delete("/memory/records/{record_id}", dependencies=[Depends(_check_auth)])
+async def delete_memory_record(record_id: int, request: Request):
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+
+    body = {}
+    with contextlib.suppress(Exception):
+        parsed = await request.json()
+        if isinstance(parsed, dict):
+            body = parsed
+
+    ok, message, payload = memory.delete_memory_record(
+        record_id=int(record_id),
+        actor=f"webui:{normalize_text(str(body.get('actor', 'admin'))) or 'admin'}",
+        note=normalize_text(str(body.get("note", ""))),
+        reason=normalize_text(str(body.get("reason", ""))),
+    )
+    if not ok:
+        raise HTTPException(400, message)
+    return {"ok": True, "message": "记忆已删除", "item": payload}
+
+
+@router.get("/memory/audit", dependencies=[Depends(_check_auth)])
+async def get_memory_audit(
+    record_id: int = Query(0, ge=0),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+):
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+
+    offset = (int(page) - 1) * int(page_size)
+    rid = int(record_id) if int(record_id) > 0 else None
+    items, total = memory.list_memory_audit_logs(record_id=rid, limit=int(page_size), offset=offset)
+    return {"items": items, "total": total, "page": int(page), "page_size": int(page_size)}
+
+
+@router.post("/memory/compact", dependencies=[Depends(_check_auth)])
+async def post_memory_compact(request: Request):
+    e = _engine
+    if not e or not hasattr(e, "memory"):
+        raise HTTPException(503, "记忆引擎未初始化")
+    memory = getattr(e, "memory", None)
+    if memory is None:
+        raise HTTPException(503, "记忆引擎未初始化")
+
+    body = {}
+    with contextlib.suppress(Exception):
+        parsed = await request.json()
+        if isinstance(parsed, dict):
+            body = parsed
+
+    dry_run = bool(body.get("dry_run", True))
+    ok, message, payload = memory.compact_memory_records(
+        conversation_id=normalize_text(str(body.get("conversation_id", ""))),
+        user_id=normalize_text(str(body.get("user_id", ""))),
+        role=normalize_text(str(body.get("role", ""))).lower(),
+        actor=f"webui:{normalize_text(str(body.get('actor', 'admin'))) or 'admin'}",
+        note=normalize_text(str(body.get("note", ""))),
+        reason=normalize_text(str(body.get("reason", ""))),
+        dry_run=dry_run,
+        keep_latest=int(body.get("keep_latest", 1) or 1),
+    )
+    if not ok:
+        raise HTTPException(400, message)
+    return {
+        "ok": True,
+        "message": ("记忆整理预览完成" if dry_run else "记忆整理执行完成"),
+        "result": payload,
+    }
+
+
 @router.get("/image-gen", dependencies=[Depends(_check_auth)])
 async def get_image_gen():
     """获取图片生成配置。"""
@@ -1219,7 +2341,49 @@ async def put_image_gen(request: Request):
     if "image_gen" not in current_config:
         current_config["image_gen"] = {}
 
-    current_config["image_gen"].update(image_gen_cfg)
+    old_image_cfg = current_config.get("image_gen", {})
+    old_models = old_image_cfg.get("models", []) if isinstance(old_image_cfg, dict) else []
+    merged_image_cfg = dict(old_image_cfg) if isinstance(old_image_cfg, dict) else {}
+    merged_image_cfg.update(image_gen_cfg)
+
+    default_provider = "openai"
+    if isinstance(merged_image_cfg, dict):
+        default_provider = normalize_text(str(merged_image_cfg.get("provider", ""))).lower() or "openai"
+
+    if "models" in image_gen_cfg:
+        merged_image_cfg["models"] = _normalize_image_gen_models_for_save(
+            image_gen_cfg.get("models"),
+            old_models,
+            default_provider=default_provider,
+        )
+
+    # 保证 default_model 可命中 models，避免保存后运行期回退到错误模型。
+    ensured_default, default_changed = _ensure_image_gen_default_model(merged_image_cfg)
+    if default_changed and ensured_default:
+        _log.warning("image_gen_default_model_adjusted | default_model=%s", ensured_default)
+
+    # 保存前加密 image_gen.models.*.api_key（占位符/已加密值除外）。
+    try:
+        from core.crypto import SecretManager
+
+        sm = SecretManager(_ROOT_DIR / "storage" / ".secret_key")
+        models = merged_image_cfg.get("models", []) if isinstance(merged_image_cfg, dict) else []
+        if isinstance(models, list):
+            for model_cfg in models:
+                if not isinstance(model_cfg, dict):
+                    continue
+                api_key = normalize_text(str(model_cfg.get("api_key", "")))
+                if not api_key:
+                    continue
+                if api_key.startswith("${") and api_key.endswith("}"):
+                    continue
+                if SecretManager.is_encrypted(api_key):
+                    continue
+                model_cfg["api_key"] = sm.encrypt(api_key)
+    except Exception:
+        _log.warning("image_gen_api_key_encrypt_failed", exc_info=True)
+
+    current_config["image_gen"] = merged_image_cfg
 
     # 写入文件
     config_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1238,6 +2402,91 @@ async def put_image_gen(request: Request):
         raise HTTPException(500, f"重载失败: {ex}")
 
 
+@router.post("/image-gen/test", dependencies=[Depends(_check_auth)])
+async def test_image_gen(request: Request):
+    """测试图片生成（支持传入未保存的 image_gen 覆盖配置）。"""
+    e = _engine
+    if not e:
+        raise HTTPException(503, "引擎未初始化")
+
+    body = await request.json()
+    if not isinstance(body, dict):
+        body = {}
+
+    prompt = normalize_text(str(body.get("prompt", ""))) or (
+        "A cute anime catgirl maid with pink hair, soft lighting, high quality illustration"
+    )
+    requested_model = normalize_text(str(body.get("model", "")))
+    size = normalize_text(str(body.get("size", ""))) or None
+    style = normalize_text(str(body.get("style", ""))) or None
+    image_override = body.get("image_gen")
+
+    raw_cfg = getattr(e.config_manager, "raw", {})
+    effective_cfg = copy.deepcopy(raw_cfg) if isinstance(raw_cfg, dict) else {}
+    current_image_cfg = effective_cfg.get("image_gen", {})
+    if not isinstance(current_image_cfg, dict):
+        current_image_cfg = {}
+
+    working_image_cfg = copy.deepcopy(current_image_cfg)
+    default_adjusted = False
+
+    if isinstance(image_override, dict):
+        old_models = working_image_cfg.get("models", []) if isinstance(working_image_cfg, dict) else []
+        working_image_cfg.update(image_override)
+
+        default_provider = normalize_text(str(working_image_cfg.get("provider", ""))).lower() or "openai"
+        if "models" in image_override:
+            working_image_cfg["models"] = _normalize_image_gen_models_for_save(
+                image_override.get("models"),
+                old_models,
+                default_provider=default_provider,
+            )
+
+        _, default_adjusted = _ensure_image_gen_default_model(working_image_cfg)
+    else:
+        _, default_adjusted = _ensure_image_gen_default_model(working_image_cfg)
+
+    effective_cfg["image_gen"] = working_image_cfg
+
+    models = working_image_cfg.get("models", [])
+    configured_models = len(models) if isinstance(models, list) else 0
+
+    try:
+        image_engine = ImageGenEngine(effective_cfg, model_client=getattr(e, "model_client", None))
+        result = await image_engine.generate(
+            prompt=prompt,
+            model=requested_model or None,
+            size=size,
+            style=style,
+        )
+
+        image_url = normalize_text(result.url)
+        if not image_url and result.base64_data:
+            image_url = f"data:image/png;base64,{result.base64_data}"
+
+        return {
+            "ok": bool(result.ok),
+            "message": result.message,
+            "image_url": image_url,
+            "model_used": result.model_used,
+            "revised_prompt": result.revised_prompt,
+            "requested_model": requested_model,
+            "default_model": normalize_text(str(working_image_cfg.get("default_model", ""))),
+            "configured_models": configured_models,
+            "default_adjusted": default_adjusted,
+        }
+    except Exception as exc:
+        _log.warning("image_gen_test_failed | %s", exc, exc_info=True)
+        return {
+            "ok": False,
+            "message": str(exc),
+            "requested_model": requested_model,
+            "default_model": normalize_text(str(working_image_cfg.get("default_model", ""))),
+            "configured_models": configured_models,
+            "default_adjusted": default_adjusted,
+        }
+
+
 @router.post("/image-gen/models", dependencies=[Depends(_check_auth)])
 async def add_image_gen_model(request: Request):
     """添加图片生成模型。"""
@@ -1249,6 +2498,19 @@ async def add_image_gen_model(request: Request):
     model_cfg = body.get("model", {})
     if not isinstance(model_cfg, dict):
         raise HTTPException(400, "model 必须是对象")
+
+    model_cfg = copy.deepcopy(model_cfg)
+    model_cfg["provider"] = normalize_text(str(model_cfg.get("provider", ""))).lower() or "openai"
+    model_cfg["model"] = normalize_text(str(model_cfg.get("model", ""))) or normalize_text(str(model_cfg.get("name", "")))
+    model_cfg["name"] = normalize_text(str(model_cfg.get("name", ""))) or normalize_text(str(model_cfg.get("model", "")))
+    if not model_cfg.get("api_base"):
+        auto_base = _setup_resolve_image_gen_base_url(
+            image_provider=str(model_cfg.get("provider", "openai")),
+            image_base_url_raw="",
+            resolved_api_key=normalize_text(str(model_cfg.get("api_key", ""))),
+        )
+        if auto_base:
+            model_cfg["api_base"] = auto_base
 
     # 验证必填字段
     if not model_cfg.get("name"):
@@ -1389,6 +2651,15 @@ async def ws_log_stream(ws: WebSocket, token: str = Query("")):
                 # 文件被截断或重新创建
                 last_size = 0
 
+    except WebSocketDisconnect:
+        # 浏览器主动断开属于正常行为，不记错误日志。
+        _log.debug("WebSocket 日志流断开")
+    except RuntimeError as e:
+        msg = normalize_text(str(e)).lower()
+        if "websocket" in msg and ("disconnect" in msg or "close" in msg):
+            _log.debug("WebSocket 日志流关闭: %s", e)
+        else:
+            _log.error(f"WebSocket 日志流错误: {e}")
     except Exception as e:
         _log.error(f"WebSocket 日志流错误: {e}")
     finally:
@@ -1400,51 +2671,163 @@ async def ws_log_stream(ws: WebSocket, token: str = Query("")):
 # Cookie 管理 API
 # ============================================================================
 
+@router.get("/cookies/capabilities", dependencies=[Depends(_check_auth)])
+async def cookies_capabilities():
+    """返回 Cookie 自动提取能力（按当前部署环境）。"""
+    return {"ok": True, "data": _cookie_capabilities_payload()}
+
+
+@router.post("/cookies/bilibili-qr/start", dependencies=[Depends(_check_auth)])
+async def cookies_bilibili_qr_start():
+    """开始 B站二维码登录会话（Cookie 页面）。"""
+    result = await _start_bilibili_qr_session()
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=503)
+    return result
+
+
+@router.get("/cookies/bilibili-qr/status", dependencies=[Depends(_check_auth)])
+async def cookies_bilibili_qr_status(session_id: str = Query("")):
+    """轮询 B站二维码状态（Cookie 页面）。"""
+    sid = normalize_text(session_id)
+    if not sid:
+        return JSONResponse({"ok": False, "status": "error", "message": "缺少 session_id"}, status_code=400)
+    result = await _bilibili_qr_status(sid)
+    if not result.get("ok") and str(result.get("status", "") or "") in {"expired", "error"}:
+        return JSONResponse(result, status_code=410 if result.get("status") == "expired" else 400)
+    return result
+
+
+@router.post("/cookies/bilibili-qr/cancel", dependencies=[Depends(_check_auth)])
+async def cookies_bilibili_qr_cancel(request: Request):
+    """取消 B站二维码会话（Cookie 页面）。"""
+    body = await request.json()
+    sid = normalize_text(str(body.get("session_id", "")))
+    if not sid:
+        return JSONResponse({"ok": False, "message": "缺少 session_id"}, status_code=400)
+    return _cancel_bilibili_qr_session(sid)
+
+
 @router.post("/cookies/extract", dependencies=[Depends(_check_auth)])
 async def extract_cookie(request: Request):
     """提取平台 Cookie。"""
+    def _cookie_error(
+        *,
+        status_code: int,
+        code: str,
+        message: str,
+        hint: str = "",
+        detail: str = "",
+    ) -> JSONResponse:
+        payload: dict[str, Any] = {"ok": False, "error_code": code, "message": message}
+        if hint:
+            payload["hint"] = hint
+        if detail:
+            payload["detail"] = detail
+        return JSONResponse(payload, status_code=status_code)
+
     try:
         body = await request.json()
-        platform = body.get("platform", "bilibili")
+        platform = normalize_text(str(body.get("platform", "bilibili"))).lower() or "bilibili"
+        if platform == "qq":
+            platform = "qzone"
+        browser = normalize_text(str(body.get("browser", "edge"))).lower() or "edge"
+        allow_close = bool(body.get("allow_close", False))
+        loop = asyncio.get_running_loop()
 
         from core.cookie_auth import (
             extract_bilibili_cookies,
             extract_douyin_cookie,
             extract_kuaishou_cookie,
+            extract_qzone_cookies,
         )
 
         if platform == "bilibili":
-            result = await extract_bilibili_cookies()
+            result = await loop.run_in_executor(
+                None,
+                lambda: extract_bilibili_cookies(browser=browser, auto_close=allow_close),
+            )
             if result and isinstance(result, dict):
-                sessdata = result.get("SESSDATA", "")
-                bili_jct = result.get("bili_jct", "")
+                sessdata = normalize_text(str(result.get("sessdata", "") or result.get("SESSDATA", "")))
+                bili_jct = normalize_text(str(result.get("bili_jct", "") or result.get("BILI_JCT", "")))
                 if sessdata:
-                    return JSONResponse({
-                        "cookie": json.dumps(result),
-                        "message": "B站登录成功",
-                        "sessdata": sessdata,
-                        "bili_jct": bili_jct,
-                    })
-            return JSONResponse({"error": "B站登录失败"}, status_code=400)
+                    cookie_dict = {"SESSDATA": sessdata}
+                    if bili_jct:
+                        cookie_dict["bili_jct"] = bili_jct
+                    return JSONResponse(
+                        {
+                            "ok": True,
+                            "cookie": json.dumps(cookie_dict, ensure_ascii=False),
+                            "message": "B站 Cookie 提取成功（浏览器）",
+                            "sessdata": sessdata,
+                            "bili_jct": bili_jct,
+                        }
+                    )
+            return _cookie_error(
+                status_code=400,
+                code="bilibili_extract_failed",
+                message="B站 Cookie 提取失败",
+                hint="请先在浏览器登录 B站，或改用“B站扫码登录”。",
+            )
 
         elif platform == "douyin":
-            cookie = await extract_douyin_cookie()
+            cookie = await loop.run_in_executor(
+                None,
+                lambda: extract_douyin_cookie(browser=browser, auto_close=allow_close),
+            )
             if cookie:
-                return JSONResponse({"cookie": cookie, "message": "抖音 Cookie 提取成功"})
-            return JSONResponse({"error": "抖音 Cookie 提取失败"}, status_code=400)
+                return JSONResponse({"ok": True, "cookie": cookie, "message": "抖音 Cookie 提取成功"})
+            return _cookie_error(
+                status_code=400,
+                code="douyin_extract_failed",
+                message="抖音 Cookie 提取失败",
+                hint="请确认已在当前浏览器登录抖音账号后重试。",
+            )
 
         elif platform == "kuaishou":
-            cookie = await extract_kuaishou_cookie()
+            cookie = await loop.run_in_executor(
+                None,
+                lambda: extract_kuaishou_cookie(browser=browser, auto_close=allow_close),
+            )
             if cookie:
-                return JSONResponse({"cookie": cookie, "message": "快手 Cookie 提取成功"})
-            return JSONResponse({"error": "快手 Cookie 提取失败"}, status_code=400)
+                return JSONResponse({"ok": True, "cookie": cookie, "message": "快手 Cookie 提取成功"})
+            return _cookie_error(
+                status_code=400,
+                code="kuaishou_extract_failed",
+                message="快手 Cookie 提取失败",
+                hint="请确认已在当前浏览器登录快手账号后重试。",
+            )
+
+        elif platform == "qzone":
+            cookie = await loop.run_in_executor(
+                None,
+                lambda: extract_qzone_cookies(browser=browser, auto_close=allow_close),
+            )
+            if cookie:
+                return JSONResponse({"ok": True, "cookie": cookie, "message": "QQ空间 Cookie 提取成功"})
+            return _cookie_error(
+                status_code=400,
+                code="qzone_extract_failed",
+                message="QQ空间 Cookie 提取失败",
+                hint="请先登录 qzone.qq.com / user.qzone.qq.com，再重试提取。",
+            )
 
         else:
-            return JSONResponse({"error": "不支持的平台"}, status_code=400)
+            return _cookie_error(
+                status_code=400,
+                code="unsupported_platform",
+                message="不支持的平台",
+            )
 
     except Exception as e:
-        _log.error(f"Cookie 提取失败: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+        _log.error(f"Cookie 提取失败: {e}", exc_info=True)
+        return _cookie_error(
+            status_code=500,
+            code="internal_error",
+            message="Cookie 提取失败（内部错误）",
+            hint="请查看日志并检查浏览器登录状态后重试。",
+            detail=str(e),
+        )
 
 
 @router.post("/cookies/save", dependencies=[Depends(_check_auth)])
@@ -1452,7 +2835,9 @@ async def save_cookie(request: Request):
     """保存 Cookie 到配置文件。"""
     try:
         body = await request.json()
-        platform = body.get("platform", "bilibili")
+        platform = normalize_text(str(body.get("platform", "bilibili"))).lower() or "bilibili"
+        if platform == "qq":
+            platform = "qzone"
         cookie = body.get("cookie", "")
 
         if not cookie:
@@ -1462,14 +2847,41 @@ async def save_cookie(request: Request):
         if not config_file.exists():
             return JSONResponse({"error": "配置文件不存在"}, status_code=404)
 
-        config = yaml.safe_load(config_file.read_text(encoding="utf-8"))
+        config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+        if not isinstance(config, dict):
+            config = {}
 
         if platform == "bilibili":
-            # B站需要解析 JSON 格式的 cookie
+            # B站支持 JSON 或标准 cookie 字符串。
             try:
-                cookie_dict = json.loads(cookie) if isinstance(cookie, str) else cookie
-                sessdata = cookie_dict.get("SESSDATA", "")
-                bili_jct = cookie_dict.get("bili_jct", "")
+                cookie_dict: dict[str, Any]
+                if isinstance(cookie, dict):
+                    cookie_dict = cookie
+                else:
+                    cookie_text = normalize_text(str(cookie))
+                    if cookie_text.startswith("{") and cookie_text.endswith("}"):
+                        parsed = json.loads(cookie_text)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("invalid_cookie_json")
+                        cookie_dict = parsed
+                    else:
+                        cookie_dict = {}
+                        for part in cookie_text.split(";"):
+                            seg = part.strip()
+                            if not seg or "=" not in seg:
+                                continue
+                            k, v = seg.split("=", 1)
+                            key = normalize_text(k)
+                            if key:
+                                cookie_dict[key] = v.strip()
+                sessdata = normalize_text(
+                    str(cookie_dict.get("SESSDATA", "") or cookie_dict.get("sessdata", ""))
+                )
+                bili_jct = normalize_text(
+                    str(cookie_dict.get("bili_jct", "") or cookie_dict.get("BILI_JCT", ""))
+                )
+                if not sessdata:
+                    return JSONResponse({"error": "B站 Cookie 缺少 SESSDATA"}, status_code=400)
 
                 if "video_analysis" not in config:
                     config["video_analysis"] = {}
@@ -1478,7 +2890,7 @@ async def save_cookie(request: Request):
 
                 config["video_analysis"]["bilibili"]["sessdata"] = sessdata
                 config["video_analysis"]["bilibili"]["bili_jct"] = bili_jct
-            except:
+            except Exception:
                 return JSONResponse({"error": "B站 Cookie 格式错误"}, status_code=400)
 
         elif platform in ["douyin", "kuaishou", "qzone"]:
@@ -1510,6 +2922,8 @@ async def save_cookie(request: Request):
 
 _setup_done = False
 _setup_uvicorn_server: Any | None = None
+_setup_bili_qr_sessions: dict[str, dict[str, Any]] = {}
+_SETUP_BILI_QR_TTL_SECONDS = 150
 
 setup_router = APIRouter(prefix="/api/webui/setup", tags=["setup"])
 
@@ -1517,7 +2931,7 @@ _SETUP_COOKIE_PLATFORM_DOMAINS: dict[str, list[str]] = {
     "bilibili": [".bilibili.com"],
     "douyin": [".douyin.com"],
     "kuaishou": [".kuaishou.com"],
-    "qzone": ["qzone.qq.com"],
+    "qzone": [".qq.com", ".i.qq.com", ".qzone.qq.com"],
 }
 
 _SETUP_COOKIE_PLATFORM_SITES: dict[str, str] = {
@@ -1550,6 +2964,73 @@ _SETUP_API_ENV_MAP = {
     "siliconflow": "${SILICONFLOW_API_KEY}",
 }
 
+
+def _cleanup_bilibili_qr_sessions() -> None:
+    now = time.time()
+    expired = [
+        sid for sid, data in _setup_bili_qr_sessions.items()
+        if now - float(data.get("created_at", 0.0) or 0.0) >= _SETUP_BILI_QR_TTL_SECONDS
+    ]
+    for sid in expired:
+        _setup_bili_qr_sessions.pop(sid, None)
+
+
+def _cookie_capabilities_payload() -> dict[str, Any]:
+    from core.cookie_auth import get_cookie_runtime_capabilities
+    payload = get_cookie_runtime_capabilities()
+    payload["qr_session_ttl_seconds"] = _SETUP_BILI_QR_TTL_SECONDS
+    return payload
+
+
+async def _start_bilibili_qr_session() -> dict[str, Any]:
+    from core.cookie_auth import bilibili_qr_create_session
+
+    _cleanup_bilibili_qr_sessions()
+    session = await bilibili_qr_create_session()
+    if not session:
+        return {"ok": False, "message": "当前环境未启用 B站扫码依赖，请安装 bilibili-api-python 后重试"}
+
+    session_id = uuid.uuid4().hex
+    _setup_bili_qr_sessions[session_id] = {
+        "qr": session.get("qr"),
+        "created_at": time.time(),
+    }
+    return {
+        "ok": True,
+        "session_id": session_id,
+        "qr_url": str(session.get("qr_url", "") or ""),
+        "qr_image_data_uri": str(session.get("qr_image_data_uri", "") or ""),
+        "qr_terminal": str(session.get("qr_terminal", "") or ""),
+        "expires_in_seconds": int(session.get("timeout_seconds", 120) or 120),
+        "message": "请使用 B站 App 扫描二维码并在手机确认",
+    }
+
+
+async def _bilibili_qr_status(session_id: str) -> dict[str, Any]:
+    from core.cookie_auth import bilibili_qr_check_state
+
+    _cleanup_bilibili_qr_sessions()
+    item = _setup_bili_qr_sessions.get(session_id)
+    if not item:
+        return {"ok": False, "status": "expired", "message": "二维码会话不存在或已过期，请重新获取"}
+
+    qr = item.get("qr")
+    if qr is None:
+        _setup_bili_qr_sessions.pop(session_id, None)
+        return {"ok": False, "status": "error", "message": "二维码会话异常，请重新获取"}
+
+    result = await bilibili_qr_check_state(qr)
+    status = str(result.get("status", "") or "")
+    if status in {"done", "expired", "error"}:
+        _setup_bili_qr_sessions.pop(session_id, None)
+    return result
+
+
+def _cancel_bilibili_qr_session(session_id: str) -> dict[str, Any]:
+    _cleanup_bilibili_qr_sessions()
+    existed = bool(_setup_bili_qr_sessions.pop(session_id, None))
+    return {"ok": True, "cancelled": existed}
+
 _SETUP_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "skiapi": {"model": "claude-opus-4-6", "base_url": "https://skiapi.dev", "endpoint_type": "openai"},
     "openai": {"model": "gpt-5.2", "base_url": "https://api.openai.com", "endpoint_type": "openai_response"},
@@ -1564,6 +3045,15 @@ _SETUP_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "mistral": {"model": "mistral-medium-latest", "base_url": "https://api.mistral.ai", "endpoint_type": "openai"},
     "zhipu": {"model": "glm-4-plus", "base_url": "https://open.bigmodel.cn/api/paas/v4", "endpoint_type": "openai"},
     "siliconflow": {"model": "Qwen/Qwen2.5-72B-Instruct", "base_url": "https://api.siliconflow.cn/v1", "endpoint_type": "openai"},
+}
+
+_SETUP_IMAGE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
+    "skiapi": {"model": "grok-imagine-1.0", "base_url": "https://skiapi.dev/v1", "env": "${SKIAPI_KEY}"},
+    "openai": {"model": "dall-e-3", "base_url": "https://api.openai.com/v1", "env": "${OPENAI_API_KEY}"},
+    "xai": {"model": "grok-imagine-1.0", "base_url": "https://api.x.ai/v1", "env": "${XAI_API_KEY}"},
+    "flux": {"model": "flux-1-schnell", "base_url": "https://api.siliconflow.cn/v1", "env": "${SILICONFLOW_API_KEY}"},
+    "sd": {"model": "stable-diffusion-xl", "base_url": "http://127.0.0.1:7860", "env": "${API_KEY}"},
+    "custom": {"model": "dall-e-3", "base_url": "", "env": "${API_KEY}"},
 }
 
 _SETUP_ENDPOINT_TYPE_OPTIONS = [
@@ -1636,6 +3126,162 @@ def _setup_resolve_api_key(provider: str, raw_api_key: str) -> str:
     return ""
 
 
+def _setup_resolve_image_gen_api_key(
+    *,
+    image_provider: str,
+    image_api_key_raw: str,
+    primary_provider: str,
+    primary_api_key_raw: str,
+) -> str:
+    key = normalize_text(image_api_key_raw)
+    if key:
+        return key
+
+    primary_key = normalize_text(primary_api_key_raw)
+    # 主模型与生图同 provider 时，优先复用主模型密钥/占位符。
+    if image_provider == primary_provider:
+        if primary_key:
+            return primary_key
+        return _SETUP_API_ENV_MAP.get(primary_provider, "${API_KEY}")
+
+    # skiapi 密钥（sk-O...）可作为聚合网关生图密钥使用。
+    if primary_key.startswith("sk-O"):
+        return primary_key
+
+    if image_provider in _SETUP_API_ENV_MAP:
+        return _SETUP_API_ENV_MAP.get(image_provider, "${API_KEY}")
+    return _SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_provider, {}).get("env", "${API_KEY}")
+
+
+def _setup_resolve_image_gen_base_url(*, image_provider: str, image_base_url_raw: str, resolved_api_key: str) -> str:
+    base = normalize_text(image_base_url_raw).rstrip("/")
+    if base:
+        return base
+
+    # skiapi 密钥优先落到 skiapi 域名，避免 provider 选项与密钥来源不一致。
+    if normalize_text(resolved_api_key).startswith("sk-O"):
+        return "https://skiapi.dev/v1"
+
+    provider_default = _SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_provider, {})
+    base = normalize_text(provider_default.get("base_url", "")).rstrip("/")
+    if not base:
+        base = normalize_text(_SETUP_PROVIDER_DEFAULTS.get(image_provider, {}).get("base_url", "")).rstrip("/")
+    if not base:
+        return ""
+    if base.endswith("/v1"):
+        return base
+    return f"{base}/v1"
+
+
+def _normalize_image_gen_models_for_save(
+    incoming_models: Any,
+    existing_models: Any,
+    default_provider: str = "openai",
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    old_lookup: dict[str, dict[str, Any]] = {}
+
+    if isinstance(existing_models, list):
+        for item in existing_models:
+            if not isinstance(item, dict):
+                continue
+            for key in (
+                normalize_text(str(item.get("name", ""))).lower(),
+                normalize_text(str(item.get("model", ""))).lower(),
+            ):
+                if key:
+                    old_lookup[key] = item
+
+    if not isinstance(incoming_models, list):
+        return normalized
+
+    for raw in incoming_models:
+        if not isinstance(raw, dict):
+            continue
+        item = copy.deepcopy(raw)
+        provider = normalize_text(str(item.get("provider", ""))).lower() or default_provider or "openai"
+        model_name = normalize_text(str(item.get("model", ""))) or normalize_text(str(item.get("name", "")))
+        if not model_name:
+            continue
+        name = normalize_text(str(item.get("name", ""))) or model_name
+        item["provider"] = provider
+        item["model"] = model_name
+        item["name"] = name
+
+        lookup = old_lookup.get(name.lower()) or old_lookup.get(model_name.lower())
+        api_key = str(item.get("api_key", "")).strip()
+        if api_key == "***":
+            if isinstance(lookup, dict) and lookup.get("api_key"):
+                item["api_key"] = lookup.get("api_key")
+            else:
+                item.pop("api_key", None)
+        elif not api_key and isinstance(lookup, dict) and lookup.get("api_key"):
+            item["api_key"] = lookup.get("api_key")
+
+        resolved_key = normalize_text(str(item.get("api_key", "")))
+        api_base = normalize_text(str(item.get("api_base", ""))).rstrip("/")
+        if not api_base:
+            old_base = normalize_text(str(lookup.get("api_base", ""))).rstrip("/") if isinstance(lookup, dict) else ""
+            if old_base:
+                item["api_base"] = old_base
+            else:
+                auto_base = _setup_resolve_image_gen_base_url(
+                    image_provider=provider,
+                    image_base_url_raw="",
+                    resolved_api_key=resolved_key,
+                )
+                if auto_base:
+                    item["api_base"] = auto_base
+        else:
+            item["api_base"] = api_base
+
+        normalized.append(item)
+
+    return normalized
+
+
+def _ensure_image_gen_default_model(image_cfg: dict[str, Any]) -> tuple[str, bool]:
+    """确保 default_model 命中 models；未命中时自动回填首个模型。"""
+    if not isinstance(image_cfg, dict):
+        return "", False
+
+    models = image_cfg.get("models", [])
+    if not isinstance(models, list) or not models:
+        return normalize_text(str(image_cfg.get("default_model", ""))), False
+
+    valid_keys: set[str] = set()
+    first_model = ""
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        model_name = normalize_text(str(item.get("model", "")))
+        display_name = normalize_text(str(item.get("name", "")))
+        if model_name:
+            if not first_model:
+                first_model = model_name
+            valid_keys.add(model_name)
+            valid_keys.add(model_name.lower())
+        if display_name:
+            if not first_model:
+                first_model = display_name
+            valid_keys.add(display_name)
+            valid_keys.add(display_name.lower())
+
+    current_default = normalize_text(str(image_cfg.get("default_model", "")))
+    if not first_model:
+        return current_default, False
+
+    if not current_default:
+        image_cfg["default_model"] = first_model
+        return first_model, True
+
+    if current_default in valid_keys or current_default.lower() in valid_keys:
+        return current_default, False
+
+    image_cfg["default_model"] = first_model
+    return first_model, True
+
+
 def _setup_extract_response_text_openai(data: dict[str, Any]) -> str:
     output_text = normalize_text(str(data.get("output_text", "")))
     if output_text:
@@ -1697,24 +3343,41 @@ def _setup_build_config_from_legacy_payload(body: dict[str, Any]) -> dict[str, A
 
     # 图片生成配置
     image_gen_enable = bool(body.get("image_gen_enable", True))
-    image_gen_provider = normalize_text(str(body.get("image_gen_provider", ""))) or "openai"
+    image_gen_provider = normalize_text(str(body.get("image_gen_provider", ""))).lower()
+    if not image_gen_provider:
+        image_gen_provider = provider if provider in _SETUP_IMAGE_PROVIDER_DEFAULTS else "openai"
+    image_defaults = _SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_gen_provider, {})
     image_gen_api_key = normalize_text(str(body.get("image_gen_api_key", "")))
     image_gen_base_url = normalize_text(str(body.get("image_gen_base_url", "")))
-    image_gen_model = normalize_text(str(body.get("image_gen_model", ""))) or "dall-e-3"
+    image_gen_model = normalize_text(str(body.get("image_gen_model", ""))) or image_defaults.get("model", "dall-e-3")
     image_gen_size = normalize_text(str(body.get("image_gen_size", ""))) or "1024x1024"
+
+    resolved_image_gen_api_key = _setup_resolve_image_gen_api_key(
+        image_provider=image_gen_provider,
+        image_api_key_raw=image_gen_api_key,
+        primary_provider=provider,
+        primary_api_key_raw=api_key_raw,
+    )
+    resolved_image_gen_base_url = _setup_resolve_image_gen_base_url(
+        image_provider=image_gen_provider,
+        image_base_url_raw=image_gen_base_url,
+        resolved_api_key=resolved_image_gen_api_key,
+    )
 
     # 构建图片生成模型配置
     image_gen_models = []
-    if image_gen_api_key or image_gen_base_url:
+    if image_gen_enable:
         model_config: dict[str, Any] = {
-            "name": image_gen_provider,
+            # name 统一用模型名，避免与 default_model 脱节导致运行时匹配失败
+            "name": image_gen_model,
+            "provider": image_gen_provider,
             "model": image_gen_model,
             "default_size": image_gen_size,
         }
-        if image_gen_base_url:
-            model_config["api_base"] = image_gen_base_url
-        if image_gen_api_key:
-            model_config["api_key"] = image_gen_api_key
+        if resolved_image_gen_base_url:
+            model_config["api_base"] = resolved_image_gen_base_url
+        if resolved_image_gen_api_key:
+            model_config["api_key"] = resolved_image_gen_api_key
         image_gen_models.append(model_config)
 
     config_data: dict[str, Any] = {
@@ -1827,6 +3490,43 @@ async def setup_defaults():
             {"value": "minimal", "label": "极简"},
         ],
     }
+
+
+@setup_router.get("/cookie-capabilities")
+async def setup_cookie_capabilities():
+    """返回 Cookie 自动提取能力（按当前部署环境）。"""
+    return {"ok": True, "data": _cookie_capabilities_payload()}
+
+
+@setup_router.post("/bilibili-qr/start")
+async def setup_bilibili_qr_start():
+    """开始 B站二维码登录会话（Setup 页面）。"""
+    result = await _start_bilibili_qr_session()
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=503)
+    return result
+
+
+@setup_router.get("/bilibili-qr/status")
+async def setup_bilibili_qr_status(session_id: str = Query("")):
+    """轮询 B站二维码状态（Setup 页面）。"""
+    sid = normalize_text(session_id)
+    if not sid:
+        return JSONResponse({"ok": False, "status": "error", "message": "缺少 session_id"}, status_code=400)
+    result = await _bilibili_qr_status(sid)
+    if not result.get("ok") and str(result.get("status", "") or "") in {"expired", "error"}:
+        return JSONResponse(result, status_code=410 if result.get("status") == "expired" else 400)
+    return result
+
+
+@setup_router.post("/bilibili-qr/cancel")
+async def setup_bilibili_qr_cancel(request: Request):
+    """取消 B站二维码会话（Setup 页面）。"""
+    body = await request.json()
+    sid = normalize_text(str(body.get("session_id", "")))
+    if not sid:
+        return JSONResponse({"ok": False, "message": "缺少 session_id"}, status_code=400)
+    return _cancel_bilibili_qr_session(sid)
 
 
 @setup_router.post("/test-api")
@@ -2236,14 +3936,6 @@ def _join_cookie_pairs(cookies: dict[str, str], important: list[str] | None = No
     return "; ".join(parts)
 
 
-_SETUP_COOKIE_PLATFORM_SITES: dict[str, str] = {
-    "bilibili": "bilibili.com",
-    "douyin": "douyin.com",
-    "kuaishou": "kuaishou.com",
-    "qzone": "qzone.qq.com",
-}
-
-
 def _format_platform_cookie_payload(
     platform: str,
     raw_by_domain: dict[str, dict[str, str]],
@@ -2524,12 +4216,28 @@ async def setup_save(request: Request):
                 if cookie:
                     video_cfg[platform]["cookie"] = sm.encrypt(str(cookie))
 
+        # 加密 image_gen 模型 API key
+        image_gen_cfg = config_data.get("image_gen", {})
+        models = image_gen_cfg.get("models", []) if isinstance(image_gen_cfg, dict) else []
+        if isinstance(models, list):
+            for model_cfg in models:
+                if not isinstance(model_cfg, dict):
+                    continue
+                api_key = normalize_text(str(model_cfg.get("api_key", "")))
+                if not api_key:
+                    continue
+                if api_key.startswith("${") and api_key.endswith("}"):
+                    continue
+                if SecretManager.is_encrypted(api_key):
+                    continue
+                model_cfg["api_key"] = sm.encrypt(api_key)
+
     except Exception as e:
         _log.warning(f"加密失败，使用明文存储: {e}")
 
     # 合并到模板
     template = load_config_template()
-    merged = _deep_merge_template(template, config_data)
+    merged = _deep_merge_template(template, _strip_deprecated_local_paths_config(config_data))
 
     # 写入配置文件
     config_file = _ROOT_DIR / "config" / "config.yml"

@@ -36,6 +36,19 @@ const ENDPOINT_TYPE_OPTIONS = [
   { value: "weiyi_ai", label: "唯—AI (A)" },
 ];
 
+const IMAGE_GEN_DEFAULTS: Record<string, { model: string; baseUrl: string; env: string }> = {
+  skiapi: { model: "grok-imagine-1.0", baseUrl: "https://skiapi.dev/v1", env: "SKIAPI_KEY" },
+  openai: { model: "dall-e-3", baseUrl: "https://api.openai.com/v1", env: "OPENAI_API_KEY" },
+  xai: { model: "grok-imagine-1.0", baseUrl: "https://api.x.ai/v1", env: "XAI_API_KEY" },
+  flux: { model: "flux-1-schnell", baseUrl: "https://api.siliconflow.cn/v1", env: "SILICONFLOW_API_KEY" },
+  sd: { model: "stable-diffusion-xl", baseUrl: "http://127.0.0.1:7860", env: "API_KEY" },
+  custom: { model: "dall-e-3", baseUrl: "", env: "API_KEY" },
+};
+
+const IMAGE_GEN_DEFAULT_BASES = new Set(
+  Object.values(IMAGE_GEN_DEFAULTS).map((item) => item.baseUrl).filter(Boolean),
+);
+
 const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
   skiapi: [
     { value: "claude-opus-4-6", label: "claude-opus-4-6" },
@@ -180,6 +193,21 @@ type SetupDraft = {
   cookieAllowClose?: boolean;
 };
 
+type CookieCapabilities = {
+  os?: string;
+  browsers?: {
+    recommended?: string;
+    installed?: string[];
+  };
+  notices?: string[];
+  platforms?: {
+    bilibili?: { qr_scan?: boolean; browser_extract?: boolean };
+    douyin?: { browser_extract?: boolean };
+    kuaishou?: { browser_extract?: boolean };
+    qzone?: { browser_extract?: boolean };
+  };
+};
+
 export default function SetupPage() {
   const [step, setStep] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -212,10 +240,10 @@ export default function SetupPage() {
 
   // Image Gen
   const [imageGenEnable, setImageGenEnable] = useState(true);
-  const [imageGenProvider, setImageGenProvider] = useState("openai");
+  const [imageGenProvider, setImageGenProvider] = useState("skiapi");
   const [imageGenApiKey, setImageGenApiKey] = useState("");
-  const [imageGenBaseUrl, setImageGenBaseUrl] = useState("");
-  const [imageGenModel, setImageGenModel] = useState("dall-e-3");
+  const [imageGenBaseUrl, setImageGenBaseUrl] = useState(IMAGE_GEN_DEFAULTS.skiapi.baseUrl);
+  const [imageGenModel, setImageGenModel] = useState(IMAGE_GEN_DEFAULTS.skiapi.model);
   const [imageGenSize, setImageGenSize] = useState("1024x1024");
   const [testingImageGen, setTestingImageGen] = useState(false);
   const [testImageGenResult, setTestImageGenResult] = useState<{ ok: boolean; msg: string; imageUrl?: string } | null>(null);
@@ -232,6 +260,13 @@ export default function SetupPage() {
   const [cookieAllowClose, setCookieAllowClose] = useState(false);
   const [smartExtracting, setSmartExtracting] = useState(false);
   const [smartMsg, setSmartMsg] = useState("");
+  const [cookieCapabilities, setCookieCapabilities] = useState<CookieCapabilities | null>(null);
+  const [cookieCapabilitiesError, setCookieCapabilitiesError] = useState("");
+  const [biliQrSessionId, setBiliQrSessionId] = useState("");
+  const [biliQrImage, setBiliQrImage] = useState("");
+  const [biliQrUrl, setBiliQrUrl] = useState("");
+  const [biliQrStatus, setBiliQrStatus] = useState("");
+  const [biliQrLoading, setBiliQrLoading] = useState(false);
 
   // Auto-poll smart extraction results
   const pollSmartResult = useCallback(async () => {
@@ -286,6 +321,104 @@ export default function SetupPage() {
     setSmartMsg("轮询超时");
     setSmartExtracting(false);
   }, []);
+
+  const loadCookieCapabilities = useCallback(async () => {
+    try {
+      const res = await fetch(`${BASE}/setup/cookie-capabilities`);
+      const data = await res.json();
+      if (data?.ok && data?.data) {
+        const caps = data.data as CookieCapabilities;
+        setCookieCapabilities(caps);
+        setCookieCapabilitiesError("");
+        const recommended = String(caps?.browsers?.recommended || "").trim();
+        if (recommended) setCookieBrowser(recommended);
+        return;
+      }
+      setCookieCapabilitiesError(String(data?.message || "获取 Cookie 能力失败"));
+    } catch (e: unknown) {
+      setCookieCapabilitiesError(e instanceof Error ? e.message : "获取 Cookie 能力失败");
+    }
+  }, []);
+
+  const startBilibiliQr = useCallback(async () => {
+    setBiliQrLoading(true);
+    setBiliQrStatus("正在生成二维码...");
+    try {
+      if (biliQrSessionId) {
+        await fetch(`${BASE}/setup/bilibili-qr/cancel`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ session_id: biliQrSessionId }),
+        }).catch(() => undefined);
+      }
+      const res = await fetch(`${BASE}/setup/bilibili-qr/start`, { method: "POST" });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) {
+        setBiliQrStatus(String(data?.message || "二维码生成失败"));
+        setBiliQrLoading(false);
+        return;
+      }
+      const sid = String(data.session_id || "");
+      setBiliQrSessionId(sid);
+      setBiliQrImage(String(data.qr_image_data_uri || ""));
+      setBiliQrUrl(String(data.qr_url || ""));
+      setBiliQrStatus(String(data.message || "请使用 B站 App 扫码"));
+      setBiliQrLoading(false);
+    } catch (e: unknown) {
+      setBiliQrStatus(e instanceof Error ? e.message : "二维码生成失败");
+      setBiliQrLoading(false);
+    }
+  }, [biliQrSessionId]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    if (!biliQrSessionId) return () => {
+      if (timer) window.clearTimeout(timer);
+    };
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`${BASE}/setup/bilibili-qr/status?session_id=${encodeURIComponent(biliQrSessionId)}`);
+        const data = await res.json();
+        const status = String(data?.status || "");
+        if (status === "done" && data?.data) {
+          setBiliSessdata(String(data.data.sessdata || ""));
+          setBiliBiliJct(String(data.data.bili_jct || ""));
+          setCookieStatus((prev) => ({ ...prev, bilibili: { ok: true, msg: "扫码登录成功" } }));
+          setBiliQrStatus("扫码登录成功，已回填 Cookie");
+          setBiliQrSessionId("");
+          return;
+        }
+        if (status === "expired" || status === "error") {
+          setCookieStatus((prev) => ({ ...prev, bilibili: { ok: false, msg: String(data?.message || "二维码已失效") } }));
+          setBiliQrStatus(String(data?.message || "二维码已失效"));
+          setBiliQrSessionId("");
+          return;
+        }
+        setBiliQrStatus(String(data?.message || "等待扫码..."));
+      } catch {
+        // 服务可能重启，继续重试
+      }
+      timer = window.setTimeout(poll, 1800);
+    };
+    timer = window.setTimeout(poll, 1200);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [biliQrSessionId]);
+
+  useEffect(() => () => {
+    if (!biliQrSessionId) return;
+    fetch(`${BASE}/setup/bilibili-qr/cancel`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ session_id: biliQrSessionId }),
+    }).catch(() => undefined);
+  }, [biliQrSessionId]);
+
+  useEffect(() => {
+    loadCookieCapabilities();
+  }, [loadCookieCapabilities]);
 
   useEffect(() => {
     // Restore draft if exists.
@@ -838,15 +971,18 @@ export default function SetupPage() {
                     onSelectionChange={(keys) => {
                       const v = Array.from(keys)[0];
                       if (v) {
-                        setImageGenProvider(String(v));
-                        if (v === "openai") setImageGenModel("dall-e-3");
-                        else if (v === "xai") setImageGenModel("grok-imagine-1.0");
-                        else if (v === "flux") setImageGenModel("flux-1-schnell");
-                        else if (v === "sd") setImageGenModel("stable-diffusion-xl");
+                        const nextProvider = String(v);
+                        setImageGenProvider(nextProvider);
+                        const defaults = IMAGE_GEN_DEFAULTS[nextProvider] || IMAGE_GEN_DEFAULTS.custom;
+                        setImageGenModel(defaults.model);
+                        if (!imageGenBaseUrl || IMAGE_GEN_DEFAULT_BASES.has(imageGenBaseUrl)) {
+                          setImageGenBaseUrl(defaults.baseUrl);
+                        }
                       }
                     }}
                     classNames={{ trigger: "bg-content2" }}
                   >
+                    <SelectItem key="skiapi">SKIAPI</SelectItem>
                     <SelectItem key="openai">OpenAI (DALL-E)</SelectItem>
                     <SelectItem key="xai">xAI (Grok Imagine)</SelectItem>
                     <SelectItem key="flux">Flux</SelectItem>
@@ -862,7 +998,7 @@ export default function SetupPage() {
                   />
                   <Input
                     label="API Key"
-                    description="留空则从环境变量读取"
+                    description={`留空则从环境变量 ${IMAGE_GEN_DEFAULTS[imageGenProvider]?.env || "API_KEY"} 读取`}
                     type="password"
                     value={imageGenApiKey}
                     onValueChange={setImageGenApiKey}
@@ -870,7 +1006,7 @@ export default function SetupPage() {
                   />
                   <Input
                     label="Base URL（可选）"
-                    placeholder="留空使用默认"
+                    placeholder={IMAGE_GEN_DEFAULTS[imageGenProvider]?.baseUrl || "留空使用默认"}
                     value={imageGenBaseUrl}
                     onValueChange={setImageGenBaseUrl}
                     classNames={{ inputWrapper: "bg-content2" }}
@@ -935,6 +1071,8 @@ export default function SetupPage() {
                         <SelectItem key="edge">Edge</SelectItem>
                         <SelectItem key="chrome">Chrome</SelectItem>
                         <SelectItem key="brave">Brave</SelectItem>
+                        <SelectItem key="chromium">Chromium</SelectItem>
+                        <SelectItem key="firefox">Firefox</SelectItem>
                       </Select>
                     </div>
                     <Button
@@ -952,6 +1090,16 @@ export default function SetupPage() {
                     {smartMsg}
                   </Chip>
                 )}
+                {cookieCapabilitiesError && (
+                  <Chip size="sm" variant="flat" color="danger">
+                    Cookie 能力检测失败：{cookieCapabilitiesError}
+                  </Chip>
+                )}
+                {!cookieCapabilitiesError && cookieCapabilities?.notices?.map((note, idx) => (
+                  <Chip key={`${idx}-${note}`} size="sm" variant="flat" color="warning">
+                    {note}
+                  </Chip>
+                ))}
               </div>
 
               <Divider />
@@ -989,15 +1137,44 @@ export default function SetupPage() {
                       </Chip>
                     )}
                   </div>
-                  <Button
-                    size="sm" variant="flat" color="primary" radius="full"
-                    startContent={<Download size={14} />}
-                    isLoading={extracting === "bilibili"}
-                    onPress={() => extractCookie("bilibili")}
-                  >
-                    自动获取
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm" variant="flat" color="secondary" radius="full"
+                      isLoading={biliQrLoading}
+                      onPress={startBilibiliQr}
+                    >
+                      扫码登录
+                    </Button>
+                    <Button
+                      size="sm" variant="flat" color="primary" radius="full"
+                      startContent={<Download size={14} />}
+                      isLoading={extracting === "bilibili"}
+                      onPress={() => extractCookie("bilibili")}
+                    >
+                      浏览器提取
+                    </Button>
+                  </div>
                 </div>
+                {biliQrStatus && (
+                  <Chip size="sm" variant="flat" color={biliQrSessionId ? "warning" : (biliQrStatus.includes("成功") ? "success" : "default")}>
+                    {biliQrStatus}
+                  </Chip>
+                )}
+                {biliQrImage && biliQrSessionId && (
+                  <div className="rounded-lg border border-default-200 bg-content1 p-3 w-fit">
+                    <img src={biliQrImage} alt="B站扫码二维码" className="w-44 h-44" />
+                    {biliQrUrl && (
+                      <a
+                        className="mt-2 block text-xs text-primary underline break-all"
+                        href={biliQrUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        二维码链接（打不开图片时点这里）
+                      </a>
+                    )}
+                  </div>
+                )}
                 <Input label="SESSDATA" size="sm" value={biliSessdata} onValueChange={setBiliSessdata}
                   placeholder="自动获取或手动粘贴" classNames={{ inputWrapper: "bg-content1" }} />
                 <Input label="bili_jct" size="sm" value={biliBiliJct} onValueChange={setBiliBiliJct}

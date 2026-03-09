@@ -16,8 +16,9 @@ type QuickField = {
 const QUICK_FIELDS: QuickField[] = [
   { path: "agent.identity", label: "Agent 身份定义", kind: "text" },
   { path: "agent.rules", label: "Agent 核心规则", kind: "text" },
-  { path: "agent.tool_priority", label: "工具选择优先级", kind: "text" },
-  { path: "agent.music_selection_guide", label: "音乐选择智能指南", kind: "text" },
+  { path: "agent.network_flow", label: "联网处理流程", kind: "text" },
+  { path: "agent.tool_usage", label: "工具使用规范", kind: "text" },
+  { path: "agent.reply_style", label: "回复风格", kind: "text" },
   { path: "agent.context_rules", label: "上下文理解规则", kind: "text" },
   { path: "messages.mention_only_fallback", label: "空@回复（无名字）", kind: "text" },
   { path: "messages.mention_only_fallback_with_name", label: "空@回复（带名字）", kind: "text" },
@@ -31,16 +32,10 @@ const QUICK_FIELDS: QuickField[] = [
   { path: "agent_runtime.reply_context_to_user", label: "回复上下文（用户）", kind: "text" },
   { path: "agent_runtime.attached_media_line", label: "附加媒体行", kind: "text" },
   { path: "agent_runtime.reply_media_line", label: "回复媒体行", kind: "text" },
-  { path: "thinking_rules", label: "思考规则", kind: "text" },
-  { path: "vision.main_system", label: "图片识别系统提示", kind: "text" },
-  { path: "video.batch_system", label: "视频批处理系统提示", kind: "text" },
-  { path: "personality_output_rules", label: "人格输出规则", kind: "text" },
-  { path: "image_question_cues", label: "图片问题触发词", kind: "list" },
-  { path: "image_reference_cues", label: "图片引用触发词", kind: "list" },
-  { path: "image_request_cues", label: "图片请求触发词", kind: "list" },
-  { path: "image_send_cues", label: "图片发送触发词", kind: "list" },
-  { path: "local_media_request_cues", label: "本地媒体请求触发词", kind: "list" },
-  { path: "media_instruction_cues", label: "媒体指令触发词", kind: "list" },
+  { path: "verbosity.verbose", label: "详细回复模板", kind: "text" },
+  { path: "verbosity.medium", label: "中等回复模板", kind: "text" },
+  { path: "verbosity.brief", label: "简短回复模板", kind: "text" },
+  { path: "verbosity.minimal", label: "极简回复模板", kind: "text" },
 ];
 
 function getNestedRawValue(obj: AnyObj, path: string): unknown {
@@ -101,7 +96,8 @@ export default function PromptsPage() {
   const load = useCallback(async () => {
     try {
       const res = await api.getPrompts();
-      setContent(res.content);
+      const text = String(res.content ?? res.yaml_text ?? "");
+      setContent(text);
       setQuick(res.parsed || {});
     } catch (e: unknown) {
       setMsg(e instanceof Error ? e.message : "加载失败");
@@ -116,7 +112,12 @@ export default function PromptsPage() {
     setSaving(true);
     setMsg("");
     try {
-      const res = await api.updatePrompts(content);
+      const text = String(content ?? "");
+      if (!text.trim()) {
+        setMsg("提示词内容为空，先点击“全量重载”恢复默认模板后再保存。");
+        return;
+      }
+      const res = await api.updatePrompts(text);
       setMsg(res.ok ? "保存成功，提示词已重载" : `失败: ${res.message}`);
     } catch (e: unknown) {
       setMsg(e instanceof Error ? e.message : "保存失败");
@@ -136,7 +137,7 @@ export default function PromptsPage() {
       const res = await api.patchPrompts(patch);
       setQuick(res.parsed || {});
       const full = await api.getPrompts();
-      setContent(full.content);
+      setContent(String(full.content ?? full.yaml_text ?? ""));
       setMsg(res.ok ? "常用提示词已保存并重载" : `失败: ${res.message}`);
     } catch (e: unknown) {
       setMsg(e instanceof Error ? e.message : "保存失败");
@@ -187,6 +188,9 @@ export default function PromptsPage() {
       {msg && <p className={msg.includes("成功") ? "text-success" : "text-danger"}>{msg}</p>}
       <p className="text-xs text-default-400">
         编辑 config/prompts.yml — 保存后自动重载提示词，无需重启 bot
+      </p>
+      <p className="text-xs text-default-400">
+        说明：本地 cue/关键词路由已硬删除，提示词仅用于 AI 行为约束，不再作为本地分支匹配词表。
       </p>
       <Accordion selectionMode="multiple" defaultExpandedKeys={["quick_prompts"]}>
         <AccordionItem key="quick_prompts" title="常用提示词可视化编辑">

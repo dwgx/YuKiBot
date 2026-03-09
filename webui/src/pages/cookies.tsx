@@ -1,15 +1,59 @@
-import { useState } from "react";
-import { Card, CardBody, CardHeader, Button, Textarea, Select, SelectItem, Chip } from "@heroui/react";
-import { RefreshCw, Save, AlertCircle, CheckCircle2 } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Card, CardBody, CardHeader, Button, Textarea, Select, SelectItem, Chip, Switch } from "@heroui/react";
+import { RefreshCw, Save, AlertCircle, CheckCircle2, QrCode } from "lucide-react";
 import { api } from "../api/client";
 
-type Platform = "bilibili" | "douyin" | "kuaishou";
+type Platform = "bilibili" | "douyin" | "kuaishou" | "qzone";
+type Browser = "edge" | "chrome" | "firefox" | "brave" | "chromium";
+
+type CookieCapabilities = {
+  browsers?: {
+    recommended?: string;
+  };
+  notices?: string[];
+  platforms?: {
+    bilibili?: { qr_scan?: boolean; browser_extract?: boolean };
+  };
+};
+
+const authHeaders = () => ({
+  "Content-Type": "application/json",
+  Authorization: `Bearer ${api.getToken()}`,
+});
 
 export default function CookiesPage() {
   const [platform, setPlatform] = useState<Platform>("bilibili");
+  const [browser, setBrowser] = useState<Browser>("edge");
+  const [allowClose, setAllowClose] = useState(false);
   const [cookie, setCookie] = useState("");
   const [loading, setLoading] = useState(false);
   const [msg, setMsg] = useState("");
+  const [caps, setCaps] = useState<CookieCapabilities | null>(null);
+
+  const [biliQrSessionId, setBiliQrSessionId] = useState("");
+  const [biliQrImage, setBiliQrImage] = useState("");
+  const [biliQrUrl, setBiliQrUrl] = useState("");
+  const [biliQrStatus, setBiliQrStatus] = useState("");
+  const [biliQrLoading, setBiliQrLoading] = useState(false);
+
+  const loadCapabilities = useCallback(async () => {
+    try {
+      const res = await fetch("/api/webui/cookies/capabilities", { headers: { Authorization: `Bearer ${api.getToken()}` } });
+      const data = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (res.ok && data?.data) {
+        const capability = data.data as CookieCapabilities;
+        setCaps(capability);
+        const recommended = String(capability?.browsers?.recommended || "").trim();
+        if (recommended) setBrowser(recommended as Browser);
+      }
+    } catch {
+      // ignore capability failures
+    }
+  }, []);
+
+  useEffect(() => {
+    loadCapabilities();
+  }, [loadCapabilities]);
 
   const handleExtract = async () => {
     setLoading(true);
@@ -17,18 +61,20 @@ export default function CookiesPage() {
     try {
       const res = await fetch("/api/webui/cookies/extract", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${api.getToken()}`,
-        },
-        body: JSON.stringify({ platform }),
+        headers: authHeaders(),
+        body: JSON.stringify({ platform, browser, allow_close: allowClose }),
       });
+      const data = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.ok) {
-        const data = await res.json();
-        setCookie(data.cookie || "");
-        setMsg(data.message || "提取成功");
+        setCookie(String(data.cookie || ""));
+        setMsg(String(data.message || "提取成功"));
       } else {
-        setMsg(`提取失败: ${res.statusText}`);
+        const hint = String(data.hint || "").trim();
+        const reason =
+          String(data.error || data.message || "").trim() ||
+          res.statusText ||
+          `HTTP ${res.status}`;
+        setMsg(`提取失败: ${hint ? `${reason}（${hint}）` : reason}`);
       }
     } catch (err: any) {
       setMsg(`错误: ${err.message}`);
@@ -43,16 +89,18 @@ export default function CookiesPage() {
     try {
       const res = await fetch("/api/webui/cookies/save", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${api.getToken()}`,
-        },
+        headers: authHeaders(),
         body: JSON.stringify({ platform, cookie }),
       });
+      const data = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.ok) {
-        setMsg("保存成功");
+        setMsg(String(data.message || "保存成功"));
       } else {
-        setMsg(`保存失败: ${res.statusText}`);
+        const reason =
+          String(data.error || data.message || "").trim() ||
+          res.statusText ||
+          `HTTP ${res.status}`;
+        setMsg(`保存失败: ${reason}`);
       }
     } catch (err: any) {
       setMsg(`错误: ${err.message}`);
@@ -60,6 +108,86 @@ export default function CookiesPage() {
       setLoading(false);
     }
   };
+
+  const startBilibiliQr = useCallback(async () => {
+    setBiliQrLoading(true);
+    setBiliQrStatus("正在生成二维码...");
+    try {
+      if (biliQrSessionId) {
+        await fetch("/api/webui/cookies/bilibili-qr/cancel", {
+          method: "POST",
+          headers: authHeaders(),
+          body: JSON.stringify({ session_id: biliQrSessionId }),
+        }).catch(() => undefined);
+      }
+      const res = await fetch("/api/webui/cookies/bilibili-qr/start", {
+        method: "POST",
+        headers: authHeaders(),
+      });
+      const data = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (!res.ok || !data?.ok) {
+        setBiliQrStatus(String(data?.message || "二维码生成失败"));
+        setBiliQrLoading(false);
+        return;
+      }
+      setBiliQrSessionId(String(data.session_id || ""));
+      setBiliQrImage(String(data.qr_image_data_uri || ""));
+      setBiliQrUrl(String(data.qr_url || ""));
+      setBiliQrStatus(String(data.message || "请使用 B站 App 扫码"));
+      setBiliQrLoading(false);
+    } catch (e: unknown) {
+      setBiliQrStatus(e instanceof Error ? e.message : "二维码生成失败");
+      setBiliQrLoading(false);
+    }
+  }, [biliQrSessionId]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    if (!biliQrSessionId) return () => {
+      if (timer) window.clearTimeout(timer);
+    };
+
+    const poll = async () => {
+      try {
+        const res = await fetch(`/api/webui/cookies/bilibili-qr/status?session_id=${encodeURIComponent(biliQrSessionId)}`, {
+          headers: { Authorization: `Bearer ${api.getToken()}` },
+        });
+        const data = await res.json().catch(() => ({} as Record<string, unknown>));
+        const status = String(data?.status || "");
+        if (status === "done" && data?.data) {
+          const sess = String((data.data as Record<string, unknown>).sessdata || "");
+          const jct = String((data.data as Record<string, unknown>).bili_jct || "");
+          setCookie(JSON.stringify({ SESSDATA: sess, bili_jct: jct }, null, 2));
+          setBiliQrStatus("扫码登录成功，已回填 Cookie");
+          setMsg("B站扫码登录成功");
+          setBiliQrSessionId("");
+          return;
+        }
+        if (status === "expired" || status === "error") {
+          setBiliQrStatus(String(data?.message || "二维码已失效"));
+          setBiliQrSessionId("");
+          return;
+        }
+        setBiliQrStatus(String(data?.message || "等待扫码..."));
+      } catch {
+        // ignore poll errors
+      }
+      timer = window.setTimeout(poll, 1800);
+    };
+    timer = window.setTimeout(poll, 1200);
+    return () => {
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [biliQrSessionId]);
+
+  useEffect(() => () => {
+    if (!biliQrSessionId) return;
+    fetch("/api/webui/cookies/bilibili-qr/cancel", {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ session_id: biliQrSessionId }),
+    }).catch(() => undefined);
+  }, [biliQrSessionId]);
 
   return (
     <div className="space-y-4 max-w-4xl">
@@ -78,30 +206,105 @@ export default function CookiesPage() {
             selectedKeys={[platform]}
             onChange={(e) => setPlatform(e.target.value as Platform)}
           >
-            <SelectItem key="bilibili">B站 (扫码登录)</SelectItem>
+            <SelectItem key="bilibili">B站 (扫码登录 + 浏览器提取)</SelectItem>
             <SelectItem key="douyin">抖音 (浏览器提取)</SelectItem>
             <SelectItem key="kuaishou">快手 (浏览器提取)</SelectItem>
+            <SelectItem key="qzone">QQ空间 (浏览器提取)</SelectItem>
           </Select>
 
-          <div className="flex gap-2">
-            <Button
-              color="primary"
-              startContent={<RefreshCw size={16} />}
-              isLoading={loading}
-              onPress={handleExtract}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <Select
+              label="浏览器"
+              selectedKeys={[browser]}
+              onChange={(e) => setBrowser(e.target.value as Browser)}
             >
-              {platform === "bilibili" ? "扫码登录" : "提取 Cookie"}
-            </Button>
+              <SelectItem key="edge">Edge</SelectItem>
+              <SelectItem key="chrome">Chrome</SelectItem>
+              <SelectItem key="brave">Brave</SelectItem>
+              <SelectItem key="chromium">Chromium</SelectItem>
+              <SelectItem key="firefox">Firefox</SelectItem>
+            </Select>
+            <div className="flex items-end pb-2">
+              <Switch size="sm" isSelected={allowClose} onValueChange={setAllowClose}>
+                自动关闭浏览器后重试
+              </Switch>
+            </div>
           </div>
 
           {platform === "bilibili" && (
-            <div className="text-sm text-default-500">
-              点击后将在终端显示二维码，使用 B站 App 扫码登录
+            <div className="flex flex-wrap gap-2">
+              <Button
+                color="secondary"
+                startContent={<QrCode size={16} />}
+                isLoading={biliQrLoading}
+                onPress={startBilibiliQr}
+              >
+                生成扫码二维码
+              </Button>
+              <Button
+                color="primary"
+                startContent={<RefreshCw size={16} />}
+                isLoading={loading}
+                onPress={handleExtract}
+              >
+                浏览器提取
+              </Button>
             </div>
           )}
+
           {platform !== "bilibili" && (
+            <div className="flex gap-2">
+              <Button
+                color="primary"
+                startContent={<RefreshCw size={16} />}
+                isLoading={loading}
+                onPress={handleExtract}
+              >
+                提取 Cookie
+              </Button>
+            </div>
+          )}
+
+          {biliQrStatus && platform === "bilibili" && (
+            <Chip size="sm" variant="flat" color={biliQrSessionId ? "warning" : (biliQrStatus.includes("成功") ? "success" : "default")}>
+              {biliQrStatus}
+            </Chip>
+          )}
+          {biliQrImage && biliQrSessionId && platform === "bilibili" && (
+            <div className="rounded-lg border border-default-200 bg-content1 p-3 w-fit">
+              <img src={biliQrImage} alt="B站二维码" className="w-44 h-44" />
+              {biliQrUrl && (
+                <a
+                  className="mt-2 block text-xs text-primary underline break-all"
+                  href={biliQrUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  二维码链接（图片无法显示时使用）
+                </a>
+              )}
+            </div>
+          )}
+
+          {caps?.notices?.map((note, idx) => (
+            <Chip key={`${idx}-${note}`} size="sm" variant="flat" color="warning">
+              {note}
+            </Chip>
+          ))}
+
+          {platform === "qzone" && (
             <div className="text-sm text-default-500">
-              需要先在浏览器登录对应平台，然后点击提取。Chrome 需要关闭浏览器后重新打开。
+              需要先在浏览器登录 QQ 空间（qzone.qq.com / user.qzone.qq.com）再提取。
+            </div>
+          )}
+          {platform !== "bilibili" && platform !== "qzone" && (
+            <div className="text-sm text-default-500">
+              需要先在浏览器登录对应平台，然后点击提取。
+            </div>
+          )}
+          {platform === "bilibili" && (
+            <div className="text-sm text-default-500">
+              推荐先用“扫码登录”。扫码成功会自动回填 `SESSDATA / bili_jct` 到下方文本框。
             </div>
           )}
         </CardBody>

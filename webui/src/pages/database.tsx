@@ -57,10 +57,12 @@ export default function DatabasePage() {
   const [loadingOverview, setLoadingOverview] = useState(true);
   const [loadingTables, setLoadingTables] = useState(false);
   const [loadingRows, setLoadingRows] = useState(false);
+  const [clearingTable, setClearingTable] = useState(false);
   const [error, setError] = useState("");
 
   const [queryInput, setQueryInput] = useState("");
   const [executedQuery, setExecutedQuery] = useState("");
+  const [queryRefreshToken, setQueryRefreshToken] = useState(0);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(50);
   const [rowsData, setRowsData] = useState<DbRowsResponse | null>(null);
@@ -124,7 +126,7 @@ export default function DatabasePage() {
     } finally {
       setLoadingRows(false);
     }
-  }, [executedQuery, includeSystem, page, pageSize, selectedDb, selectedTable]);
+  }, [executedQuery, includeSystem, page, pageSize, queryRefreshToken, selectedDb, selectedTable]);
 
   useEffect(() => {
     loadOverview();
@@ -145,6 +147,39 @@ export default function DatabasePage() {
     () => overview.find((db) => db.name === selectedDb) || null,
     [overview, selectedDb],
   );
+  const applyQuery = useCallback(() => {
+    setExecutedQuery(queryInput.trim());
+    setPage(1);
+    setQueryRefreshToken((v) => v + 1);
+  }, [queryInput]);
+  const clearQuery = useCallback(() => {
+    setQueryInput("");
+    setExecutedQuery("");
+    setPage(1);
+    setQueryRefreshToken((v) => v + 1);
+  }, []);
+  const clearCurrentTable = useCallback(async () => {
+    if (!selectedDb || !selectedTable || clearingTable) return;
+    const confirmed = window.confirm(`确认清空 ${selectedDb}.${selectedTable} 的全部数据？此操作不可撤销。`);
+    if (!confirmed) return;
+
+    setClearingTable(true);
+    try {
+      const res = await api.clearDbTable(selectedDb, selectedTable);
+      setError(`[OK] ${res.message}，共删除 ${res.deleted} 行`);
+      setPage(1);
+      setQueryInput("");
+      setExecutedQuery("");
+      setQueryRefreshToken((v) => v + 1);
+      await loadOverview();
+      await loadTables();
+      await loadRows();
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "清空数据失败");
+    } finally {
+      setClearingTable(false);
+    }
+  }, [clearingTable, loadOverview, loadRows, loadTables, selectedDb, selectedTable]);
 
   return (
     <section className="space-y-4">
@@ -152,22 +187,41 @@ export default function DatabasePage() {
         <div className="flex items-center gap-2">
           <Database size={20} />
           <h2 className="text-xl font-bold">数据库查看</h2>
-          <Chip size="sm" variant="flat" color="primary">只读</Chip>
+          <Chip size="sm" variant="flat" color={selectedTable ? "warning" : "primary"}>
+            {selectedTable ? "可清空当前表" : "只读"}
+          </Chip>
         </div>
-        <Button
-          variant="flat"
-          startContent={<RefreshCw size={16} />}
-          onPress={() => {
-            loadOverview();
-            loadTables();
-            loadRows();
-          }}
-        >
-          刷新
-        </Button>
+        <div className="flex items-center gap-2">
+          {selectedTable && (
+            <Button
+              color="danger"
+              variant="flat"
+              onPress={clearCurrentTable}
+              isLoading={clearingTable}
+              isDisabled={loadingRows || loadingTables}
+            >
+              清空当前表
+            </Button>
+          )}
+          <Button
+            variant="flat"
+            startContent={<RefreshCw size={16} />}
+            onPress={() => {
+              loadOverview();
+              loadTables();
+              loadRows();
+            }}
+          >
+            刷新
+          </Button>
+        </div>
       </div>
 
-      {error && <p className="text-danger text-sm">{error}</p>}
+      {error && (
+        <p className={`${error.startsWith("[OK]") ? "text-success" : "text-danger"} text-sm`}>
+          {error.replace(/^\[OK\]\s*/, "")}
+        </p>
+      )}
 
       <Card>
         <CardHeader className="pb-1">数据源</CardHeader>
@@ -227,35 +281,23 @@ export default function DatabasePage() {
           <Input
             label="关键词搜索"
             value={queryInput}
+            isClearable
+            onClear={clearQuery}
             onValueChange={setQueryInput}
             onKeyDown={(e) => {
               if (e.key === "Enter") {
-                setExecutedQuery(queryInput.trim());
-                setPage(1);
+                applyQuery();
               }
             }}
             placeholder="按当前表全部列模糊匹配"
             startContent={<Search size={16} />}
           />
           <div className="flex items-end gap-2 pb-1">
-            <Button
-              color="primary"
-              onPress={() => {
-                setExecutedQuery(queryInput.trim());
-                setPage(1);
-              }}
-            >
+            <Button color="primary" onPress={applyQuery}>
               查询
             </Button>
-            <Button
-              variant="flat"
-              onPress={() => {
-                setQueryInput("");
-                setExecutedQuery("");
-                setPage(1);
-              }}
-            >
-              清空
+            <Button variant="flat" onPress={clearQuery}>
+              清空筛选
             </Button>
           </div>
         </CardBody>

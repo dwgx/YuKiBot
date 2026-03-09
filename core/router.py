@@ -7,13 +7,10 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from core import prompt_loader as _pl
 from core.personality import PersonalityEngine
 from core.prompt_policy import PromptPolicy
 from core.system_prompts import SystemPromptRelay
 from services.model_client import ModelClient
-# 已移除本地关键词判断，完全依赖 AI
-# from utils.intent import ...
 from utils.text import clip_text, normalize_text
 
 
@@ -79,7 +76,6 @@ class RouterEngine:
         self.failover_mode = str(routing_cfg.get("failover_mode", "mention_or_private_only")).strip()
         self.trust_ai_fully = bool(routing_cfg.get("trust_ai_fully", True))  # 默认完全信任 AI
         self.followup_fast_path_enable = bool(routing_cfg.get("followup_fast_path_enable", False))  # 禁用快速路径
-        self.enable_keyword_heuristics = bool(routing_cfg.get("enable_keyword_heuristics", False))  # 禁用关键词
         self.passive_multimodal_followup_min_confidence = max(
             0.0,
             min(1.0, float(routing_cfg.get("passive_multimodal_followup_min_confidence", 0.72))),
@@ -364,12 +360,13 @@ class RouterEngine:
         user_text = payload.text
         has_image_media = any(item.startswith("image:") for item in payload.media_summary)
         media_user_text = self._extract_multimodal_user_text(user_text)
+        has_inline_multimodal_text = bool(media_user_text)
         followup_multimodal_window = bool(payload.followup_candidate or payload.active_session)
         passive_multimodal_addressed = (
             payload.mentioned
             or payload.is_private
             or self._looks_like_bot_address(user_text)
-            or self._looks_like_media_instruction(user_text)
+            or has_inline_multimodal_text
         )
         passive_multimodal_followup_allowed = (
             followup_multimodal_window
@@ -378,18 +375,6 @@ class RouterEngine:
             and not self._contains_explicit_adult_intent(media_user_text)
             and passive_multimodal_addressed
         )
-        media_force = (
-            payload.mentioned
-            or payload.followup_candidate
-            or payload.active_session
-            or self._looks_like_bot_address(user_text)
-            or payload.busy_users <= 1
-        )
-
-        # 关键词覆盖门控：trust_ai_fully=true 时完全跳过关键词覆盖；
-        # 否则仅在 AI 置信度 < 0.5 时用关键词兜底。
-        keyword_override_enabled = not self.trust_ai_fully and confidence < 0.5
-
         # 纯"系统拼接的多模态占位文本"默认不触发业务动作，避免用户随手发图被误接话。
         # 但如果同条消息里有明确指令（如"这是什么/识图/把图发送过来"），允许继续处理。
         if (
@@ -397,7 +382,7 @@ class RouterEngine:
             and not payload.mentioned
             and not payload.is_private
             and not self._looks_like_bot_address(user_text)
-            and not self._looks_like_media_instruction(user_text)
+            and not has_inline_multimodal_text
             and not passive_multimodal_followup_allowed
             and not payload.active_session
             and not payload.followup_candidate
@@ -418,7 +403,6 @@ class RouterEngine:
             and not payload.active_session
             and not self._looks_like_bot_address(user_text)
             and int(payload.busy_users or 0) >= self.multi_user_dialogue_min_users
-            and not self._looks_like_group_open_question(user_text)
         ):
             return RouterDecision(
                 should_handle=False,
@@ -442,7 +426,7 @@ class RouterEngine:
 
         if (
             has_image_media
-            and self._looks_like_media_instruction(user_text)
+            and has_inline_multimodal_text
             and not self._contains_explicit_adult_intent(media_user_text)
             and action in {"ignore", "reply", "search"}
         ):
@@ -456,86 +440,7 @@ class RouterEngine:
             if not normalize_text(str(tool_args.get("query", ""))):
                 tool_args["query"] = normalize_text(media_user_text) or "分析这张图"
 
-        if keyword_override_enabled and (
-            self._looks_like_safe_beauty_request(user_text)
-            and not self._contains_explicit_adult_intent(user_text)
-            and (action in {"reply", "search"} or (action == "ignore" and media_force))
-        ):
-            action = "search"
-            should_handle = True
-            tool_args = dict(tool_args)
-            if self._looks_like_video_request(user_text):
-                tool_args["mode"] = "video"
-            elif self._looks_like_image_request(user_text):
-                tool_args["mode"] = "image"
-            if not normalize_text(str(tool_args.get("query", ""))):
-                tool_args["query"] = normalize_text(user_text)
-
-        if keyword_override_enabled and action in {"reply", "search"} and self._looks_like_github_request(user_text):
-            action = "search"
-            should_handle = True
-            tool_args = dict(tool_args)
-            if not normalize_text(str(tool_args.get("query", ""))):
-                tool_args["query"] = normalize_text(user_text)
-
-            method_existing = normalize_text(str(tool_args.get("method", ""))).lower()
-            if not method_existing:
-                repo = self._extract_github_repo_from_text(user_text)
-                if repo and self._looks_like_repo_readme_request(user_text):
-                    tool_args["method"] = "browser.github_readme"
-                    tool_args["method_args"] = {"repo": repo}
-                else:
-                    tool_args["method"] = "browser.github_search"
-                    if not isinstance(tool_args.get("method_args"), dict):
-                        tool_args["method_args"] = {}
-
-        if keyword_override_enabled and self._looks_like_image_request(user_text) and (
-            action in {"reply", "search"} or (action == "ignore" and media_force)
-        ):
-            action = "search"
-            should_handle = True
-            tool_args = dict(tool_args)
-            tool_args["mode"] = "image"
-            if not normalize_text(str(tool_args.get("query", ""))):
-                tool_args["query"] = normalize_text(user_text)
-
-        if keyword_override_enabled and (
-            self._looks_like_video_request(user_text)
-            and not self._contains_explicit_adult_intent(user_text)
-            and (action in {"reply", "search"} or (action == "ignore" and media_force))
-        ):
-            action = "search"
-            should_handle = True
-            tool_args = dict(tool_args)
-            tool_args["mode"] = "video"
-            if not normalize_text(str(tool_args.get("query", ""))):
-                tool_args["query"] = normalize_text(user_text)
-
-        if keyword_override_enabled and action == "reply" and self._looks_like_summary_request(user_text):
-            should_handle = True
-            if reply_style == "short":
-                reply_style = "serious"
-
-        # 中性内容救回：AI 误判"小姐姐视频/舞蹈视频/BV号推荐"为软色情而拒绝时，
-        # 如果文本不含明确露骨词且是合规媒体请求，强制覆盖为 search。
-        if (
-            action == "reply"
-            and media_force
-            and not self._contains_explicit_adult_intent(user_text)
-            and (
-                self._looks_like_safe_beauty_request(user_text)
-                or (self._looks_like_video_request(user_text) and not self._contains_explicit_adult_intent(user_text))
-            )
-        ):
-            action = "search"
-            should_handle = True
-            tool_args = dict(tool_args)
-            if self._looks_like_video_request(user_text):
-                tool_args["mode"] = "video"
-            elif self._looks_like_image_request(user_text):
-                tool_args["mode"] = "image"
-            if not normalize_text(str(tool_args.get("query", ""))):
-                tool_args["query"] = normalize_text(user_text)
+        # 关键词覆盖路径已移除：路由结果完全以模型判定为准。
 
         if payload.at_other_user_only and not payload.mentioned and should_handle and action != "ignore":
             if not self._looks_like_bot_address(user_text):
@@ -578,16 +483,18 @@ class RouterEngine:
             return None
 
         has_image_media = any(item.startswith("image:") for item in payload.media_summary)
+        media_user_text = normalize_text(self._extract_multimodal_user_text(payload.text))
+        has_inline_multimodal_text = bool(media_user_text)
         fast_path_allowed = (
             payload.mentioned
             or payload.is_private
             or self._looks_like_bot_address(payload.text)
-            or self._looks_like_media_instruction(payload.text)
+            or has_inline_multimodal_text
         )
         if has_image_media and fast_path_allowed and (
-            self._looks_like_media_instruction(payload.text) or self._is_passive_multimodal_event(payload.text)
+            has_inline_multimodal_text or self._is_passive_multimodal_event(payload.text)
         ):
-            query = normalize_text(self._extract_multimodal_user_text(payload.text)) or "继续分析这张图"
+            query = media_user_text or "继续分析这张图"
             return RouterDecision(
                 should_handle=True,
                 action="search",
@@ -600,26 +507,10 @@ class RouterEngine:
         return None
 
     def _looks_like_bot_address(self, text: str) -> bool:
-        if not self.enable_keyword_heuristics:  # 纯 AI 模式：禁用关键词
-            return False
         content = normalize_text(text).lower()
         if not content:
             return False
-        if any(alias and alias in content for alias in self.bot_aliases):
-            return True
-        direct_cues = ("你觉得", "你怎么看", "你认为", "你能", "你可以", "你帮我", "请你", "问你")
-        return any(cue in content for cue in direct_cues)
-
-    @staticmethod
-    def _looks_like_image_request(text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    def _looks_like_video_request(self, text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    @staticmethod
-    def _looks_like_safe_beauty_request(text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
+        return any(alias and alias in content for alias in self.bot_aliases)
 
     @staticmethod
     def _contains_explicit_adult_intent(text: str) -> bool:
@@ -684,40 +575,6 @@ class RouterEngine:
             parts.pop(0)
         return " ".join(parts).strip()
 
-    @classmethod
-    def _looks_like_media_instruction(cls, text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    def _looks_like_github_request(self, text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    @staticmethod
-    def _looks_like_summary_request(text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    @staticmethod
-    def _looks_like_group_open_question(text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    def _looks_like_repo_readme_request(self, text: str) -> bool:
-        return False  # 纯 AI 模式：禁用关键词判断
-
-    @staticmethod
-    def _extract_github_repo_from_text(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-        match = re.search(
-            r"https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
-            content,
-            flags=re.IGNORECASE,
-        )
-        if not match:
-            return ""
-        owner = match.group(1)
-        repo = re.sub(r"\.git$", "", match.group(2), flags=re.IGNORECASE)
-        return f"{owner}/{repo}"
-
     @staticmethod
     def _canonicalize_method_name(raw: str) -> str:
         value = normalize_text(raw)
@@ -746,12 +603,6 @@ class RouterEngine:
             "pick_audio": "media.pick_audio_from_message",
             "qq_avatar": "media.qq_avatar",
             "video_analyze": "video.analyze",
-            "local.read": "local.read_text",
-            "local_read": "local.read_text",
-            "read_local": "local.read_text",
-            "local.media": "local.media_from_path",
-            "local_media": "local.media_from_path",
-            "local.send_media": "local.media_from_path",
         }
         if value in aliases:
             return aliases[value]

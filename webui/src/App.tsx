@@ -8,8 +8,10 @@ import ConfigPage from "./pages/config";
 import PromptsPage from "./pages/prompts";
 import LogsPage from "./pages/logs";
 import DatabasePage from "./pages/database";
+import MemoryPage from "./pages/memory";
 import CookiesPage from "./pages/cookies";
 import PluginsPage from "./pages/plugins";
+import ChatPage from "./pages/chat";
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const token = api.getToken();
@@ -35,6 +37,8 @@ export default function App() {
         <Route path="prompts" element={<PromptsPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="database" element={<DatabasePage />} />
+        <Route path="chat" element={<ChatPage />} />
+        <Route path="memory" element={<MemoryPage />} />
         <Route path="cookies" element={<CookiesPage />} />
         <Route path="plugins" element={<PluginsPage />} />
       </Route>

@@ -63,14 +63,21 @@ class ApiClient {
     });
   }
 
+  testImageGen(payload: ImageGenTestRequest) {
+    return this.request<ImageGenTestResponse>("/image-gen/test", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
   getPrompts() {
-    return this.request<{ content: string; parsed: Record<string, unknown> }>("/prompts");
+    return this.request<{ content?: string; yaml_text?: string; parsed: Record<string, unknown> }>("/prompts");
   }
 
   updatePrompts(content: string) {
     return this.request<{ ok: boolean; message: string }>("/prompts", {
       method: "PUT",
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ yaml_text: content, content }),
     });
   }
 
@@ -121,9 +128,190 @@ class ApiClient {
     return this.request<DbRowsResponse>(`/db/${encodeURIComponent(db)}/rows?${q.toString()}`);
   }
 
+  clearDbTable(db: string, table: string) {
+    return this.request<{ ok: boolean; message: string; db: string; table: string; deleted: number }>(
+      `/db/${encodeURIComponent(db)}/clear`,
+      {
+        method: "POST",
+        body: JSON.stringify({ table }),
+      },
+    );
+  }
+
+  getMemoryRecords(params: {
+    conversationId?: string;
+    userId?: string;
+    role?: string;
+    keyword?: string;
+    page?: number;
+    pageSize?: number;
+  }) {
+    const q = new URLSearchParams({
+      conversation_id: params.conversationId ?? "",
+      user_id: params.userId ?? "",
+      role: params.role ?? "",
+      keyword: params.keyword ?? "",
+      page: String(params.page ?? 1),
+      page_size: String(params.pageSize ?? 50),
+    });
+    return this.request<MemoryRecordsResponse>(`/memory/records?${q.toString()}`);
+  }
+
+  addMemoryRecord(payload: MemoryRecordCreateRequest) {
+    return this.request<{ ok: boolean; message: string; item: MemoryRecordItem }>("/memory/records", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  updateMemoryRecord(recordId: number, payload: MemoryRecordUpdateRequest) {
+    return this.request<{ ok: boolean; message: string; item: MemoryRecordItem }>(
+      `/memory/records/${recordId}`,
+      {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
+  deleteMemoryRecord(recordId: number, payload: MemoryRecordDeleteRequest) {
+    return this.request<{ ok: boolean; message: string; item: MemoryRecordItem }>(
+      `/memory/records/${recordId}`,
+      {
+        method: "DELETE",
+        body: JSON.stringify(payload),
+      },
+    );
+  }
+
+  getMemoryAudit(params: { recordId?: number; page?: number; pageSize?: number }) {
+    const q = new URLSearchParams({
+      record_id: String(params.recordId ?? 0),
+      page: String(params.page ?? 1),
+      page_size: String(params.pageSize ?? 50),
+    });
+    return this.request<MemoryAuditResponse>(`/memory/audit?${q.toString()}`);
+  }
+
+  compactMemory(payload: MemoryCompactRequest) {
+    return this.request<{ ok: boolean; message: string; result: MemoryCompactResult }>("/memory/compact", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+  }
+
+  getChatConversations(params?: { limit?: number; botId?: string }) {
+    const q = new URLSearchParams({
+      limit: String(params?.limit ?? 100),
+      bot_id: params?.botId ?? "",
+    });
+    return this.request<ChatConversationResponse>(`/chat/conversations?${q.toString()}`);
+  }
+
+  getChatHistory(params: { chatType: "group" | "private"; peerId: string; limit?: number; messageSeq?: string; botId?: string }) {
+    const q = new URLSearchParams({
+      chat_type: params.chatType,
+      peer_id: params.peerId,
+      limit: String(params.limit ?? 30),
+      message_seq: params.messageSeq ?? "",
+      bot_id: params.botId ?? "",
+    });
+    return this.request<ChatHistoryResponse>(`/chat/history?${q.toString()}`);
+  }
+
+  sendChatText(payload: { chatType: "group" | "private"; peerId: string; text: string; botId?: string; replyToMessageId?: string }) {
+    return this.request<{ ok: boolean; message_id?: string }>("/chat/send-text", {
+      method: "POST",
+      body: JSON.stringify({
+        chat_type: payload.chatType,
+        peer_id: payload.peerId,
+        text: payload.text,
+        bot_id: payload.botId ?? "",
+        reply_to_message_id: payload.replyToMessageId ?? "",
+      }),
+    });
+  }
+
+  sendChatImage(payload: { chatType: "group" | "private"; peerId: string; imageUrl?: string; imageBase64?: string; botId?: string }) {
+    return this.request<{ ok: boolean; message_id?: string }>("/chat/send-image", {
+      method: "POST",
+      body: JSON.stringify({
+        chat_type: payload.chatType,
+        peer_id: payload.peerId,
+        image_url: payload.imageUrl ?? "",
+        image_base64: payload.imageBase64 ?? "",
+        bot_id: payload.botId ?? "",
+      }),
+    });
+  }
+
+  interruptChat(conversationId: string) {
+    return this.request<{ ok: boolean; message: string; result: ChatInterruptResult }>("/chat/interrupt", {
+      method: "POST",
+      body: JSON.stringify({ conversation_id: conversationId }),
+    });
+  }
+
+  recallChatMessage(payload: { messageId: string; chatType?: "group" | "private"; peerId?: string; botId?: string }) {
+    return this.request<{ ok: boolean; message: string; message_id: string }>("/chat/message/recall", {
+      method: "POST",
+      body: JSON.stringify({
+        message_id: payload.messageId,
+        chat_type: payload.chatType ?? "",
+        peer_id: payload.peerId ?? "",
+        bot_id: payload.botId ?? "",
+      }),
+    });
+  }
+
+  setChatMessageEssence(payload: { messageId: string; chatType?: "group" | "private"; peerId?: string; botId?: string }) {
+    return this.request<{ ok: boolean; message: string; message_id: string }>("/chat/message/essence", {
+      method: "POST",
+      body: JSON.stringify({
+        message_id: payload.messageId,
+        chat_type: payload.chatType ?? "",
+        peer_id: payload.peerId ?? "",
+        bot_id: payload.botId ?? "",
+      }),
+    });
+  }
+
+  removeChatMessageEssence(payload: { messageId: string; chatType?: "group" | "private"; peerId?: string; botId?: string }) {
+    return this.request<{ ok: boolean; message: string; message_id: string }>("/chat/message/essence/remove", {
+      method: "POST",
+      body: JSON.stringify({
+        message_id: payload.messageId,
+        chat_type: payload.chatType ?? "",
+        peer_id: payload.peerId ?? "",
+        bot_id: payload.botId ?? "",
+      }),
+    });
+  }
+
+  addChatMessageToSticker(payload: { messageId: string; sourceUserId?: string; description?: string; botId?: string }) {
+    return this.request<{ ok: boolean; message: string; key: string; owner: string; source: string; description: string }>("/chat/message/add-sticker", {
+      method: "POST",
+      body: JSON.stringify({
+        message_id: payload.messageId,
+        source_user_id: payload.sourceUserId ?? "",
+        description: payload.description ?? "",
+        bot_id: payload.botId ?? "",
+      }),
+    });
+  }
+
+  getChatAgentState(params?: { conversationId?: string; limit?: number }) {
+    const q = new URLSearchParams({
+      conversation_id: params?.conversationId ?? "",
+      limit: String(params?.limit ?? 200),
+    });
+    return this.request<ChatAgentStateResponse>(`/chat/agent-state?${q.toString()}`);
+  }
+
   logsStreamUrl(): string {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    return `${proto}//${location.host}/api/webui/logs/stream?token=${this.getToken()}`;
+    const token = encodeURIComponent(this.getToken());
+    return `${proto}//${location.host}/api/webui/logs/stream?token=${token}`;
   }
 }
 
@@ -183,6 +371,184 @@ export interface DbRowsResponse {
   total: number;
   columns: DbColumnInfo[];
   rows: Record<string, unknown>[];
+}
+
+export interface ImageGenTestRequest {
+  prompt: string;
+  model?: string;
+  size?: string;
+  style?: string;
+  image_gen?: Record<string, unknown>;
+}
+
+export interface ImageGenTestResponse {
+  ok: boolean;
+  message: string;
+  image_url?: string;
+  model_used?: string;
+  revised_prompt?: string;
+  requested_model?: string;
+  default_model?: string;
+  configured_models?: number;
+  default_adjusted?: boolean;
+}
+
+export interface MemoryRecordItem {
+  id: number;
+  conversation_id: string;
+  conversation_label?: string;
+  user_id: string;
+  display_name?: string;
+  role: string;
+  content: string;
+  created_at: string;
+}
+
+export interface MemoryRecordsResponse {
+  items: MemoryRecordItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface MemoryAuditItem {
+  id: number;
+  record_id: number | null;
+  action: string;
+  actor: string;
+  note: string;
+  reason: string;
+  before_content: string;
+  after_content: string;
+  conversation_id: string;
+  user_id: string;
+  role: string;
+  created_at: string;
+}
+
+export interface MemoryAuditResponse {
+  items: MemoryAuditItem[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface MemoryRecordCreateRequest {
+  conversation_id: string;
+  user_id: string;
+  role?: string;
+  content: string;
+  note?: string;
+  reason?: string;
+  actor?: string;
+}
+
+export interface MemoryRecordUpdateRequest {
+  content: string;
+  note: string;
+  reason?: string;
+  actor?: string;
+}
+
+export interface MemoryRecordDeleteRequest {
+  note: string;
+  reason?: string;
+  actor?: string;
+}
+
+export interface MemoryCompactRequest {
+  conversation_id?: string;
+  user_id?: string;
+  role?: string;
+  dry_run?: boolean;
+  keep_latest?: number;
+  note?: string;
+  reason?: string;
+  actor?: string;
+}
+
+export interface MemoryCompactResult {
+  dry_run: boolean;
+  scanned: number;
+  duplicates: number;
+  keep_latest: number;
+  filters: {
+    conversation_id: string;
+    user_id: string;
+    role: string;
+  };
+  deleted_ids: number[];
+}
+
+export interface ChatConversationItem {
+  conversation_id: string;
+  chat_type: "group" | "private";
+  peer_id: string;
+  peer_name: string;
+  last_time: number;
+  unread_count: number;
+  last_message: string;
+}
+
+export interface ChatConversationResponse {
+  items: ChatConversationItem[];
+  total: number;
+}
+
+export interface ChatMessageItem {
+  message_id: string;
+  seq: string;
+  timestamp: number;
+  time_iso: string;
+  sender_id: string;
+  sender_name: string;
+  sender_role: string;
+  is_self: boolean;
+  is_essence?: boolean;
+  is_recalled?: boolean;
+  recalled_at?: number;
+  recalled_source?: string;
+  text: string;
+  segments: Array<{ type: string; data: Record<string, unknown> }>;
+}
+
+export interface ChatHistoryResponse {
+  conversation_id: string;
+  chat_type: "group" | "private";
+  peer_id: string;
+  items: ChatMessageItem[];
+  permission?: ChatHistoryPermission;
+}
+
+export interface ChatHistoryPermission {
+  bot_role: string;
+  can_recall: boolean;
+  can_set_essence: boolean;
+}
+
+export interface ChatInterruptResult {
+  cancelled: number;
+  skipped_non_interruptible: number;
+  skipped_running: number;
+  skipped_finished: number;
+}
+
+export interface ChatAgentStateItem {
+  conversation_id: string;
+  pending_count: number;
+  running_count: number;
+  queued_count: number;
+  interruptible_count: number;
+  latest_trace_id: string;
+  last_trace_id?: string;
+  last_user_id?: string;
+  last_text_preview?: string;
+  last_update?: string;
+}
+
+export interface ChatAgentStateResponse {
+  items: ChatAgentStateItem[];
+  total: number;
 }
 
 export const api = new ApiClient();

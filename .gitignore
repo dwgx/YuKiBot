@@ -39,6 +39,7 @@ storage/whitelist_groups.json
 *.swp
 Thumbs.db
 Desktop.ini
+.DS_Store
 
 # WebUI 前端
 webui/node_modules/

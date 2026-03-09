@@ -9,9 +9,13 @@ B站: 使用 bilibili-api-python 的 QrCodeLogin，终端显示二维码扫码
 from __future__ import annotations
 
 import asyncio
+import base64
+import contextlib
+import importlib.util
 import json
 import logging
 import os
+import platform
 import shutil
 import socket
 import subprocess
@@ -88,30 +92,95 @@ def _print_compact_qr(data: str) -> None:
 #  B站扫码登录
 # ═══════════════════════════════════════════════════════════
 
-async def bilibili_qr_login() -> dict[str, str] | None:
-    """B站二维码扫码登录，返回 {sessdata, bili_jct, dedeuserid} 或 None。"""
+async def bilibili_qr_create_session() -> dict[str, Any] | None:
+    """创建 B站二维码会话，返回可供 WebUI 展示和轮询的对象。"""
     try:
-        from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginEvents, QrCodeLoginChannel
+        from bilibili_api.login_v2 import QrCodeLogin, QrCodeLoginChannel
     except ImportError:
-        print("  [错误] bilibili-api-python 未安装，无法扫码登录。")
-        print("  pip install bilibili-api-python")
+        _log.warning("bilibili_qr unavailable: bilibili-api-python not installed")
         return None
 
     qr = QrCodeLogin(platform=QrCodeLoginChannel.WEB)
     await qr.generate_qrcode()
 
+    image_data_uri = ""
+    with contextlib.suppress(Exception):
+        pic = qr.get_qrcode_picture()
+        content = bytes(getattr(pic, "content", b"") or b"")
+        if content:
+            image_type = str(getattr(pic, "imageType", "") or "").strip().lower()
+            mime = "image/png"
+            if image_type in {"jpg", "jpeg"}:
+                mime = "image/jpeg"
+            elif image_type == "gif":
+                mime = "image/gif"
+            image_data_uri = f"data:{mime};base64,{base64.b64encode(content).decode('ascii')}"
+
+    terminal = ""
+    with contextlib.suppress(Exception):
+        terminal = str(qr.get_qrcode_terminal() or "")
+
     url = getattr(qr, "_QrCodeLogin__qr_link", "")
+    return {
+        "qr": qr,
+        "qr_url": str(url or ""),
+        "qr_image_data_uri": image_data_uri,
+        "qr_terminal": terminal,
+        "timeout_seconds": 120,
+    }
+
+
+async def bilibili_qr_check_state(qr: Any) -> dict[str, Any]:
+    """检查 B站二维码登录状态。"""
+    from bilibili_api.login_v2 import QrCodeLoginEvents
+
+    try:
+        state = await qr.check_state()
+    except Exception as exc:
+        _log.debug("bilibili_qr check_state error: %s", exc)
+        return {"ok": False, "status": "error", "message": "状态检查失败，请重试"}
+
+    if state == QrCodeLoginEvents.DONE:
+        cred = qr.get_credential()
+        return {
+            "ok": True,
+            "status": "done",
+            "data": {
+                "sessdata": cred.sessdata or "",
+                "bili_jct": cred.bili_jct or "",
+                "dedeuserid": getattr(cred, "dedeuserid", "") or "",
+            },
+            "message": "登录成功",
+        }
+    if state == QrCodeLoginEvents.TIMEOUT:
+        return {"ok": False, "status": "expired", "message": "二维码已过期，请重新获取"}
+    if state == QrCodeLoginEvents.CONF:
+        return {"ok": True, "status": "confirm", "message": "已扫码，请在手机上确认"}
+    if state == QrCodeLoginEvents.SCAN:
+        return {"ok": True, "status": "scanned", "message": "已扫码，等待确认"}
+    return {"ok": True, "status": "pending", "message": "等待扫码"}
+
+
+async def bilibili_qr_login() -> dict[str, str] | None:
+    """B站二维码扫码登录，返回 {sessdata, bili_jct, dedeuserid} 或 None。"""
+    session = await bilibili_qr_create_session()
+    if not session:
+        print("  [错误] bilibili-api-python 未安装，无法扫码登录。")
+        print("  pip install bilibili-api-python")
+        return None
+
+    qr = session["qr"]
+    url = str(session.get("qr_url", "") or "")
+    terminal = str(session.get("qr_terminal", "") or "")
     if url:
         print("\n请用 B站 APP 扫描下方二维码登录:\n")
         _print_compact_qr(url)
+    elif terminal:
+        print("\n请用 B站 APP 扫描下方二维码登录:\n")
+        print(terminal)
     else:
-        try:
-            terminal_qr = qr.get_qrcode_terminal()
-            print("\n请用 B站 APP 扫描下方二维码登录:\n")
-            print(terminal_qr)
-        except Exception:
-            print("\n无法获取二维码，请检查网络连接。")
-            return None
+        print("\n无法获取二维码，请检查网络连接。")
+        return None
 
     print("等待扫码...")
 
@@ -120,26 +189,20 @@ async def bilibili_qr_login() -> dict[str, str] | None:
     interval = 2
 
     while elapsed < timeout:
-        try:
-            state = await qr.check_state()
-        except Exception as exc:
-            _log.debug("check_state error: %s", exc)
-            await asyncio.sleep(interval)
-            elapsed += interval
-            continue
-
-        if state == QrCodeLoginEvents.DONE:
-            cred = qr.get_credential()
+        state = await bilibili_qr_check_state(qr)
+        status = str(state.get("status", "") or "")
+        if status == "done":
             print("  B站登录成功!")
+            data = state.get("data", {}) if isinstance(state, dict) else {}
             return {
-                "sessdata": cred.sessdata or "",
-                "bili_jct": cred.bili_jct or "",
-                "dedeuserid": getattr(cred, "dedeuserid", "") or "",
+                "sessdata": str(data.get("sessdata", "") or ""),
+                "bili_jct": str(data.get("bili_jct", "") or ""),
+                "dedeuserid": str(data.get("dedeuserid", "") or ""),
             }
-        elif state == QrCodeLoginEvents.TIMEOUT:
+        elif status == "expired":
             print("  二维码已过期。")
             return None
-        elif state == QrCodeLoginEvents.CONF:
+        elif status in {"confirm", "scanned"}:
             print("  已扫码，请在手机上确认...")
 
         await asyncio.sleep(interval)
@@ -172,39 +235,75 @@ _BROWSER_DISPLAY = {
     "edge": "Microsoft Edge",
     "firefox": "Mozilla Firefox",
     "brave": "Brave",
+    "chromium": "Chromium",
+    "qzone": "QQ 空间",
 }
 
 _BROWSER_PROCESS_NAMES = {
-    "chrome": "chrome.exe",
-    "edge": "msedge.exe",
-    "brave": "brave.exe",
-    "firefox": "firefox.exe",
-    "opera": "opera.exe",
+    "chrome": "chrome",
+    "edge": "msedge",
+    "brave": "brave",
+    "firefox": "firefox",
+    "chromium": "chromium",
+    "opera": "opera",
 }
 
-# Windows 下浏览器可执行文件路径
-_BROWSER_PATHS: dict[str, list[str]] = {
-    "chrome": [
-        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
-        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-    ],
-    "edge": [
-        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
-    ],
-    "brave": [
-        os.path.expandvars(r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-        os.path.expandvars(r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    ],
-}
-
-# 浏览器 User Data 目录
-_BROWSER_USER_DATA: dict[str, str] = {
-    "chrome": os.path.expandvars(r"%LocalAppData%\Google\Chrome\User Data"),
-    "edge": os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\User Data"),
-    "brave": os.path.expandvars(r"%LocalAppData%\BraveSoftware\Brave-Browser\User Data"),
-}
+if sys.platform == "darwin":
+    # macOS
+    _BROWSER_PATHS: dict[str, list[str]] = {
+        "chrome": ["/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"],
+        "edge": ["/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"],
+        "brave": ["/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"],
+        "chromium": ["/Applications/Chromium.app/Contents/MacOS/Chromium"],
+        "firefox": ["/Applications/Firefox.app/Contents/MacOS/firefox"],
+    }
+    _BROWSER_USER_DATA: dict[str, str] = {
+        "chrome": str(Path.home() / "Library" / "Application Support" / "Google" / "Chrome"),
+        "edge": str(Path.home() / "Library" / "Application Support" / "Microsoft Edge"),
+        "brave": str(Path.home() / "Library" / "Application Support" / "BraveSoftware" / "Brave-Browser"),
+        "chromium": str(Path.home() / "Library" / "Application Support" / "Chromium"),
+    }
+elif os.name == "nt":
+    # Windows
+    _BROWSER_PATHS = {
+        "chrome": [
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        ],
+        "edge": [
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        ],
+        "brave": [
+            os.path.expandvars(r"%ProgramFiles%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            os.path.expandvars(r"%LocalAppData%\BraveSoftware\Brave-Browser\Application\brave.exe"),
+        ],
+        "firefox": [
+            os.path.expandvars(r"%ProgramFiles%\Mozilla Firefox\firefox.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Mozilla Firefox\firefox.exe"),
+        ],
+    }
+    _BROWSER_USER_DATA = {
+        "chrome": os.path.expandvars(r"%LocalAppData%\Google\Chrome\User Data"),
+        "edge": os.path.expandvars(r"%LocalAppData%\Microsoft\Edge\User Data"),
+        "brave": os.path.expandvars(r"%LocalAppData%\BraveSoftware\Brave-Browser\User Data"),
+    }
+else:
+    # Linux
+    _BROWSER_PATHS = {
+        "chrome": ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable"],
+        "edge": ["/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable"],
+        "brave": ["/usr/bin/brave-browser", "/usr/bin/brave"],
+        "chromium": ["/usr/bin/chromium", "/usr/bin/chromium-browser"],
+        "firefox": ["/usr/bin/firefox"],
+    }
+    _BROWSER_USER_DATA = {
+        "chrome": str(Path.home() / ".config" / "google-chrome"),
+        "edge": str(Path.home() / ".config" / "microsoft-edge"),
+        "brave": str(Path.home() / ".config" / "BraveSoftware" / "Brave-Browser"),
+        "chromium": str(Path.home() / ".config" / "chromium"),
+    }
 
 _CHROMIUM_BROWSERS = {"chrome", "edge", "brave", "opera", "chromium"}
 _ROOKIEPY_PREFETCH_DOMAINS = [
@@ -365,8 +464,25 @@ def _find_browser_exe(browser: str) -> str | None:
         if os.path.isfile(path):
             return path
     # 尝试 shutil.which
-    names = {"chrome": "chrome", "edge": "msedge", "brave": "brave"}
+    names = {
+        "chrome": "google-chrome" if os.name != "nt" else "chrome",
+        "edge": "microsoft-edge" if os.name != "nt" else "msedge",
+        "brave": "brave-browser" if os.name != "nt" else "brave",
+        "chromium": "chromium",
+        "firefox": "firefox",
+    }
     found = shutil.which(names.get(browser, browser))
+    if not found and browser in {"chrome", "edge", "brave"}:
+        # 补充常见二进制名
+        fallback_names = {
+            "chrome": ["chrome", "google-chrome-stable"],
+            "edge": ["msedge", "microsoft-edge-stable"],
+            "brave": ["brave"],
+        }
+        for name in fallback_names.get(browser, []):
+            found = shutil.which(name)
+            if found:
+                break
     return found
 
 
@@ -698,9 +814,24 @@ def _get_browser_process_state(browser: str) -> tuple[int, int]:
     name = _BROWSER_PROCESS_NAMES.get(browser)
     if not name:
         return (0, 0)
-
     proc_name = name.replace(".exe", "")
-    # 先用 PowerShell 拿更准确的 MainWindowHandle。
+
+    if os.name != "nt":
+        # Linux/macOS：使用 pgrep，无法可靠区分前台窗口，foreground 取 total 以便后续逻辑工作。
+        try:
+            result = subprocess.run(
+                ["pgrep", "-x", proc_name],
+                capture_output=True,
+                text=True,
+                timeout=4,
+            )
+            pids = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+            total = len(pids)
+            return (total, total)
+        except Exception:
+            return (0, 0)
+
+    # Windows：先用 PowerShell 拿更准确的 MainWindowHandle。
     try:
         ps_script = (
             f"$rows = Get-Process -Name '{proc_name}' -ErrorAction SilentlyContinue | "
@@ -735,7 +866,7 @@ def _get_browser_process_state(browser: str) -> tuple[int, int]:
     # 回退 tasklist（只计数，不区分前台）。
     try:
         result = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+            ["tasklist", "/FI", f"IMAGENAME eq {name}.exe", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=5,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -745,7 +876,7 @@ def _get_browser_process_state(browser: str) -> tuple[int, int]:
             lower = line.lower()
             if "no tasks are running" in lower or "没有运行的任务" in lower or "info:" in lower:
                 continue
-            if lower.startswith(f'"{name.lower()}"'):
+            if lower.startswith(f'"{proc_name.lower()}.exe"'):
                 count += 1
         return (count, 0)
     except Exception:
@@ -778,20 +909,32 @@ def _stop_browser_processes(browser: str) -> bool:
         return False
     if not _is_browser_running(browser):
         return True
+
+    proc_name = name.replace(".exe", "")
     try:
-        subprocess.run(
-            ["taskkill", "/IM", name, "/F", "/T"],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/IM", f"{proc_name}.exe", "/F", "/T"],
+                capture_output=True,
+                text=True,
+                timeout=8,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        else:
+            subprocess.run(["pkill", "-TERM", "-x", proc_name], capture_output=True, text=True, timeout=6)
     except Exception:
         return False
     for _ in range(8):
         time.sleep(0.3)
         if not _is_browser_running(browser):
             return True
+    if os.name != "nt":
+        with contextlib.suppress(Exception):
+            subprocess.run(["pkill", "-KILL", "-x", proc_name], capture_output=True, text=True, timeout=5)
+        for _ in range(5):
+            time.sleep(0.2)
+            if not _is_browser_running(browser):
+                return True
     return False
 
 
@@ -1190,7 +1333,7 @@ def extract_browser_cookies_with_source(
         _log.debug("rookiepy 提取到 qzone 残片，继续回退: %s %s", browser, domain)
 
     # 策略 2: CDP（Chrome/Edge/Brave）— 优先不关闭浏览器
-    if browser in ("chrome", "edge", "brave"):
+    if browser in ("chrome", "edge", "brave", "chromium"):
         print(f"  正在从 {_BROWSER_DISPLAY.get(browser, browser)} 提取 Cookie...")
         cookies = _extract_via_cdp(browser, domain, auto_close=auto_close)
         if cookies:
@@ -1201,7 +1344,7 @@ def extract_browser_cookies_with_source(
             _log.debug("CDP 提取到 qzone 残片: %s %s", browser, domain)
 
     # 策略 2.5: 直接读取 SQLite cookie 数据库（Chromium 系浏览器，无需关闭）
-    if browser in ("chrome", "edge", "brave"):
+    if browser in ("chrome", "edge", "brave", "chromium"):
         cookies = _extract_via_sqlite_direct(browser, domain)
         if cookies:
             if not qzone_related or _has_qzone_signal(cookies):
@@ -1599,13 +1742,13 @@ def extract_bilibili_cookies(browser: str = "edge", auto_close: bool = False) ->
 def _detect_installed_browsers() -> list[str]:
     """检测本机安装的浏览器。"""
     available = []
-    for name in ("edge", "chrome", "firefox", "brave"):
-        if name == "firefox":
-            if shutil.which("firefox"):
-                available.append(name)
-        else:
-            if _find_browser_exe(name):
-                available.append(name)
+    for name in ("edge", "chrome", "brave", "chromium", "firefox"):
+        if _find_browser_exe(name):
+            available.append(name)
+    # 保留原有默认顺序，避免旧环境中完全无检测结果时为空
+    if "chromium" in available and "chrome" in available:
+        # 已有 chrome 时通常不单独展示 chromium，避免 UI 选择过多
+        available = [b for b in available if b != "chromium"]
     return available or ["edge", "chrome", "firefox"]
 
 
@@ -1786,6 +1929,61 @@ def interactive_qzone_cookie() -> str:
         return _safe_input("  QQ空间 Cookie 字符串: ")
 
     return ""
+
+
+def get_cookie_runtime_capabilities() -> dict[str, Any]:
+    """返回当前运行环境的 Cookie 自动提取能力，用于 WebUI 展示。"""
+    system = platform.system().lower()
+    if system == "darwin":
+        system = "macos"
+
+    def _has_module(module_name: str) -> bool:
+        try:
+            return importlib.util.find_spec(module_name) is not None
+        except Exception:
+            return False
+
+    installed_browsers = [b for b in ("edge", "chrome", "brave", "chromium", "firefox") if _find_browser_exe(b)]
+    recommended_browser = "firefox" if "firefox" in installed_browsers else (installed_browsers[0] if installed_browsers else "")
+
+    cdp_supported_browsers = [b for b in ("edge", "chrome", "brave", "chromium") if b in installed_browsers]
+    browser_cookie3_ok = _has_module("browser_cookie3")
+    rookiepy_ok = _has_module("rookiepy")
+    bilibili_qr_ok = _has_module("bilibili_api")
+
+    notices: list[str] = []
+    if system != "windows":
+        notices.append(
+            "Linux/macOS 下浏览器 Cookie 解密能力受系统密钥链和浏览器版本影响，自动提取可能失败。"
+        )
+    if not rookiepy_ok and not browser_cookie3_ok:
+        notices.append("未检测到 rookiepy/browser_cookie3，浏览器自动提取能力有限。")
+    if not bilibili_qr_ok:
+        notices.append("未检测到 bilibili-api-python，B站扫码登录不可用。")
+
+    browser_extract_ok = bool(installed_browsers and (rookiepy_ok or browser_cookie3_ok))
+    return {
+        "os": system,
+        "python_platform": sys.platform,
+        "modules": {
+            "rookiepy": rookiepy_ok,
+            "browser_cookie3": browser_cookie3_ok,
+            "bilibili_api": bilibili_qr_ok,
+        },
+        "browsers": {
+            "installed": installed_browsers,
+            "recommended": recommended_browser,
+            "cdp_supported": cdp_supported_browsers,
+        },
+        "platforms": {
+            "bilibili": {"qr_scan": bilibili_qr_ok, "browser_extract": browser_extract_ok},
+            "douyin": {"browser_extract": browser_extract_ok},
+            "kuaishou": {"browser_extract": browser_extract_ok},
+            "qzone": {"browser_extract": browser_extract_ok},
+        },
+        "notices": notices,
+    }
+
 
 async def check_bilibili_cookie(sessdata: str) -> bool:
     """验证 B站 sessdata 是否有效。"""

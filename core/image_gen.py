@@ -73,11 +73,24 @@ class ImageGenEngine:
         self.max_prompt_length = int(img_cfg.get("max_prompt_length", 1000))
         self.model_client = model_client
 
-        # 解析模型配置
-        self._models: dict[str, dict[str, Any]] = {}
-        for m in img_cfg.get("models", []):
-            if isinstance(m, dict) and m.get("name"):
-                self._models[m["name"]] = m
+        # 解析模型配置（兼容按 name 或 model 进行匹配）
+        self._models: list[dict[str, Any]] = []
+        self._models_by_name: dict[str, dict[str, Any]] = {}
+        self._models_by_model: dict[str, dict[str, Any]] = {}
+        for raw in img_cfg.get("models", []):
+            if not isinstance(raw, dict):
+                continue
+            item = dict(raw)
+            self._models.append(item)
+
+            name = str(item.get("name", "")).strip()
+            model_name = str(item.get("model", "")).strip()
+            if name:
+                self._models_by_name[name] = item
+                self._models_by_name[name.lower()] = item
+            if model_name:
+                self._models_by_model[model_name] = item
+                self._models_by_model[model_name.lower()] = item
 
         self._template_dir = Path(img_cfg.get("template_dir", "storage/image_templates"))
         self._template_dir.mkdir(parents=True, exist_ok=True)
@@ -122,21 +135,111 @@ class ImageGenEngine:
         use_model = model or self.default_model
         use_size = size or self.default_size
 
-        # 尝试使用配置的模型
-        model_cfg = self._models.get(use_model)
+        # 尝试使用 image_gen 配置模型（优先 model 字段，再 name）
+        model_cfg, matched_by = self._resolve_model_config(use_model)
+        if not model_cfg and self._models:
+            # 开箱即用兜底：
+            # 当只有 1 条配置模型时，优先走这条，避免 Agent 误传模型名导致回退到 model_client。
+            if len(self._models) == 1:
+                auto_cfg = self._models[0]
+                auto_model = str(auto_cfg.get("model", "")).strip() or str(auto_cfg.get("name", "")).strip()
+                if auto_model:
+                    _log.warning(
+                        "image_gen_model_auto_override | requested=%s | override=%s | reason=single_configured_model",
+                        use_model,
+                        auto_model,
+                    )
+                    use_model = auto_model
+                    model_cfg = auto_cfg
+                    matched_by = "auto_single_config"
         if model_cfg:
-            return await self._generate_with_config(content, model_cfg, use_size, style)
+            _log.info(
+                "image_gen_route | route=config | requested=%s | matched_by=%s | cfg_name=%s | cfg_model=%s",
+                use_model,
+                matched_by,
+                str(model_cfg.get("name", "")),
+                str(model_cfg.get("model", "")),
+            )
+            primary_result = await self._generate_with_config(content, model_cfg, use_size, style)
+            if primary_result.ok:
+                return primary_result
+
+            # 兜底容错：主模型暂时不可用时自动切换同配置中的其它模型重试。
+            if self._should_failover_to_other_model(primary_result):
+                for alt_cfg in self._models:
+                    if alt_cfg is model_cfg:
+                        continue
+                    alt_model = str(alt_cfg.get("model", "")).strip() or str(alt_cfg.get("name", "")).strip()
+                    if not alt_model:
+                        continue
+                    _log.warning(
+                        "image_gen_failover_try | from=%s | to=%s",
+                        str(model_cfg.get("model", "")).strip() or str(model_cfg.get("name", "")).strip(),
+                        alt_model,
+                    )
+                    alt_result = await self._generate_with_config(content, alt_cfg, use_size, style)
+                    if alt_result.ok:
+                        _log.info("image_gen_failover_ok | model=%s", alt_model)
+                        return alt_result
+            return primary_result
+
+        _log.info(
+            "image_gen_route | route=model_client_fallback | requested=%s | configured=%d",
+            use_model,
+            len(self._models),
+        )
 
         # 回退到 model_client
         if self.model_client and hasattr(self.model_client, "generate_image"):
+            fallback_error = ""
             try:
                 url = await self.model_client.generate_image(content, size=use_size)
                 if url:
                     return ImageGenResult(ok=True, message="图片已生成。", url=url, model_used=use_model)
             except Exception as exc:
                 _log.warning("image_gen_fallback_error | %s", exc)
+                fallback_error = str(exc)
+            if fallback_error:
+                return ImageGenResult(ok=False, message=f"图片生成失败（回退通道异常）: {fallback_error}")
 
-        return ImageGenResult(ok=False, message="图片生成失败，请检查模型配置。")
+        return ImageGenResult(ok=False, message="图片生成失败（未命中可用生图模型）。")
+
+    def _resolve_model_config(self, requested_model: str) -> tuple[dict[str, Any] | None, str]:
+        key = str(requested_model or "").strip()
+        if not key:
+            return None, ""
+
+        # 1) 先按 model 字段精确匹配（最符合 default_model 场景）
+        model_cfg = self._models_by_model.get(key) or self._models_by_model.get(key.lower())
+        if model_cfg:
+            return model_cfg, "model"
+
+        # 2) 再按 name 字段匹配（兼容旧配置）
+        model_cfg = self._models_by_name.get(key) or self._models_by_name.get(key.lower())
+        if model_cfg:
+            return model_cfg, "name"
+
+        return None, ""
+
+    @staticmethod
+    def _should_failover_to_other_model(result: ImageGenResult) -> bool:
+        if result.ok:
+            return False
+        text = (result.message or "").lower()
+        if not text:
+            return False
+        retry_cues = (
+            "503",
+            "无可用渠道",
+            "distributor",
+            "timeout",
+            "超时",
+            "temporarily unavailable",
+            "bad gateway",
+            "gateway timeout",
+            "connection reset",
+        )
+        return any(cue in text for cue in retry_cues)
 
     async def _generate_with_config(
         self,
@@ -188,14 +291,45 @@ class ImageGenEngine:
                         url=url_result, base64_data=b64,
                         model_used=model_name, revised_prompt=revised,
                     )
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code if exc.response is not None else 0
+            detail = ""
+            try:
+                payload = exc.response.json() if exc.response is not None else {}
+                if isinstance(payload, dict):
+                    err = payload.get("error")
+                    if isinstance(err, dict):
+                        detail = str(err.get("message", "") or err.get("code", "")).strip()
+                    elif isinstance(err, str):
+                        detail = err.strip()
+                    if not detail:
+                        detail = str(payload.get("message", "") or payload.get("code", "")).strip()
+            except Exception:
+                detail = ""
+            if not detail and exc.response is not None:
+                detail = (exc.response.text or "").strip()[:220]
+
+            _log.warning("image_gen_api_error | model=%s | http=%s | detail=%s", model_name, status, detail)
+            if status == 503 and ("无可用渠道" in detail or "distributor" in detail.lower()):
+                return ImageGenResult(
+                    ok=False,
+                    message=f"模型 {model_name} 当前无可用渠道（上游 503），请稍后重试或切换生图模型。",
+                )
+            return ImageGenResult(ok=False, message=f"模型 {model_name} 生成失败（HTTP {status}）：{detail or '请求失败'}")
         except Exception as exc:
             _log.warning("image_gen_api_error | model=%s | %s", model_name, exc)
+            return ImageGenResult(ok=False, message=f"模型 {model_name} 生成失败：{exc}")
 
         return ImageGenResult(ok=False, message=f"模型 {model_name} 生成失败。")
 
     def list_models(self) -> list[dict[str, str]]:
         """列出所有可用的图片生成模型。"""
         models = [{"name": self.default_model, "type": "default"}]
-        for name, cfg in self._models.items():
-            models.append({"name": name, "type": cfg.get("type", "openai_compatible")})
+        seen: set[str] = {self.default_model}
+        for cfg in self._models:
+            model_name = str(cfg.get("model", "")).strip() or str(cfg.get("name", "")).strip()
+            if not model_name or model_name in seen:
+                continue
+            seen.add(model_name)
+            models.append({"name": model_name, "type": str(cfg.get("type", "openai_compatible"))})
         return models

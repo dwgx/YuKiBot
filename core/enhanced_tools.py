@@ -217,7 +217,7 @@ def _register_image_gen_tools(registry: AgentToolRegistry, image_gen: ImageGenEn
         result = await image_gen.generate(prompt, model=model, size=size, style=style)
         if result.ok:
             return ToolCallResult(ok=True, data={
-                "url": result.url, "model": result.model_used,
+                "url": result.url, "image_url": result.url, "model": result.model_used,
                 "revised_prompt": result.revised_prompt,
             }, display=f"图片已生成 (模型: {result.model_used})")
         return ToolCallResult(ok=False, error=result.message)
@@ -231,7 +231,7 @@ def _register_image_gen_tools(registry: AgentToolRegistry, image_gen: ImageGenEn
         description="生成图片（增强版，支持多模型、NSFW过滤）。\n使用场景: 用户要求画图、生成图片时使用。自动过滤不当内容。",
         parameters={"type": "object", "properties": {
             "prompt": {"type": "string", "description": "图片描述（英文效果更好）"},
-            "model": {"type": "string", "description": "模型名(可选，默认dall-e-3)"},
+            "model": {"type": "string", "description": "模型名(可选，默认使用 image_gen.default_model)"},
             "size": {"type": "string", "description": "尺寸(可选，如1024x1024)"},
             "style": {"type": "string", "description": "风格(可选，如vivid/natural)"},
         }, "required": ["prompt"]},

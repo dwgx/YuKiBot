@@ -203,20 +203,10 @@ def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dic
         "tool_interface": {
             "enable": True,
             "browser_enable": True,
-            "local_enable": True,
             "auto_method_enable": True,
             "github_enable": True,
             "github_api_base": "https://api.github.com",
             "github_token": "${GITHUB_TOKEN}",
-            "local_allowed_roots": [
-                "storage",
-                "config",
-                "docs",
-                "core",
-                "services",
-                "plugins",
-                ".",
-            ],
         },
     }
     image = {"enable": allow_image}

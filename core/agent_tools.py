@@ -17,12 +17,17 @@ import random
 import re
 import shutil
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
+from core.recalled_messages import (
+    build_conversation_id as _build_recall_conversation_id,
+    record_recalled_message as _record_recalled_message,
+)
 from utils.text import clip_text, normalize_text, tokenize
 
 _log = logging.getLogger("yukiko.agent_tools")
@@ -77,6 +82,10 @@ class AgentToolRegistry:
         "send_emoji": {"keyword": "query", "name": "query"},
         "send_sticker": {"keyword": "query", "name": "query"},
         "send_face": {"name": "query", "emoji": "query"},
+        "correct_sticker": {"target": "key", "name": "key"},
+        "memory_update": {"id": "record_id", "text": "content"},
+        "memory_delete": {"id": "record_id"},
+        "memory_audit": {"id": "record_id"},
         "web_search": {"q": "query", "keyword": "query"},
         "music_play": {"query": "keyword", "song": "keyword", "name": "keyword"},
         "music_search": {"query": "keyword", "song": "keyword", "name": "keyword"},
@@ -112,6 +121,7 @@ class AgentToolRegistry:
         "set_group_special_title",
         "set_essence_msg",
         "delete_essence_msg",
+        "recall_recent_messages",
         "set_group_card",
         "set_group_portrait",
         "delete_group_file",
@@ -127,6 +137,7 @@ class AgentToolRegistry:
         self._handlers: dict[str, ToolHandler] = {}
         self._prompt_hints: list[PromptHint] = []
         self._context_providers: dict[str, tuple[ContextProvider, int]] = {}
+        self._intent_keyword_routing_enabled = False
 
     def register(self, schema: ToolSchema, handler: ToolHandler) -> None:
         self._schemas[schema.name] = schema
@@ -227,7 +238,7 @@ class AgentToolRegistry:
         "social": ["戳", "poke", "点赞", "表情", "好友", "头像", "签到", "状态", "名片"],
         "file": ["文件", "上传", "下载", "资源", "安装包", "压缩包"],
         "search": ["搜索", "搜", "查", "找", "热搜", "热榜", "知乎", "百科", "wiki", "github", "网页", "链接", "url", "抓取", "提取", "摘要", "总结这个"],
-        "knowledge": ["知识", "记住", "学习", "知识库", "梗"],
+        "knowledge": ["知识", "记住", "学习", "知识库", "梗", "记忆", "记忆库", "回忆", "历史记录", "整理记忆", "去重", "合并重复"],
         "media": ["图片", "图", "视频", "语音", "音频", "识图", "ocr", "分析", "看图", "抖音", "壁纸", "头像"],
         "sticker": ["表情包", "表情", "emoji", "贴纸", "sticker"],
         "qzone": ["空间", "qzone", "说说", "相册"],
@@ -238,12 +249,39 @@ class AgentToolRegistry:
     # 每个分组始终包含的工具名
     _ALWAYS_INCLUDE = {"final_answer", "think"}
 
+    def set_intent_keyword_routing_enabled(self, enabled: bool) -> None:
+        self._intent_keyword_routing_enabled = bool(enabled)
+
+    def _tool_visible_for_permission(self, name: str, permission_level: str) -> bool:
+        level = normalize_text(permission_level or "user").lower() or "user"
+        is_super = level == "super_admin"
+        is_group_admin = level in {"group_admin", "super_admin"}
+        if name in self._SUPER_ADMIN_TOOLS and not is_super:
+            return False
+        if name in self._GROUP_ADMIN_TOOLS and not is_group_admin:
+            return False
+        return True
+
+    def _list_tools_for_permission(self, permission_level: str) -> list[str]:
+        selected: list[str] = []
+        for name in self._schemas.keys():
+            if not self._tool_visible_for_permission(name, permission_level):
+                continue
+            selected.append(name)
+        for must_keep in self._ALWAYS_INCLUDE:
+            if must_keep in self._schemas and must_keep not in selected:
+                selected.append(must_keep)
+        return selected
+
     def select_tools_for_intent(self, message_text: str, permission_level: str = "user") -> list[str]:
         """根据用户消息意图，选择相关的工具子集。
 
         返回工具名列表。始终包含 core 组 + 匹配到的意图组。
         如果没有匹配到任何意图，返回全量工具（兜底）。
         """
+        if not self._intent_keyword_routing_enabled:
+            return self._list_tools_for_permission(permission_level)
+
         text = message_text.lower()
         matched_groups: set[str] = {"core"}  # core 始终包含
 
@@ -257,7 +295,7 @@ class AgentToolRegistry:
 
         # 如果没匹配到任何意图组，返回全量
         if matched_groups == {"core"}:
-            return list(self._schemas.keys())
+            return self._list_tools_for_permission(permission_level)
 
         # 搜索意图自动带上 knowledge
         if "search" in matched_groups:
@@ -553,6 +591,7 @@ def register_builtin_tools(
     _register_admin_tools(registry)
     _register_utility_tools(registry)
     _register_crawler_tools(registry)
+    _register_memory_tools(registry)
     _register_ai_method_tools(registry)
     _register_qzone_tools(registry, config)
     _register_scrapy_llm_tools(registry, model_client)
@@ -605,6 +644,7 @@ _TOOL_GROUP_MAP: dict[str, str] = {
     "send_group_notice": "group_manage",
     "del_group_notice": "group_manage",
     "delete_message": "group_manage",
+    "recall_recent_messages": "group_manage",
     "set_essence_msg": "group_manage",
     "delete_essence_msg": "group_manage",
     "delete_group_file": "group_manage",
@@ -647,6 +687,12 @@ _TOOL_GROUP_MAP: dict[str, str] = {
     # knowledge — 知识库
     "search_knowledge": "knowledge",
     "learn_knowledge": "knowledge",
+    "memory_list": "knowledge",
+    "memory_add": "knowledge",
+    "memory_update": "knowledge",
+    "memory_delete": "knowledge",
+    "memory_audit": "knowledge",
+    "memory_compact": "knowledge",
     # media — 媒体处理
     "generate_image": "media",
     "parse_video": "media",
@@ -672,6 +718,7 @@ _TOOL_GROUP_MAP: dict[str, str] = {
     "list_emojis": "sticker",
     "browse_sticker_categories": "sticker",
     "learn_sticker": "sticker",
+    "correct_sticker": "sticker",
     "scan_stickers": "sticker",
     "fetch_custom_face": "sticker",
     "fetch_emoji_like": "sticker",
@@ -853,6 +900,43 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
             category="napcat",
         ),
         _handle_delete_message,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="recall_recent_messages",
+            description=(
+                "按用户+时间窗批量撤回群消息（需要管理员权限）。\n"
+                "使用场景: 用户说'撤回这个人10分钟内说的话'、'把他刚刚刷的内容都撤回'时使用。\n"
+                "优先用于管理员明确要求的批量撤回，不需要本地关键词硬编码判断。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "integer", "description": "目标群号"},
+                    "user_id": {"type": "integer", "description": "要撤回的用户QQ号"},
+                    "within_minutes": {"type": "integer", "description": "时间窗，单位分钟，例如 10"},
+                    "limit": {"type": "integer", "description": "最多撤回多少条，默认20，最大50"},
+                    "max_pages": {"type": "integer", "description": "最多翻多少页历史，默认6，最大12"},
+                },
+                "required": ["group_id", "user_id", "within_minutes"],
+            },
+            category="napcat",
+        ),
+        _handle_recall_recent_messages,
+    )
+
+    registry.register_prompt_hint(
+        PromptHint(
+            source="message_recall",
+            section="tools_guidance",
+            content=(
+                "当用户指出机器人上一条/某条消息说错了，且你能定位到具体消息ID时，优先调用 delete_message 撤回，再给更正版本。"
+                "当管理员要求“撤回某人最近N分钟的话”时，优先调用 recall_recent_messages。"
+                "能执行撤回就直接执行，不要只口头说“我帮你撤回”。"
+            ),
+            priority=28,
+        )
     )
 
     # 群禁言
@@ -1204,6 +1288,154 @@ def _safe_user_id(value: Any) -> int | None:
         return None
 
 
+def _render_onebot_message_text(raw_message: Any, segments: Any) -> str:
+    text = normalize_text(str(raw_message))
+    if text:
+        return text
+    if not isinstance(segments, list):
+        return ""
+    parts: list[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        data = seg.get("data", {}) or {}
+        if seg_type == "text":
+            content = normalize_text(str(data.get("text", "")))
+            if content:
+                parts.append(content)
+        elif seg_type in {"image", "video", "record", "audio", "file"}:
+            parts.append(f"[{seg_type}]")
+        elif seg_type == "at":
+            qq = normalize_text(str(data.get("qq", "")))
+            parts.append(f"@{qq or 'someone'}")
+        elif seg_type:
+            parts.append(f"[{seg_type}]")
+    return normalize_text(" ".join(parts))
+
+
+def _unwrap_onebot_message_result(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    data = raw.get("data")
+    if isinstance(data, dict) and (
+        data.get("message_id")
+        or data.get("real_id")
+        or data.get("message")
+        or data.get("raw_message")
+    ):
+        return data
+    return raw
+
+
+def _extract_history_messages(raw: Any) -> list[dict[str, Any]]:
+    payload = _unwrap_onebot_message_result(raw)
+    if isinstance(payload, dict):
+        items = payload.get("messages")
+        if not isinstance(items, list):
+            items = payload.get("items")
+        if isinstance(items, list):
+            return [item for item in items if isinstance(item, dict)]
+    if isinstance(raw, list):
+        return [item for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _resolve_recall_scope_from_message(item: dict[str, Any], context: dict[str, Any]) -> tuple[str, str]:
+    message_type = normalize_text(str(item.get("message_type", ""))).lower()
+    group_id = normalize_text(str(item.get("group_id", "")))
+    user_id = normalize_text(str(item.get("user_id", "")))
+    sender = item.get("sender", {}) if isinstance(item.get("sender"), dict) else {}
+    sender_id = normalize_text(str(sender.get("user_id", "")))
+    bot_id = normalize_text(str(context.get("bot_id", "")))
+    if message_type == "group" or group_id:
+        return "group", group_id or normalize_text(str(context.get("group_id", "")))
+    if message_type in {"private", "friend"}:
+        peer_id = user_id
+        if peer_id and bot_id and peer_id == bot_id and sender_id and sender_id != bot_id:
+            peer_id = sender_id
+        if not peer_id:
+            peer_id = normalize_text(str(context.get("user_id", ""))) or sender_id
+        return "private", peer_id
+    if bool(context.get("is_private")):
+        return "private", normalize_text(str(context.get("user_id", "")))
+    fallback_group_id = normalize_text(str(context.get("group_id", "")))
+    if fallback_group_id:
+        return "group", fallback_group_id
+    return "", ""
+
+
+def _build_recall_payload_from_message(
+    item: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    source: str,
+    note: str,
+) -> dict[str, Any] | None:
+    chat_type, peer_id = _resolve_recall_scope_from_message(item, context)
+    if chat_type not in {"group", "private"} or not peer_id:
+        return None
+    sender = item.get("sender", {}) if isinstance(item.get("sender"), dict) else {}
+    sender_id = normalize_text(str(sender.get("user_id", "")))
+    sender_name = (
+        normalize_text(str(sender.get("card", "")))
+        or normalize_text(str(sender.get("nickname", "")))
+        or sender_id
+        or "未知用户"
+    )
+    sender_role = normalize_text(str(sender.get("role", ""))).lower()
+    segments = item.get("message", [])
+    if not isinstance(segments, list):
+        segments = []
+    bot_id = normalize_text(str(context.get("bot_id", "")))
+    return {
+        "conversation_id": _build_recall_conversation_id(chat_type, peer_id),
+        "chat_type": chat_type,
+        "peer_id": peer_id,
+        "bot_id": bot_id,
+        "message_id": normalize_text(str(item.get("message_id", "") or item.get("real_id", "") or item.get("id", ""))),
+        "seq": normalize_text(str(item.get("message_seq", "") or item.get("real_seq", ""))),
+        "timestamp": int(item.get("time", 0) or 0),
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "sender_role": sender_role,
+        "is_self": bool(sender_id and bot_id and sender_id == bot_id),
+        "text": _render_onebot_message_text(item.get("raw_message", ""), segments),
+        "segments": segments,
+        "operator_id": normalize_text(str(context.get("user_id", ""))),
+        "operator_name": normalize_text(str(context.get("user_name", ""))),
+        "source": source,
+        "note": note,
+        "recalled_at": int(time.time()),
+    }
+
+
+async def _record_recalled_message_from_message_id(
+    message_id: int,
+    context: dict[str, Any],
+    *,
+    source: str,
+    note: str,
+) -> None:
+    api_call = context.get("api_call")
+    if not callable(api_call):
+        return
+    try:
+        raw = await api_call("get_msg", message_id=message_id)
+    except Exception:
+        return
+    item = _unwrap_onebot_message_result(raw)
+    if not item:
+        return
+    payload = _build_recall_payload_from_message(item, context, source=source, note=note)
+    if not payload:
+        return
+    try:
+        _record_recalled_message(payload)
+    except Exception:
+        _log.warning("record_recalled_message_failed | message_id=%s", message_id, exc_info=True)
+
+
 async def _handle_get_group_member_list(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     group_id = int(args.get("group_id", 0))
     if not group_id:
@@ -1257,7 +1489,140 @@ async def _handle_delete_message(args: dict[str, Any], context: dict[str, Any]) 
     message_id = int(args.get("message_id", 0))
     if not message_id:
         return ToolCallResult(ok=False, error="missing message_id")
+    await _record_recalled_message_from_message_id(
+        message_id,
+        context,
+        source="agent.delete_message",
+        note="agent single recall",
+    )
     return await _napcat_api_call(context, "delete_msg", f"已撤回消息 {message_id}", message_id=message_id)
+
+
+async def _handle_recall_recent_messages(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    api_call = context.get("api_call")
+    if not callable(api_call):
+        return ToolCallResult(ok=False, error="no_api_call_available")
+    group_id = int(args.get("group_id", 0))
+    user_id = _safe_user_id(args.get("user_id", 0))
+    within_minutes = int(args.get("within_minutes", 0) or 0)
+    limit = max(1, min(50, int(args.get("limit", 20) or 20)))
+    max_pages = max(1, min(12, int(args.get("max_pages", 6) or 6)))
+    if not group_id or user_id is None or within_minutes <= 0:
+        return ToolCallResult(ok=False, error="missing group_id, user_id or within_minutes")
+
+    cutoff_ts = int(time.time()) - (within_minutes * 60)
+    seen_keys: set[str] = set()
+    matched: list[dict[str, Any]] = []
+    next_seq: int | None = None
+
+    for _ in range(max_pages):
+        kwargs: dict[str, Any] = {"group_id": group_id}
+        if next_seq is not None and next_seq > 0:
+            kwargs["message_seq"] = next_seq
+        try:
+            raw_page = await api_call("get_group_msg_history", **kwargs)
+        except Exception as exc:
+            return ToolCallResult(ok=False, error=f"history_fetch_failed:{exc}")
+        page_items = _extract_history_messages(raw_page)
+        if not page_items:
+            break
+
+        oldest_ts_on_page: int | None = None
+        lowest_seq_on_page: int | None = None
+        for item in page_items:
+            sender = item.get("sender", {}) if isinstance(item.get("sender"), dict) else {}
+            sender_id = normalize_text(str(sender.get("user_id", "")))
+            message_id = normalize_text(str(item.get("message_id", "") or item.get("real_id", "") or item.get("id", "")))
+            seq = int(item.get("message_seq", 0) or item.get("real_seq", 0) or 0)
+            ts = int(item.get("time", 0) or 0)
+            key = message_id or (f"seq:{seq}" if seq else "")
+            if key and key in seen_keys:
+                continue
+            if key:
+                seen_keys.add(key)
+            if ts > 0 and (oldest_ts_on_page is None or ts < oldest_ts_on_page):
+                oldest_ts_on_page = ts
+            if seq > 0 and (lowest_seq_on_page is None or seq < lowest_seq_on_page):
+                lowest_seq_on_page = seq
+            if sender_id != str(user_id):
+                continue
+            if ts <= 0 or ts < cutoff_ts:
+                continue
+            matched.append(item)
+            if len(matched) >= limit:
+                break
+
+        if len(matched) >= limit:
+            break
+        if oldest_ts_on_page is not None and oldest_ts_on_page < cutoff_ts:
+            break
+        if lowest_seq_on_page is None or lowest_seq_on_page <= 1:
+            break
+        next_seq = lowest_seq_on_page - 1
+
+    if not matched:
+        return ToolCallResult(
+            ok=True,
+            data={"group_id": group_id, "user_id": user_id, "matched": 0, "recalled": 0, "failed": 0},
+            display=f"未找到 {user_id} 在最近 {within_minutes} 分钟内可撤回的消息",
+        )
+
+    matched.sort(
+        key=lambda item: (
+            int(item.get("time", 0) or 0),
+            int(item.get("message_seq", 0) or item.get("real_seq", 0) or 0),
+        )
+    )
+    recalled_ids: list[str] = []
+    failed_ids: list[str] = []
+    preview_lines: list[str] = []
+    for item in matched[:limit]:
+        message_id_text = normalize_text(str(item.get("message_id", "") or item.get("real_id", "") or item.get("id", "")))
+        if not message_id_text:
+            failed_ids.append("unknown")
+            continue
+        payload = _build_recall_payload_from_message(
+            item,
+            context,
+            source="agent.recall_recent_messages",
+            note=f"agent batch recall {within_minutes}m",
+        )
+        if payload:
+            try:
+                _record_recalled_message(payload)
+            except Exception:
+                _log.warning("record_recalled_message_failed | tool=recall_recent_messages | message_id=%s", message_id_text, exc_info=True)
+        try:
+            message_id_arg: Any = int(message_id_text) if message_id_text.isdigit() else message_id_text
+            await api_call("delete_msg", message_id=message_id_arg)
+            recalled_ids.append(message_id_text)
+            preview_lines.append(
+                f"[{time.strftime('%H:%M:%S', time.localtime(int(item.get('time', 0) or 0)))}] "
+                f"{clip_text(_render_onebot_message_text(item.get('raw_message', ''), item.get('message', [])), 50)}"
+            )
+        except Exception:
+            failed_ids.append(message_id_text)
+
+    summary = f"已撤回 {len(recalled_ids)} 条，目标={user_id}，时间窗={within_minutes}分钟"
+    if preview_lines:
+        summary += "\n" + "\n".join(preview_lines[:6])
+    if failed_ids:
+        summary += f"\n失败 {len(failed_ids)} 条"
+    return ToolCallResult(
+        ok=bool(recalled_ids),
+        data={
+            "group_id": group_id,
+            "user_id": user_id,
+            "within_minutes": within_minutes,
+            "matched": len(matched),
+            "recalled": len(recalled_ids),
+            "failed": len(failed_ids),
+            "message_ids": recalled_ids,
+            "failed_message_ids": failed_ids,
+        },
+        error="" if recalled_ids else "no_messages_recalled",
+        display=summary,
+    )
 
 
 async def _handle_set_group_ban(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
@@ -3679,8 +4044,6 @@ def _make_search_handler(search_engine: Any) -> ToolHandler:
             _log.warning("web_search failed | query=%s mode=%s err=%s", query, mode, exc)
             return ToolCallResult(ok=False, error=f"search_error: {exc}", display=f"搜索失败: {exc}")
     return handler
-
-
 def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         query = normalize_text(str(args.get("query", "")))
@@ -3741,8 +4104,6 @@ def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
             return ToolCallResult(ok=False, error=f"search_web_media_error:{exc}", display=f"媒体检索失败: {exc}")
 
     return handler
-
-
 def _make_search_download_resources_handler(search_engine: Any) -> ToolHandler:
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         query = normalize_text(str(args.get("query", "")))
@@ -4249,6 +4610,7 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
     raw_segments = context.get("raw_segments", [])
     reply_media_segments = context.get("reply_media_segments", [])
     conversation_id = str(context.get("conversation_id", ""))
+    api_call = context.get("api_call")
 
     def _image_count(segments: Any) -> int:
         if not isinstance(segments, list):
@@ -4341,12 +4703,9 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
             if reply_to_message_id:
                 method_args["target_message_id"] = reply_to_message_id
         else:
-            if not explicit_reference:
-                return ToolCallResult(
-                    ok=False,
-                    error="image_context_missing",
-                    display="我现在拿不到你要问的那张图。请直接发图，或回复那张图片再问我。",
-                )
+            # 在“这条消息没有图片 / 也没引用图片”时，优先尝试会话最近图片兜底：
+            # - recent_only_when_unique=True：仅当最近唯一时自动命中，避免误判错图。
+            # - 用户显式说“这张/刚刚那张”时同样走该路径。
             selected_source = "recent_cache_fallback"
             method_args["allow_recent_fallback"] = True
             method_args["recent_only_when_unique"] = True
@@ -4374,6 +4733,7 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
             message_text=message_text,
             raw_segments=selected_segments if selected_segments else (list(raw_segments) if isinstance(raw_segments, list) else []),
             conversation_id=conversation_id,
+            api_call=api_call,
         )
     except Exception as exc:
         _log.warning("analyze_image_error | %s", exc)
@@ -5785,6 +6145,80 @@ async def _handle_browse_categories(args: dict[str, Any], context: dict[str, Any
     )
 
 
+def _parse_sticker_terms(value: Any, max_items: int = 16) -> list[str]:
+    if value is None:
+        return []
+    raw_items: list[str] = []
+    if isinstance(value, list):
+        raw_items = [normalize_text(str(item)) for item in value]
+    else:
+        text = normalize_text(str(value))
+        if text:
+            raw_items = [
+                normalize_text(part)
+                for part in re.split(r"[,\n;，；、|/\s]+", text)
+            ]
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        token = normalize_text(item).lstrip("#")
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= max(1, int(max_items)):
+            break
+    return out
+
+
+async def _handle_correct_sticker(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """纠正自动学习错误的表情包元数据。"""
+    sticker_mgr = context.get("sticker_manager")
+    if not sticker_mgr:
+        return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
+
+    key = normalize_text(str(args.get("key", "") or args.get("target", "")))
+    source_user = normalize_text(str(args.get("source_user", "") or context.get("user_id", "")))
+    description = normalize_text(str(args.get("description", "")))
+    category = normalize_text(str(args.get("category", "")))
+
+    has_tags_input = "tags" in args
+    has_emotions_input = "emotions" in args
+    tags = _parse_sticker_terms(args.get("tags"), max_items=16) if has_tags_input else None
+    emotions = _parse_sticker_terms(args.get("emotions"), max_items=12) if has_emotions_input else None
+
+    ok, message, payload = sticker_mgr.update_emoji_metadata(
+        key=key,
+        source_user=source_user,
+        description=description,
+        category=category,
+        tags=tags,
+        emotions=emotions,
+    )
+    if not ok:
+        return ToolCallResult(ok=False, data=payload or {}, display=message)
+
+    key_show = normalize_text(str(payload.get("key", "")))
+    desc_show = normalize_text(str(payload.get("description", "")))
+    cat_show = normalize_text(str(payload.get("category", "")))
+    tag_show = ",".join(payload.get("tags", [])[:6]) if isinstance(payload.get("tags"), list) else ""
+    em_show = ",".join(payload.get("emotions", [])[:6]) if isinstance(payload.get("emotions"), list) else ""
+
+    lines = [message]
+    if key_show:
+        lines.append(f"key: {key_show}")
+    if desc_show:
+        lines.append(f"描述: {desc_show}")
+    if cat_show:
+        lines.append(f"分类: {cat_show}")
+    if tag_show:
+        lines.append(f"标签: {tag_show}")
+    if em_show:
+        lines.append(f"情绪: {em_show}")
+
+    return ToolCallResult(ok=True, data=payload, display="\n".join(lines))
+
+
 def _make_learn_sticker_handler(model_client: Any) -> ToolHandler:
     """创建 learn_sticker 工具的 handler (闭包持有 model_client)。"""
 
@@ -5833,6 +6267,14 @@ def _make_learn_sticker_handler(model_client: Any) -> ToolHandler:
 
 def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = None) -> None:
     """Register sticker/face tools into the agent tool registry."""
+    registry.register_prompt_hint(
+        PromptHint(
+            source="sticker",
+            section="tools_guidance",
+            content="当用户说“学错了/描述不对/帮我改这个表情包”时，优先用 correct_sticker 修正元数据并写回知识库。",
+            priority=35,
+        )
+    )
 
     registry.register(
         ToolSchema(
@@ -5999,6 +6441,49 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
             _make_learn_sticker_handler(model_client),
         )
 
+    registry.register(
+        ToolSchema(
+            name="correct_sticker",
+            description=(
+                "纠正表情包学习结果（用户指明AI识别偏差时使用）。"
+                "默认修正最近学习的一张；也可传 key 指定目标。"
+                "修正后会写回知识库并标记为手动覆盖。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "key": {
+                        "type": "string",
+                        "description": "目标表情 key（可选，不填默认最近学习）",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "纠正后的描述（可选）",
+                    },
+                    "category": {
+                        "type": "string",
+                        "description": "纠正后的分类（可选）：搞笑/可爱/嘲讽/日常/动漫/反应/文字/其他",
+                    },
+                    "tags": {
+                        "type": "string",
+                        "description": "标签，逗号或空格分隔（可选）",
+                    },
+                    "emotions": {
+                        "type": "string",
+                        "description": "情绪词，逗号或空格分隔（可选）",
+                    },
+                    "source_user": {
+                        "type": "string",
+                        "description": "按指定用户的最近学习记录定位目标（可选）",
+                    },
+                },
+                "required": [],
+            },
+            category="napcat",
+        ),
+        _handle_correct_sticker,
+    )
+
     # scan_stickers — 重新扫描表情包目录
     async def _handle_scan_stickers(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         sticker_mgr = context.get("sticker_manager")
@@ -6025,6 +6510,345 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
             category="napcat",
         ),
         _handle_scan_stickers,
+    )
+
+
+# ── Memory tools ──
+
+def _register_memory_tools(registry: AgentToolRegistry) -> None:
+    registry.register_prompt_hint(
+        PromptHint(
+            source="memory",
+            section="tools_guidance",
+            content=(
+                "当用户要求整理/修正记忆库时，优先使用 memory_list/memory_add/memory_update/memory_delete/memory_compact。"
+                "注意：update/delete 必须提供 note 备注，说明改动原因。"
+                "若需要去重整理，先 memory_compact dry_run 预览，再带 note 执行。"
+            ),
+            priority=30,
+        )
+    )
+
+    async def _handle_memory_list(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+
+        conversation_id = normalize_text(str(args.get("conversation_id", ""))) or normalize_text(
+            str(context.get("conversation_id", ""))
+        )
+        user_id = normalize_text(str(args.get("user_id", "")))
+        role = normalize_text(str(args.get("role", ""))).lower()
+        keyword = normalize_text(str(args.get("keyword", "")))
+        limit = int(args.get("limit", 30) or 30)
+        page = int(args.get("page", 1) or 1)
+        page = max(1, page)
+        offset = (page - 1) * max(1, limit)
+
+        items, total = memory.list_memory_records(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=role,
+            keyword=keyword,
+            limit=limit,
+            offset=offset,
+        )
+        lines = [f"记忆记录: {total} 条（第 {page} 页）"]
+        for item in items[:10]:
+            lines.append(
+                f"#{item.get('id')} [{item.get('role')}] {item.get('user_id')}: "
+                f"{clip_text(str(item.get('content', '')), 80)}"
+            )
+        return ToolCallResult(
+            ok=True,
+            data={
+                "items": items,
+                "total": total,
+                "page": page,
+                "limit": max(1, limit),
+            },
+            display="\n".join(lines),
+        )
+
+    async def _handle_memory_add(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+
+        content = normalize_text(str(args.get("content", "")))
+        if not content:
+            return ToolCallResult(ok=False, error="missing_content")
+
+        conversation_id = normalize_text(str(args.get("conversation_id", ""))) or normalize_text(
+            str(context.get("conversation_id", ""))
+        )
+        user_id = normalize_text(str(args.get("user_id", ""))) or normalize_text(str(context.get("user_id", "")))
+        role = normalize_text(str(args.get("role", ""))).lower() or "user"
+        note = normalize_text(str(args.get("note", "")))
+        reason = normalize_text(str(args.get("reason", "")))
+        actor = f"agent:{normalize_text(str(context.get('user_id', '')))}"
+
+        ok, message, payload = memory.add_memory_record(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=role,
+            content=content,
+            actor=actor,
+            note=note,
+            reason=reason,
+        )
+        return ToolCallResult(
+            ok=ok,
+            data=payload,
+            error="" if ok else message,
+            display=(f"已新增记忆 #{payload.get('id')}" if ok else message),
+        )
+
+    async def _handle_memory_update(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        record_id = int(args.get("record_id", 0) or 0)
+        content = normalize_text(str(args.get("content", "")))
+        note = normalize_text(str(args.get("note", "")))
+        reason = normalize_text(str(args.get("reason", "")))
+        if record_id <= 0:
+            return ToolCallResult(ok=False, error="missing_record_id")
+        if not content:
+            return ToolCallResult(ok=False, error="missing_content")
+        if not note:
+            return ToolCallResult(ok=False, error="missing_note")
+
+        actor = f"agent:{normalize_text(str(context.get('user_id', '')))}"
+        ok, message, payload = memory.update_memory_record(
+            record_id=record_id,
+            content=content,
+            actor=actor,
+            note=note,
+            reason=reason,
+        )
+        return ToolCallResult(
+            ok=ok,
+            data=payload,
+            error="" if ok else message,
+            display=(f"记忆 #{record_id} 已更新（备注: {note}）" if ok else message),
+        )
+
+    async def _handle_memory_delete(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        record_id = int(args.get("record_id", 0) or 0)
+        note = normalize_text(str(args.get("note", "")))
+        reason = normalize_text(str(args.get("reason", "")))
+        if record_id <= 0:
+            return ToolCallResult(ok=False, error="missing_record_id")
+        if not note:
+            return ToolCallResult(ok=False, error="missing_note")
+
+        actor = f"agent:{normalize_text(str(context.get('user_id', '')))}"
+        ok, message, payload = memory.delete_memory_record(
+            record_id=record_id,
+            actor=actor,
+            note=note,
+            reason=reason,
+        )
+        return ToolCallResult(
+            ok=ok,
+            data=payload,
+            error="" if ok else message,
+            display=(f"记忆 #{record_id} 已删除（备注: {note}）" if ok else message),
+        )
+
+    async def _handle_memory_audit(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        record_id = int(args.get("record_id", 0) or 0)
+        limit = int(args.get("limit", 30) or 30)
+        page = int(args.get("page", 1) or 1)
+        page = max(1, page)
+        offset = (page - 1) * max(1, limit)
+        rid = record_id if record_id > 0 else None
+        items, total = memory.list_memory_audit_logs(record_id=rid, limit=limit, offset=offset)
+        lines = [f"记忆审计: {total} 条（第 {page} 页）"]
+        for item in items[:10]:
+            lines.append(
+                f"#{item.get('id')} rec={item.get('record_id')} "
+                f"{item.get('action')} by {item.get('actor')} note={clip_text(str(item.get('note', '')), 24)}"
+            )
+        return ToolCallResult(
+            ok=True,
+            data={"items": items, "total": total, "page": page, "limit": max(1, limit)},
+            display="\n".join(lines),
+        )
+
+    async def _handle_memory_compact(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+
+        conversation_id = normalize_text(str(args.get("conversation_id", ""))) or normalize_text(
+            str(context.get("conversation_id", ""))
+        )
+        user_id = normalize_text(str(args.get("user_id", "")))
+        role = normalize_text(str(args.get("role", ""))).lower()
+        dry_run = bool(args.get("dry_run", True))
+        keep_latest = int(args.get("keep_latest", 1) or 1)
+        note = normalize_text(str(args.get("note", "")))
+        reason = normalize_text(str(args.get("reason", "")))
+
+        if not dry_run and not note:
+            return ToolCallResult(ok=False, error="missing_note")
+
+        actor = f"agent:{normalize_text(str(context.get('user_id', '')))}"
+        ok, message, payload = memory.compact_memory_records(
+            conversation_id=conversation_id,
+            user_id=user_id,
+            role=role,
+            actor=actor,
+            note=note,
+            reason=reason,
+            dry_run=dry_run,
+            keep_latest=keep_latest,
+        )
+        if not ok:
+            return ToolCallResult(ok=False, error=message, data=payload)
+        return ToolCallResult(
+            ok=True,
+            data=payload,
+            display=(
+                f"记忆整理预览完成：扫描 {payload.get('scanned', 0)} 条，"
+                f"可去重 {payload.get('duplicates', 0)} 条"
+                if dry_run
+                else f"记忆整理已执行：扫描 {payload.get('scanned', 0)} 条，"
+                     f"已去重 {payload.get('duplicates', 0)} 条（备注: {note}）"
+            ),
+        )
+
+    registry.register(
+        ToolSchema(
+            name="memory_list",
+            description="查询记忆库记录（可按会话、用户、角色、关键词过滤）。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "会话ID，默认当前会话"},
+                    "user_id": {"type": "string", "description": "用户ID(可选)"},
+                    "role": {"type": "string", "description": "角色过滤 user/assistant/system(可选)"},
+                    "keyword": {"type": "string", "description": "内容关键词(可选)"},
+                    "limit": {"type": "integer", "description": "每页条数(默认30，最大200)"},
+                    "page": {"type": "integer", "description": "页码(默认1)"},
+                },
+                "required": [],
+            },
+            category="search",
+            group="knowledge",
+        ),
+        _handle_memory_list,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="memory_add",
+            description="新增一条记忆记录到记忆库。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "会话ID，默认当前会话"},
+                    "user_id": {"type": "string", "description": "用户ID，默认当前用户"},
+                    "role": {"type": "string", "description": "角色 user/assistant/system，默认user"},
+                    "content": {"type": "string", "description": "记忆内容"},
+                    "note": {"type": "string", "description": "备注(可选)"},
+                    "reason": {"type": "string", "description": "原因(可选)"},
+                },
+                "required": ["content"],
+            },
+            category="utility",
+            group="knowledge",
+        ),
+        _handle_memory_add,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="memory_update",
+            description="修改指定记忆记录。必须填写 note 备注。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "record_id": {"type": "integer", "description": "记录ID"},
+                    "content": {"type": "string", "description": "修改后的内容"},
+                    "note": {"type": "string", "description": "修改备注（必填）"},
+                    "reason": {"type": "string", "description": "修改原因（可选）"},
+                },
+                "required": ["record_id", "content", "note"],
+            },
+            category="utility",
+            group="knowledge",
+        ),
+        _handle_memory_update,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="memory_delete",
+            description="删除指定记忆记录。必须填写 note 备注。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "record_id": {"type": "integer", "description": "记录ID"},
+                    "note": {"type": "string", "description": "删除备注（必填）"},
+                    "reason": {"type": "string", "description": "删除原因（可选）"},
+                },
+                "required": ["record_id", "note"],
+            },
+            category="utility",
+            group="knowledge",
+        ),
+        _handle_memory_delete,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="memory_audit",
+            description="查看记忆库增删改审计日志。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "record_id": {"type": "integer", "description": "指定记录ID(可选)"},
+                    "limit": {"type": "integer", "description": "每页条数(默认30，最大500)"},
+                    "page": {"type": "integer", "description": "页码(默认1)"},
+                },
+                "required": [],
+            },
+            category="search",
+            group="knowledge",
+        ),
+        _handle_memory_audit,
+    )
+
+    registry.register(
+        ToolSchema(
+            name="memory_compact",
+            description="自动整理记忆库：按会话/用户/角色去重。建议先 dry_run 预览，再带 note 执行。",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "conversation_id": {"type": "string", "description": "会话ID，默认当前会话"},
+                    "user_id": {"type": "string", "description": "用户ID(可选)"},
+                    "role": {"type": "string", "description": "角色过滤 user/assistant/system(可选)"},
+                    "dry_run": {"type": "boolean", "description": "是否仅预览(默认true)"},
+                    "keep_latest": {"type": "integer", "description": "每组重复内容保留最新N条(默认1)"},
+                    "note": {"type": "string", "description": "执行整理时的备注（dry_run=false 时必填）"},
+                    "reason": {"type": "string", "description": "整理原因（可选）"},
+                },
+                "required": [],
+            },
+            category="utility",
+            group="knowledge",
+        ),
+        _handle_memory_compact,
     )
 
 

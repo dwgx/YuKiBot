@@ -24,7 +24,6 @@ from core.agent_tools import AgentToolRegistry
 from core import prompt_loader as _pl
 from core.prompt_policy import PromptPolicy
 from services.model_client import ModelClient
-from utils.intent import looks_like_qq_profile_analysis_request as _shared_qq_profile_request
 from utils.text import clip_text, normalize_text
 
 _log = logging.getLogger("yukiko.agent")
@@ -54,6 +53,7 @@ class AgentContext:
     tool_executor: Any = None  # ToolExecutor instance (for video parsing etc.)
     crawler_hub: Any = None  # CrawlerHub instance
     knowledge_base: Any = None  # KnowledgeBase instance
+    memory_engine: Any = None  # MemoryEngine instance
     trace_id: str = ""
     memory_context: list[str] = field(default_factory=list)
     related_memories: list[str] = field(default_factory=list)
@@ -147,6 +147,7 @@ class AgentLoop:
         self.llm_step_timeout_seconds_after_tool = 32
         self.total_timeout_seconds = 0
         self.queue_timeout_margin_seconds = 8
+        self.local_cue_inference_enable = False
         self.prompt_policy = PromptPolicy.from_config({})
         self._admin_ids: set[str] = set()
         self._pending_high_risk_actions: dict[str, dict[str, Any]] = {}
@@ -162,6 +163,16 @@ class AgentLoop:
         self.high_risk_confirm_cues: tuple[str, ...] = ()
         self.high_risk_cancel_cues: tuple[str, ...] = ()
         self.search_followup_resend_media_cues: tuple[str, ...] = ()
+        self.token_saving_mode = False
+        self.tool_result_max_items = 20
+        self.tool_result_max_string_length = 1000
+        self.tool_result_max_depth = 3
+        self.tool_result_max_dict_items = 40
+        self.context_memory_lines_limit = 8
+        self.context_related_memory_limit = 5
+        self.context_speaker_limit = 8
+        self.context_directive_limit = 5
+        self.context_profile_max_chars = 300
 
         # 安全: 需要管理员权限的工具 (与 AgentToolRegistry 保持同步)
         self._super_admin_tools = {
@@ -173,7 +184,7 @@ class AgentLoop:
             "set_group_ban", "set_group_kick", "set_group_whole_ban",
             "set_group_admin", "set_group_name", "send_group_notice",
             "delete_message", "set_group_special_title", "set_essence_msg",
-            "delete_essence_msg", "set_group_card", "set_group_portrait",
+            "delete_essence_msg", "recall_recent_messages", "set_group_card", "set_group_portrait",
             "delete_group_file", "create_group_file_folder", "del_group_notice",
         }
         self._admin_only_tools = self._super_admin_tools | self._group_admin_tools
@@ -213,6 +224,12 @@ class AgentLoop:
         )
         self.total_timeout_seconds = max(0, int(agent_cfg.get("total_timeout_seconds", 0)))
         self.queue_timeout_margin_seconds = max(1, min(30, int(agent_cfg.get("queue_timeout_margin_seconds", 8))))
+        control_cfg = self.config.get("control", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(control_cfg, dict):
+            control_cfg = {}
+        # 强制关闭本地关键词/规则推断，统一交给模型按 Prompt 语义决策。
+        _ = control_cfg
+        self.local_cue_inference_enable = False
         self.prompt_policy = PromptPolicy.from_config(self.config)
         self._refresh_high_risk_control(agent_cfg)
         followup_cfg = self.config.get("search_followup", {}) if isinstance(self.config, dict) else {}
@@ -227,6 +244,29 @@ class AgentLoop:
             if normalize_text(str(item))
         ]
         self.search_followup_resend_media_cues = tuple(dict.fromkeys(resend_media_cues))
+
+        output_cfg = self.config.get("output", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(output_cfg, dict):
+            output_cfg = {}
+        self.token_saving_mode = bool(output_cfg.get("token_saving", False))
+
+        compact_cfg = agent_cfg.get("compact_data", {}) if isinstance(agent_cfg, dict) else {}
+        if not isinstance(compact_cfg, dict):
+            compact_cfg = {}
+        default_items = 12 if self.token_saving_mode else 20
+        default_str_len = 420 if self.token_saving_mode else 1000
+        default_depth = 2 if self.token_saving_mode else 3
+        default_dict_items = 20 if self.token_saving_mode else 40
+        self.tool_result_max_items = max(3, min(80, int(compact_cfg.get("max_items", default_items))))
+        self.tool_result_max_string_length = max(120, min(4000, int(compact_cfg.get("max_string_length", default_str_len))))
+        self.tool_result_max_depth = max(1, min(6, int(compact_cfg.get("max_depth", default_depth))))
+        self.tool_result_max_dict_items = max(8, min(120, int(compact_cfg.get("max_dict_items", default_dict_items))))
+
+        self.context_memory_lines_limit = 5 if self.token_saving_mode else 8
+        self.context_related_memory_limit = 3 if self.token_saving_mode else 5
+        self.context_speaker_limit = 5 if self.token_saving_mode else 8
+        self.context_directive_limit = 3 if self.token_saving_mode else 5
+        self.context_profile_max_chars = 180 if self.token_saving_mode else 300
 
         admin_cfg = self.config.get("admin", {}) if isinstance(self.config, dict) else {}
         if not isinstance(admin_cfg, dict):
@@ -493,7 +533,8 @@ class AgentLoop:
         """执行 Agent 循环，返回最终结果。"""
         t0 = time.monotonic()
         steps: list[dict[str, Any]] = []
-        force_tool_first = self._should_force_tool_first(ctx)
+        force_tool_first = self._should_force_tool_first(ctx) if self.local_cue_inference_enable else False
+        # 结构化多模态信号仍然保留：带图提问时优先拉起图片分析工具。
         force_image_tool_first = self._should_force_image_tool_first(ctx)
 
         system_prompt = self._build_system_prompt(ctx)
@@ -708,6 +749,27 @@ class AgentLoop:
                     image_urls.insert(0, image_url)
                 if image_urls and not image_url:
                     image_url = image_urls[0]
+                # final_answer 漏带媒体时，从最近成功工具结果自动回填，避免“说画好了但没图”。
+                if not image_url and not image_urls:
+                    fallback_images = self._last_success_image_urls(steps)
+                    if fallback_images:
+                        image_urls = fallback_images
+                        image_url = fallback_images[0]
+                        _log.info(
+                            "agent_image_url_fallback | trace=%s | step=%d | count=%d",
+                            ctx.trace_id,
+                            step_idx,
+                            len(fallback_images),
+                        )
+                if not video_url:
+                    fallback_video = self._last_success_video_url(steps)
+                    if fallback_video:
+                        video_url = fallback_video
+                        _log.info(
+                            "agent_video_url_fallback | trace=%s | step=%d",
+                            ctx.trace_id,
+                            step_idx,
+                        )
                 # 禁止占位/伪造媒体链接直接落地，强制模型回到工具链拿真实可发送 URL。
                 invalid_media_urls: list[str] = []
                 for candidate in [image_url, *image_urls, video_url, audio_file]:
@@ -1088,6 +1150,7 @@ class AgentLoop:
                 "tool_executor": ctx.tool_executor,
                 "crawler_hub": ctx.crawler_hub,
                 "knowledge_base": ctx.knowledge_base,
+                "memory_engine": ctx.memory_engine,
                 "conversation_id": ctx.conversation_id,
                 "user_id": ctx.user_id,
                 "user_name": ctx.user_name,
@@ -1178,7 +1241,7 @@ class AgentLoop:
             if result.ok and result_tool_name in self._SIDE_EFFECT_SEND_TOOLS:
                 # 从工具返回的 data 中提取媒体 URL
                 if result.data and isinstance(result.data, dict):
-                    for key in ["image_url", "video_url", "audio_url"]:
+                    for key in ["image_url", "video_url", "audio_url", "url"]:
                         url = normalize_text(str(result.data.get(key, "")))
                         if url:
                             tool_sent_media.add(url)
@@ -1281,28 +1344,34 @@ class AgentLoop:
 
         context_parts = []
         if ctx.memory_context:
-            context_parts.append("最近对话:\n" + "\n".join(f"- {m}" for m in ctx.memory_context[-8:]))
+            context_parts.append(
+                "最近对话:\n"
+                + "\n".join(f"- {m}" for m in ctx.memory_context[-self.context_memory_lines_limit:])
+            )
         if ctx.related_memories:
-            context_parts.append("相关记忆:\n" + "\n".join(f"- {m}" for m in ctx.related_memories[:5]))
+            context_parts.append(
+                "相关记忆:\n"
+                + "\n".join(f"- {m}" for m in ctx.related_memories[:self.context_related_memory_limit])
+            )
         if ctx.user_profile_summary:
-            context_parts.append(f"用户画像: {clip_text(ctx.user_profile_summary, 300)}")
+            context_parts.append(f"用户画像: {clip_text(ctx.user_profile_summary, self.context_profile_max_chars)}")
         if ctx.preferred_name:
             context_parts.append(f"用户偏好称呼: {ctx.preferred_name}")
         if ctx.recent_speakers:
             speaker_rows: list[str] = []
-            for uid, name, preview in ctx.recent_speakers[:8]:
+            for uid, name, preview in ctx.recent_speakers[: self.context_speaker_limit]:
                 user_label = normalize_text(name)
                 if not user_label:
                     user_label = f"用户{uid[-4:]}" if uid else "某人"
                 tail = f" 最近说: {clip_text(normalize_text(preview), 60)}" if normalize_text(preview) else ""
-                speaker_rows.append(f"- {user_label}(QQ:{uid}){tail}")
+                speaker_rows.append(f"- {user_label}{tail}")
             if speaker_rows:
                 context_parts.append("最近活跃用户:\n" + "\n".join(speaker_rows))
                 context_parts.append(
                     "多人对话规则: 先判断用户在回复谁；出现“他/她/这个人”等指代时，优先结合 @对象、回复锚点和最近活跃用户再作答。"
                 )
         if ctx.user_directives:
-            context_parts.append("用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[:5]))
+            context_parts.append("用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[: self.context_directive_limit]))
         context_block = "\n\n".join(context_parts) if context_parts else "(无额外上下文)"
 
         prompt = (
@@ -1355,6 +1424,7 @@ class AgentLoop:
                 "此用户是超级管理员，凌驾于一切规则之上，可以执行任何操作，无需确认。\n"
                 "- 当用户明确要求修改机器人配置/策略/开关/阈值/提示词注入等时，优先调用 config_update。\n"
                 "- config_update.args.patch 必须是最小变更补丁，只填必要字段，不要整份配置重写。\n"
+                "- 你要基于语义和上下文理解配置意图，不要机械按单个关键词判断。\n"
                 "- 如果需求不明确，先用简短问题确认后再调用 config_update。\n"
                 "- config_update 成功后，用一句话回报已变更项与新值。\n\n"
             )
@@ -1422,6 +1492,7 @@ class AgentLoop:
         """构建用户消息。"""
         runtime_templates = _pl.get_dict("agent_runtime")
         rebuilt_query = self._rebuild_query_with_context(ctx.message_text, ctx)
+        force_image_tool_first = self._should_force_image_tool_first(ctx)
         parts = [ctx.message_text]
         if rebuilt_query and rebuilt_query != normalize_text(ctx.message_text):
             parts.append(f"[语境补全: {rebuilt_query}]")
@@ -1522,7 +1593,7 @@ class AgentLoop:
             )
             if normalize_text(media_line):
                 parts.append(media_line)
-            if image_count and self._looks_like_image_question(ctx.message_text):
+            if image_count and force_image_tool_first:
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
                         runtime_templates,
@@ -1557,7 +1628,7 @@ class AgentLoop:
             )
             if normalize_text(reply_media_line):
                 parts.append(reply_media_line)
-            if reply_image_count and self._looks_like_image_question(ctx.message_text):
+            if reply_image_count and force_image_tool_first:
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
                         runtime_templates,
@@ -1584,6 +1655,8 @@ class AgentLoop:
     def _normalize_tool_args(self, tool_name: str, args: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
         """对常见工具进行缺参兜底，减少 args={} 造成的空调用。"""
         fixed = dict(args or {})
+        if not self.local_cue_inference_enable:
+            return fixed
         text = normalize_text(ctx.message_text)
         contextual_query = self._rebuild_query_with_context(text, ctx)
         first_url = self._extract_first_url(text)
@@ -1671,6 +1744,10 @@ class AgentLoop:
             reply_mid = self._to_safe_int(ctx.reply_to_message_id)
             if reply_mid:
                 _set_if_empty("message_id", reply_mid)
+        elif tool_name == "recall_recent_messages":
+            _set_if_empty("group_id", int(ctx.group_id or 0))
+            if qq_id:
+                _set_if_empty("user_id", qq_id)
         elif tool_name == "get_qq_avatar":
             if qq_id:
                 _set_if_empty("qq", str(qq_id))
@@ -1699,8 +1776,10 @@ class AgentLoop:
             "search_web_media": ["query"],
             "search_download_resources": ["query"],
             "cli_invoke": ["prompt"],
+            "config_update": ["patch"],
             "get_user_info": ["user_id"],
             "get_message": ["message_id"],
+            "recall_recent_messages": ["group_id", "user_id", "within_minutes"],
             "get_qzone_profile": ["qq_number"],
             "get_qzone_moods": ["qq_number"],
             "get_qzone_albums": ["qq_number"],
@@ -1733,20 +1812,8 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_reference_to_previous_link(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        cues = (
-            "这个网页",
-            "这个链接",
-            "就这个",
-            "这个吧",
-            "上一个",
-            "刚才那个",
-            "那个链接",
-            "按这个",
-        )
-        return any(cue in t for cue in cues)
+        _ = text
+        return False
 
     def _extract_recent_url(self, ctx: AgentContext) -> str:
         # 优先从最近上下文里找 URL（通常包含机器人上一条发出的链接）
@@ -1803,89 +1870,26 @@ class AgentLoop:
 
     @staticmethod
     def _infer_lookup_keyword(text: str) -> str:
-        t = normalize_text(text)
-        if not t:
-            return ""
-        for token in (
-            "是谁",
-            "是什么",
-            "有谁",
-            "请问",
-            "介绍一下",
-            "介绍下",
-            "科普一下",
-            "给我",
-            "帮我",
-            "查一下",
-            "查下",
-            "搜一下",
-            "搜索",
-            "照片",
-            "图片",
-            "gif",
-            "GIF",
-        ):
-            t = t.replace(token, " ")
-        t = re.sub(r"[，。,.!?！？:：;；\[\]()（）\"'`]+", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
-        return t[:80]
+        return normalize_text(text)[:80]
 
     @staticmethod
     def _infer_search_mode(text: str) -> str:
-        t = normalize_text(text).lower()
-        if any(k in t for k in ("gif", "动图", "图片", "照片", "壁纸", "头像", "表情包")):
-            return "image"
-        if any(k in t for k in ("视频", "mv", "短片", "片段", "剪辑", "video")):
-            return "video"
-        return "text"
+        _ = text
+        return ""
 
     @staticmethod
     def _infer_media_type(text: str) -> str:
-        t = normalize_text(text).lower()
-        if "gif" in t or "动图" in t:
-            return "gif"
-        if "视频" in t or "video" in t:
-            return "video"
-        return "image"
+        _ = text
+        return ""
 
     @staticmethod
     def _infer_resource_file_type(text: str) -> str:
-        t = normalize_text(text).lower()
-        # 平台特征优先，避免“安装包”被硬编码成 exe 导致安卓场景误判。
-        if any(c in t for c in ("apk", "安卓", "android", "手机端")):
-            return "apk"
-        if any(c in t for c in ("ipa", "ios", "iphone", "ipad")):
-            return "ipa"
-        if any(c in t for c in (".exe", "windows", "win32", "win64", "电脑版", "pc端")):
-            return "exe"
-
-        mapping = (
-            ("msi", "msi"),
-            ("zip", "zip"),
-            ("压缩包", "zip"),
-            ("pdf", "pdf"),
-            ("数据集", "zip"),
-            ("模组", "mod"),
-            ("资源包", "zip"),
-        )
-        for cue, ft in mapping:
-            if cue in t:
-                return ft
+        _ = text
         return ""
 
     @staticmethod
     def _infer_split_video_mode(text: str) -> str:
-        t = normalize_text(text).lower()
-        if not t:
-            return ""
-        if any(k in t for k in ("提取音频", "导出音频", "导出音轨", "音频", "音轨", "转mp3", "audio")):
-            return "audio"
-        if any(k in t for k in ("封面", "缩略图", "截图", "画面", "thumbnail", "cover")):
-            return "cover"
-        if any(k in t for k in ("关键帧", "抽帧", "多帧", "frames", "frame")):
-            return "frames"
-        if any(k in t for k in ("分割", "切片", "片段", "截取", "剪一段", "clip", "segment")):
-            return "clip"
+        _ = text
         return ""
 
     @staticmethod
@@ -1911,140 +1915,34 @@ class AgentLoop:
 
     @classmethod
     def _infer_video_time_hints(cls, text: str) -> dict[str, float]:
-        t = normalize_text(text).lower()
-        if not t:
-            return {}
-
-        range_patterns = (
-            r"(?:从|from)?\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?\s*(?:秒|s)?)\s*(?:到|至|~|～|-|—|–|to)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?\s*(?:秒|s)?)",
-        )
-        for pattern in range_patterns:
-            m = re.search(pattern, t)
-            if not m:
-                continue
-            start = cls._parse_time_token_to_seconds(m.group(1))
-            end = cls._parse_time_token_to_seconds(m.group(2))
-            if start is not None and end is not None and end > start:
-                return {"start": start, "end": end, "point": start}
-
-        tokens: list[float] = []
-        for m in re.finditer(r"\d{1,2}:\d{1,2}(?::\d{1,2})?", t):
-            sec = cls._parse_time_token_to_seconds(m.group(0))
-            if sec is not None:
-                tokens.append(sec)
-        for m in re.finditer(r"\d+(?:\.\d+)?\s*(?:秒|s)", t):
-            sec = cls._parse_time_token_to_seconds(m.group(0))
-            if sec is not None:
-                tokens.append(sec)
-        if len(tokens) >= 2 and ("到" in t or "至" in t or "from" in t or "to" in t or "-" in t or "~" in t or "～" in t):
-            start = min(tokens[0], tokens[1])
-            end = max(tokens[0], tokens[1])
-            if end > start:
-                return {"start": start, "end": end, "point": start}
-        if tokens:
-            return {"point": tokens[0]}
+        _ = (cls, text)
         return {}
 
     @staticmethod
     def _infer_frame_count_hint(text: str) -> int:
-        t = normalize_text(text)
-        if not t:
-            return 0
-        m = re.search(r"(\d{1,2})\s*(?:张|幀|帧|frames?)", t, flags=re.IGNORECASE)
-        if not m:
-            return 0
-        try:
-            value = int(m.group(1))
-        except ValueError:
-            return 0
-        return max(1, min(12, value))
+        _ = text
+        return 0
 
     def _rebuild_query_with_context(self, text: str, ctx: AgentContext) -> str:
-        raw = normalize_text(text)
-        if not raw:
-            return ""
-        if not self._is_context_continuation_phrase(raw):
-            return raw
-        tail = self._strip_continuation_prefix(raw)
-        # 优先使用被引用消息的正文作为语境锚点，解决 QQ reply 场景下指代丢失。
-        # 但如果引用的是 bot 自己的消息，不要用 bot 的回复作为 topic（避免自我迷惑）。
-        reply_uid = normalize_text(str(ctx.reply_to_user_id))
-        is_reply_to_bot = reply_uid == str(ctx.bot_id)
-        topic = ""
-        if not is_reply_to_bot:
-            topic = self._extract_topic_from_reply_text(ctx.reply_to_text)
-        if not topic:
-            topic = self._extract_recent_topic(ctx, current_text=raw)
-        if topic and tail:
-            if tail in topic:
-                return topic
-            if topic in tail:
-                return tail
-            return f"{topic} {tail}".strip()
-        if topic:
-            return topic
-        return tail or raw
+        _ = ctx
+        return normalize_text(text)
 
     @staticmethod
     def _is_context_continuation_phrase(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        if len(t) <= 16 and re.fullmatch(r"[?？!！,，.。~\-\s]*", t):
-            return True
-        starters = (
-            "so", "so?", "so？", "所以", "所以呢", "所以说", "然后", "然后呢", "那呢", "然后我要", "那我要",
-        )
-        return any(t.startswith(s) for s in starters)
+        _ = text
+        return False
 
     @staticmethod
     def _strip_continuation_prefix(text: str) -> str:
-        t = normalize_text(text)
-        t = re.sub(r"^(?i:so)\s*[?？:：,，]?\s*", "", t)
-        t = re.sub(r"^(所以(?:呢|说)?|然后(?:呢)?|那(?:然后|么)?呢?)\s*[?？:：,，]?\s*", "", t)
-        t = re.sub(r"^(我要|我想要|我想|给我|来个|来一个|帮我)\s*", "", t)
-        t = normalize_text(t)
-        return t
+        return normalize_text(text)
 
     def _extract_recent_topic(self, ctx: AgentContext, current_text: str) -> str:
-        current = normalize_text(current_text)
-        rows = list(ctx.memory_context or [])
-        for line in reversed(rows):
-            row = normalize_text(line)
-            if not row:
-                continue
-            if row.startswith("[bot]"):
-                continue
-            while row.startswith("["):
-                close = row.find("]")
-                if close <= 0:
-                    break
-                row = normalize_text(row[close + 1 :])
-            if not row or row == current:
-                continue
-            if self._is_context_continuation_phrase(row):
-                continue
-            cleaned = re.sub(
-                r"^(帮我|给我|请|麻烦|你去|你帮我|我想|我要|搜一下|搜索|查一下|查下|找一下|找)\s*",
-                "",
-                row,
-            ).strip()
-            topic = cleaned or row
-            if len(topic) < 2:
-                continue
-            return topic[:80]
+        _ = (ctx, current_text)
         return ""
 
     @staticmethod
     def _extract_topic_from_reply_text(reply_text: str) -> str:
-        text = normalize_text(reply_text)
-        if not text:
-            return ""
-        text = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
-        text = normalize_text(text)
-        if not text:
-            return ""
-        return clip_text(text, 100)
+        return clip_text(normalize_text(reply_text), 100)
 
     @staticmethod
     def _fallback_tool_on_failure(tool_name: str, args: dict[str, Any], error: str = "") -> tuple[str, dict[str, Any]] | None:
@@ -2100,13 +1998,12 @@ class AgentLoop:
         queue_cfg = self.config.get("queue", {}) if isinstance(self.config, dict) else {}
         if isinstance(queue_cfg, dict):
             queue_timeout = self._to_safe_int(queue_cfg.get("process_timeout_seconds"))
-            text = normalize_text(ctx.message_text).lower()
             video_override = self._to_safe_int(queue_cfg.get("video_process_timeout_seconds"))
             download_override = self._to_safe_int(queue_cfg.get("download_process_timeout_seconds"))
-            if any(token in text for token in ("下载", "安装包", ".exe", ".apk", ".zip", "网盘")):
-                queue_timeout = max(queue_timeout, download_override)
-            elif has_media or any(token in text for token in ("视频", "解析", "bilibili", "抖音", "快手", "acfun", "bv")):
+            if has_media:
                 queue_timeout = max(queue_timeout, video_override)
+            if download_override > 0:
+                queue_timeout = max(queue_timeout, download_override)
 
             if queue_timeout > 0:
                 queue_budget = max(15, queue_timeout - self.queue_timeout_margin_seconds)
@@ -2131,29 +2028,12 @@ class AgentLoop:
         t = normalize_text(text)
         if not t:
             return "随机"
-        lower = t.lower()
-        if any(cue in lower for cue in ("刚学", "刚刚学", "刚才学", "最近学", "刚学的", "刚刚学的", "刚刚那个", "刚才那个")):
-            return "最近"
-        if any(cue in lower for cue in ("随机", "随便", "来个", "来一张", "来张", "发个", "发一张")):
-            return "随机"
-        cleaned = re.sub(
-            r"(请|請|麻烦|麻煩|帮我|幫我|给我|給我|把|发表情包|發表情包|表情包|表情|emoji|emote|动图|動圖|gif|贴纸|貼紙|发|發|来|來|一张|一張|一个|一個|一下|吧|呀|啊|嘛|呢)",
-            " ",
-            t,
-            flags=re.IGNORECASE,
-        )
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if cleaned:
-            return cleaned[:40]
-        return "随机"
+        return t[:40]
 
     @staticmethod
     def _is_explicit_emoji_request(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        cues = ("表情包", "表情", "emoji", "emote", "动图", "gif", "贴纸")
-        return any(cue in t for cue in cues)
+        _ = text
+        return False
 
     def _looks_like_choice_followup(self, text: str) -> bool:
         _ = text
@@ -2162,25 +2042,14 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_file_send_request(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        cues = (
-            "发我安装包",
-            "直接发我",
-            "丢给我",
-            "上传群文件",
-            "给我下载",
-            "帮我下载",
-            "安装包",
-            "apk",
-            "exe",
-            "zip",
-        )
-        return any(cue in t for cue in cues)
+        _ = text
+        return False
 
     def _looks_like_profile_analysis_request(self, text: str) -> bool:
-        return _shared_qq_profile_request(text, config=self.config)
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        return bool(re.search(r"(是谁|资料|資料|信息|头像|空间|空間|qzone|\?|？)", content))
 
     def _should_force_tool_first(self, ctx: AgentContext) -> bool:
         """判断当前请求是否必须先进行工具调用。"""
@@ -2249,21 +2118,71 @@ class AgentLoop:
             return False
         if self._looks_like_image_question(text):
             return True
-        reference_cues = tuple(
-            normalize_text(cue).lower() for cue in _pl.get_list("image_reference_cues") if normalize_text(cue)
-        )
-        if ("?" in text or "？" in text) and reference_cues and any(cue in text for cue in reference_cues):
+        if not text:
+            return False
+        if "?" in text or "？" in text:
             return True
-        return False
+        analysis_markers = (
+            "谁",
+            "什么",
+            "哪",
+            "哪里",
+            "识别",
+            "分析",
+            "看看",
+            "看下",
+            "介绍",
+            "解释",
+            "出处",
+            "来源",
+            "内容",
+            "总结",
+        )
+        return any(marker in text for marker in analysis_markers)
 
     @staticmethod
     def _looks_like_image_question(text: str) -> bool:
-        """判断文本是否在对图片提问。"""
-        t = (text or "").lower()
-        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
-        if not cues:
+        content = normalize_text(text).lower()
+        if not content:
             return False
-        return any(c in t for c in cues)
+        reference_markers = (
+            "图",
+            "图片",
+            "这张",
+            "这图",
+            "图里",
+            "图中",
+            "截图",
+            "照片",
+            "头像",
+            "image",
+            "photo",
+            "picture",
+        )
+        question_markers = (
+            "谁",
+            "什么",
+            "哪",
+            "哪里",
+            "识别",
+            "分析",
+            "看看",
+            "看下",
+            "介绍",
+            "解释",
+            "出处",
+            "来源",
+            "内容",
+            "总结",
+            "是不是",
+        )
+        if any(marker in content for marker in ("图里", "图中", "图片里", "图片中", "这张图", "截图里", "照片里")):
+            return True
+        if ("?" in content or "？" in content) and any(marker in content for marker in reference_markers):
+            return True
+        return any(marker in content for marker in reference_markers) and any(
+            marker in content for marker in question_markers
+        )
 
     def _parse_llm_output(self, text: str) -> dict[str, Any] | None:
         """解析 LLM 输出为 tool_call dict，失败返回 None。"""
@@ -2509,17 +2428,47 @@ class AgentLoop:
 
     def _compact_data(self, data: dict[str, Any], max_items: int = 20) -> dict[str, Any]:
         """压缩工具返回数据，避免 token 爆炸。"""
-        result = {}
-        for key, value in data.items():
-            if isinstance(value, list):
-                result[key] = value[:max_items]
-                if len(value) > max_items:
-                    result[f"{key}_total"] = len(value)
-            elif isinstance(value, str) and len(value) > 1000:
-                result[key] = value[:1000] + "..."
-            else:
-                result[key] = value
-        return result
+        if not isinstance(data, dict):
+            return {}
+
+        item_limit = max(3, int(max_items or self.tool_result_max_items))
+        str_limit = max(120, int(self.tool_result_max_string_length))
+        depth_limit = max(1, int(self.tool_result_max_depth))
+        dict_item_limit = max(8, int(self.tool_result_max_dict_items))
+
+        def _compact_value(value: Any, depth: int) -> Any:
+            if isinstance(value, str):
+                if len(value) <= str_limit:
+                    return value
+                return value[:str_limit] + "..."
+
+            if depth >= depth_limit:
+                if isinstance(value, dict):
+                    return {"_omitted": f"dict({len(value)})"}
+                if isinstance(value, (list, tuple, set)):
+                    return {"_omitted": f"list({len(value)})"}
+                return value
+
+            if isinstance(value, dict):
+                result_dict: dict[str, Any] = {}
+                keys = list(value.keys())
+                for key in keys[:dict_item_limit]:
+                    key_name = normalize_text(str(key)) or str(key)
+                    result_dict[key_name] = _compact_value(value.get(key), depth + 1)
+                if len(keys) > dict_item_limit:
+                    result_dict["_truncated_fields"] = len(keys) - dict_item_limit
+                return result_dict
+
+            if isinstance(value, (list, tuple, set)):
+                rows = list(value)
+                compact_rows = [_compact_value(item, depth + 1) for item in rows[:item_limit]]
+                if len(rows) > item_limit:
+                    compact_rows.append({"_truncated_items": len(rows) - item_limit})
+                return compact_rows
+
+            return value
+
+        return _compact_value(data, 0) if isinstance(data, dict) else {}
 
     @staticmethod
     def _last_success_display(steps: list[dict[str, Any]]) -> str:
@@ -2545,6 +2494,97 @@ class AgentLoop:
                     if prefer_non_silk and path.lower().endswith(".silk"):
                         continue
                     return path
+        return ""
+
+    @classmethod
+    def _looks_like_image_url(cls, value: str) -> bool:
+        text = normalize_text(value).lower()
+        if not text:
+            return False
+        if text.startswith("data:image/"):
+            return True
+        if cls._is_local_media_path(text):
+            return bool(re.search(r"\.(?:png|jpe?g|gif|webp|bmp|svg)$", text))
+        if re.search(r"\.(?:png|jpe?g|gif|webp|bmp|svg)(?:\?|$)", text):
+            return True
+        return any(
+            token in text
+            for token in ("/files/image/", "/image/", "/images/", "grok-image")
+        )
+
+    @classmethod
+    def _looks_like_video_url(cls, value: str) -> bool:
+        text = normalize_text(value).lower()
+        if not text:
+            return False
+        if cls._is_local_media_path(text):
+            return bool(re.search(r"\.(?:mp4|mov|mkv|webm|avi|m4v)$", text))
+        if re.search(r"\.(?:mp4|mov|mkv|webm|avi|m4v)(?:\?|$)", text):
+            return True
+        return any(token in text for token in ("/video/", "/videos/", "/files/video/"))
+
+    @classmethod
+    def _last_success_image_urls(cls, steps: list[dict[str, Any]]) -> list[str]:
+        for step in reversed(steps):
+            if not bool(step.get("ok")):
+                continue
+            data = step.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            tool = normalize_text(str(step.get("tool", ""))).lower()
+            candidates: list[str] = []
+
+            raw_urls = data.get("image_urls", [])
+            if isinstance(raw_urls, list):
+                for item in raw_urls:
+                    value = ""
+                    if isinstance(item, dict):
+                        value = normalize_text(str(item.get("url", "") or item.get("image_url", "")))
+                    else:
+                        value = normalize_text(str(item))
+                    if value:
+                        candidates.append(value)
+
+            image_url = normalize_text(str(data.get("image_url", "")))
+            if image_url:
+                candidates.append(image_url)
+
+            raw_url = normalize_text(str(data.get("url", "")))
+            if raw_url and ("image" in tool or cls._looks_like_image_url(raw_url)):
+                candidates.append(raw_url)
+
+            filtered: list[str] = []
+            seen: set[str] = set()
+            for candidate in candidates:
+                if not cls._looks_like_image_url(candidate):
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                filtered.append(candidate)
+            if filtered:
+                return filtered
+        return []
+
+    @classmethod
+    def _last_success_video_url(cls, steps: list[dict[str, Any]]) -> str:
+        for step in reversed(steps):
+            if not bool(step.get("ok")):
+                continue
+            data = step.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            tool = normalize_text(str(step.get("tool", ""))).lower()
+            candidates: list[str] = [
+                normalize_text(str(data.get("video_url", ""))),
+                normalize_text(str(data.get("video", ""))),
+            ]
+            raw_url = normalize_text(str(data.get("url", "")))
+            if raw_url and ("video" in tool or cls._looks_like_video_url(raw_url)):
+                candidates.append(raw_url)
+            for candidate in candidates:
+                if candidate and cls._looks_like_video_url(candidate):
+                    return candidate
         return ""
 
     def _extract_embedded_tool_call_from_text(self, text: str) -> dict[str, Any] | None:

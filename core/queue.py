@@ -94,6 +94,60 @@ class GroupQueueDispatcher:
     def pending_count(self, conversation_id: str) -> int:
         return self._state(conversation_id).pending_count
 
+    def get_conversation_state(self, conversation_id: str) -> dict[str, Any]:
+        """返回某会话的队列状态快照（用于 WebUI 观测）。"""
+        cid = str(conversation_id or "")
+        state = self._groups.get(cid)
+        if state is None:
+            return {
+                "conversation_id": cid,
+                "exists": False,
+                "pending_count": 0,
+                "running_count": 0,
+                "queued_count": 0,
+                "interruptible_count": 0,
+                "latest_trace_id": "",
+            }
+        pending = 0
+        running = 0
+        interruptible = 0
+        latest_trace_id = ""
+        latest_seq = -1
+        for item in state.items.values():
+            if item.final_dispatched:
+                continue
+            if item.interruptible:
+                interruptible += 1
+            if item.state == "running":
+                running += 1
+            else:
+                pending += 1
+            if item.seq > latest_seq:
+                latest_seq = int(item.seq)
+                latest_trace_id = str(item.trace_id or "")
+        return {
+            "conversation_id": cid,
+            "exists": True,
+            "pending_count": int(state.pending_count),
+            "running_count": running,
+            "queued_count": pending,
+            "interruptible_count": interruptible,
+            "latest_trace_id": latest_trace_id,
+        }
+
+    def list_conversation_states(self, limit: int = 200) -> list[dict[str, Any]]:
+        """返回所有有活跃任务的会话快照。"""
+        rows: list[dict[str, Any]] = []
+        for cid in list(self._groups.keys()):
+            snap = self.get_conversation_state(cid)
+            if not bool(snap.get("exists")):
+                continue
+            if int(snap.get("pending_count", 0) or 0) <= 0:
+                continue
+            rows.append(snap)
+        rows.sort(key=lambda item: int(item.get("pending_count", 0) or 0), reverse=True)
+        return rows[: max(1, int(limit))]
+
     async def submit(
         self,
         conversation_id: str,
@@ -229,6 +283,63 @@ class GroupQueueDispatcher:
                 reason,
                 item.interruptible,
             )
+
+    async def cancel_conversation(
+        self,
+        conversation_id: str,
+        *,
+        reason: str = "cancelled_by_webui",
+        include_running: bool = True,
+        interruptible_only: bool = True,
+    ) -> dict[str, int]:
+        """取消某会话的全部待处理任务，返回取消统计。"""
+        cid = str(conversation_id or "")
+        state = self._groups.get(cid)
+        if state is None:
+            return {"cancelled": 0, "skipped_non_interruptible": 0, "skipped_running": 0, "skipped_finished": 0}
+
+        victims: list[_QueueItem] = []
+        skipped_non_interruptible = 0
+        skipped_finished = 0
+        skipped_running = 0
+        async with state.state_lock:
+            for item in state.items.values():
+                if item.final_dispatched or item.state in {"finished", "cancelled"}:
+                    skipped_finished += 1
+                    continue
+                if interruptible_only and not item.interruptible:
+                    skipped_non_interruptible += 1
+                    continue
+                if not include_running and item.state == "running":
+                    skipped_running += 1
+                    continue
+                item.state = "cancelled"
+                item.cancel_reason = reason
+                victims.append(item)
+
+        for item in victims:
+            if item.process_task is not None and not item.process_task.done():
+                item.process_task.cancel()
+            if item.runner_task is not None and not item.runner_task.done():
+                item.runner_task.cancel()
+            await self._finalize_item(
+                state=state,
+                item=item,
+                dispatch=QueueDispatchResult(
+                    status="cancelled",
+                    reason=reason,
+                    conversation_id=cid,
+                    seq=item.seq,
+                    trace_id=item.trace_id,
+                ),
+            )
+
+        return {
+            "cancelled": len(victims),
+            "skipped_non_interruptible": skipped_non_interruptible,
+            "skipped_running": skipped_running,
+            "skipped_finished": skipped_finished,
+        }
 
     async def _run_item(
         self,
