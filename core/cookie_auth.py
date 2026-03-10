@@ -315,6 +315,186 @@ _ROOKIEPY_PREFETCH_DOMAINS = [
 ]
 _ROOKIEPY_ELEVATED_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 _ROOKIEPY_ELEVATED_SKIP_UNTIL: dict[str, float] = {}
+_ROOKIEPY_ADMIN_HINT_LAST_AT = 0.0
+_ROOKIEPY_ADMIN_HINT_COOLDOWN_SECONDS = 8.0
+
+
+def _emit_rookiepy_admin_hint_once() -> None:
+    global _ROOKIEPY_ADMIN_HINT_LAST_AT
+    now = time.time()
+    if now - _ROOKIEPY_ADMIN_HINT_LAST_AT < _ROOKIEPY_ADMIN_HINT_COOLDOWN_SECONDS:
+        return
+    _ROOKIEPY_ADMIN_HINT_LAST_AT = now
+    print(
+        "  提示: Chromium v130+ Cookie 解密可能需要管理员权限。"
+        "请以管理员身份运行，或关闭浏览器后重试。"
+    )
+
+
+def _is_windows_admin() -> bool:
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _ps_single_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _extract_via_rookiepy_elevated_prefetch(
+    browser: str,
+    domains: list[str],
+) -> dict[str, dict[str, str]]:
+    """尝试一次提权批量提取并缓存结果，返回请求域名的缓存快照。"""
+    normalized_domains = [str(domain or "").strip() for domain in domains if str(domain or "").strip()]
+    cache = _ROOKIEPY_ELEVATED_CACHE.setdefault(browser, {})
+    if not normalized_domains:
+        return {}
+
+    if os.name != "nt":
+        return {domain: dict(cache.get(domain, {})) for domain in normalized_domains}
+
+    now = time.time()
+    skip_until = float(_ROOKIEPY_ELEVATED_SKIP_UNTIL.get(browser, 0.0) or 0.0)
+    if now < skip_until:
+        return {domain: dict(cache.get(domain, {})) for domain in normalized_domains}
+
+    missing = [domain for domain in dict.fromkeys(normalized_domains) if domain not in cache]
+    if not missing:
+        return {domain: dict(cache.get(domain, {})) for domain in normalized_domains}
+
+    def _extract_in_current_process() -> None:
+        try:
+            import rookiepy
+        except Exception:
+            return
+        fn = getattr(rookiepy, browser, None)
+        if not fn:
+            return
+        for domain in missing:
+            candidates = [domain]
+            stripped = domain.lstrip(".")
+            if stripped and stripped != domain:
+                candidates.append(stripped)
+            cookies: dict[str, str] = {}
+            for candidate in candidates:
+                try:
+                    raw = fn([candidate])
+                except Exception:
+                    continue
+                for item in raw or []:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "") or "").strip()
+                    if not name:
+                        continue
+                    cookies[name] = str(item.get("value", "") or "")
+            if cookies:
+                cache[domain] = cookies
+
+    # 已在管理员上下文中时，直接在当前进程执行。
+    if _is_windows_admin():
+        _extract_in_current_process()
+        return {domain: dict(cache.get(domain, {})) for domain in normalized_domains}
+
+    helper_script = """import json
+import sys
+
+browser = sys.argv[1]
+output_path = sys.argv[2]
+domains = sys.argv[3:]
+payload = {"cookies": {}, "error": ""}
+
+try:
+    import rookiepy
+    fn = getattr(rookiepy, browser, None)
+    if fn is None:
+        raise RuntimeError(f"rookiepy backend unavailable: {browser}")
+    for domain in domains:
+        result = {}
+        candidates = [domain]
+        stripped = domain.lstrip(".")
+        if stripped and stripped != domain:
+            candidates.append(stripped)
+        for candidate in candidates:
+            try:
+                raw = fn([candidate])
+            except Exception:
+                continue
+            for item in raw or []:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name", "") or "").strip()
+                if not name:
+                    continue
+                result[name] = str(item.get("value", "") or "")
+        payload["cookies"][domain] = result
+except Exception as exc:
+    payload["error"] = str(exc)
+
+with open(output_path, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, ensure_ascii=False)
+"""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="yukiko-rookiepy-") as tmpdir:
+            script_path = Path(tmpdir) / "prefetch.py"
+            output_path = Path(tmpdir) / "prefetch-result.json"
+            script_path.write_text(helper_script, encoding="utf-8")
+
+            python_exe = str(sys.executable or "python").strip() or "python"
+            args = [str(script_path), browser, str(output_path), *missing]
+            ps_args = ", ".join(_ps_single_quote(arg) for arg in args)
+            ps_command = (
+                f"$args = @({ps_args}); "
+                f"Start-Process -FilePath {_ps_single_quote(python_exe)} "
+                f"-ArgumentList $args -Verb RunAs -WindowStyle Hidden -Wait"
+            )
+            subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-Command",
+                    ps_command,
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=120,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+
+            if output_path.exists():
+                payload = json.loads(output_path.read_text(encoding="utf-8") or "{}")
+                cookies_payload = payload.get("cookies", {}) if isinstance(payload, dict) else {}
+                if isinstance(cookies_payload, dict):
+                    for domain, cookies in cookies_payload.items():
+                        if isinstance(cookies, dict):
+                            cache[str(domain)] = {
+                                str(name): str(value)
+                                for name, value in cookies.items()
+                                if str(name).strip()
+                            }
+            else:
+                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = now + 20.0
+    except Exception as exc:
+        _log.debug("rookiepy elevated prefetch failed | browser=%s | err=%s", browser, exc)
+        _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = now + 20.0
+
+    if all(not cache.get(domain) for domain in missing):
+        _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = max(
+            float(_ROOKIEPY_ELEVATED_SKIP_UNTIL.get(browser, 0.0) or 0.0),
+            now + 12.0,
+        )
+
+    return {domain: dict(cache.get(domain, {})) for domain in normalized_domains}
 
 _COOKIE_PLATFORM_LOGIN_GUIDES: dict[str, dict[str, Any]] = {
     "bilibili": {
@@ -1126,10 +1306,7 @@ def _extract_via_rookiepy(browser: str, domain: str) -> dict[str, str]:
         msg = str(exc)
         lower = msg.lower()
         if "appbound encryption" in lower or "running as admin" in lower:
-            print(
-                "  提示: Chromium v130+ Cookie 解密可能需要管理员权限。"
-                "请以管理员身份运行，或关闭浏览器后重试。"
-            )
+            _emit_rookiepy_admin_hint_once()
             domains = list(dict.fromkeys([domain, *_ROOKIEPY_PREFETCH_DOMAINS]))
             elevated = _extract_via_rookiepy_elevated_prefetch(browser, domains).get(domain, {})
             if elevated:
