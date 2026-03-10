@@ -909,6 +909,28 @@ class SearchEngine:
             for k in expired:
                 del store[k]
 
+    @staticmethod
+    def _compact_match_text(text: str) -> str:
+        lowered = (text or "").lower()
+        cleaned = re.sub(r"[^\w\s\u4e00-\u9fff]", " ", lowered)
+        return re.sub(r"[\s\-\_·•./|\\,，;；:&()（）\[\]{}]+", "", cleaned)
+
+    @classmethod
+    def _query_relevance_tokens(cls, query: str) -> list[str]:
+        base = cls._compact_match_text(query)
+        if not base:
+            return []
+        raw = re.split(r"[\s,，;；/|]+", (query or "").lower())
+        tokens: list[str] = []
+        for part in raw:
+            compact = cls._compact_match_text(part)
+            if not compact or compact in tokens:
+                continue
+            tokens.append(compact)
+        if not tokens and base:
+            tokens.append(base)
+        return tokens
+
     async def search_bilibili_videos(self, query: str, limit: int = 5) -> list[SearchResult]:
         """通过 bilibili-api-python 搜索视频（自动处理 WBI 签名）。"""
         clean_query = query.strip()
@@ -952,6 +974,19 @@ class SearchEngine:
             results.append(SearchResult(title=title[:120], snippet=snippet[:240], url=url))
             if len(results) >= limit:
                 break
+
+        tokens = self._query_relevance_tokens(clean_query)
+        if len(tokens) >= 2 and results:
+            filtered: list[SearchResult] = []
+            for row in results:
+                haystack = self._compact_match_text(f"{row.title} {row.snippet}")
+                if not haystack:
+                    continue
+                hit_count = sum(1 for token in tokens if token in haystack)
+                if hit_count >= 2:
+                    filtered.append(row)
+            results = filtered
+
         if results:
             self._bili_cache[cache_key] = (time.monotonic(), list(results))
             self._evict_cache()

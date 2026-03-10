@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import io
+import logging
 import os
 import sys
 
@@ -27,6 +28,18 @@ def _load_env_files() -> None:
 
 
 _load_env_files()
+
+
+def _tune_runtime_logging() -> None:
+    # Keep startup/runtime diagnostics, suppress noisy per-request HTTP access logs.
+    uvicorn_access = logging.getLogger("uvicorn.access")
+    uvicorn_access.disabled = True
+    uvicorn_access.propagate = False
+    logging.getLogger("websockets.server").setLevel(logging.WARNING)
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
+
+
+_tune_runtime_logging()
 
 # 首次运行向导：
 #   config.yml 不存在 → 启动 WebUI 配置页面

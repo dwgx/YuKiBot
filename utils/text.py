@@ -33,6 +33,42 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+def normalize_matching_text(text: str) -> str:
+    """规范化用于匹配的文本（更激进的清理）。"""
+    normalized = normalize_text(text)
+    # 移除常见的标点和特殊字符，保留字母数字和中文
+    normalized = re.sub(r"[^\w\s\u4e00-\u9fff]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _compact_for_match(text: str) -> str:
+    return re.sub(r"[\s\-\_·•./|\\,，;；:&()（）\[\]{}]+", "", normalize_matching_text(text).lower())
+
+
+def has_unrequested_title_qualifier(actual_title: str, requested_title: str) -> bool:
+    """判断实际标题是否包含了用户未请求的后缀/版本信息。"""
+    actual_compact = _compact_for_match(actual_title)
+    requested_compact = _compact_for_match(requested_title)
+
+    # 单字请求极易误判（例如「回」命中「回到」），直接放行。
+    if not actual_compact or len(requested_compact) < 2:
+        return False
+    if requested_compact not in actual_compact:
+        return False
+    if requested_compact == actual_compact:
+        return False
+
+    remainder = actual_compact.replace(requested_compact, "", 1)
+    if not remainder:
+        return False
+
+    requested_tokens = set(tokenize(normalize_matching_text(requested_title)))
+    remainder_tokens = set(tokenize(remainder))
+    if requested_tokens and remainder_tokens and remainder_tokens.issubset(requested_tokens):
+        return False
+    return True
+
+
 def tokenize(text: str) -> list[str]:
     return [item.lower() for item in _TOKEN_PATTERN.findall(text or "")]
 

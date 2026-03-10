@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from types import ModuleType
 
 from core.agent_tools import (
     _handle_music_play,
@@ -9,6 +10,7 @@ from core.agent_tools import (
     _handle_music_search,
 )
 from core.music import MusicEngine, MusicPlayResult, MusicSearchResult, build_music_keyword
+from core.search import SearchEngine
 from core.tools import ToolExecutor, ToolResult
 from utils.text import has_unrequested_title_qualifier, normalize_matching_text
 
@@ -190,6 +192,89 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.error, "no_exact_match")
         self.assertEqual(seen_calls, [("原声", "热水澡", "蛋堡", True)])
+
+    async def test_search_bilibili_videos_filters_multi_token_mismatch(self) -> None:
+        import sys
+
+        fake_api = ModuleType("bilibili_api")
+        fake_search = ModuleType("bilibili_api.search")
+        fake_search.SearchObjectType = ModuleType("SearchObjectType")
+        fake_search.SearchObjectType.VIDEO = "video"
+
+        async def fake_search_by_type(keyword: str, search_type, page: int):
+            return {
+                "result": [
+                    {
+                        "bvid": "BV1AXAZeeENK",
+                        "title": "『下架歌曲』《××你好》 in3 阴三儿（附下载链接）",
+                        "description": "相关搬运",
+                        "duration": "05:45",
+                    },
+                    {
+                        "bvid": "BV1RightHit",
+                        "title": "IN3《黑》完整版",
+                        "description": "in3 官方歌词版",
+                        "duration": "03:45",
+                    },
+                ]
+            }
+
+        fake_search.search_by_type = fake_search_by_type
+        fake_api.search = fake_search
+        original_module = sys.modules.get("bilibili_api")
+        sys.modules["bilibili_api"] = fake_api
+        try:
+            engine = SearchEngine({})
+            results = await engine.search_bilibili_videos("IN3 黑", limit=5)
+        finally:
+            if original_module is None:
+                del sys.modules["bilibili_api"]
+            else:
+                sys.modules["bilibili_api"] = original_module
+
+        self.assertEqual(len(results), 1)
+        self.assertIn("《黑》", results[0].title)
+
+    async def test_search_bilibili_videos_returns_empty_when_no_row_matches_multi_token_query(self) -> None:
+        import sys
+
+        fake_api = ModuleType("bilibili_api")
+        fake_search = ModuleType("bilibili_api.search")
+        fake_search.SearchObjectType = ModuleType("SearchObjectType")
+        fake_search.SearchObjectType.VIDEO = "video"
+
+        async def fake_search_by_type(keyword: str, search_type, page: int):
+            return {
+                "result": [
+                    {
+                        "bvid": "BV1OnlyIN3",
+                        "title": "『下架歌曲』《××你好》 in3 阴三儿（附下载链接）",
+                        "description": "相关搬运",
+                        "duration": "05:45",
+                    },
+                    {
+                        "bvid": "BV1OnlyHei",
+                        "title": "黑色幽默 现场版",
+                        "description": "无关描述",
+                        "duration": "04:00",
+                    },
+                ]
+            }
+
+        fake_search.search_by_type = fake_search_by_type
+        fake_api.search = fake_search
+        original_module = sys.modules.get("bilibili_api")
+        sys.modules["bilibili_api"] = fake_api
+        try:
+            engine = SearchEngine({})
+            results = await engine.search_bilibili_videos("IN3 黑", limit=5)
+        finally:
+            if original_module is None:
+                del sys.modules["bilibili_api"]
+            else:
+                sys.modules["bilibili_api"] = original_module
+
+        self.assertEqual(results, [])
 
     async def test_music_engine_search_prefers_canonical_query_before_modifier_only_keyword(self) -> None:
         engine = MusicEngine({"music": {"enable": True, "local_source_enable": False}})

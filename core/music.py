@@ -21,7 +21,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from utils.text import normalize_text
+from utils.text import has_unrequested_title_qualifier, normalize_matching_text, normalize_text
 
 _log = logging.getLogger("yukiko.music")
 
@@ -167,12 +167,24 @@ class MusicEngine:
         """Compatibility hook."""
         return None
 
-    async def search(self, keyword: str, limit: int = 5) -> list[MusicSearchResult]:
+    async def search(
+        self,
+        keyword: str,
+        limit: int = 5,
+        *,
+        title: str = "",
+        artist: str = "",
+    ) -> list[MusicSearchResult]:
         """Search songs with minimal local preference logic."""
-        if not self._enable or not keyword.strip():
+        query = build_music_keyword(
+            normalize_matching_text(keyword),
+            normalize_matching_text(title),
+            normalize_matching_text(artist),
+        )
+        if not self._enable or not query.strip():
             return []
 
-        kw = keyword.strip()
+        kw = query.strip()
         intent = self._parse_keyword_intent(kw)
         fetch_limit = max(limit * 3, 20)  # 获取更多结果用于过滤
 
@@ -203,7 +215,7 @@ class MusicEngine:
 
     @staticmethod
     def _parse_keyword_intent(keyword: str) -> MusicKeywordIntent:
-        raw = normalize_text(keyword)
+        raw = normalize_matching_text(keyword)
         lower = raw.lower()
         parts = [x for x in re.split(r"[\s,，;；/|]+", lower) if x]
         artist_tokens: tuple[str, ...] = ()
@@ -212,25 +224,48 @@ class MusicEngine:
             artist_hint = " ".join(parts[1:])
             artist_tokens = tuple(dict.fromkeys(x for x in parts[1:] if x))
             return MusicKeywordIntent(
-                title_hint=normalize_text(title_hint),
-                artist_hint=normalize_text(artist_hint),
+                title_hint=normalize_matching_text(title_hint),
+                artist_hint=normalize_matching_text(artist_hint),
                 artist_tokens=artist_tokens,
             )
         return MusicKeywordIntent(
-            title_hint=normalize_text(lower),
+            title_hint=normalize_matching_text(lower),
             artist_hint="",
             artist_tokens=(),
         )
 
     @staticmethod
     def _compact_text(text: str) -> str:
-        return re.sub(r"[\s\-\_·•./|\\,，;；:&()（）\[\]{}]+", "", normalize_text(text).lower())
+        return re.sub(r"[\s\-\_·•./|\\,，;；:&()（）\[\]{}]+", "", normalize_matching_text(text).lower())
+
+    @classmethod
+    def _title_match_level(cls, expected_title: str, actual_title: str) -> int:
+        expected = cls._compact_text(expected_title)
+        actual = cls._compact_text(actual_title)
+        if not expected or not actual:
+            return 0
+        if expected == actual:
+            return 3
+        if expected in actual or actual in expected:
+            return 2
+        return 0
+
+    @classmethod
+    def _should_avoid_version(cls, actual_title: str, requested_text: str = "") -> bool:
+        return has_unrequested_title_qualifier(actual_title, requested_text)
+
+    @staticmethod
+    def _requires_verified_original(keyword: str) -> bool:
+        content = normalize_matching_text(keyword).lower()
+        if not content:
+            return False
+        return any(token in content for token in ("原声", "原版", "原曲", "官方"))
 
     @classmethod
     def _artist_matches_intent(cls, artist: str, intent: MusicKeywordIntent) -> bool:
         if not intent.artist_hint:
             return True
-        artist_norm = normalize_text(artist).lower()
+        artist_norm = normalize_matching_text(artist).lower()
         artist_compact = cls._compact_text(artist_norm)
         hint_compact = cls._compact_text(intent.artist_hint)
         if hint_compact and (hint_compact in artist_compact or artist_compact in hint_compact):
@@ -238,7 +273,7 @@ class MusicEngine:
         if intent.artist_tokens:
             token_hits = 0
             for token in intent.artist_tokens:
-                token_norm = normalize_text(token).lower()
+                token_norm = normalize_matching_text(token).lower()
                 token_compact = cls._compact_text(token_norm)
                 if not token_compact:
                     continue
@@ -662,11 +697,16 @@ class MusicEngine:
     async def _get_play_url_with_alternative(
         self,
         song: MusicSearchResult,
+        *,
+        require_verified_original: bool = False,
     ) -> MusicPlayUrl:
         """获取播放链接，支持本地音源替换。"""
         # 先尝试网易云音源
         netease_url = await self._get_play_url(song.song_id)
         if netease_url.url and not netease_url.is_trial:
+            return netease_url
+
+        if require_verified_original:
             return netease_url
 
         # 如果网易云失败，尝试本地音源匹配
@@ -832,12 +872,24 @@ class MusicEngine:
 
         return str(data.get("lrc", {}).get("lyric", "") or "")
 
-    async def play(self, keyword: str, as_voice: bool = True) -> MusicPlayResult:
-        results = await self.search(keyword, limit=12)
+    async def play(
+        self,
+        keyword: str,
+        as_voice: bool = True,
+        *,
+        title: str = "",
+        artist: str = "",
+    ) -> MusicPlayResult:
+        query = build_music_keyword(
+            normalize_matching_text(keyword),
+            normalize_matching_text(title),
+            normalize_matching_text(artist),
+        )
+        results = await self.search(query, limit=12, title=title, artist=artist)
         if not results:
             return MusicPlayResult(ok=False, message="没找到相关歌曲", error="no_results")
 
-        intent = self._parse_keyword_intent(keyword)
+        intent = self._parse_keyword_intent(query)
         ordered = self._order_play_candidates(results, intent=intent)
         has_artist_hint = bool(intent.artist_hint)
         artist_matched: list[MusicSearchResult] = []
@@ -863,18 +915,23 @@ class MusicEngine:
         last_error: MusicPlayResult | None = None
         strict_last_error: MusicPlayResult | None = None
         strict_attempted = 0
+        require_verified_original = self._requires_verified_original(query)
 
         # 依次尝试多个候选，尽量拿到可下载完整音频。
         for idx, song in enumerate(ordered[:8], start=1):
             strict_mode_for_song = bool(has_artist_hint and self._artist_matches_intent(song.artist, intent))
             if has_artist_hint and strict_mode_for_song:
                 strict_attempted += 1
-            one = await self._play_song(song, as_voice=as_voice)
+            one = await self._play_song(
+                song,
+                as_voice=as_voice,
+                require_verified_original=require_verified_original,
+            )
             if one.ok:
                 if idx > 1:
                     _log.info(
                         "music_play_fallback_hit | keyword=%s | picked=%d/%d | id=%d | song=%s - %s",
-                        normalize_text(keyword)[:80],
+                        normalize_matching_text(query)[:80],
                         idx,
                         len(ordered[:8]),
                         song.song_id,
@@ -934,8 +991,17 @@ class MusicEngine:
             error=(last_error.error if last_error else "") or "play_failed",
         )
 
-    async def _play_song(self, song: MusicSearchResult, as_voice: bool) -> MusicPlayResult:
-        play_url = await self._get_play_url_with_alternative(song)
+    async def _play_song(
+        self,
+        song: MusicSearchResult,
+        as_voice: bool,
+        *,
+        require_verified_original: bool = False,
+    ) -> MusicPlayResult:
+        play_url = await self._get_play_url_with_alternative(
+            song,
+            require_verified_original=require_verified_original,
+        )
         if not play_url.url:
             return MusicPlayResult(ok=False, song=song, error="no_url")
         if play_url.is_trial:
@@ -1219,3 +1285,26 @@ class MusicEngine:
                 file_path.unlink(missing_ok=True)
         except Exception:
             pass
+
+
+def build_music_keyword(keyword: str, title: str = "", artist: str = "") -> str:
+    """构建音乐搜索关键词。
+
+    Args:
+        keyword: 基础关键词
+        title: 歌曲标题
+        artist: 歌手名
+
+    Returns:
+        组合后的搜索关键词
+    """
+    parts = []
+    if title:
+        parts.append(title)
+    if artist:
+        parts.append(artist)
+
+    if parts:
+        return " ".join(parts)
+    return keyword
+
