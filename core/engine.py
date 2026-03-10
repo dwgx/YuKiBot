@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -117,12 +117,14 @@ class PluginRegistry:
         self.plugins: dict[str, Any] = {}
         self.schemas: list[dict[str, Any]] = []
         self._plugin_configs: dict[str, dict[str, Any]] = {}
+        self._plugin_meta: dict[str, dict[str, Any]] = {}
         self._config_dir = config_dir or plugins_dir.parent / "config"
 
     def load(self, global_config: dict[str, Any] | None = None) -> None:
         self.plugins.clear()
         self.schemas.clear()
         self._plugin_configs.clear()
+        self._plugin_meta.clear()
 
         plugins_config = (global_config or {}).get("plugins", {})
         if not isinstance(plugins_config, dict):
@@ -152,15 +154,18 @@ class PluginRegistry:
                     continue
 
                 # 首次配置向导: 插件定义了 needs_setup() 且返回 True
+                needs_setup = False
                 needs_setup_fn = getattr(plugin_cls, "needs_setup", None)
-                if callable(needs_setup_fn) and needs_setup_fn():
-                    interactive_fn = getattr(plugin_cls, "interactive_setup", None)
-                    if callable(interactive_fn):
-                        self.logger.info("插件 %s 需要首次配置，启动向导...", file.stem)
-                        try:
-                            interactive_fn()
-                        except Exception as exc:
-                            self.logger.warning("插件 %s 配置向导失败: %s", file.stem, exc)
+                if callable(needs_setup_fn):
+                    needs_setup = bool(needs_setup_fn())
+                interactive_fn = getattr(plugin_cls, "interactive_setup", None)
+                supports_interactive_setup = callable(interactive_fn)
+                if needs_setup and supports_interactive_setup:
+                    self.logger.info("插件 %s 需要首次配置，启动向导...", file.stem)
+                    try:
+                        interactive_fn()
+                    except Exception as exc:
+                        self.logger.warning("插件 %s 配置向导失败: %s", file.stem, exc)
 
                 plugin = plugin_cls()
 
@@ -190,7 +195,16 @@ class PluginRegistry:
                             rules.append(left)
 
                 self.plugins[name] = plugin
-                self._plugin_configs[name] = self._load_plugin_config(name, plugins_config)
+                plugin_cfg = self._load_plugin_config(name, plugins_config)
+                self._plugin_configs[name] = plugin_cfg
+                plugin_meta = self._build_plugin_meta(
+                    name=name,
+                    plugin=plugin,
+                    config=plugin_cfg,
+                    needs_setup=needs_setup,
+                    supports_interactive_setup=supports_interactive_setup,
+                )
+                self._plugin_meta[name] = plugin_meta
                 self.schemas.append(
                     {
                         "name": name,
@@ -201,6 +215,7 @@ class PluginRegistry:
                     }
                 )
                 self.logger.info("已加载插件：%s", name)
+                self._emit_plugin_config_guidance(name, plugin_meta)
             except Exception as exc:
                 self.logger.exception("加载插件失败 %s：%s", file.name, exc)
 
@@ -249,6 +264,104 @@ class PluginRegistry:
 
         # 优先级 3: config.yml → plugins.<name>
         return fallback.get(name, {}) or {}
+
+    def _has_local_plugin_config(self, name: str) -> bool:
+        plugin_cfg_dir = getattr(self, "_plugin_config_dir", self.plugins_dir / "config")
+        return (plugin_cfg_dir / f"{name}.yml").is_file()
+
+    def _normalize_plugin_guide(self, raw: Any) -> list[str]:
+        if isinstance(raw, str):
+            item = normalize_text(raw)
+            return [item] if item else []
+        if not isinstance(raw, list):
+            return []
+        return [normalize_text(str(item)) for item in raw if normalize_text(str(item))]
+
+    def _extract_plugin_editable_keys(self, plugin: Any, config: dict[str, Any]) -> list[str]:
+        keys: list[str] = []
+        config_schema = getattr(plugin, "config_schema", None)
+        if isinstance(config_schema, dict):
+            properties = config_schema.get("properties", {})
+            if isinstance(properties, dict):
+                keys.extend(
+                    normalize_text(str(item))
+                    for item in properties.keys()
+                    if normalize_text(str(item))
+                )
+        if not keys and isinstance(config, dict):
+            keys.extend(
+                normalize_text(str(item))
+                for item in config.keys()
+                if normalize_text(str(item))
+            )
+        seen: set[str] = set()
+        unique: list[str] = []
+        for item in keys:
+            if item not in seen:
+                seen.add(item)
+                unique.append(item)
+        return unique
+
+    def _resolve_plugin_config_target(
+        self,
+        name: str,
+        *,
+        supports_interactive_setup: bool,
+    ) -> str:
+        if supports_interactive_setup or self._has_local_plugin_config(name):
+            return f"plugins/config/{name}.yml"
+        return f"config/plugins.yml -> {name}"
+
+    def _build_plugin_meta(
+        self,
+        *,
+        name: str,
+        plugin: Any,
+        config: dict[str, Any],
+        needs_setup: bool,
+        supports_interactive_setup: bool,
+    ) -> dict[str, Any]:
+        editable_keys = self._extract_plugin_editable_keys(plugin, config)
+        config_guide = self._normalize_plugin_guide(getattr(plugin, "config_guide", None))
+        config_target = self._resolve_plugin_config_target(
+            name,
+            supports_interactive_setup=supports_interactive_setup,
+        )
+        configurable = bool(editable_keys or config_guide or supports_interactive_setup or config)
+        if not config_guide and configurable:
+            config_guide = [f"配置入口: {config_target}"]
+            if editable_keys:
+                preview = "、".join(editable_keys[:4])
+                config_guide.append(f"常用字段: {preview}")
+            if supports_interactive_setup:
+                config_guide.append("首次启动支持交互向导，之后也可以直接手改 YAML。")
+        setup_mode = "wizard" if supports_interactive_setup else "manual" if configurable else "none"
+        return {
+            "configurable": configurable,
+            "config_target": config_target,
+            "editable_keys": editable_keys,
+            "config_guide": config_guide,
+            "supports_interactive_setup": supports_interactive_setup,
+            "needs_setup": needs_setup,
+            "setup_mode": setup_mode,
+            "using_defaults": not bool(config),
+        }
+
+    def _emit_plugin_config_guidance(self, name: str, meta: dict[str, Any]) -> None:
+        if not isinstance(meta, dict) or not meta.get("configurable"):
+            return
+        editable_keys = meta.get("editable_keys", [])
+        if not isinstance(editable_keys, list):
+            editable_keys = []
+        key_preview = "、".join(str(item) for item in editable_keys[:4]) if editable_keys else "-"
+        self.logger.info(
+            "插件配置指导 | plugin=%s | target=%s | mode=%s | defaults=%s | fields=%s",
+            name,
+            meta.get("config_target", ""),
+            meta.get("setup_mode", "manual"),
+            "yes" if meta.get("using_defaults") else "no",
+            key_preview,
+        )
 
     async def call(self, name: str, message: str, context: dict[str, Any]) -> str:
         plugin = self.plugins.get(name)
@@ -634,8 +747,8 @@ class YukikoEngine:
             self.agent_tool_registry.set_intent_keyword_routing_enabled(False)
         self.control_chat_mode = normalize_text(str(control_cfg.get("chat_mode", "balanced"))).lower() or "balanced"
         self.control_undirected_policy = normalize_text(
-            str(control_cfg.get("undirected_policy", "high_confidence_only"))
-        ).lower() or "high_confidence_only"
+            str(control_cfg.get("undirected_policy", "mention_only"))
+        ).lower() or "mention_only"
         self.control_knowledge_learning = normalize_text(
             str(control_cfg.get("knowledge_learning", "aggressive"))
         ).lower() or "aggressive"
@@ -670,7 +783,7 @@ class YukikoEngine:
             or default_overload_notice
         )
 
-        # 搜索候选快捷复用功能已下线，统一交给 AI 正常理解当前输入。
+        # 搜索候选追问：用于“第2个 / 就这个 / 再发一次”类轻量 follow-up。
         self.search_followup_cache_enable = False
         self.search_followup_cache_ttl_seconds = 30 * 60
         self.search_followup_number_choice_enable = False
@@ -678,6 +791,24 @@ class YukikoEngine:
         self.search_followup_resend_enable = False
         self.search_followup_resend_media_cues = ()
         self.search_followup_max_choices = 10
+        followup_cfg = self.config.get("search_followup", {}) or {}
+        if isinstance(followup_cfg, dict):
+            ttl_minutes = max(1, min(24 * 60, int(followup_cfg.get("ttl_minutes", 30) or 30)))
+            self.search_followup_cache_enable = bool(followup_cfg.get("enable", False))
+            self.search_followup_cache_ttl_seconds = ttl_minutes * 60
+            self.search_followup_number_choice_enable = bool(followup_cfg.get("number_choice_enable", False))
+            self.search_followup_rotate_choice_enable = bool(followup_cfg.get("rotate_choice_enable", False))
+            self.search_followup_resend_enable = bool(followup_cfg.get("resend_enable", False))
+            resend_cues_raw = followup_cfg.get("resend_media_cues", [])
+            if isinstance(resend_cues_raw, list):
+                self.search_followup_resend_media_cues = tuple(
+                    dict.fromkeys(
+                        normalize_text(str(item)).lower()
+                        for item in resend_cues_raw
+                        if normalize_text(str(item))
+                    )
+                )
+            self.search_followup_max_choices = max(1, min(20, int(followup_cfg.get("max_choices", 10) or 10)))
         if hasattr(self, "_recent_search_cache"):
             self._recent_search_cache.clear()
 
@@ -1199,7 +1330,7 @@ class YukikoEngine:
                 self._record_intent(message, action="reply", reason="explicit_fact_recall", text=text)
                 return EngineResponse(action="reply", reason="explicit_fact_recall", reply_text=rendered)
 
-        # 候选缓存追问已下线。
+        # 最近结果追问：命中后优先走本地缓存选择，不必重新让 Agent 理解“第2个/再发一次”。
 
         # ── 音乐快速通道：可配置地跳过 Agent/Router，直接执行 ──
         agent_cfg = self.config.get("agent", {}) if isinstance(self.config, dict) else {}
@@ -1210,6 +1341,7 @@ class YukikoEngine:
             keyword = self._extract_music_keyword(text)
             if keyword:
                 action = "music_search" if self._looks_like_music_search_request(text) else "music_play"
+                tool_args = {"keyword": keyword, "limit": 8} if action == "music_search" else {"keyword": keyword}
                 self.logger.info(
                     "music_fast_path | trace=%s | action=%s | keyword=%s",
                     message.trace_id, action, clip_text(keyword, 60),
@@ -1217,7 +1349,7 @@ class YukikoEngine:
                 tool_result = await self.tools.execute(
                     action=action,
                     tool_name=action,
-                    tool_args={"keyword": keyword},
+                    tool_args=tool_args,
                     message_text=text,
                     conversation_id=message.conversation_id,
                     user_id=message.user_id,
@@ -1236,52 +1368,6 @@ class YukikoEngine:
                     reply_text = normalize_text(str(tool_result.payload.get("text", "")))
                     record_b64 = normalize_text(str(tool_result.payload.get("record_b64", "")))
                     audio_file = normalize_text(str(tool_result.payload.get("audio_file", "")))
-                music_play_failed = (
-                    action == "music_play"
-                    and (tool_result is None or not bool(getattr(tool_result, "ok", False)))
-                    and not record_b64
-                    and not audio_file
-                )
-                if music_play_failed:
-                    fallback_query = f"{keyword} site:bilibili.com/video 歌曲"
-                    fallback_result = await self.tools.execute(
-                        action="search",
-                        tool_name="search",
-                        tool_args={"query": fallback_query, "mode": "video"},
-                        message_text=fallback_query,
-                        conversation_id=message.conversation_id,
-                        user_id=message.user_id,
-                        user_name=message.user_name,
-                        group_id=message.group_id,
-                        api_call=message.api_call,
-                        raw_segments=message.raw_segments,
-                        bot_id=message.bot_id,
-                        trace_id=message.trace_id,
-                    )
-                    if fallback_result is not None and bool(getattr(fallback_result, "ok", False)):
-                        fallback_payload = getattr(fallback_result, "payload", {}) or {}
-                        fallback_text = normalize_text(str(fallback_payload.get("text", "")))
-                        fallback_video_url = normalize_text(str(fallback_payload.get("video_url", "")))
-                        fallback_relevant = self._is_music_fallback_relevant(keyword=keyword, payload=fallback_payload)
-                        if fallback_video_url and fallback_relevant:
-                            video_url = fallback_video_url
-                        elif fallback_video_url and not fallback_relevant:
-                            self.logger.info(
-                                "music_fallback_video_reject | trace=%s | keyword=%s | video_url=%s",
-                                message.trace_id,
-                                clip_text(keyword, 80),
-                                clip_text(fallback_video_url, 120),
-                            )
-                        if fallback_text:
-                            fallback_text = clip_text(fallback_text, 900)
-                            if reply_text and fallback_relevant:
-                                reply_text = f"{reply_text}\n\n我再给你全网找了这些可听来源：\n{fallback_text}"
-                            elif reply_text and not fallback_relevant:
-                                reply_text = f"{reply_text}\n\n我也全网找了，但结果不够匹配，我先不给你乱发。你可以补充更完整歌名或版本。"
-                            elif fallback_relevant:
-                                reply_text = f"这首歌在曲库里没精确命中。我先给你全网找了这些可听来源：\n{fallback_text}"
-                            else:
-                                reply_text = "这首歌在曲库里没精确命中，我全网也没找到高置信结果。你可以补充更完整歌名或版本。"
                 if not reply_text:
                     reply_text = await self._ai_error_reply(
                         user_text=text,
@@ -2926,20 +3012,44 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_explicit_request(text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
-        # 本地词表已移除，仅保留结构化“问句/请求”信号。
         if "?" in content or "？" in content:
             return True
-        if re.search(r"(吗|呢|嘛|咋办|咋整|是否|是不是|行不行|可不可以)$", content):
+        if re.match(r"^[!/][a-z0-9_.:-]+", content, flags=re.IGNORECASE):
             return True
         return False
 
     @staticmethod
-    def _looks_like_media_instruction(text: str) -> bool:
-        _ = text
+    def _has_control_token(text: str, *tokens: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        for token in tokens:
+            token_norm = normalize_text(token).lower()
+            if not token_norm:
+                continue
+            if re.search(rf"(?<![a-z0-9_]){re.escape(token_norm)}(?![a-z0-9_])", content):
+                return True
         return False
+
+    def _has_structural_media_locator(self, text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if self._is_passive_multimodal_text(text):
+            return True
+        if re.search(r"https?://[^\s]+", content):
+            return True
+        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", content, flags=re.IGNORECASE):
+            return True
+        if re.search(r"\.(?:png|jpe?g|gif|webp|bmp|mp4|webm|mov|m4v|mp3|wav|flac|ogg)\b", content, flags=re.IGNORECASE):
+            return True
+        return self._has_control_token(content, "/image", "/img", "/video", "/music", "/audio", "/avatar")
+
+    def _looks_like_media_instruction(self, text: str) -> bool:
+        return self._has_structural_media_locator(text)
 
     def _has_recent_reply_to_user(self, message: EngineMessage, within_seconds: int = 120) -> bool:
         state = self._last_reply_state.get(message.conversation_id, {})
@@ -3115,18 +3225,34 @@ class YukikoEngine:
             return True
         return bool(re.search(r"\.(mp4|webm|mov|m4v)\b", content))
 
-    @staticmethod
-    def _looks_like_image_analyze_intent(text: str) -> bool:
-        _ = text
-        return False
+    def _looks_like_image_analyze_intent(self, text: str) -> bool:
+        content = normalize_text(text)
+        if not content:
+            return False
+        return self._has_structural_media_locator(text) and (
+            self._has_control_token(text, "/analyze", "mode=analyze", "ocr=true")
+            or "?" in content
+            or "？" in content
+        )
 
     def _looks_like_video_resolve_intent(self, text: str) -> bool:
-        _ = text
-        return False
+        return self._looks_like_video_request(text) and self._has_control_token(
+            text,
+            "/send",
+            "/resolve",
+            "mode=send",
+            "mode=resolve",
+        )
 
     def _looks_like_video_analysis_intent(self, text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text)
+        if not content:
+            return False
+        return self._looks_like_video_request(text) and (
+            self._has_control_token(text, "/analyze", "mode=analyze", "output=text", "mode=text")
+            or "?" in content
+            or "？" in content
+        )
 
     @staticmethod
     def _looks_like_low_info_group_chitchat(text: str) -> bool:
@@ -3138,18 +3264,11 @@ class YukikoEngine:
             return True
         if re.fullmatch(r"[?？!！。./\\,，:：;；~～\-_=+*'\"`·…]{1,12}", compact):
             return True
-        if len(compact) <= 8 and compact in {
-            "?", "？", "??", "？？", "???", "？？？",
-            "牛逼", "nb", "666", "6", "确实", "笑死", "笑死我了", "哈哈", "哈哈哈",
-            "行", "ok", "好的", "草", "卧槽", "无语", "逆天",
-        }:
-            return True
-        return len(compact) <= 4
+        return len(compact) <= 2
 
     @staticmethod
     def _looks_like_video_text_only_intent(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "output=text", "mode=text", "text-only", "/text")
 
     @staticmethod
     def _looks_like_download_task_intent(text: str) -> bool:
@@ -3160,13 +3279,23 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_music_request(text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if re.search(r"https?://[^\s]+", content):
+            return True
+        if re.search(r"\.(?:mp3|wav|flac|ogg|m4a|aac)\b", content, flags=re.IGNORECASE):
+            return True
+        return YukikoEngine._has_control_token(text, "/music", "/song", "mode=music")
 
     @staticmethod
     def _looks_like_music_search_request(text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if not YukikoEngine._looks_like_music_request(content):
+            return False
+        return YukikoEngine._has_control_token(text, "/search", "mode=search")
 
     @staticmethod
     def _extract_music_keyword(text: str) -> str:
@@ -3178,6 +3307,16 @@ class YukikoEngine:
         content = re.sub(r"^(?:请|麻烦|帮我|给我|你给我|你帮我)\s*", "", content)
         # 去掉 "alger" 等非标准前缀（用户可能误用其他 bot 名）
         content = re.sub(r"^(?:alger|yuki|yukiko)\s*", "", content, flags=re.IGNORECASE)
+        # 去掉常见英文包装语，避免 "music name is xxx" 之类被整句拿去搜。
+        content = re.sub(
+            r"^(?:i\s+(?:want|wanna)\s+to\s+(?:listen|hear)(?:\s+to)?(?:\s+the)?\s+(?:music|song)\s*[,，]?\s*)",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(r"^(?:can\s+you\s+)?(?:play|search|find)\s+", "", content, flags=re.IGNORECASE)
+        content = re.sub(r"^(?:music|song)\s+name\s+is\s*", "", content, flags=re.IGNORECASE)
+        content = re.sub(r"^(?:the\s+)?(?:music|song)\s+is\s*", "", content, flags=re.IGNORECASE)
         # 去掉 "发语音" 修饰词
         content = re.sub(r"发语音\s*", "", content)
         # 去掉常见发起词，仅保留歌名关键词（循环剥离，处理 "点歌 点歌XXX" 等重复）。
@@ -3294,20 +3433,20 @@ class YukikoEngine:
         return f"{owner}/{repo}"
 
     def _looks_like_qq_avatar_intent(self, text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
-        has_avatar_token = ("头像" in content) or ("avatar" in content)
-        has_qq_target = bool(re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content)) or ("qq" in content)
-        return has_avatar_token and has_qq_target
+        if not self._has_control_token(text, "/avatar", "/qqavatar", "type=avatar"):
+            return False
+        return bool(re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content) or self._has_control_token(text, "target=self", "/me"))
 
     def _looks_like_qq_profile_intent(self, text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
-        if not (re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content) or "qq" in content):
+        if not self._has_control_token(text, "/qqprofile", "/profile", "type=qq-profile"):
             return False
-        return bool(re.search(r"(资料|資料|信息|信息|是谁|头像|空间|qzone|\?|？)", content))
+        return bool(re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content) or self._has_control_token(text, "target=self", "/me"))
 
     @staticmethod
     def _extract_candidate_qq_target(message: EngineMessage, text: str) -> str:
@@ -3390,13 +3529,22 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_local_file_request(text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        local_terms = ("local", "desktop", "folder", "\u672c\u5730", "\u684c\u9762", "\u6587\u4ef6\u5939")
+        file_terms = ("file", "upload", "download", "\u6587\u4ef6", "\u4e0a\u4f20", "\u4e0b\u8f7d", "\u5b89\u88c5\u5305", "\u538b\u7f29\u5305")
+        has_ext = bool(re.search(r"\.(?:zip|7z|rar|exe|apk|ipa|msi|pdf|docx?|xlsx?|pptx?|txt|mp3|mp4)\b", content, flags=re.IGNORECASE))
+        return any(term in content for term in local_terms) and (any(term in content for term in file_terms) or has_ext)
 
     @staticmethod
     def _looks_like_local_media_request(text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text)
+        if not content:
+            return False
+        has_local_path = bool(re.search(r"(?:[A-Za-z]:\\|\\\\|/)", content))
+        has_media_ext = bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp|mp4|webm|mov|m4v|mp3|wav|flac|ogg)\b", content, flags=re.IGNORECASE))
+        return has_local_path and has_media_ext
 
     @staticmethod
     def _looks_like_local_media_path(path: str) -> bool:
@@ -3894,16 +4042,9 @@ class YukikoEngine:
 
     @staticmethod
     def _contains_video_send_negative_claim(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        return bool(
-            re.search(
-                r"(没法|无法|不能).{0,8}(发|发送|下载).{0,6}(视频|影片)|只能.{0,4}(给|发).{0,4}(链接)",
-                content,
-                flags=re.IGNORECASE,
-            )
-        )
+        _ = text
+        # 已移除本地负面话术猜测，统一交给模型或显式状态判断。
+        return False
 
     @staticmethod
     def _inject_user_name(reply_text: str, user_name: str, should_address: bool) -> str:
@@ -4308,13 +4449,11 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_summary_followup(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "/summary", "/summarize", "mode=summary", "output=summary")
 
     @staticmethod
     def _looks_like_resend_followup(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "/resend", "/retry", "mode=resend")
 
     def _compose_cached_full_reply(self, message: EngineMessage) -> str:
         if not bool(getattr(self, "search_followup_cache_enable", True)):
@@ -4460,22 +4599,18 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_choice_next(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "/next", "page=next")
 
     @staticmethod
     def _looks_like_choice_prev(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "/prev", "page=prev")
 
     def _looks_like_resend_media_followup(self, text: str) -> bool:
-        _ = text
-        return False
+        return self._looks_like_resend_followup(text) and self._has_structural_media_locator(text)
 
     @staticmethod
     def _looks_like_source_trace_followup(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "/source", "/sources", "mode=sources")
 
     def _build_cached_source_trace_result(self, cached: dict[str, Any], text: str) -> dict[str, Any] | None:
         if not isinstance(cached, dict):
@@ -4532,8 +4667,7 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_sticker_request(text: str) -> bool:
-        _ = text
-        return False
+        return YukikoEngine._has_control_token(text, "/sticker", "/emoji", "/meme")
 
     @staticmethod
     def _looks_like_choice_prompt_text(text: str) -> bool:
@@ -5486,64 +5620,23 @@ class YukikoEngine:
         content = normalize_text(text)
         if not content:
             return False
-        if "?" in content or "？" in content:
-            return False
-        if re.search(r"(吗|嘛|么|呢|谁|什么|怎么|为何|为什么|哪[里个儿]|是否|几[点时个号]|多少|多[大长久远高])", content):
-            return False
         if len(content) > self.fragment_hold_max_chars:
             return False
         if re.search(r"https?://", content, flags=re.IGNORECASE):
             return False
         if re.search(r"[。！？!?]", content):
             return False
-        if re.search(r"(吗|嘛|么|呢|谁|什么|怎么|为何|为什么)$", content):
-            return False
         if self._looks_like_explicit_request(content):
             return False
         if self._is_passive_multimodal_text(content):
-            return False
-
-        lower = content.lower()
-        greetings = {
-            "你好",
-            "hello",
-            "hi",
-            "在吗",
-            "在嘛",
-            "yuki",
-            "yukiko",
-            "雪",
-            "早",
-            "早安",
-            "晚安",
-        }
-        if lower in greetings:
-            return False
-
-        if content in {"?", "？", "??", "？？", "嗯", "哦", "好", "行", "666", "nb"}:
-            return False
-
-        # 负反馈/纠错语句应直接放行，避免被当成碎片吞掉。
-        feedback_cues = (
-            "错了",
-            "不对",
-            "你错",
-            "瞎猜",
-            "胡说",
-            "乱说",
-            "离谱",
-            "扯淡",
-            "这不对",
-        )
-        if any(cue in content for cue in feedback_cues):
             return False
 
         # @机器人的消息一律不 hold，交给 router LLM 判断意图
         if message.mentioned:
             return False
 
-        # 群聊里非 @mention 的短消息，仅对纯英文关键词/ID 做 fragment hold
-        # 中文短句不再 hold — 交给 router LLM 判断是否需要回复
+        # 只保留结构化判定：群聊里非 @mention 的短 token / ID 可以暂存，
+        # 自然语言短句一律交给 router/LLM，不再做本地词表分类。
         if re.fullmatch(r"[A-Za-z0-9_\-.]{2,32}", content):
             return True
         return False
@@ -5555,21 +5648,11 @@ class YukikoEngine:
             return False
         if len(content) > 42:
             return False
-        if content in {"?", "？", "??", "？？"}:
-            return True
-
-        # "是谁/是什么/怎么..."这类疑问尾句默认视作补句。
-        if re.search(r"(谁|什么|哪里|哪位|怎么|为何|为什么|呢|嘛|吗)\s*$", content):
-            return True
-        return False
+        return bool(re.fullmatch(r"[?？!！~～…,.，]{1,6}", content))
 
     @staticmethod
     def _is_fragment_timeout_nudge(text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
-        if content in {"?", "？", "??", "？？", "人呢", "在吗", "快点", "说话", "回复", "还在吗"}:
-            return True
-        if re.fullmatch(r"[?？!！]+", content):
-            return True
-        return False
+        return bool(re.fullmatch(r"[?？!！~～…,.，]{1,8}", content))

@@ -1,8 +1,0 @@
-enabled: true
-timeout_seconds: 18
-default_limit: 8
-max_text_chars: 12000
-llm_input_chars: 6500
-llm_max_tokens: 900
-retry_nearby_snapshots: 2
-include_non_200_default: false

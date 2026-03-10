@@ -25,12 +25,13 @@ from urllib.parse import urlencode
 import httpx
 
 from core.image import ImageEngine
-from core.music import MusicEngine, MusicPlayResult
+from core.music import MusicEngine, MusicPlayResult, build_music_keyword
 from core.prompt_policy import PromptPolicy
+from core.soundcloud import SoundCloudClient
 from core.search import SearchEngine, SearchResult
 from core.system_prompts import SystemPromptRelay
 from core.video_analyzer import VideoAnalyzer, VideoAnalysisResult
-from utils.text import clip_text, normalize_text
+from utils.text import clip_text, normalize_matching_text, normalize_text
 
 try:
     from yt_dlp import YoutubeDL
@@ -255,6 +256,7 @@ class ToolExecutor:
                 self._ffmpeg_probe_dir = ""
         self._video_analyzer = VideoAnalyzer(raw_cfg)
         self._music_engine = MusicEngine(raw_cfg)
+        self._soundcloud_client = SoundCloudClient(timeout=max(10.0, self._video_metadata_timeout_seconds))
         self._prompt_policy = PromptPolicy.from_config(raw_cfg)
 
         # 初始化混合视频解析器（bilix + yt-dlp）
@@ -1102,7 +1104,7 @@ class ToolExecutor:
             {
                 "name": "browser.resolve_video",
                 "scope": "browser",
-                "description": "解析抖音/快手/B站/AcFun 或直链视频，返回可发送 video_url",
+                "description": "解析抖音/快手/B站/AcFun 或直链视频；也支持 SoundCloud track/playlist/discover，返回 video_url 或 audio_url",
                 "args_schema": {"url": "string"},
             },
             {
@@ -2252,6 +2254,52 @@ class ToolExecutor:
             evidence=evidence,
         )
 
+    async def _resolve_soundcloud_audio_result(self, method_name: str, source_url: str) -> ToolResult:
+        try:
+            audio = await self._soundcloud_client.resolve_page_audio(source_url)
+        except Exception as exc:
+            _tool_log.warning("soundcloud_resolve_fail | url=%s | %s", source_url[:120], exc)
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "这条 SoundCloud 链接这次没解析出来，你换个链接我继续试。"},
+                error="soundcloud_resolve_failed",
+            )
+
+        if audio is None or not audio.audio_url:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "这条 SoundCloud 链接里暂时没拿到可播音频。"},
+                error="soundcloud_audio_unavailable",
+            )
+
+        title = normalize_text(audio.title)
+        artist = normalize_text(audio.artist)
+        page_url = normalize_text(audio.page_url) or normalize_text(source_url)
+        playlist_title = normalize_text(audio.playlist_title)
+        text = f"已拿到 SoundCloud 音频：{title or '未命名曲目'}"
+        if artist:
+            text = f"{text} - {artist}"
+        if playlist_title and self._soundcloud_client.is_discover_url(source_url):
+            text = f"{text}（Discover / {playlist_title}）"
+        evidence = [{"title": title or "SoundCloud 音频", "point": text, "source": page_url}]
+        payload: dict[str, Any] = {
+            "mode": "audio",
+            "text": text,
+            "audio_url": audio.audio_url,
+            "url": page_url,
+            "jump_url": page_url,
+            "source_platform": "soundcloud",
+            "title": title,
+            "singer": artist,
+            "evidence": evidence,
+        }
+        if audio.artwork_url:
+            payload["image_url"] = audio.artwork_url
+            payload["cover_url"] = audio.artwork_url
+        return ToolResult(ok=True, tool_name=method_name, payload=payload, evidence=evidence)
+
     async def _method_browser_resolve_video(
         self, method_name: str, method_args: dict[str, Any], query: str
     ) -> ToolResult:
@@ -2287,6 +2335,9 @@ class ToolExecutor:
                 payload={"text": "这个视频链接命中了安全限制（内网/本地地址不可访问）"},
                 error="unsafe_url",
             )
+
+        if self._soundcloud_client.is_soundcloud_url(url):
+            return await self._resolve_soundcloud_audio_result(method_name, url)
 
         if self._is_direct_video_url(url):
             resolved_direct = url
@@ -5099,38 +5150,7 @@ class ToolExecutor:
 
     @staticmethod
     def _looks_like_analysis_text_only_request(text: str) -> bool:
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        plain = re.sub(r"\s+", "", content)
-        cues = (
-            "不需要本地下载发我",
-            "不需要下载发我",
-            "不用下载发我",
-            "不要发视频",
-            "不用发我",
-            "不需要发我",
-            "只要总结",
-            "只总结",
-            "只要文字总结",
-            "只要文本总结",
-            "只需要总结",
-            "不需要本地下載發我",
-            "不需要下載發我",
-            "不用下載發我",
-            "不要發視頻",
-            "只要文字總結",
-            "只需要總結",
-        )
-        if any(cue in plain for cue in cues):
-            return True
-        patterns = (
-            r"不(?:需要|用|要)?(?:本地)?(?:下载|下載).{0,8}(?:发我|發我|给我|給我|发送|發送)",
-            r"(?:不要|别|別|不需要|不用).{0,4}(?:发|發|发送|發送).{0,4}(?:视频|視頻|影片)",
-            r"(?:只要|只需|仅要|僅要|仅需|僅需).{0,4}(?:文字|文本|总结|總結|结论|結論)",
-            r"(?:只总结|只總結|仅总结|僅總結)",
-        )
-        return any(re.search(pattern, content) for pattern in patterns)
+        return ToolExecutor._has_control_token(text, "output=text", "mode=text", "text-only", "/text")
 
     def _compose_video_result_text(
         self,
@@ -5639,14 +5659,28 @@ class ToolExecutor:
 
     # ── 音乐搜索 & 播放 ──────────────────────────────────────────────
 
+    @staticmethod
+    def _music_artist_matches(song_artist: str, expected_artist: str) -> bool:
+        compact_expected = MusicEngine._compact_text(expected_artist)
+        if not compact_expected:
+            return True
+        compact_song_artist = MusicEngine._compact_text(song_artist)
+        if not compact_song_artist:
+            return False
+        return compact_expected in compact_song_artist or compact_song_artist in compact_expected
+
     async def _music_search(self, tool_args: dict[str, Any], message_text: str) -> ToolResult:
-        keyword = normalize_text(str(tool_args.get("keyword", "")))
-        title = normalize_text(str(tool_args.get("title", "")))
-        artist = normalize_text(str(tool_args.get("artist", "")))
+        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        title = normalize_matching_text(str(tool_args.get("title", "")))
+        artist = normalize_matching_text(str(tool_args.get("artist", "")))
+        try:
+            limit = max(1, min(12, int(tool_args.get("limit", 5) or 5)))
+        except Exception:
+            limit = 5
         if not keyword and title:
             keyword = f"{title} {artist}".strip()
         if not keyword:
-            keyword = normalize_text(message_text)
+            keyword = normalize_matching_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
         # 去掉常见前缀
@@ -5656,18 +5690,58 @@ class ToolExecutor:
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
 
-        results = await self._music_engine.search(keyword, limit=5)
+        query = build_music_keyword(keyword, title, artist)
+        results = await self._music_engine.search(keyword, limit=limit, title=title, artist=artist)
         if not results:
             return ToolResult(
                 ok=False, tool_name="music_search",
-                payload={"text": f"没找到「{keyword}」相关的歌曲。"},
+                payload={"text": f"没找到「{query or keyword}」相关的歌曲。"},
                 error="no_results",
             )
-        lines = [f"🎵 搜索「{keyword}」找到 {len(results)} 首歌："]
+        if title:
+            visible_results = [
+                song for song in results
+                if not MusicEngine._should_avoid_version(song.name, title or keyword)
+            ]
+            exact_title_results = [
+                song for song in visible_results
+                if MusicEngine._title_match_level(title, song.name) >= 2
+            ]
+            if not exact_title_results:
+                suggestions = MusicEngine._format_song_choices(visible_results, requested_text=title or keyword)
+                text = f"没找到和《{title}》明确匹配的歌曲。"
+                if suggestions:
+                    text += f"\n这些只是近似结果参考，不能直接当成同一首播：\n{suggestions}"
+                return ToolResult(
+                    ok=False,
+                    tool_name="music_search",
+                    payload={"text": text, "results": []},
+                    error="no_exact_match",
+                )
+            if artist:
+                exact_artist_results = [
+                    song for song in exact_title_results
+                    if self._music_artist_matches(song.artist, artist)
+                ]
+                if not exact_artist_results:
+                    suggestions = MusicEngine._format_song_choices(exact_title_results, requested_text=title)
+                    text = f"找到了《{title}》，但没有歌手为「{artist}」的精确结果。"
+                    if suggestions:
+                        text += f"\n可参考这些同名歌曲，但不能直接替你播：\n{suggestions}"
+                    return ToolResult(
+                        ok=False,
+                        tool_name="music_search",
+                        payload={"text": text, "results": []},
+                        error="artist_mismatch",
+                    )
+                results = exact_artist_results
+            else:
+                results = exact_title_results
+        lines = [f"🎵 搜索「{query or keyword}」找到 {len(results)} 首歌："]
         for i, s in enumerate(results, 1):
             dur = f" ({s.duration_ms // 1000 // 60}:{s.duration_ms // 1000 % 60:02d})" if s.duration_ms else ""
             lines.append(f"{i}. {s.name} - {s.artist}{dur}")
-        lines.append("\n发送「点歌 歌名」可以直接播放。")
+        lines.append("\n仅这些精确结果才适合继续播放。")
         return ToolResult(
             ok=True, tool_name="music_search",
             payload={"text": "\n".join(lines), "results": [
@@ -5684,8 +5758,10 @@ class ToolExecutor:
             return ToolResult(ok=False, tool_name="music_play_by_id", error="invalid_song_id")
 
         # 从 tool_args 获取歌曲信息
-        song_name = normalize_text(str(tool_args.get("song_name", "")))
-        artist = normalize_text(str(tool_args.get("artist", "")))
+        song_name = normalize_matching_text(str(tool_args.get("song_name", "")))
+        artist = normalize_matching_text(str(tool_args.get("artist", "")))
+        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        require_verified_original = MusicEngine._requires_verified_original(keyword)
 
         # 直接根据 ID 播放
         from core.music import MusicSearchResult
@@ -5697,7 +5773,11 @@ class ToolExecutor:
             duration_ms=0,
             source="netease",
         )
-        result = await self._music_engine._play_song(song, as_voice=True)
+        result = await self._music_engine._play_song(
+            song,
+            as_voice=True,
+            require_verified_original=require_verified_original,
+        )
 
         if not result.ok:
             return ToolResult(
@@ -5720,17 +5800,83 @@ class ToolExecutor:
 
         return ToolResult(ok=True, tool_name="music_play_by_id", payload=payload)
 
+    @staticmethod
+    def _pick_music_search_candidate(
+        results: list[dict[str, Any]],
+        *,
+        keyword: str = "",
+        title: str = "",
+        artist: str = "",
+    ) -> dict[str, Any] | None:
+        if not results:
+            return None
+
+        compact_title = MusicEngine._compact_text(title)
+        compact_artist = MusicEngine._compact_text(artist)
+        compact_keyword = MusicEngine._compact_text(keyword)
+        artist_only_query = bool(compact_artist and not compact_title and compact_keyword == compact_artist)
+
+        def _title_hit(row: dict[str, Any]) -> bool:
+            if not compact_title:
+                return True
+            row_name_raw = str(row.get("name", ""))
+            row_name = MusicEngine._compact_text(row_name_raw)
+            if not row_name:
+                return False
+            if MusicEngine._should_avoid_version(row_name_raw, title or keyword):
+                return False
+            return MusicEngine._title_match_level(title, row_name_raw) >= 2
+
+        def _artist_hit(row: dict[str, Any]) -> bool:
+            if not compact_artist:
+                return True
+            row_artist = MusicEngine._compact_text(str(row.get("artist", "")))
+            if not row_artist:
+                return False
+            return compact_artist in row_artist or row_artist in compact_artist
+
+        if compact_title:
+            for row in results:
+                if _title_hit(row) and _artist_hit(row):
+                    return row
+            if compact_artist:
+                return None
+            for row in results:
+                if _title_hit(row):
+                    return row
+            return None
+
+        if artist_only_query:
+            return None
+
+        for row in results:
+            if _title_hit(row) and _artist_hit(row):
+                return row
+        for row in results:
+            if _title_hit(row):
+                return row
+        for row in results:
+            if _artist_hit(row):
+                return row
+
+        if compact_keyword:
+            for row in results:
+                row_full = MusicEngine._compact_text(f"{row.get('name', '')} {row.get('artist', '')}")
+                if row_full and compact_keyword in row_full:
+                    return row
+        return results[0]
+
     async def _music_play(
         self, tool_args: dict[str, Any], message_text: str,
         api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
     ) -> ToolResult:
-        keyword = normalize_text(str(tool_args.get("keyword", "")))
-        title = normalize_text(str(tool_args.get("title", "")))
-        artist = normalize_text(str(tool_args.get("artist", "")))
+        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        title = normalize_matching_text(str(tool_args.get("title", "")))
+        artist = normalize_matching_text(str(tool_args.get("artist", "")))
         if not keyword and title:
             keyword = f"{title} {artist}".strip()
         if not keyword:
-            keyword = normalize_text(message_text)
+            keyword = normalize_matching_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
         for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
@@ -5739,7 +5885,59 @@ class ToolExecutor:
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
 
-        result = await self._music_engine.play(keyword, as_voice=True)
+        query = build_music_keyword(keyword, title, artist) or keyword
+        result = await self._music_engine.play(keyword, as_voice=True, title=title, artist=artist)
+        retry_blocked_errors = {"no_exact_match", "ambiguous_keyword", "artist_mismatch"}
+        if not result.ok and query and result.error not in retry_blocked_errors:
+            search_result = await self._music_search(
+                {"keyword": query, "title": title, "artist": artist, "limit": 8},
+                query,
+            )
+            search_payload = search_result.payload if isinstance(getattr(search_result, "payload", None), dict) else {}
+            candidate = self._pick_music_search_candidate(
+                search_payload.get("results", []),
+                keyword=query,
+                title=title,
+                artist=artist,
+            )
+            if candidate:
+                _tool_log.info(
+                    "music_play_retry_by_id | song=%s | artist=%s | id=%s",
+                    candidate.get("name", ""),
+                    candidate.get("artist", ""),
+                    candidate.get("id", 0),
+                )
+                play_by_id_result = await self._music_play_by_id(
+                    {
+                        "song_id": candidate.get("id", 0),
+                        "song_name": candidate.get("name", ""),
+                        "artist": candidate.get("artist", ""),
+                        "keyword": keyword,
+                    },
+                    api_call,
+                    group_id,
+                )
+                if play_by_id_result.ok:
+                    return play_by_id_result
+                retry_payload = play_by_id_result.payload if isinstance(play_by_id_result.payload, dict) else {}
+                retry_text = normalize_text(str(retry_payload.get("text", "")))
+                if retry_text and not result.message:
+                    result.message = retry_text
+                if play_by_id_result.error:
+                    result.error = play_by_id_result.error
+
+        if not result.ok and query and result.error not in retry_blocked_errors:
+            _tool_log.info("music_play_fallback_bilibili | query=%s | error=%s", query, result.error or "?")
+            bili_result = await self._bilibili_audio_extract({"keyword": query}, query, api_call, group_id)
+            if bili_result.ok:
+                return bili_result
+            bili_payload = bili_result.payload if isinstance(getattr(bili_result, "payload", None), dict) else {}
+            bili_text = normalize_text(str(bili_payload.get("text", "")))
+            if bili_text and not result.message:
+                result.message = bili_text
+            if bili_result.error:
+                result.error = bili_result.error
+
         if not result.ok:
             return ToolResult(
                 ok=False, tool_name="music_play",
@@ -5772,12 +5970,11 @@ class ToolExecutor:
             return ToolResult(ok=False, tool_name="bilibili_audio_extract", error="empty_keyword")
 
         # 在 B 站搜索视频
-        search_query = f"site:bilibili.com {keyword}"
         try:
             from core.search import SearchEngine
             search_cfg = self._raw_config.get("search", {})
             search_engine = SearchEngine(search_cfg)
-            results = await search_engine.search(search_query)
+            results = await search_engine.search_bilibili_videos(keyword, limit=5)
 
             if not results:
                 return ToolResult(
@@ -5786,89 +5983,35 @@ class ToolExecutor:
                     error="no_bilibili_results",
                 )
 
-            # 尝试第一个结果
-            first_url = results[0].url
-            _tool_log.info("bilibili_audio_extract | keyword=%s | url=%s", keyword, first_url)
+            audio_path = None
+            picked_title = ""
+            last_error = "download_failed"
+            candidate_results = results[:3]
+            for idx, row in enumerate(candidate_results, start=1):
+                first_url = normalize_text(getattr(row, "url", ""))
+                picked_title = normalize_text(getattr(row, "title", "")) or f"B站结果{idx}"
+                if not first_url:
+                    continue
+                _tool_log.info("bilibili_audio_extract | keyword=%s | idx=%d | url=%s", keyword, idx, first_url)
 
-            # 直接下载音频流（不需要 ffmpeg）
-            try:
-                from yt_dlp import YoutubeDL
+                # 优先走 bilix 的 B站专用下载，失败再回退到 yt-dlp。
+                audio_path = await self._download_bilibili_audio_via_bilix(first_url)
+                if audio_path:
+                    break
 
-                digest = hashlib.sha1(first_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
-                audio_path = self._video_cache_dir / f"{digest}_audio.mp3"
-
-                ydl_opts = {
-                    "quiet": True,
-                    "no_warnings": True,
-                    "format": "bestaudio/best",
-                    "outtmpl": str(audio_path.with_suffix("")),
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }] if self._ffmpeg_available else [],
-                    "socket_timeout": self._video_download_timeout_seconds,
-                    "retries": 2,
-                    "logger": _SilentYTDLPLogger(),
-                }
-
-                if self._video_cookies_file:
-                    ydl_opts["cookiefile"] = self._video_cookies_file
-                if self._video_cookies_from_browser:
-                    ydl_opts["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
-                if self._ffmpeg_location:
-                    ydl_opts["ffmpeg_location"] = self._ffmpeg_location
-                _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, first_url)
                 try:
-                    while True:
-                        try:
-                            with YoutubeDL(ydl_opts) as ydl:
-                                ydl.download([first_url])
-                            break
-                        except Exception as exc:
-                            err_text = normalize_text(str(exc))
-                            lowered = err_text.lower()
-                            # 浏览器 cookie 数据库读取失败时，自动切到非 browser-cookie 重试一次。
-                            if (
-                                self._disable_cookie_browser_on_error(err_text)
-                                or "cookies database" in lowered
-                                or "cookiesfrombrowser" in lowered
-                            ) and "cookiesfrombrowser" in ydl_opts:
-                                _tool_log.warning(
-                                    "bilibili_audio_retry_without_cookie_browser | url=%s | reason=%s",
-                                    first_url,
-                                    clip_text(err_text, 140),
-                                )
-                                ydl_opts.pop("cookiesfrombrowser", None)
-                                continue
-                            raise
-                finally:
-                    if _tmp_cookie_file:
-                        try:
-                            os.unlink(_tmp_cookie_file)
-                        except OSError:
-                            pass
+                    audio_path = await asyncio.to_thread(self._download_bilibili_audio_via_ytdlp, first_url)
+                    if audio_path:
+                        break
+                except Exception as exc:
+                    last_error = normalize_text(str(exc)) or "download_error"
+                    _tool_log.warning("bilibili_audio_download_error | url=%s | %s", first_url, exc)
+                    continue
 
-                # 查找生成的音频文件
-                if not audio_path.exists():
-                    # 可能是 .mp3.mp3 或其他后缀
-                    for candidate in self._video_cache_dir.glob(f"{digest}_audio*"):
-                        if candidate.suffix in [".mp3", ".m4a", ".opus", ".webm"]:
-                            audio_path = candidate
-                            break
-
-                if not audio_path.exists():
-                    return ToolResult(
-                        ok=False, tool_name="bilibili_audio_extract",
-                        payload={"text": f"B 站音频下载失败。"},
-                        error="download_failed",
-                    )
-
-            except Exception as exc:
-                _tool_log.warning("bilibili_audio_download_error | url=%s | %s", first_url, exc)
+            if not audio_path:
                 return ToolResult(
                     ok=False, tool_name="bilibili_audio_extract",
-                    payload={"text": f"B 站音频下载失败：{exc}"},
+                    payload={"text": f"B 站音频下载失败：{last_error}"},
                     error="download_error",
                 )
 
@@ -5877,7 +6020,7 @@ class ToolExecutor:
             if self._music_engine and self._music_engine._pilk_available:
                 silk_path = await self._music_engine._convert_to_silk(audio_path)
 
-            payload: dict[str, Any] = {"text": f"已从 B 站提取音频：{results[0].title}"}
+            payload: dict[str, Any] = {"text": f"已从 B 站提取音频：{picked_title}"}
             if silk_path and silk_path.exists():
                 payload["audio_file_silk"] = str(silk_path)
                 payload["audio_file"] = str(audio_path)
@@ -5893,6 +6036,125 @@ class ToolExecutor:
                 payload={"text": f"B 站音频提取失败: {exc}"},
                 error="extract_error",
             )
+
+    async def _download_bilibili_audio_via_bilix(self, source_url: str) -> Path | None:
+        """优先使用 bilix 下载 B站音频，规避 yt-dlp 常见 412。"""
+        try:
+            from bilix.sites.bilibili import DownloaderBilibili
+        except Exception:
+            return None
+
+        digest = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        output_dir = self._video_cache_dir / f"bilix_audio_{digest}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            async with DownloaderBilibili(
+                sess_data=self._bilibili_sessdata or None,
+                video_concurrency=1,
+                part_concurrency=4,
+            ) as downloader:
+                await asyncio.wait_for(
+                    downloader.get_video(
+                        source_url,
+                        path=output_dir,
+                        quality=0,
+                        image=False,
+                        subtitle=False,
+                        dm=False,
+                        only_audio=True,
+                    ),
+                    timeout=max(20.0, min(float(self._video_download_timeout_seconds), 60.0)),
+                )
+            candidates = sorted(
+                [p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".aac", ".m4a", ".mp3", ".opus", ".ogg", ".flac", ".wav"}],
+                key=lambda p: p.stat().st_size if p.exists() else 0,
+                reverse=True,
+            )
+            if not candidates:
+                return None
+            src = candidates[0]
+            final_path = self._video_cache_dir / f"{digest}_audio{src.suffix.lower()}"
+            final_path.parent.mkdir(parents=True, exist_ok=True)
+            if final_path.exists():
+                final_path.unlink()
+            shutil.move(str(src), str(final_path))
+            _tool_log.info("bilibili_audio_bilix_ok | url=%s | path=%s", source_url, final_path.name)
+            return final_path
+        except Exception as exc:
+            _tool_log.warning("bilibili_audio_bilix_fail | url=%s | %s", source_url, exc)
+            return None
+        finally:
+            shutil.rmtree(output_dir, ignore_errors=True)
+
+    def _download_bilibili_audio_via_ytdlp(self, source_url: str) -> Path | None:
+        """yt-dlp 兜底下载 B站音频。"""
+        from yt_dlp import YoutubeDL
+
+        digest = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        audio_path = self._video_cache_dir / f"{digest}_audio.mp3"
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "format": "bestaudio/best",
+            "outtmpl": str(audio_path.with_suffix("")),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }] if self._ffmpeg_available else [],
+            "socket_timeout": self._video_download_timeout_seconds,
+            "retries": 2,
+            "logger": _SilentYTDLPLogger(),
+            "extractor_args": {"BiliBili": {"try_look": ["1"]}},
+            "http_headers": {
+                **self._http_headers,
+                "Referer": "https://www.bilibili.com/",
+                "Origin": "https://www.bilibili.com",
+            },
+        }
+
+        if self._video_cookies_file:
+            ydl_opts["cookiefile"] = self._video_cookies_file
+        if self._video_cookies_from_browser:
+            ydl_opts["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
+        if self._ffmpeg_location:
+            ydl_opts["ffmpeg_location"] = self._ffmpeg_location
+        _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, source_url)
+        try:
+            while True:
+                try:
+                    with YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([source_url])
+                    break
+                except Exception as exc:
+                    err_text = normalize_text(str(exc))
+                    lowered = err_text.lower()
+                    if (
+                        self._disable_cookie_browser_on_error(err_text)
+                        or "cookies database" in lowered
+                        or "cookiesfrombrowser" in lowered
+                    ) and "cookiesfrombrowser" in ydl_opts:
+                        _tool_log.warning(
+                            "bilibili_audio_retry_without_cookie_browser | url=%s | reason=%s",
+                            source_url,
+                            clip_text(err_text, 140),
+                        )
+                        ydl_opts.pop("cookiesfrombrowser", None)
+                        continue
+                    raise
+        finally:
+            if _tmp_cookie_file:
+                try:
+                    os.unlink(_tmp_cookie_file)
+                except OSError:
+                    pass
+
+        if not audio_path.exists():
+            for candidate in self._video_cache_dir.glob(f"{digest}_audio*"):
+                if candidate.suffix.lower() in {".mp3", ".m4a", ".opus", ".webm", ".aac"}:
+                    audio_path = candidate
+                    break
+        return audio_path if audio_path.exists() else None
 
     async def _group_member_count(
         self,
@@ -7910,12 +8172,70 @@ class ToolExecutor:
 
     @staticmethod
     def _looks_like_download_request_text(text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        download_terms = (
+            "download",
+            "installer",
+            "setup",
+            "upload",
+            "send",
+            "\u4e0b\u8f7d",
+            "\u4e0a\u4f20",
+            "\u53d1\u6211",
+            "\u7ed9\u6211",
+            "\u7fa4\u6587\u4ef6",
+            "\u5b89\u88c5\u5305",
+            "\u538b\u7f29\u5305",
+        )
+        has_ext = bool(re.search(r"\.(?:zip|7z|rar|exe|apk|ipa|msi|dmg|pkg|deb|rpm|jar)\b", content, flags=re.IGNORECASE))
+        return any(term in content for term in download_terms) or has_ext
 
     def _looks_like_software_download_request(self, text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        software_terms = (
+            "github",
+            "release",
+            "latest version",
+            "installer",
+            "setup",
+            "client",
+            "app",
+            "software",
+            "tool",
+            "\u5b89\u88c5\u5305",
+            "\u5ba2\u6237\u7aef",
+            "\u8f6f\u4ef6",
+            "\u5de5\u5177",
+            "\u4e0b\u8f7d",
+            "\u5b98\u65b9",
+            "\u6700\u65b0\u7248",
+        )
+        platform_terms = (
+            "windows",
+            "win",
+            "mac",
+            "macos",
+            "linux",
+            "android",
+            "ios",
+            "apk",
+            "exe",
+            "dmg",
+            "deb",
+            "rpm",
+            "jar",
+            "\u5b89\u5353",
+            "\u82f9\u679c",
+            "\u684c\u9762\u7248",
+        )
+        return any(term in content for term in software_terms) and (
+            any(term in content for term in platform_terms)
+            or self._looks_like_download_request_text(content)
+        )
 
     @staticmethod
     def _guess_download_preferences(raw_query: str, message_text: str, repo_name: str = "") -> tuple[str, str]:
@@ -8128,40 +8448,86 @@ class ToolExecutor:
 
     @staticmethod
     def _is_generic_search_command(text: str) -> bool:
+        return ToolExecutor._has_control_token(text, "/search", "mode=search")
+
+    @staticmethod
+    def _has_control_token(text: str, *tokens: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
-        generic = (
-            "你去搜",
-            "你去搜索",
-            "去搜",
-            "去搜索",
-            "上网搜",
-            "网上搜",
-            "帮我搜",
-            "查一下",
-            "查查",
-            "搜一下",
-            "搜索一下",
-        )
-        if any(cue in content for cue in generic):
+        for token in tokens:
+            token_norm = normalize_text(token).lower()
+            if not token_norm:
+                continue
+            if re.search(rf"(?<![a-z0-9_]){re.escape(token_norm)}(?![a-z0-9_])", content):
+                return True
+        return False
+
+    @staticmethod
+    def _has_question_punctuation(text: str) -> bool:
+        content = normalize_text(text)
+        return bool(content and ("?" in content or "？" in content))
+
+    @staticmethod
+    def _has_image_locator(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if ToolExecutor._is_passive_multimodal_text(text):
             return True
-        return len(content) <= 8 and content in {"搜", "搜索", "查", "去搜", "去查"}
+        return bool(
+            re.search(r"https?://[^\s]+", content)
+            or re.search(r"\.(?:png|jpe?g|gif|webp|bmp)\b", content, flags=re.IGNORECASE)
+        )
+
+    @staticmethod
+    def _has_video_locator(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if re.search(r"https?://[^\s]+", content):
+            return True
+        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", content, flags=re.IGNORECASE):
+            return True
+        return bool(re.search(r"\.(?:mp4|webm|mov|m4v)\b", content, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _has_audio_locator(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        if re.search(r"https?://[^\s]+", content):
+            return True
+        return bool(re.search(r"\.(?:mp3|wav|flac|ogg|m4a|aac)\b", content, flags=re.IGNORECASE))
 
     @staticmethod
     def _looks_like_media_request(text: str) -> bool:
-        _ = text
-        return False
+        return (
+            ToolExecutor._has_image_locator(text)
+            or ToolExecutor._has_video_locator(text)
+            or ToolExecutor._has_audio_locator(text)
+            or ToolExecutor._has_control_token(text, "/image", "/video", "/music", "/avatar", "mode=image", "mode=video", "mode=music")
+        )
 
     @staticmethod
     def _looks_like_deep_web_analysis_request(text: str) -> bool:
-        _ = text
-        return False
+        content = ToolExecutor._normalize_multimodal_query(text)
+        if not content:
+            return False
+        if ToolExecutor._looks_like_media_request(text):
+            return False
+        return ToolExecutor._has_question_punctuation(content) or ToolExecutor._has_control_token(text, "/lookup", "/search", "mode=web")
 
     @staticmethod
     def _should_auto_web_analysis(query: str, query_type: str, intent_text: str) -> bool:
-        _ = (query, query_type, intent_text)
-        return False
+        if normalize_text(query_type).lower() in {"image", "video"}:
+            return False
+        if ToolExecutor._looks_like_media_request(intent_text):
+            return False
+        content = normalize_text(f"{query}\n{intent_text}")
+        if not content or len(content) < 4:
+            return False
+        return ToolExecutor._looks_like_deep_web_analysis_request(content)
 
     @staticmethod
     def _normalize_multimodal_query(text: str) -> str:
@@ -8169,7 +8535,8 @@ class ToolExecutor:
         if not content:
             return ""
         content = re.sub(r"\bMULTIMODAL_EVENT(?:_AT)?\b", " ", content, flags=re.IGNORECASE)
-        content = content.replace("用户发送多模态消息：", " ").replace("用户@了你并发送多模态消息：", " ")
+        content = content.replace("\u7528\u6237\u53d1\u9001\u4e86\u591a\u6a21\u6001\u6d88\u606f:", " ")
+        content = content.replace("\u7528\u6237@\u673a\u5668\u4eba\u5e76\u53d1\u9001\u591a\u6a21\u6001\u6d88\u606f:", " ")
         content = content.replace("user sent multimodal message:", " ").replace(
             "user mentioned bot and sent multimodal message:",
             " ",
@@ -8189,33 +8556,28 @@ class ToolExecutor:
 
     @staticmethod
     def _looks_like_vision_web_lookup_request(text: str) -> bool:
-        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        content = ToolExecutor._normalize_multimodal_query(text)
         if not content:
             return False
-        if "?" in content or "？" in content:
-            return True
-        if "联网" in content or "搜索" in content or "查" in content:
-            return True
-        return False
+        return ToolExecutor._has_question_punctuation(content) or ToolExecutor._has_control_token(text, "/lookup", "mode=lookup")
 
     @staticmethod
     def _looks_like_image_request(text: str) -> bool:
-        _ = text
-        return False
+        return ToolExecutor._has_image_locator(text) or ToolExecutor._has_control_token(text, "/image", "/img", "mode=image")
 
     @staticmethod
     def _looks_like_image_send_request(text: str) -> bool:
-        _ = text
-        return False
+        return ToolExecutor._looks_like_image_request(text) and ToolExecutor._has_control_token(text, "/send", "mode=send", "output=image")
 
     def _looks_like_video_send_request(self, text: str) -> bool:
-        _ = text
-        return False
+        return self._looks_like_video_request(text) and self._has_control_token(text, "/send", "/resolve", "mode=send", "mode=resolve")
 
     @staticmethod
     def _looks_like_image_analysis_request(text: str) -> bool:
-        _ = text
-        return False
+        return ToolExecutor._looks_like_image_request(text) and (
+            ToolExecutor._has_question_punctuation(text)
+            or ToolExecutor._has_control_token(text, "/analyze", "mode=analyze", "ocr=true")
+        )
 
     @staticmethod
     def _is_passive_multimodal_text(text: str) -> bool:
@@ -8230,46 +8592,38 @@ class ToolExecutor:
             return True
         return (
             content.startswith("MULTIMODAL_EVENT")
-            or content.startswith("用户发送多模态消息：")
-            or content.startswith("用户@了你并发送多模态消息：")
+            or content.startswith("\u7528\u6237\u53d1\u9001\u4e86\u591a\u6a21\u6001\u6d88\u606f:")
+            or content.startswith("\u7528\u6237@\u673a\u5668\u4eba\u5e76\u53d1\u9001\u591a\u6a21\u6001\u6d88\u606f:")
             or content.lower().startswith("user sent multimodal message:")
             or content.lower().startswith("user mentioned bot and sent multimodal message:")
         )
 
     @staticmethod
     def _looks_like_music_request(text: str) -> bool:
-        _ = text
-        return False
+        return ToolExecutor._has_audio_locator(text) or ToolExecutor._has_control_token(text, "/music", "/song", "mode=music")
 
     def _looks_like_video_request(self, text: str) -> bool:
-        content = self._normalize_multimodal_query(text)
-        if not content:
-            return False
-        content = content.lower()
-        if re.search(r"https?://[^\s]+", content):
-            return True
-        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", content, flags=re.IGNORECASE):
-            return True
-        return bool(re.search(r"\.(mp4|webm|mov|m4v)\b", content))
+        return self._has_video_locator(text) or self._has_control_token(text, "/video", "mode=video")
 
     def _looks_like_douyin_search_request(self, text: str) -> bool:
-        _ = text
-        return False
+        return self._has_control_token(text, "/douyin", "platform=douyin")
 
-    @staticmethod
-    def _looks_like_video_analysis_request(text: str) -> bool:
-        _ = text
-        return False
+    def _looks_like_video_analysis_request(self, text: str) -> bool:
+        return self._looks_like_video_request(text) and (
+            self._has_question_punctuation(text)
+            or self._has_control_token(text, "/analyze", "mode=analyze", "output=text", "mode=text")
+        )
 
     @staticmethod
     def _looks_like_qq_avatar_request(text: str) -> bool:
-        _ = text
-        return False
+        content = normalize_text(text)
+        if not content or not ToolExecutor._has_control_token(text, "/avatar", "/qqavatar", "type=avatar"):
+            return False
+        return bool(ToolExecutor._extract_qq_number(content) or ToolExecutor._contains_self_avatar_cue(content))
 
     @staticmethod
     def _contains_self_avatar_cue(text: str) -> bool:
-        _ = text
-        return False
+        return ToolExecutor._has_control_token(text, "target=self", "/me")
 
     @staticmethod
     def _extract_qq_number(text: str) -> str:
