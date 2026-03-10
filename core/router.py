@@ -457,10 +457,6 @@ class RouterEngine:
             reply_target = normalize_text(payload.reply_to_user_id)
             if reply_target and reply_target != payload.user_id:
                 target_user_id = reply_target
-            elif payload.at_other_user_ids:
-                discuss_cues = ("他", "她", "这个人", "那个人", "ta", "是谁", "叫什么", "哪里人", "你觉得他")
-                if any(cue in normalize_text(user_text).lower() for cue in discuss_cues):
-                    target_user_id = payload.at_other_user_ids[0]
 
         return RouterDecision(
             should_handle=should_handle,
@@ -517,20 +513,22 @@ class RouterEngine:
         content = normalize_text(text).lower()
         if not content:
             return False
-        adult_cues = (
-            "成人",
-            "18禁",
-            "无码",
-            "里番",
-            "porn",
+        structured_tokens = (
+            "/nsfw",
+            "/adult",
+            "mode=nsfw",
+            "mode=adult",
+            "safety=nsfw",
+            "safety=adult",
+            "rating=r18",
+            "adult=true",
             "nsfw",
             "r18",
-            "黄网",
-            "露点",
-            "做爱",
-            "性行为",
         )
-        return any(cue in content for cue in adult_cues)
+        for token in structured_tokens:
+            if re.search(rf"(?<![a-z0-9_]){re.escape(token)}(?![a-z0-9_])", content):
+                return True
+        return False
 
     @staticmethod
     def _is_passive_multimodal_event(text: str) -> bool:
