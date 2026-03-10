@@ -9,11 +9,24 @@ type Browser = "edge" | "chrome" | "firefox" | "brave" | "chromium";
 type CookieCapabilities = {
   browsers?: {
     recommended?: string;
+    installed?: string[];
+    scan_login_supported?: string[];
   };
   notices?: string[];
   platforms?: {
-    bilibili?: { qr_scan?: boolean; browser_extract?: boolean };
+    bilibili?: { qr_scan?: boolean; browser_extract?: boolean; browser_scan_login?: boolean };
+    douyin?: { browser_extract?: boolean; browser_scan_login?: boolean };
+    kuaishou?: { browser_extract?: boolean; browser_scan_login?: boolean };
+    qzone?: { browser_extract?: boolean; browser_scan_login?: boolean };
   };
+};
+
+type LoginGuide = {
+  message?: string;
+  login_url?: string;
+  after_login_url?: string;
+  instructions?: string[];
+  notes?: string[];
 };
 
 const authHeaders = () => ({
@@ -27,8 +40,10 @@ export default function CookiesPage() {
   const [allowClose, setAllowClose] = useState(false);
   const [cookie, setCookie] = useState("");
   const [loading, setLoading] = useState(false);
+  const [openingLogin, setOpeningLogin] = useState(false);
   const [msg, setMsg] = useState("");
   const [caps, setCaps] = useState<CookieCapabilities | null>(null);
+  const [loginGuide, setLoginGuide] = useState<LoginGuide | null>(null);
 
   const [biliQrSessionId, setBiliQrSessionId] = useState("");
   const [biliQrImage, setBiliQrImage] = useState("");
@@ -55,6 +70,10 @@ export default function CookiesPage() {
     loadCapabilities();
   }, [loadCapabilities]);
 
+  useEffect(() => {
+    setLoginGuide(null);
+  }, [platform]);
+
   const handleExtract = async () => {
     setLoading(true);
     setMsg("");
@@ -80,6 +99,35 @@ export default function CookiesPage() {
       setMsg(`错误: ${err.message}`);
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handlePrepareLogin = async () => {
+    setOpeningLogin(true);
+    setMsg("");
+    try {
+      const res = await fetch("/api/webui/cookies/prepare-login", {
+        method: "POST",
+        headers: authHeaders(),
+        body: JSON.stringify({ platform, browser }),
+      });
+      const data = await res.json().catch(() => ({} as Record<string, unknown>));
+      if (!res.ok || !data?.ok) {
+        setMsg(String(data?.message || "Failed to open login page"));
+        return;
+      }
+      setLoginGuide({
+        message: String(data.message || ""),
+        login_url: String(data.login_url || ""),
+        after_login_url: String(data.after_login_url || ""),
+        instructions: Array.isArray(data.instructions) ? data.instructions.map((item: unknown) => String(item)) : [],
+        notes: Array.isArray(data.notes) ? data.notes.map((item: unknown) => String(item)) : [],
+      });
+      setMsg(String(data.message || "Opened login page"));
+    } catch (err: any) {
+      setMsg(`Error: ${err.message}`);
+    } finally {
+      setOpeningLogin(false);
     }
   };
 
@@ -206,10 +254,10 @@ export default function CookiesPage() {
             selectedKeys={[platform]}
             onChange={(e) => setPlatform(e.target.value as Platform)}
           >
-            <SelectItem key="bilibili">B站 (扫码登录 + 浏览器提取)</SelectItem>
-            <SelectItem key="douyin">抖音 (浏览器提取)</SelectItem>
-            <SelectItem key="kuaishou">快手 (浏览器提取)</SelectItem>
-            <SelectItem key="qzone">QQ空间 (浏览器提取)</SelectItem>
+            <SelectItem key="bilibili">Bilibili (QR + browser extract)</SelectItem>
+            <SelectItem key="douyin">Douyin (scan-login + extract)</SelectItem>
+            <SelectItem key="kuaishou">Kuaishou (scan-login + extract)</SelectItem>
+            <SelectItem key="qzone">QZone (scan-login + extract)</SelectItem>
           </Select>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -255,12 +303,20 @@ export default function CookiesPage() {
           {platform !== "bilibili" && (
             <div className="flex gap-2">
               <Button
+                color="secondary"
+                startContent={<QrCode size={16} />}
+                isLoading={openingLogin}
+                onPress={handlePrepareLogin}
+              >
+                Open Scan Login
+              </Button>
+              <Button
                 color="primary"
                 startContent={<RefreshCw size={16} />}
                 isLoading={loading}
                 onPress={handleExtract}
               >
-                提取 Cookie
+                Extract Cookie
               </Button>
             </div>
           )}
@@ -292,21 +348,31 @@ export default function CookiesPage() {
             </Chip>
           ))}
 
-          {platform === "qzone" && (
-            <div className="text-sm text-default-500">
-              需要先在浏览器登录 QQ 空间（qzone.qq.com / user.qzone.qq.com）再提取。
-            </div>
-          )}
-          {platform !== "bilibili" && platform !== "qzone" && (
-            <div className="text-sm text-default-500">
-              需要先在浏览器登录对应平台，然后点击提取。
+          {platform !== "bilibili" && (
+            <div className="space-y-1 text-sm text-default-500">
+              <p>{loginGuide?.message || "Open the official login page, finish scan login in the same browser, then extract cookies."}</p>
+              {loginGuide?.login_url ? (
+                <a className="block text-xs text-primary underline break-all" href={loginGuide.login_url} target="_blank" rel="noreferrer">
+                  {loginGuide.login_url}
+                </a>
+              ) : null}
+              {loginGuide?.after_login_url ? (
+                <p className="text-xs">After login, confirm the page has reached {loginGuide.after_login_url}.</p>
+              ) : null}
+              {(loginGuide?.instructions || []).map((line, idx) => (
+                <p key={`guide-${idx}`} className="text-xs">{idx + 1}. {line}</p>
+              ))}
+              {(loginGuide?.notes || []).map((line, idx) => (
+                <p key={`note-${idx}`} className="text-xs">Note: {line}</p>
+              ))}
             </div>
           )}
           {platform === "bilibili" && (
             <div className="text-sm text-default-500">
-              推荐先用“扫码登录”。扫码成功会自动回填 `SESSDATA / bili_jct` 到下方文本框。
+              You can scan-login to refill `SESSDATA / bili_jct` directly, or extract them from a browser that is already signed in.
             </div>
           )}
+
         </CardBody>
       </Card>
 

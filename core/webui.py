@@ -694,14 +694,27 @@ def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
     if not isinstance(cfg_map, dict):
         cfg_map = {}
 
+    meta_map = getattr(registry, "_plugin_meta", {}) if registry else {}
+    if not isinstance(meta_map, dict):
+        meta_map = {}
+
     payload: list[dict[str, Any]] = []
     for name in sorted(plugin_map.keys(), key=lambda x: normalize_text(str(x)).lower()):
         plugin_obj = plugin_map.get(name)
         schema = schema_map.get(name, {})
+        meta = meta_map.get(name, {})
+        if not isinstance(meta, dict):
+            meta = {}
 
         config = copy.deepcopy(cfg_map.get(name, {}))
         if not isinstance(config, dict):
             config = {}
+
+        display_name = normalize_text(str(config.get("display_name", "")))
+        if not display_name:
+            display_name = normalize_text(str(getattr(plugin_obj, "display_name", "")))
+        if not display_name:
+            display_name = name
 
         description = normalize_text(str(getattr(plugin_obj, "description", "")))
         if not description:
@@ -713,19 +726,37 @@ def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
         if not isinstance(args_schema, dict):
             args_schema = {}
 
+        config_schema = getattr(plugin_obj, "config_schema", None)
+        if not isinstance(config_schema, dict):
+            config_schema = schema.get("config_schema", {})
+        if not isinstance(config_schema, dict):
+            config_schema = {}
+
         rules = _normalize_plugin_rules(getattr(plugin_obj, "rules", None))
         if not rules:
             rules = _normalize_plugin_rules(schema.get("rules", []))
 
+        config_guide = _normalize_plugin_rules(meta.get("config_guide", []))
+        editable_keys = _normalize_plugin_rules(meta.get("editable_keys", []))
+
         source, config_file = _plugin_source_info(engine, registry, name)
         payload.append({
             "name": name,
+            "display_name": display_name,
             "description": description,
             "enabled": bool(config.get("enabled", True)),
             "source": source,
             "config_file": config_file,
+            "config_target": normalize_text(str(meta.get("config_target", ""))),
             "config": config,
             "args_schema": args_schema,
+            "config_schema": config_schema,
+            "config_guide": config_guide,
+            "editable_keys": editable_keys,
+            "configurable": bool(meta.get("configurable", bool(config_schema or config_guide or config))),
+            "supports_interactive_setup": bool(meta.get("supports_interactive_setup", False)),
+            "needs_setup": bool(meta.get("needs_setup", False)),
+            "using_defaults": bool(meta.get("using_defaults", not bool(config))),
             "rules": rules,
             "internal_only": bool(getattr(plugin_obj, "internal_only", False)),
             "agent_tool": bool(getattr(plugin_obj, "agent_tool", False)),
@@ -1893,6 +1924,52 @@ async def chat_send_text(request: Request):
     return {"ok": True, "message_id": message_id}
 
 
+@router.post("/chat/agent-text", dependencies=[Depends(_check_auth)])
+async def chat_agent_text(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    resolved_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    text = str(body.get("text", ""))
+    reply_to_message_id = normalize_text(str(body.get("reply_to_message_id", "")))
+    if resolved_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+    if not peer_id:
+        raise HTTPException(400, "peer_id 不能为空")
+    if not normalize_text(text):
+        raise HTTPException(400, "text 不能为空")
+    if reply_to_message_id and not reply_to_message_id.isdigit():
+        raise HTTPException(400, "reply_to_message_id 必须是数字")
+    submit = getattr(_engine, "runtime_webui_agent_submit", None) if _engine is not None else None
+    if not callable(submit):
+        raise HTTPException(503, "当前运行时不支持聊天控制台 AI 对话")
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    context_user_id = normalize_text(str(body.get("context_user_id", "")))
+    context_user_name = normalize_text(str(body.get("context_user_name", "")))
+    context_sender_role = normalize_text(str(body.get("context_sender_role", "")))
+    try:
+        result = submit(
+            chat_type=resolved_type,
+            peer_id=peer_id,
+            text=text,
+            bot_id=bot_id,
+            reply_to_message_id=reply_to_message_id,
+            context_user_id=context_user_id,
+            context_user_name=context_user_name,
+            context_sender_role=context_sender_role,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+    except ValueError as exc:
+        raise HTTPException(400, normalize_text(str(exc)) or "参数错误") from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, normalize_text(str(exc)) or "运行时不可用") from exc
+    if not isinstance(result, dict):
+        result = {}
+    return {"ok": bool(result.get("ok", True)), **result}
+
+
 @router.post("/chat/send-image", dependencies=[Depends(_check_auth)])
 async def chat_send_image(request: Request):
     body = await request.json()
@@ -2677,6 +2754,20 @@ async def cookies_capabilities():
     return {"ok": True, "data": _cookie_capabilities_payload()}
 
 
+@router.post("/cookies/prepare-login", dependencies=[Depends(_check_auth)])
+async def cookies_prepare_login(request: Request):
+    """??????????????????? Cookie?"""
+    body = await request.json()
+    platform = _normalize_cookie_platform_key(str(body.get("platform", "")))
+    browser = normalize_text(str(body.get("browser", "edge"))).lower() or "edge"
+    if platform not in _SETUP_COOKIE_PLATFORM_DOMAINS:
+        return JSONResponse({"ok": False, "message": f"Unknown platform: {platform}"}, status_code=400)
+    result = await _prepare_cookie_login(platform, browser)
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=400)
+    return result
+
+
 @router.post("/cookies/bilibili-qr/start", dependencies=[Depends(_check_auth)])
 async def cookies_bilibili_qr_start():
     """开始 B站二维码登录会话（Cookie 页面）。"""
@@ -2948,6 +3039,13 @@ _SETUP_COOKIE_IMPORTANT_KEYS = {
     "qzone": ["p_skey", "p_uin"],
 }
 
+
+def _normalize_cookie_platform_key(platform: str) -> str:
+    key = normalize_text(platform).lower()
+    if key == "qq":
+        return "qzone"
+    return key
+
 _SETUP_API_ENV_MAP = {
     "skiapi": "${SKIAPI_KEY}",
     "openai": "${OPENAI_API_KEY}",
@@ -2980,6 +3078,24 @@ def _cookie_capabilities_payload() -> dict[str, Any]:
     payload = get_cookie_runtime_capabilities()
     payload["qr_session_ttl_seconds"] = _SETUP_BILI_QR_TTL_SECONDS
     return payload
+
+
+async def _prepare_cookie_login(platform: str, browser: str) -> dict[str, Any]:
+    from core.cookie_auth import prepare_browser_cookie_login
+
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(
+        None,
+        lambda: prepare_browser_cookie_login(platform=platform, browser=browser),
+    )
+    _log.info(
+        "cookie_prepare_login | platform=%s | browser=%s | ok=%s | url=%s",
+        platform,
+        browser,
+        bool(result.get("ok")),
+        result.get("login_url", ""),
+    )
+    return result
 
 
 async def _start_bilibili_qr_session() -> dict[str, Any]:
@@ -3496,6 +3612,20 @@ async def setup_defaults():
 async def setup_cookie_capabilities():
     """返回 Cookie 自动提取能力（按当前部署环境）。"""
     return {"ok": True, "data": _cookie_capabilities_payload()}
+
+
+@setup_router.post("/prepare-login")
+async def setup_prepare_login(request: Request):
+    """??????????????????? Cookie?"""
+    body = await request.json()
+    platform = _normalize_cookie_platform_key(str(body.get("platform", "")))
+    browser = normalize_text(str(body.get("browser", "edge"))).lower() or "edge"
+    if platform not in _SETUP_COOKIE_PLATFORM_DOMAINS:
+        return JSONResponse({"ok": False, "message": f"Unknown platform: {platform}"}, status_code=400)
+    result = await _prepare_cookie_login(platform, browser)
+    if not result.get("ok"):
+        return JSONResponse(result, status_code=400)
+    return result
 
 
 @setup_router.post("/bilibili-qr/start")
@@ -4319,7 +4449,7 @@ def run_setup_server(host: str = "127.0.0.1", port: int = 8081):
     print(f"\n  YuKiKo 首次运行配置向导")
     print(f"  请在浏览器打开: http://{host}:{port}/webui/setup\n")
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+    config = uvicorn.Config(app, host=host, port=port, log_level="warning", access_log=False)
     server = uvicorn.Server(config)
 
     global _setup_uvicorn_server

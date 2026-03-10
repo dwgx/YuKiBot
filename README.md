@@ -86,10 +86,10 @@ chmod +x start.sh build-webui.sh
 |---|---|---|---|---|
 | B站二维码扫码登录 | ✅ | ✅ | ✅ | 依赖 `bilibili-api-python`；WebUI Setup/Cookies 都可发起 |
 | B站浏览器 Cookie 提取 | ✅ | ⚠️ | ⚠️ | Linux/macOS 受 keyring/浏览器加密策略影响，可能失败 |
-| 抖音浏览器 Cookie 提取 | ✅ | ⚠️ | ⚠️ | 同上，需先在浏览器完成登录 |
-| 快手浏览器 Cookie 提取 | ✅ | ⚠️ | ⚠️ | 同上，需先在浏览器完成登录 |
-| QQ 空间 Cookie 提取 | ✅ | ⚠️ | ⚠️ | 必须先登录自己的 QZone（不是只访问别人空间） |
-| QQ 二维码直登 | ❌ | ❌ | ❌ | 当前版本未提供 QQ 扫码直登能力 |
+| Douyin browser scan-login + cookie extraction | Yes | Maybe | Maybe | Open Douyin's official login page in the browser, scan-login there, then extract cookies from the same browser profile |
+| Kuaishou browser scan-login + cookie extraction | Yes | Maybe | Maybe | Open Kuaishou's official login page in the browser, scan-login there, then extract cookies from the same browser profile |
+| QZone browser scan-login + cookie extraction | Yes | Maybe | Maybe | Open QZone's official login page in the browser, scan-login there, and make sure the browser reaches your own QZone home page before extraction |
+| QQ native QR direct login | No | No | No | Native QQ QR auth is still unavailable; use the QZone browser scan-login + cookie extraction flow instead |
 
 ### Cookie 失败时的处理顺序
 1. 先用 B站二维码登录（B站场景最稳）

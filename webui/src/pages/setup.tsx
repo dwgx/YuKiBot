@@ -5,7 +5,7 @@ import {
 } from "@heroui/react";
 import {
   Rocket, ChevronRight, ChevronLeft, Cpu, Zap,
-  Shield, Volume2, Cookie, Check, Download, RefreshCw, Sparkles,
+  Shield, Volume2, Cookie, Check, Download, RefreshCw, Sparkles, QrCode,
 } from "lucide-react";
 
 const BASE = "/api/webui";
@@ -198,14 +198,23 @@ type CookieCapabilities = {
   browsers?: {
     recommended?: string;
     installed?: string[];
+    scan_login_supported?: string[];
   };
   notices?: string[];
   platforms?: {
-    bilibili?: { qr_scan?: boolean; browser_extract?: boolean };
-    douyin?: { browser_extract?: boolean };
-    kuaishou?: { browser_extract?: boolean };
-    qzone?: { browser_extract?: boolean };
+    bilibili?: { qr_scan?: boolean; browser_extract?: boolean; browser_scan_login?: boolean };
+    douyin?: { browser_extract?: boolean; browser_scan_login?: boolean };
+    kuaishou?: { browser_extract?: boolean; browser_scan_login?: boolean };
+    qzone?: { browser_extract?: boolean; browser_scan_login?: boolean };
   };
+};
+
+type CookieLoginGuide = {
+  message?: string;
+  login_url?: string;
+  after_login_url?: string;
+  instructions?: string[];
+  notes?: string[];
 };
 
 export default function SetupPage() {
@@ -255,7 +264,9 @@ export default function SetupPage() {
   const [kuaishouCookie, setKuaishouCookie] = useState("");
   const [qzoneCookie, setQzoneCookie] = useState("");
   const [extracting, setExtracting] = useState<string | null>(null);
+  const [openingLogin, setOpeningLogin] = useState<string | null>(null);
   const [cookieStatus, setCookieStatus] = useState<Record<string, { ok: boolean; msg: string }>>({});
+  const [loginGuides, setLoginGuides] = useState<Record<string, CookieLoginGuide>>({});
   const [cookieBrowser, setCookieBrowser] = useState("edge");
   const [cookieAllowClose, setCookieAllowClose] = useState(false);
   const [smartExtracting, setSmartExtracting] = useState(false);
@@ -610,6 +621,61 @@ export default function SetupPage() {
     } finally {
       setExtracting(null);
     }
+  };
+
+  const startPlatformLogin = async (platform: string) => {
+    setOpeningLogin(platform);
+    setCookieStatus((prev) => ({ ...prev, [platform]: { ok: true, msg: "Opening login page..." } }));
+    try {
+      const res = await fetch(`${BASE}/setup/prepare-login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ platform, browser: cookieBrowser }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.ok) {
+        setCookieStatus((prev) => ({ ...prev, [platform]: { ok: false, msg: String(data?.message || "Open failed") } }));
+        return;
+      }
+      setLoginGuides((prev) => ({
+        ...prev,
+        [platform]: {
+          message: String(data.message || ""),
+          login_url: String(data.login_url || ""),
+          after_login_url: String(data.after_login_url || ""),
+          instructions: Array.isArray(data.instructions) ? data.instructions.map((item: unknown) => String(item)) : [],
+          notes: Array.isArray(data.notes) ? data.notes.map((item: unknown) => String(item)) : [],
+        },
+      }));
+      setCookieStatus((prev) => ({ ...prev, [platform]: { ok: true, msg: "Scan-login opened" } }));
+    } catch (e: unknown) {
+      setCookieStatus((prev) => ({ ...prev, [platform]: { ok: false, msg: e instanceof Error ? e.message : "Open failed" } }));
+    } finally {
+      setOpeningLogin(null);
+    }
+  };
+
+  const renderCookieLoginGuide = (platform: string, fallbackText: string) => {
+    const guide = loginGuides[platform];
+    return (
+      <div className="space-y-1 text-xs text-default-500">
+        <p>{guide?.message || fallbackText}</p>
+        {guide?.login_url ? (
+          <a className="block text-primary underline break-all" href={guide.login_url} target="_blank" rel="noreferrer">
+            {guide.login_url}
+          </a>
+        ) : null}
+        {guide?.after_login_url ? (
+          <p>After login, confirm the page has reached {guide.after_login_url}</p>
+        ) : null}
+        {(guide?.instructions || []).map((item, idx) => (
+          <p key={`${platform}-instruction-${idx}`}>{idx + 1}. {item}</p>
+        ))}
+        {(guide?.notes || []).map((item, idx) => (
+          <p key={`${platform}-note-${idx}`}>Note: {item}</p>
+        ))}
+      </div>
+    );
   };
 
   const handleProviderChange = (val: string) => {
@@ -1126,11 +1192,11 @@ export default function SetupPage() {
                 <Switch size="sm" isSelected={cookieAllowClose} onValueChange={setCookieAllowClose} />
               </div>
 
-              {/* B站 */}
-              <div className="space-y-2 p-3 rounded-xl bg-content2/50">
+              {/* Bilibili */}
+              <div className="space-y-2 rounded-xl bg-content2/50 p-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium">B站</span>
+                    <span className="text-sm font-medium">Bilibili</span>
                     {cookieStatus.bilibili && (
                       <Chip size="sm" variant="flat" color={cookieStatus.bilibili.ok ? "success" : "danger"}>
                         {cookieStatus.bilibili.msg}
@@ -1139,30 +1205,36 @@ export default function SetupPage() {
                   </div>
                   <div className="flex items-center gap-2">
                     <Button
-                      size="sm" variant="flat" color="secondary" radius="full"
+                      size="sm"
+                      variant="flat"
+                      color="secondary"
+                      radius="full"
                       isLoading={biliQrLoading}
                       onPress={startBilibiliQr}
                     >
-                      扫码登录
+                      QR Login
                     </Button>
                     <Button
-                      size="sm" variant="flat" color="primary" radius="full"
+                      size="sm"
+                      variant="flat"
+                      color="primary"
+                      radius="full"
                       startContent={<Download size={14} />}
                       isLoading={extracting === "bilibili"}
                       onPress={() => extractCookie("bilibili")}
                     >
-                      浏览器提取
+                      Extract Cookie
                     </Button>
                   </div>
                 </div>
                 {biliQrStatus && (
-                  <Chip size="sm" variant="flat" color={biliQrSessionId ? "warning" : (biliQrStatus.includes("成功") ? "success" : "default")}>
+                  <Chip size="sm" variant="flat" color={biliQrSessionId ? "warning" : (cookieStatus.bilibili?.ok ? "success" : "default")}>
                     {biliQrStatus}
                   </Chip>
                 )}
                 {biliQrImage && biliQrSessionId && (
-                  <div className="rounded-lg border border-default-200 bg-content1 p-3 w-fit">
-                    <img src={biliQrImage} alt="B站扫码二维码" className="w-44 h-44" />
+                  <div className="w-fit rounded-lg border border-default-200 bg-content1 p-3">
+                    <img src={biliQrImage} alt="Bilibili QR code" className="h-44 w-44" />
                     {biliQrUrl && (
                       <a
                         className="mt-2 block text-xs text-primary underline break-all"
@@ -1170,94 +1242,177 @@ export default function SetupPage() {
                         target="_blank"
                         rel="noreferrer"
                       >
-                        二维码链接（打不开图片时点这里）
+                        QR link (use this if the image does not render)
                       </a>
                     )}
                   </div>
                 )}
-                <Input label="SESSDATA" size="sm" value={biliSessdata} onValueChange={setBiliSessdata}
-                  placeholder="自动获取或手动粘贴" classNames={{ inputWrapper: "bg-content1" }} />
-                <Input label="bili_jct" size="sm" value={biliBiliJct} onValueChange={setBiliBiliJct}
-                  placeholder="自动获取或手动粘贴" classNames={{ inputWrapper: "bg-content1" }} />
+                <Input
+                  label="SESSDATA"
+                  size="sm"
+                  value={biliSessdata}
+                  onValueChange={setBiliSessdata}
+                  placeholder="Auto fill or paste manually"
+                  classNames={{ inputWrapper: "bg-content1" }}
+                />
+                <Input
+                  label="bili_jct"
+                  size="sm"
+                  value={biliBiliJct}
+                  onValueChange={setBiliBiliJct}
+                  placeholder="Auto fill or paste manually"
+                  classNames={{ inputWrapper: "bg-content1" }}
+                />
               </div>
 
-              {/* 抖音 */}
-              <div className="space-y-2 p-3 rounded-xl bg-content2/50">
+              {/* Douyin */}
+              <div className="space-y-2 rounded-xl bg-content2/50 p-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium">抖音</span>
+                    <span className="text-sm font-medium">Douyin</span>
                     {cookieStatus.douyin && (
                       <Chip size="sm" variant="flat" color={cookieStatus.douyin.ok ? "success" : "danger"}>
                         {cookieStatus.douyin.msg}
                       </Chip>
                     )}
                   </div>
-                  <Button
-                    size="sm" variant="flat" color="primary" radius="full"
-                    startContent={<Download size={14} />}
-                    isLoading={extracting === "douyin"}
-                    onPress={() => extractCookie("douyin")}
-                  >
-                    自动获取
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      color="secondary"
+                      radius="full"
+                      startContent={<QrCode size={14} />}
+                      isLoading={openingLogin === "douyin"}
+                      onPress={() => startPlatformLogin("douyin")}
+                    >
+                      Open Scan Login
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      color="primary"
+                      radius="full"
+                      startContent={<Download size={14} />}
+                      isLoading={extracting === "douyin"}
+                      onPress={() => extractCookie("douyin")}
+                    >
+                      Extract Cookie
+                    </Button>
+                  </div>
                 </div>
-                <Textarea label="Cookie" size="sm" minRows={1} maxRows={2} value={douyinCookie}
-                  onValueChange={setDouyinCookie} placeholder="自动获取或手动粘贴"
-                  classNames={{ inputWrapper: "bg-content1" }} />
+                {renderCookieLoginGuide("douyin", "Open Douyin's official login page, finish scan login, then come back here to extract cookies from the same browser.")}
+                <Textarea
+                  label="Cookie"
+                  size="sm"
+                  minRows={1}
+                  maxRows={2}
+                  value={douyinCookie}
+                  onValueChange={setDouyinCookie}
+                  placeholder="Auto fill or paste manually"
+                  classNames={{ inputWrapper: "bg-content1" }}
+                />
               </div>
 
-              {/* 快手 */}
-              <div className="space-y-2 p-3 rounded-xl bg-content2/50">
+              {/* Kuaishou */}
+              <div className="space-y-2 rounded-xl bg-content2/50 p-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium">快手</span>
+                    <span className="text-sm font-medium">Kuaishou</span>
                     {cookieStatus.kuaishou && (
                       <Chip size="sm" variant="flat" color={cookieStatus.kuaishou.ok ? "success" : "danger"}>
                         {cookieStatus.kuaishou.msg}
                       </Chip>
                     )}
                   </div>
-                  <Button
-                    size="sm" variant="flat" color="primary" radius="full"
-                    startContent={<Download size={14} />}
-                    isLoading={extracting === "kuaishou"}
-                    onPress={() => extractCookie("kuaishou")}
-                  >
-                    自动获取
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      color="secondary"
+                      radius="full"
+                      startContent={<QrCode size={14} />}
+                      isLoading={openingLogin === "kuaishou"}
+                      onPress={() => startPlatformLogin("kuaishou")}
+                    >
+                      Open Scan Login
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      color="primary"
+                      radius="full"
+                      startContent={<Download size={14} />}
+                      isLoading={extracting === "kuaishou"}
+                      onPress={() => extractCookie("kuaishou")}
+                    >
+                      Extract Cookie
+                    </Button>
+                  </div>
                 </div>
-                <Textarea label="Cookie" size="sm" minRows={1} maxRows={2} value={kuaishouCookie}
-                  onValueChange={setKuaishouCookie} placeholder="自动获取或手动粘贴"
-                  classNames={{ inputWrapper: "bg-content1" }} />
+                {renderCookieLoginGuide("kuaishou", "Open Kuaishou's official login page, finish scan login, then come back here to extract cookies from the same browser.")}
+                <Textarea
+                  label="Cookie"
+                  size="sm"
+                  minRows={1}
+                  maxRows={2}
+                  value={kuaishouCookie}
+                  onValueChange={setKuaishouCookie}
+                  placeholder="Auto fill or paste manually"
+                  classNames={{ inputWrapper: "bg-content1" }}
+                />
               </div>
 
-              {/* QQ空间 */}
-              <div className="space-y-2 p-3 rounded-xl bg-content2/50">
+              {/* QZone */}
+              <div className="space-y-2 rounded-xl bg-content2/50 p-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium">QQ空间</span>
+                    <span className="text-sm font-medium">QZone</span>
                     {cookieStatus.qzone && (
                       <Chip size="sm" variant="flat" color={cookieStatus.qzone.ok ? "success" : "danger"}>
                         {cookieStatus.qzone.msg}
                       </Chip>
                     )}
                   </div>
-                  <Button
-                    size="sm" variant="flat" color="primary" radius="full"
-                    startContent={<Download size={14} />}
-                    isLoading={extracting === "qzone"}
-                    onPress={() => extractCookie("qzone")}
-                  >
-                    自动获取
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      color="secondary"
+                      radius="full"
+                      startContent={<QrCode size={14} />}
+                      isLoading={openingLogin === "qzone"}
+                      onPress={() => startPlatformLogin("qzone")}
+                    >
+                      Open Scan Login
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="flat"
+                      color="primary"
+                      radius="full"
+                      startContent={<Download size={14} />}
+                      isLoading={extracting === "qzone"}
+                      onPress={() => extractCookie("qzone")}
+                    >
+                      Extract Cookie
+                    </Button>
+                  </div>
                 </div>
-                <Textarea label="Cookie" size="sm" minRows={1} maxRows={2} value={qzoneCookie}
-                  onValueChange={setQzoneCookie} placeholder="p_skey=xxx; uin=xxx; skey=xxx"
-                  classNames={{ inputWrapper: "bg-content1" }} />
+                {renderCookieLoginGuide("qzone", "Open QZone's official login page, finish scan login, confirm the browser reaches your own QZone home page, then extract cookies.")}
+                <Textarea
+                  label="Cookie"
+                  size="sm"
+                  minRows={1}
+                  maxRows={2}
+                  value={qzoneCookie}
+                  onValueChange={setQzoneCookie}
+                  placeholder="p_skey=xxx; uin=xxx; skey=xxx"
+                  classNames={{ inputWrapper: "bg-content1" }}
+                />
               </div>
             </div>
           )}
-
           {error && <p className="text-danger text-sm">{error}</p>}
 
           {/* Navigation */}

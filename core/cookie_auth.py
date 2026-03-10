@@ -316,147 +316,146 @@ _ROOKIEPY_PREFETCH_DOMAINS = [
 _ROOKIEPY_ELEVATED_CACHE: dict[str, dict[str, dict[str, str]]] = {}
 _ROOKIEPY_ELEVATED_SKIP_UNTIL: dict[str, float] = {}
 
+_COOKIE_PLATFORM_LOGIN_GUIDES: dict[str, dict[str, Any]] = {
+    "bilibili": {
+        "display_name": "Bilibili",
+        "site": "bilibili.com",
+        "login_url": "https://passport.bilibili.com/login",
+        "after_login_url": "https://www.bilibili.com/",
+        "instructions": [
+            "The browser will open Bilibili's official login page. You can scan with the Bilibili app or sign in manually.",
+            "After login, wait until the page returns to bilibili.com, then come back and extract cookies.",
+        ],
+        "notes": [
+            "If you only need Bilibili cookies, WebUI also supports the native QR login flow.",
+        ],
+    },
+    "douyin": {
+        "display_name": "Douyin",
+        "site": "douyin.com",
+        "login_url": "https://login.douyin.com/",
+        "after_login_url": "https://www.douyin.com/",
+        "instructions": [
+            "The browser will open Douyin's official login page. Scan with the Douyin app.",
+            "After login, wait until the page reaches douyin.com, then come back and extract cookies.",
+        ],
+        "notes": [
+            "If extraction fails, enable auto-close retry. Chromium v130+ may also need admin privileges.",
+        ],
+    },
+    "kuaishou": {
+        "display_name": "Kuaishou",
+        "site": "kuaishou.com",
+        "login_url": "https://www.kuaishou.com/account/login",
+        "after_login_url": "https://www.kuaishou.com/",
+        "instructions": [
+            "The browser will open Kuaishou's official login page. Scan with the Kuaishou app.",
+            "After login, make sure the page has entered kuaishou.com, then come back and extract cookies.",
+        ],
+        "notes": [
+            "If you are already logged in with this browser profile, you can skip the scan-login step and extract directly.",
+        ],
+    },
+    "qzone": {
+        "display_name": "QZone",
+        "site": "qzone.qq.com",
+        "login_url": "https://qzone.qq.com/",
+        "after_login_url": "https://user.qzone.qq.com/",
+        "instructions": [
+            "The browser will open QZone's official login page. Scan with QQ.",
+            "After login, make sure the browser enters your own QZone home page before extracting cookies.",
+        ],
+        "notes": [
+            "Do not stay on someone else's QZone page. The browser must reach your own QZone.",
+            "If the browser reaches user.qzone.qq.com/<your-qq>, the login state is ready.",
+        ],
+    },
+}
 
-def _is_windows_admin() -> bool:
-    if os.name != "nt":
-        return False
+
+def _normalize_cookie_platform_name(platform_name: str) -> str:
+    key = str(platform_name or "").strip().lower()
+    if key == "qq":
+        return "qzone"
+    return key
+
+
+def get_cookie_login_guide(platform: str) -> dict[str, Any] | None:
+    """Return browser scan-login guidance for a cookie platform."""
+    key = _normalize_cookie_platform_name(platform)
+    guide = _COOKIE_PLATFORM_LOGIN_GUIDES.get(key)
+    if not guide:
+        return None
+    return {
+        "platform": key,
+        "display_name": str(guide.get("display_name", key)),
+        "site": str(guide.get("site", "") or ""),
+        "login_url": str(guide.get("login_url", "") or ""),
+        "after_login_url": str(guide.get("after_login_url", "") or ""),
+        "instructions": [str(item) for item in (guide.get("instructions") or []) if str(item).strip()],
+        "notes": [str(item) for item in (guide.get("notes") or []) if str(item).strip()],
+    }
+
+
+def _build_browser_login_command(browser: str, url: str) -> tuple[list[str], str]:
+    exe = _find_browser_exe(browser)
+    if not exe:
+        raise FileNotFoundError(f"Browser executable not found: {_BROWSER_DISPLAY.get(browser, browser)}")
+
+    cmd = [exe]
+    profile_hint = ""
+    if browser in _CHROMIUM_BROWSERS:
+        user_data = _BROWSER_USER_DATA.get(browser, "")
+        if user_data and os.path.isdir(user_data):
+            profiles = _list_chromium_profiles(user_data)
+            if profiles:
+                profile_hint = profiles[0]
+                cmd.append(f"--profile-directory={profile_hint}")
+        cmd.append("--new-tab")
+    elif browser == "firefox":
+        cmd.append("-new-tab")
+
+    cmd.append(url)
+    return cmd, profile_hint
+
+
+def prepare_browser_cookie_login(platform: str, browser: str = "edge") -> dict[str, Any]:
+    """Open the platform login page in the selected browser for scan-login cookie extraction."""
+    key = _normalize_cookie_platform_name(platform)
+    browser_name = str(browser or "edge").strip().lower() or "edge"
+    guide = get_cookie_login_guide(key)
+    if not guide:
+        return {"ok": False, "message": f"Unsupported platform: {platform}"}
+
     try:
-        import ctypes
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def _ps_single_quote(value: str) -> str:
-    return "'" + str(value).replace("'", "''") + "'"
-
-
-def _extract_via_rookiepy_elevated_prefetch(
-    browser: str,
-    domains: list[str],
-) -> dict[str, dict[str, str]]:
-    """通过管理员提权进程调用 rookiepy，一次性提取多个域名（不关闭浏览器）。"""
-    if os.name != "nt":
-        return {}
-    if _is_windows_admin():
-        return {}
-
-    now = time.time()
-    skip_until = float(_ROOKIEPY_ELEVATED_SKIP_UNTIL.get(browser, 0.0) or 0.0)
-    cache = _ROOKIEPY_ELEVATED_CACHE.setdefault(browser, {})
-    need = [d for d in domains if d not in cache]
-    if now < skip_until and need:
-        return {d: dict(cache.get(d, {})) for d in domains}
-    if not need:
-        return {d: dict(cache.get(d, {})) for d in domains}
-
-    print("  检测到 AppBound 限制，尝试请求管理员权限读取 Cookie（不会关闭浏览器）...")
-    python_exe = sys.executable or "python"
-    helper_code = (
-        "import json,os,sys\n"
-        "sys.stderr=open(os.devnull,'w',encoding='utf-8',errors='ignore')\n"
-        "sys.stdout=open(os.devnull,'w',encoding='utf-8',errors='ignore')\n"
-        "out=sys.argv[1]\n"
-        "browser=sys.argv[2]\n"
-        "domains_path=sys.argv[3]\n"
-        "res={'ok':False,'data':{},'error':''}\n"
-        "try:\n"
-        "  import rookiepy\n"
-        "  fn=getattr(rookiepy,browser,None)\n"
-        "  if not fn:\n"
-        "    raise RuntimeError(f'browser_not_supported:{browser}')\n"
-        "  domains=json.load(open(domains_path,'r',encoding='utf-8'))\n"
-        "  data={}\n"
-        "  for domain in domains:\n"
-        "    clean=str(domain).lstrip('.').lower()\n"
-        "    cookies={}\n"
-        "    try:\n"
-        "      raw=fn([domain])\n"
-        "    except Exception:\n"
-        "      raw=[]\n"
-        "    if not raw and str(domain).startswith('.'):\n"
-        "      try:\n"
-        "        raw=fn([str(domain).lstrip('.')])\n"
-        "      except Exception:\n"
-        "        raw=[]\n"
-        "    for c in raw:\n"
-        "      name=str(c.get('name',''))\n"
-        "      value=str(c.get('value',''))\n"
-        "      cdom=str(c.get('domain','')).lstrip('.').lower()\n"
-        "      if not name:\n"
-        "        continue\n"
-        "      if clean and not (clean in cdom or cdom in clean):\n"
-        "        continue\n"
-        "      cookies[name]=value\n"
-        "    data[str(domain)] = cookies\n"
-        "  res={'ok':True,'data':data,'error':''}\n"
-        "except Exception as exc:\n"
-        "  res={'ok':False,'data':{},'error':f'{type(exc).__name__}:{exc}'}\n"
-        "json.dump(res,open(out,'w',encoding='utf-8'),ensure_ascii=False)\n"
-    )
-
-    try:
-        with tempfile.TemporaryDirectory(prefix="yukiko_rookiepy_uac_") as td:
-            tmp_root = Path(td)
-            helper_path = tmp_root / "rookiepy_uac_helper.py"
-            out_path = tmp_root / "result.json"
-            domains_path = tmp_root / "domains.json"
-            helper_path.write_text(helper_code, encoding="utf-8")
-            domains_path.write_text(json.dumps(need, ensure_ascii=False), encoding="utf-8")
-
-            arg_values = [
-                str(helper_path),
-                str(out_path),
-                browser,
-                str(domains_path),
-            ]
-            args_expr = ", ".join(_ps_single_quote(v) for v in arg_values)
-            ps_cmd = (
-                f"$p = Start-Process -FilePath {_ps_single_quote(python_exe)} "
-                f"-ArgumentList @({args_expr}) -Verb RunAs -WindowStyle Hidden -PassThru; "
-                "$p.WaitForExit(); exit $p.ExitCode"
-            )
-            proc = subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_cmd],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-
-            if proc.returncode != 0:
-                _log.debug("rookiepy elevated process exit=%s stderr=%s", proc.returncode, proc.stderr)
-                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 60.0
-                return {d: dict(cache.get(d, {})) for d in domains}
-            if not out_path.exists():
-                _log.debug("rookiepy elevated result missing")
-                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 30.0
-                return {d: dict(cache.get(d, {})) for d in domains}
-
-            payload = json.loads(out_path.read_text(encoding="utf-8"))
-            if not bool(payload.get("ok")):
-                _log.debug("rookiepy elevated failed: %s", payload.get("error", "unknown"))
-                _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 60.0
-                return {d: dict(cache.get(d, {})) for d in domains}
-
-            raw_data = payload.get("data", {})
-            if isinstance(raw_data, dict):
-                for d in need:
-                    row = raw_data.get(d, {})
-                    if isinstance(row, dict):
-                        cache[d] = {
-                            str(k): str(v)
-                            for k, v in row.items()
-                            if str(k)
-                        }
-                    else:
-                        cache[d] = {}
-            return {d: dict(cache.get(d, {})) for d in domains}
+        cmd, profile_hint = _build_browser_login_command(browser_name, str(guide.get("login_url", "") or ""))
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
     except Exception as exc:
-        _log.debug("rookiepy elevated exception: %s", exc)
-        _ROOKIEPY_ELEVATED_SKIP_UNTIL[browser] = time.time() + 60.0
-        return {d: dict(cache.get(d, {})) for d in domains}
+        return {
+            "ok": False,
+            "platform": key,
+            "browser": browser_name,
+            "message": f"Failed to open {guide['display_name']} login page: {exc}",
+        }
 
+    message = (
+        f"Opened {guide['display_name']} login page in {_BROWSER_DISPLAY.get(browser_name, browser_name)}. "
+        "Finish scan login, then come back to extract cookies."
+    )
+    return {
+        "ok": True,
+        "platform": key,
+        "browser": browser_name,
+        "browser_display": _BROWSER_DISPLAY.get(browser_name, browser_name),
+        "profile_directory": profile_hint,
+        "message": message,
+        **guide,
+    }
 
 def _find_browser_exe(browser: str) -> str | None:
     """查找浏览器可执行文件。"""
@@ -516,6 +515,8 @@ def _list_chromium_profiles(user_data: str) -> list[str]:
         profiles = [last_used] + [p for p in profiles if p != last_used]
 
     return profiles or ["Default"]
+
+
 
 
 def _is_port_free(port: int) -> bool:
@@ -1795,6 +1796,20 @@ def _ask_auto_close_for_running_browser(browser: str) -> bool:
     return answer in {"y", "yes", "1"}
 
 
+def _interactive_prepare_browser_login(platform: str, browser: str) -> bool:
+    result = prepare_browser_cookie_login(platform=platform, browser=browser)
+    if not result.get("ok"):
+        print(f"  {result.get('message', 'Failed to open login page.')}")
+        return False
+
+    print(f"  {result.get('message', '')}")
+    for idx, line in enumerate(result.get("instructions", []), start=1):
+        print(f"    {idx}. {line}")
+    for line in result.get("notes", []):
+        print(f"    - {line}")
+    _safe_input("  Press Enter after scan login is complete and the page looks ready... ")
+    return True
+
 def interactive_bilibili_cookie() -> dict[str, str]:
     """交互式获取 B站 cookie。"""
     print("\n  B站 Cookie 获取方式:")
@@ -1837,96 +1852,148 @@ def interactive_bilibili_cookie() -> dict[str, str]:
 
 
 def interactive_douyin_cookie() -> str:
-    """交互式获取抖音 cookie。"""
-    print("\n  抖音 Cookie 获取方式:")
-    print("    1. 从浏览器自动提取（需已登录 douyin.com）")
-    print("    2. 手动输入")
-    print("    3. 跳过")
+    """Interactive Douyin cookie setup."""
+    print("\n  Douyin Cookie setup:")
+    print("    1. Open official login page -> scan login -> extract (recommended)")
+    print("    2. Extract from a browser that is already logged in")
+    print("    3. Paste cookie manually")
+    print("    4. Skip")
 
-    choice = _safe_input("  选择 [1-3，默认 1]: ")
+    choice = _safe_input("  Select [1-4, default 1]: ")
     if not choice or choice == "1":
         browser = _pick_browser()
+        if not _interactive_prepare_browser_login("douyin", browser):
+            return ""
         cookie = extract_douyin_cookie(browser, auto_close=False)
         if cookie:
-            print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+            print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
             return cookie
-        # 无关闭模式失败，询问是否关闭浏览器重试
         auto_close = _ask_auto_close_for_running_browser(browser)
         if auto_close:
             cookie = extract_douyin_cookie(browser, auto_close=True)
             if cookie:
-                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
                 return cookie
-        print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到抖音登录信息。")
+        print(f"  No Douyin login was found in {_BROWSER_DISPLAY.get(browser, browser)}.")
         return ""
 
-    elif choice == "2":
-        return _safe_input("  抖音 Cookie 字符串: ")
+    if choice == "2":
+        browser = _pick_browser()
+        cookie = extract_douyin_cookie(browser, auto_close=False)
+        if cookie:
+            print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
+            return cookie
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            cookie = extract_douyin_cookie(browser, auto_close=True)
+            if cookie:
+                print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
+                return cookie
+        print(f"  No Douyin login was found in {_BROWSER_DISPLAY.get(browser, browser)}.")
+        return ""
+
+    if choice == "3":
+        return _safe_input("  Douyin cookie: ")
 
     return ""
 
 
 def interactive_kuaishou_cookie() -> str:
-    """交互式获取快手 cookie。"""
-    print("\n  快手 Cookie 获取方式:")
-    print("    1. 从浏览器自动提取（需已登录 kuaishou.com）")
-    print("    2. 手动输入")
-    print("    3. 跳过")
+    """Interactive Kuaishou cookie setup."""
+    print("\n  Kuaishou Cookie setup:")
+    print("    1. Open official login page -> scan login -> extract (recommended)")
+    print("    2. Extract from a browser that is already logged in")
+    print("    3. Paste cookie manually")
+    print("    4. Skip")
 
-    choice = _safe_input("  选择 [1-3，默认 1]: ")
+    choice = _safe_input("  Select [1-4, default 1]: ")
     if not choice or choice == "1":
         browser = _pick_browser()
+        if not _interactive_prepare_browser_login("kuaishou", browser):
+            return ""
         cookie = extract_kuaishou_cookie(browser, auto_close=False)
         if cookie:
-            print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+            print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
             return cookie
-        # 无关闭模式失败，询问是否关闭浏览器重试
         auto_close = _ask_auto_close_for_running_browser(browser)
         if auto_close:
             cookie = extract_kuaishou_cookie(browser, auto_close=True)
             if cookie:
-                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
                 return cookie
-        print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到快手登录信息。")
+        print(f"  No Kuaishou login was found in {_BROWSER_DISPLAY.get(browser, browser)}.")
         return ""
 
-    elif choice == "2":
-        return _safe_input("  快手 Cookie 字符串: ")
+    if choice == "2":
+        browser = _pick_browser()
+        cookie = extract_kuaishou_cookie(browser, auto_close=False)
+        if cookie:
+            print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
+            return cookie
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            cookie = extract_kuaishou_cookie(browser, auto_close=True)
+            if cookie:
+                print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
+                return cookie
+        print(f"  No Kuaishou login was found in {_BROWSER_DISPLAY.get(browser, browser)}.")
+        return ""
+
+    if choice == "3":
+        return _safe_input("  Kuaishou cookie: ")
 
     return ""
 
 
 def interactive_qzone_cookie() -> str:
-    """交互式获取 QQ空间 cookie。"""
-    print("\n  QQ空间 Cookie 获取方式:")
-    print("    1. 从浏览器自动提取（需已在浏览器登录 QQ空间）")
-    print("    2. 手动输入（p_skey=xxx; uin=xxx; skey=xxx）")
-    print("    3. 跳过")
-    print("\n  【重要提示】")
-    print("    - 请先在浏览器访问 https://qzone.qq.com 并登录你自己的 QQ 账号")
-    print("    - 登录后会自动跳转到你自己的空间（如 https://user.qzone.qq.com/你的QQ号）")
-    print("    - 确保页面完全加载，能看到自己的说说、相册等内容")
-    print("    - 不要只访问别人的空间，必须登录自己的空间才能获取有效 Cookie")
+    """Interactive QZone cookie setup."""
+    print("\n  QZone Cookie setup:")
+    print("    1. Open official login page -> scan login -> extract (recommended)")
+    print("    2. Extract from a browser that is already logged in")
+    print("    3. Paste manually: p_skey=xxx; uin=xxx; skey=xxx")
+    print("    4. Skip")
+    print("\n  Notes:")
+    print("    - The browser should open https://qzone.qq.com/ and sign in with your QQ account.")
+    print("    - Before extraction, confirm the browser reaches your own QZone home page.")
+    print("    - Visiting someone else's QZone page is not enough.")
 
-    choice = _safe_input("\n  选择 [1-3，默认 1]: ")
+    choice = _safe_input("  Select [1-4, default 1]: ")
     if not choice or choice == "1":
         browser = _pick_browser()
+        if not _interactive_prepare_browser_login("qzone", browser):
+            return ""
         cookie = extract_qzone_cookies(browser, auto_close=False)
         if cookie:
-            print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+            print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
             return cookie
         auto_close = _ask_auto_close_for_running_browser(browser)
         if auto_close:
             cookie = extract_qzone_cookies(browser, auto_close=True)
             if cookie:
-                print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
                 return cookie
-        print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到 QQ空间登录信息。")
-        print("  请确保已在该浏览器中访问 https://qzone.qq.com 并登录你自己的 QQ 账号")
+        print(f"  No QZone login was found in {_BROWSER_DISPLAY.get(browser, browser)}.")
+        print("  Make sure the browser reaches your own QZone home page after signing in.")
         return ""
 
-    elif choice == "2":
-        return _safe_input("  QQ空间 Cookie 字符串: ")
+    if choice == "2":
+        browser = _pick_browser()
+        cookie = extract_qzone_cookies(browser, auto_close=False)
+        if cookie:
+            print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
+            return cookie
+        auto_close = _ask_auto_close_for_running_browser(browser)
+        if auto_close:
+            cookie = extract_qzone_cookies(browser, auto_close=True)
+            if cookie:
+                print(f"  Extracted from {_BROWSER_DISPLAY.get(browser, browser)} successfully!")
+                return cookie
+        print(f"  No QZone login was found in {_BROWSER_DISPLAY.get(browser, browser)}.")
+        print("  Make sure the browser reaches your own QZone home page after signing in.")
+        return ""
+
+    if choice == "3":
+        return _safe_input("  QZone cookie: ")
 
     return ""
 
@@ -1962,6 +2029,7 @@ def get_cookie_runtime_capabilities() -> dict[str, Any]:
         notices.append("未检测到 bilibili-api-python，B站扫码登录不可用。")
 
     browser_extract_ok = bool(installed_browsers and (rookiepy_ok or browser_cookie3_ok))
+    browser_scan_login_ok = bool(installed_browsers)
     return {
         "os": system,
         "python_platform": sys.platform,
@@ -1974,12 +2042,17 @@ def get_cookie_runtime_capabilities() -> dict[str, Any]:
             "installed": installed_browsers,
             "recommended": recommended_browser,
             "cdp_supported": cdp_supported_browsers,
+            "scan_login_supported": installed_browsers,
         },
         "platforms": {
-            "bilibili": {"qr_scan": bilibili_qr_ok, "browser_extract": browser_extract_ok},
-            "douyin": {"browser_extract": browser_extract_ok},
-            "kuaishou": {"browser_extract": browser_extract_ok},
-            "qzone": {"browser_extract": browser_extract_ok},
+            "bilibili": {
+                "qr_scan": bilibili_qr_ok,
+                "browser_extract": browser_extract_ok,
+                "browser_scan_login": browser_scan_login_ok,
+            },
+            "douyin": {"browser_extract": browser_extract_ok, "browser_scan_login": browser_scan_login_ok},
+            "kuaishou": {"browser_extract": browser_extract_ok, "browser_scan_login": browser_scan_login_ok},
+            "qzone": {"browser_extract": browser_extract_ok, "browser_scan_login": browser_scan_login_ok},
         },
         "notices": notices,
     }
