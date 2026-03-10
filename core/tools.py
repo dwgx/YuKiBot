@@ -4796,8 +4796,7 @@ class ToolExecutor:
         content = normalize_text(query).lower()
         if self._looks_like_video_analysis_request(content):
             return self._video_search_analysis_max_duration_seconds, "analysis"
-        send_cues = ["发送", "发我", "发到群", "转发", "下载", "解析", "直发", "发视频", "把视频发"]
-        if any(cue in content for cue in send_cues):
+        if self._looks_like_video_send_request(content):
             return self._video_search_send_max_duration_seconds, "send"
         return self._video_search_max_duration_seconds, "default"
 
@@ -5683,12 +5682,6 @@ class ToolExecutor:
             keyword = normalize_matching_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
-        # 去掉常见前缀
-        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
-            if keyword.startswith(prefix):
-                keyword = keyword[len(prefix):].strip()
-        if not keyword:
-            return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
 
         query = build_music_keyword(keyword, title, artist)
         results = await self._music_engine.search(keyword, limit=limit, title=title, artist=artist)
@@ -5877,11 +5870,6 @@ class ToolExecutor:
             keyword = f"{title} {artist}".strip()
         if not keyword:
             keyword = normalize_matching_text(message_text)
-        if not keyword:
-            return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
-        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
-            if keyword.startswith(prefix):
-                keyword = keyword[len(prefix):].strip()
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
 
@@ -8160,93 +8148,60 @@ class ToolExecutor:
         content = normalize_text(text).lower()
         if not content:
             return False
-        if "github.com/" in content or re.search(r"\bgithub\b", content):
+        if "github.com/" in content:
             return True
-        return bool(re.search(r"\b[a-z0-9_.-]+/[a-z0-9_.-]+\b", content))
+        if self._has_control_token(text, "/github", "platform=github", "source=github"):
+            return True
+        return bool(re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", content))
 
     def _looks_like_repo_readme_request(self, text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
-        return bool(re.search(r"\breadme\b|文档|文檔|使用说明|使用說明|docs?", content, flags=re.IGNORECASE))
+        if re.search(r"README(?:\.md)?", content, flags=re.IGNORECASE):
+            return True
+        return self._has_control_token(text, "/readme", "type=readme", "target=readme")
 
     @staticmethod
     def _looks_like_download_request_text(text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
-        download_terms = (
-            "download",
-            "installer",
-            "setup",
-            "upload",
-            "send",
-            "\u4e0b\u8f7d",
-            "\u4e0a\u4f20",
-            "\u53d1\u6211",
-            "\u7ed9\u6211",
-            "\u7fa4\u6587\u4ef6",
-            "\u5b89\u88c5\u5305",
-            "\u538b\u7f29\u5305",
-        )
-        has_ext = bool(re.search(r"\.(?:zip|7z|rar|exe|apk|ipa|msi|dmg|pkg|deb|rpm|jar)\b", content, flags=re.IGNORECASE))
-        return any(term in content for term in download_terms) or has_ext
+        if ToolExecutor._has_control_token(text, "/download", "/sendfile", "mode=download", "mode=file", "output=file"):
+            return True
+        return bool(re.search(r"\.(?:zip|7z|rar|exe|apk|ipa|msi|dmg|pkg|deb|rpm|jar)", content, flags=re.IGNORECASE))
 
     def _looks_like_software_download_request(self, text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
-        software_terms = (
-            "github",
-            "release",
-            "latest version",
-            "installer",
-            "setup",
-            "client",
-            "app",
-            "software",
-            "tool",
-            "\u5b89\u88c5\u5305",
-            "\u5ba2\u6237\u7aef",
-            "\u8f6f\u4ef6",
-            "\u5de5\u5177",
-            "\u4e0b\u8f7d",
-            "\u5b98\u65b9",
-            "\u6700\u65b0\u7248",
-        )
-        platform_terms = (
-            "windows",
-            "win",
-            "mac",
-            "macos",
-            "linux",
-            "android",
-            "ios",
-            "apk",
-            "exe",
-            "dmg",
-            "deb",
-            "rpm",
-            "jar",
-            "\u5b89\u5353",
-            "\u82f9\u679c",
-            "\u684c\u9762\u7248",
-        )
-        return any(term in content for term in software_terms) and (
-            any(term in content for term in platform_terms)
+        if not (
+            self._has_control_token(text, "/download", "/release", "mode=download", "source=release")
             or self._looks_like_download_request_text(content)
-        )
+        ):
+            return False
+        if "github.com/" in content:
+            return True
+        if re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", content):
+            return True
+        return self._has_control_token(text, "/github", "platform=github", "source=github")
 
     @staticmethod
     def _guess_download_preferences(raw_query: str, message_text: str, repo_name: str = "") -> tuple[str, str]:
         merged = normalize_text(f"{raw_query}\n{message_text}\n{repo_name}").lower()
-        if "hmcl" in merged:
-            return ".jar", "HMCL.jar"
-        if any(cue in merged for cue in ("android", "安卓")):
+        if re.search(r"\.(jar)\b", merged):
+            return ".jar", ""
+        if re.search(r"\.(apk)\b", merged):
             return ".apk", ""
-        if any(cue in merged for cue in ("windows", "win", "电脑", "pc")):
+        if re.search(r"\.(exe|msi)\b", merged):
             return ".exe", ""
-        if any(cue in merged for cue in ("mac", "macos")):
+        if re.search(r"\.(dmg|pkg)\b", merged):
+            return ".dmg", ""
+        if ToolExecutor._has_control_token(merged, "platform=android"):
+            return ".apk", ""
+        if ToolExecutor._has_control_token(merged, "platform=windows", "platform=win"):
+            return ".exe", ""
+        if ToolExecutor._has_control_token(merged, "platform=mac", "platform=macos"):
             return ".dmg", ""
         return "", ""
 
@@ -8728,42 +8683,47 @@ class ToolExecutor:
         content = normalize_text(text)
         if not content:
             return []
+        if not ToolExecutor._has_control_token(text, "/avatar", "/qqavatar", "type=avatar"):
+            return []
 
-        raw_hits: list[str] = []
-        patterns = (
-            r"([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})的头像",
-            r"头像\s*[:：]?\s*([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})",
-            r"发([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})头像",
-        )
-        for pat in patterns:
-            raw_hits.extend(re.findall(pat, content, flags=re.IGNORECASE))
-
-        stopwords = {
-            "他的",
-            "她的",
-            "ta的",
-            "这个",
-            "那个",
-            "群里",
-            "群里的",
-            "qq群里",
-            "qq群里的",
-            "头像",
-            "我的",
-            "我",
-        }
-        uniq: list[str] = []
+        out: list[str] = []
         seen: set[str] = set()
-        for item in raw_hits:
-            cand = normalize_text(str(item)).strip("\"'[]()锛堬級")
-            if not cand or cand in stopwords:
-                continue
+        strip_chars = "`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A"
+
+        def add_candidate(raw: str) -> None:
+            cand = normalize_text(str(raw)).strip(strip_chars)
+            if not cand:
+                return
             key = cand.lower()
             if key in seen:
-                continue
+                return
+            if key.startswith("/") or "=" in key:
+                return
+            if key in {"me", "self"}:
+                return
+            if re.fullmatch(r"[1-9]\d{4,11}", cand):
+                return
+            compact = re.sub(r"[^a-z0-9\u4e00-\u9fff_.-]+", "", key)
+            if len(compact) < 2:
+                return
             seen.add(key)
-            uniq.append(cand)
-        return uniq[:3]
+            out.append(cand)
+
+        explicit_patterns = (
+            r"target\s*=\s*[\"']?([^\"'\s][^\"']{0,31})[\"']?",
+            r"/(?:avatar|qqavatar)\s+[\"']([^\"']{2,32})[\"']",
+        )
+        for pattern in explicit_patterns:
+            for raw in re.findall(pattern, content, flags=re.IGNORECASE):
+                add_candidate(raw)
+                if len(out) >= 3:
+                    return out[:3]
+
+        for token in re.split(r"\s+", content):
+            add_candidate(token)
+            if len(out) >= 3:
+                break
+        return out[:3]
 
     @staticmethod
     def _normalize_name_key(name: str) -> str:

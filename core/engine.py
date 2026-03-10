@@ -3302,36 +3302,10 @@ class YukikoEngine:
         content = normalize_text(text)
         if not content:
             return ""
-        # 去掉 @mention 前缀（如 "@YuKiKo 点歌..."）
         content = re.sub(r"^@\S+\s*", "", content)
-        content = re.sub(r"^(?:请|麻烦|帮我|给我|你给我|你帮我)\s*", "", content)
-        # 去掉 "alger" 等非标准前缀（用户可能误用其他 bot 名）
-        content = re.sub(r"^(?:alger|yuki|yukiko)\s*", "", content, flags=re.IGNORECASE)
-        # 去掉常见英文包装语，避免 "music name is xxx" 之类被整句拿去搜。
-        content = re.sub(
-            r"^(?:i\s+(?:want|wanna)\s+to\s+(?:listen|hear)(?:\s+to)?(?:\s+the)?\s+(?:music|song)\s*[,，]?\s*)",
-            "",
-            content,
-            flags=re.IGNORECASE,
-        )
-        content = re.sub(r"^(?:can\s+you\s+)?(?:play|search|find)\s+", "", content, flags=re.IGNORECASE)
-        content = re.sub(r"^(?:music|song)\s+name\s+is\s*", "", content, flags=re.IGNORECASE)
-        content = re.sub(r"^(?:the\s+)?(?:music|song)\s+is\s*", "", content, flags=re.IGNORECASE)
-        # 去掉 "发语音" 修饰词
-        content = re.sub(r"发语音\s*", "", content)
-        # 去掉常见发起词，仅保留歌名关键词（循环剥离，处理 "点歌 点歌XXX" 等重复）。
-        _music_prefixes = ("点歌", "听歌", "放歌", "搜歌", "来首歌", "来一首歌", "播放歌曲", "播放音乐")
-        changed = True
-        while changed:
-            changed = False
-            for prefix in _music_prefixes:
-                if content.startswith(prefix):
-                    content = content[len(prefix):].strip()
-                    changed = True
-                    break
-        content = content.strip('：:，,。.!！?？\"\'“”‘’')
-        if content in {"点歌", "听歌", "放歌", "搜歌"}:
-            return ""
+        content = re.sub(r"(?i)(?<!\S)/(?:music|song|search)\b", " ", content)
+        content = re.sub(r"(?i)\b(?:mode|type|platform|source|output|target|title|artist|id)=[^\s]+", " ", content)
+        content = re.sub(r"\s+", " ", content).strip("`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A")
         return content
 
     @staticmethod
@@ -3339,28 +3313,30 @@ class YukikoEngine:
         content = normalize_text(keyword).lower()
         if not content:
             return []
-        # 去掉兜底查询里常见的噪声词，保留“歌手/曲名”核心 token。
-        content = re.sub(
-            r"(歌曲|试听|试聽|官方|歌词|歌詞|mv|music|song|b站|抖音|视频|影片|全网|全網|帮我找|幫我找)",
-            " ",
-            content,
-            flags=re.IGNORECASE,
-        )
-        tokens = re.findall(r"[a-z0-9][a-z0-9_.-]{1,24}|[\u4e00-\u9fff]{1,8}", content)
-        stop = {"的", "了", "我", "你", "他", "她", "它", "请", "請"}
-        uniq: list[str] = []
+
+        out: list[str] = []
         seen: set[str] = set()
-        for token in tokens:
-            t = normalize_text(token).lower().strip()
-            if not t or t in stop:
+        for token in tokenize(content):
+            value = normalize_text(token).lower().strip()
+            if not value or value.startswith("/") or "=" in value:
                 continue
-            if len(t) <= 1 and not re.search(r"[a-z0-9]", t):
+            if re.search(r"[a-z0-9]", value):
+                compact = re.sub(r"[^a-z0-9_.-]+", "", value)
+                if len(compact) < 2:
+                    continue
+                value = compact
+            elif re.fullmatch(r"[\u4e00-\u9fff]+", value):
+                if len(value) < 2:
+                    continue
+            else:
                 continue
-            if t in seen:
+            if value in seen:
                 continue
-            seen.add(t)
-            uniq.append(t)
-        return uniq[:6]
+            seen.add(value)
+            out.append(value)
+            if len(out) >= 6:
+                break
+        return out
 
     @classmethod
     def _is_music_fallback_relevant(cls, keyword: str, payload: dict[str, Any]) -> bool:
@@ -3406,15 +3382,19 @@ class YukikoEngine:
         content = normalize_text(text).lower()
         if not content:
             return False
-        if "github.com/" in content or re.search(r"\bgithub\b", content):
+        if "github.com/" in content:
+            return True
+        if self._has_control_token(text, "/github", "platform=github", "source=github"):
             return True
         return bool(re.search(r"\b[a-z0-9_.-]+/[a-z0-9_.-]+\b", content))
 
     def _looks_like_repo_readme_request(self, text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
-        return bool(re.search(r"\breadme\b|文档|文檔|使用说明|使用說明|docs?", content, flags=re.IGNORECASE))
+        if re.search(r"\bREADME(?:\.md)?\b", content, flags=re.IGNORECASE):
+            return True
+        return self._has_control_token(text, "/readme", "type=readme", "target=readme")
 
     @staticmethod
     def _extract_github_repo_from_text(text: str) -> str:
@@ -4538,25 +4518,27 @@ class YukikoEngine:
         content = normalize_text(text)
         if not content:
             return None
-        # 1) 直接数字选择: 1 / 选1 / 发给我1 / 第1个
-        direct_patterns = (
-            r"^(?:选|選|要|来|來|给我|給我|发|發|发给我|發給我|第)?\s*([1-9]\d?)\s*(?:个|個|张|張|条|條|号|號)?$",
-            r"^第\s*([1-9]\d?)\s*(?:个|個|张|張|条|條|号|號)$",
-            r"^(?:发给我|發給我|给我|給我|来|來|要|选|選)\s*第\s*([1-9]\d?)\s*(?:个|個|张|張|条|條|号|號)$",
-        )
-        for pattern in direct_patterns:
-            matched = re.match(pattern, content, flags=re.IGNORECASE)
-            if matched:
-                try:
-                    return int(matched.group(1))
-                except Exception:
-                    return None
 
-        # 2) 中文序数: 第一个 / 第一张 / 发给我第一个
-        zh_ordinal = re.search(
-            r"(?:^|[^\d])第\s*([一二两三四五六七八九十]{1,3})\s*(?:个|個|张|張|条|條|号|號)",
-            content,
-            flags=re.IGNORECASE,
+        compact = re.sub(r"\s+", "", content)
+        unit_pattern = r"(?:\u4e2a|\u500b|\u5f20|\u5f35|\u6761|\u689d|\u53f7|\u865f)"
+
+        direct_match = re.fullmatch(rf"([1-9]\d?){unit_pattern}?", compact)
+        if direct_match:
+            try:
+                return int(direct_match.group(1))
+            except Exception:
+                return None
+
+        ordinal_match = re.fullmatch(rf"\u7b2c([1-9]\d?){unit_pattern}", compact)
+        if ordinal_match:
+            try:
+                return int(ordinal_match.group(1))
+            except Exception:
+                return None
+
+        zh_ordinal = re.fullmatch(
+            rf"\u7b2c([\u4e00\u4e8c\u4e24\u4e09\u56db\u4e94\u516d\u4e03\u516b\u4e5d\u5341]{{1,3}}){unit_pattern}",
+            compact,
         )
         if zh_ordinal:
             n = YukikoEngine._parse_zh_number(zh_ordinal.group(1))
@@ -5119,33 +5101,83 @@ class YukikoEngine:
 
     @staticmethod
     def _extract_topic_terms_for_memory(text: str, max_terms: int = 6) -> list[str]:
-        content = normalize_text(text).lower()
-        if not content:
+        content = normalize_text(text)
+        if not content or max_terms <= 0:
             return []
-        # 去掉“记得/链接/这个”这类泛化词，再提取真正的话题锚点。
-        cleaned = re.sub(
-            r"(还记得|记得|上次|之前|这个|那个|这条|那条|链接|連結|网址|網址|url|"
-            r"发我|发给我|给我|我要|我想|帮我|一下|一个|第[一二三四五六七八九十\d]+个)",
-            " ",
-            content,
-            flags=re.IGNORECASE,
-        )
-        stop_words = {"链接", "連結", "网址", "網址", "url", "这个", "那个", "上次", "之前"}
+
         out: list[str] = []
         seen: set[str] = set()
-        for token in tokenize(cleaned):
-            if token in stop_words:
-                continue
-            if token.isdigit():
-                continue
-            if len(token) < 2:
-                continue
-            if token in seen:
-                continue
-            seen.add(token)
-            out.append(token)
+        strip_chars = "`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A"
+
+        def add_candidate(raw: str) -> None:
+            item = normalize_text(str(raw)).strip(strip_chars)
+            if not item:
+                return
+            lower = item.lower()
+            if lower in seen:
+                return
+            if lower.startswith("/") or "=" in lower:
+                return
+            if re.search(r"https?://", lower, flags=re.IGNORECASE):
+                return
+            if re.fullmatch(r"[1-9]\d*", item):
+                return
+            if re.search(r"[a-z0-9]", lower):
+                compact = re.sub(r"[^a-z0-9_.-]+", "", lower)
+                if len(compact) < 3:
+                    return
+            elif re.fullmatch(r"[\u4e00-\u9fff]+", item):
+                if len(item) < 3:
+                    return
+            elif len(item) < 3:
+                return
+            seen.add(lower)
+            out.append(item)
+
+        explicit_patterns = (
+            r"`([^`]{2,80})`",
+            r"\*\*([^*]{2,80})\*\*",
+            r"[\u201c\"]([^\u201d\"]{2,80})[\u201d\"]",
+            r"\u300a([^\u300b]{2,80})\u300b",
+        )
+        for pattern in explicit_patterns:
+            for raw in re.findall(pattern, content):
+                add_candidate(raw)
+                if len(out) >= max_terms:
+                    return out[:max_terms]
+
+        for token in tokenize(content):
+            add_candidate(token)
             if len(out) >= max_terms:
                 break
+        return out[:max_terms]
+
+    @staticmethod
+    def _extract_structured_reference_spans(text: str, max_terms: int = 4) -> list[str]:
+        content = normalize_text(text)
+        if not content or max_terms <= 0:
+            return []
+
+        out: list[str] = []
+        seen: set[str] = set()
+        patterns = (
+            r"`([^`]{2,80})`",
+            r"\*\*([^*]{2,80})\*\*",
+            r"[\u201c\"]([^\u201d\"]{2,80})[\u201d\"]",
+            r"\u300a([^\u300b]{2,80})\u300b",
+        )
+        for pattern in patterns:
+            for raw in re.findall(pattern, content):
+                item = normalize_text(raw)
+                if not item:
+                    continue
+                key = item.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(item)
+                if len(out) >= max_terms:
+                    return out
         return out
 
     @staticmethod
@@ -5190,47 +5222,36 @@ class YukikoEngine:
 
     @staticmethod
     def _looks_like_ambiguous_link_memory_query(text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
         if re.search(r"https?://", content, flags=re.IGNORECASE):
             return False
-        if not any(token in content for token in ("链接", "連結", "网址", "網址", "url")):
+        if not YukikoEngine._has_control_token(text, "/link", "/url", "type=link", "type=url", "mode=url"):
             return False
-        # 只要能提取到具体话题锚点，就不算模糊链接追问。
-        if YukikoEngine._extract_topic_terms_for_memory(content, max_terms=3):
-            return False
-        return bool(re.search(r"(还记得|记得|那个|这个|上次|之前|发过|给我的|那条|这条|第一个)", content))
+        cleaned = re.sub(r"(?i)(?<!\S)/(?:link|url)\b", " ", content)
+        cleaned = re.sub(r"(?i)\b(?:type|mode)\s*=\s*(?:link|url)\b", " ", cleaned)
+        return not YukikoEngine._extract_topic_terms_for_memory(cleaned, max_terms=3)
 
     @staticmethod
     def _looks_like_short_context_sensitive_query(text: str) -> bool:
-        content = normalize_text(text).lower()
+        content = normalize_text(text)
         if not content:
             return False
         if re.search(r"https?://", content, flags=re.IGNORECASE):
             return False
-        if len(content) <= 6:
+        if re.fullmatch(r"[?!.,\uFF1F\uFF01\uFF0C\u3002]+", content):
             return True
         if len(content) > 24:
             return False
-        cues = (
-            "怎么没",
-            "怎么不",
-            "咋没",
-            "咋不",
-            "哪呢",
-            "在哪",
-            "发出来",
-            "没发",
-            "这张",
-            "那张",
-            "这个",
-            "那个",
-            "刚才",
-            "上面",
-            "你说的",
-        )
-        return any(cue in content for cue in cues)
+        if YukikoEngine._extract_topic_terms_for_memory(content, max_terms=2):
+            return False
+        compact = re.sub(r"\s+", "", content)
+        if len(compact) <= 8:
+            return True
+        tokens = [normalize_text(str(token)) for token in tokenize(content)]
+        tokens = [token for token in tokens if token]
+        return len(tokens) <= 2
 
     def _remember_agent_followup_cache(self, message: EngineMessage, agent_result: AgentResult) -> None:
         """将 Agent 的候选/媒体结果写入会话缓存。"""
@@ -5496,23 +5517,12 @@ class YukikoEngine:
         current_user_recent: list[str],
         related_memories: list[str],
     ) -> str:
+        _ = user_text
         text = normalize_text(reply_text)
         if not text:
             return reply_text
 
-        claim_patterns = (
-            "你之前提到过",
-            "你之前说过",
-            "上次你说",
-            "我记得你",
-            "我看了一下咱们的聊天记录",
-            "你问过我",
-            "你之前问我",
-        )
-        if not any(p in text for p in claim_patterns):
-            return reply_text
-
-        evidence_lines = []
+        evidence_lines: list[str] = []
         for row in (current_user_recent or []):
             line = normalize_text(row)
             if line:
@@ -5521,31 +5531,13 @@ class YukikoEngine:
             line = normalize_text(row)
             if line:
                 evidence_lines.append(line)
-        evidence_text = "\n".join(evidence_lines)
+        if not evidence_lines:
+            return reply_text
 
-        if not evidence_text:
-            if self._looks_like_music_request(user_text):
-                return "我现在还不知道你固定喜欢听什么歌，你给我两三首常听的，我就能记住。"
-            return "我可能记混了，刚才那句不准。你再说一次，我按这次信息来。"
-
-        # 如果提到了具体“历史偏好词”，但证据里不存在，判定为幻觉回忆。
-        mentioned_titles: list[str] = []
-        mentioned_titles.extend(re.findall(r"\*\*(.+?)\*\*", text))
-        mentioned_titles.extend(re.findall(r"[“\"]([^”\"]{2,40})[”\"]", text))
-        mentioned_titles.extend(re.findall(r"《([^》]{2,40})》", text))
-        clean_titles = [normalize_text(item) for item in mentioned_titles if normalize_text(item)]
-        for title in clean_titles[:3]:
-            if title not in evidence_text:
-                if self._looks_like_music_request(user_text):
-                    return "我还没拿到你明确的听歌偏好。你给我一首最近循环的歌，我马上按这个给你推荐。"
-                return "我刚才那句历史引用不准确，忽略它。你现在直接告诉我需求，我按你这条来。"
-
-        # 音乐偏好问题必须有音乐证据，否则不允许“你之前提到过”。
-        if self._looks_like_music_request(user_text):
-            music_kw = ("歌", "音乐", "歌手", "专辑", "网易云", "qq音乐", "hip-hop", "摇滚", "民谣", "rap")
-            if not any(kw.lower() in evidence_text.lower() for kw in music_kw):
-                return "我还不知道你固定喜欢听什么歌。你报一首最近在听的，我就按这个风格给你找。"
-
+        evidence_text = "\n".join(evidence_lines).lower()
+        for span in self._extract_structured_reference_spans(text):
+            if normalize_text(span).lower() not in evidence_text:
+                return "\u6211\u521a\u624d\u90a3\u53e5\u5386\u53f2\u5f15\u7528\u4e0d\u51c6\u786e\uff0c\u5ffd\u7565\u5b83\u3002\u4f60\u73b0\u5728\u76f4\u63a5\u544a\u8bc9\u6211\u9700\u6c42\uff0c\u6211\u6309\u4f60\u8fd9\u6761\u6765\u3002"
         return reply_text
 
     def _merge_fragmented_user_message(self, message: EngineMessage, text: str) -> tuple[str, str, bool]:

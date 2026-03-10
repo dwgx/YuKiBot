@@ -6,11 +6,13 @@ import {
   useState,
   type ChangeEvent,
   type ClipboardEvent as ReactClipboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { Button, Card, CardBody, CardHeader, Chip, Input, Spinner, Textarea } from "@heroui/react";
-import { BrainCircuit, ChevronDown, ChevronUp, Copy, ImagePlus, MessageSquare, Quote, RefreshCw, SendHorizontal, SmilePlus, Sparkles, Square, Star, Trash2, UserRound, X } from "lucide-react";
-import { AnimatePresence, motion } from "framer-motion";
+import { BrainCircuit, ChevronDown, ChevronUp, Copy, ImagePlus, MessageSquare, Minus, Pause, Play, Plus, Quote, RefreshCw, SendHorizontal, SmilePlus, Sparkles, Square, Star, Trash2, UserRound, X } from "lucide-react";
+import { AnimatePresence, motion, useDragControls } from "framer-motion";
 import { api, ChatAgentStateItem, ChatConversationItem, ChatHistoryPermission, ChatMessageItem } from "../api/client";
 
 function fmtTs(ts: number): string {
@@ -48,11 +50,83 @@ const DEFAULT_CHAT_PERMISSION: ChatHistoryPermission = {
 
 const INPUT_CLASSES = {
   label: "text-default-500 text-xs",
-  input: "text-sm !bg-transparent",
-  inputWrapper: "bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:bg-content2/70 data-[focus=true]:bg-content2/80 data-[focus=true]:border-primary/55 data-[focus=true]:shadow-[0_0_0_1px_rgba(96,165,250,0.18)]",
-  innerWrapper: "bg-transparent shadow-none",
+  input: "text-sm !bg-transparent !outline-none !ring-0 focus:!outline-none focus:!ring-0 focus-visible:!outline-none focus-visible:!ring-0 group-data-[focus=true]:!bg-transparent group-data-[has-value=true]:!bg-transparent",
+  inputWrapper: "bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:bg-content2/70 data-[focus=true]:bg-content2/80 data-[focus=true]:border-primary/55 data-[focus=true]:shadow-[0_0_0_1px_rgba(96,165,250,0.18)] data-[focus=true]:before:!bg-transparent data-[focus=true]:after:!bg-transparent before:!shadow-none after:!shadow-none",
+  innerWrapper: "!bg-transparent !shadow-none group-data-[focus=true]:!bg-transparent",
+  mainWrapper: "!bg-transparent",
   base: "w-full",
 } as const;
+
+const THINKING_ISLAND_STORAGE_KEY = "yukiko-thinking-island-offset-v1";
+const THINKING_ISLAND_SIZE_STORAGE_KEY = "yukiko-thinking-island-size-v1";
+
+type ThinkingIslandOffset = {
+  x: number;
+  y: number;
+};
+
+type PendingThinkingLog = {
+  raw: string;
+  at: number;
+};
+
+type ThinkingIslandSize = "sm" | "md" | "lg";
+
+const THINKING_ISLAND_SIZE_ORDER: ThinkingIslandSize[] = ["sm", "md", "lg"];
+
+const THINKING_ISLAND_SIZE_WIDTH: Record<ThinkingIslandSize, string> = {
+  sm: "min(520px,100%)",
+  md: "min(640px,100%)",
+  lg: "min(780px,100%)",
+};
+
+const THINKING_ISLAND_PREVIEW_HEIGHT_CLASS: Record<ThinkingIslandSize, string> = {
+  sm: "max-h-28",
+  md: "max-h-36",
+  lg: "max-h-44",
+};
+
+const THINKING_TYPING_INTERVAL_MS = 26;
+
+function thinkingTypingStepSize(text: string): number {
+  const length = Array.from(String(text || "")).length;
+  if (length <= 24) return 1;
+  if (length <= 72) return 2;
+  if (length <= 140) return 3;
+  return 4;
+}
+
+function clampThinkingIslandOffset(offset: ThinkingIslandOffset): ThinkingIslandOffset {
+  if (typeof window === "undefined") return offset;
+  const maxX = Math.max(0, Math.floor(window.innerWidth * 0.34));
+  const maxY = Math.max(0, Math.floor(window.innerHeight * 0.42));
+  return {
+    x: Math.max(-maxX, Math.min(maxX, Number.isFinite(offset.x) ? offset.x : 0)),
+    y: Math.max(-8, Math.min(maxY, Number.isFinite(offset.y) ? offset.y : 0)),
+  };
+}
+
+function loadThinkingIslandOffset(): ThinkingIslandOffset {
+  if (typeof window === "undefined") return { x: 0, y: 0 };
+  try {
+    const raw = window.localStorage.getItem(THINKING_ISLAND_STORAGE_KEY);
+    if (!raw) return { x: 0, y: 0 };
+    const data = JSON.parse(raw) as Partial<ThinkingIslandOffset>;
+    return clampThinkingIslandOffset({
+      x: Number(data?.x ?? 0),
+      y: Number(data?.y ?? 0),
+    });
+  } catch {
+    return { x: 0, y: 0 };
+  }
+}
+
+function loadThinkingIslandSize(): ThinkingIslandSize {
+  if (typeof window === "undefined") return "md";
+  const raw = String(window.localStorage.getItem(THINKING_ISLAND_SIZE_STORAGE_KEY) || "").trim().toLowerCase();
+  if (raw === "sm" || raw === "md" || raw === "lg") return raw;
+  return "md";
+}
 
 function parseThinkingLine(rawLine: string): string {
   const line = String(rawLine || "").trim();
@@ -98,8 +172,39 @@ function parseThinkingLine(rawLine: string): string {
   return "";
 }
 
+function compactThinkingRawLine(rawLine: string): string {
+  const line = String(rawLine || "").trim();
+  if (!line) return "";
+  if (!/(agent_|queue_|tool_call|tool_result|interrupt|trace=|step=)/.test(line)) return "";
+  const compact = line
+    .replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*\|\s*[A-Z]+\s*\|\s*[^|]*\|\s*/, "")
+    .replace(/^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*\[[A-Z]+\]\s*[^|]*\|\s*/, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!compact) return "";
+  return `日志: ${clip(compact, 150)}`;
+}
+
 function thinkingStatusLabel(active: boolean): string {
   return active ? "处理中" : "已完成";
+}
+
+function thinkingStreamLabel(state: "connecting" | "open" | "closed"): string {
+  if (state === "open") return "任务流已连接";
+  if (state === "connecting") return "连接任务流中";
+  return "任务流已断开";
+}
+
+function isOneBotUnavailableError(error: unknown): boolean {
+  const msg = String(error instanceof Error ? error.message : error || "").toLowerCase();
+  if (!msg) return false;
+  return (
+    msg.includes("http 503")
+    || msg.includes("503")
+    || msg.includes("未检测到在线 onebot 实例")
+    || msg.includes("nonebot 不可用")
+    || msg.includes("运行时不可用")
+  );
 }
 
 function normalizeCopyPayload(msg: ChatMessageItem): string {
@@ -140,6 +245,10 @@ export default function ChatPage() {
   const [loadingState, setLoadingState] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  const [botRuntimeStatus, setBotRuntimeStatus] = useState<"online" | "offline">("online");
+  const [pauseAutoRefresh, setPauseAutoRefresh] = useState(false);
+  const [conversationKeyword, setConversationKeyword] = useState("");
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
 
   const [conversations, setConversations] = useState<ChatConversationItem[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -155,10 +264,18 @@ export default function ChatPage() {
   const [permission, setPermission] = useState<ChatHistoryPermission>(DEFAULT_CHAT_PERMISSION);
   const [contextEgg, setContextEgg] = useState("");
   const [thinkingLines, setThinkingLines] = useState<string[]>([]);
+  const [thinkingRenderedLines, setThinkingRenderedLines] = useState<string[]>([]);
+  const [thinkingLiveLine, setThinkingLiveLine] = useState("");
+  const [thinkingTypingActive, setThinkingTypingActive] = useState(false);
   const [thinkingDraft, setThinkingDraft] = useState("");
   const [retargeting, setRetargeting] = useState(false);
   const [thinkingPanelOpen, setThinkingPanelOpen] = useState(true);
-  const [thinkingIslandExpanded, setThinkingIslandExpanded] = useState(true);
+  const [thinkingIslandExpanded, setThinkingIslandExpanded] = useState(false);
+  const [thinkingIslandOffset, setThinkingIslandOffset] = useState<ThinkingIslandOffset>(() => loadThinkingIslandOffset());
+  const [thinkingIslandSize, setThinkingIslandSize] = useState<ThinkingIslandSize>(() => loadThinkingIslandSize());
+  const [thinkingStreamState, setThinkingStreamState] = useState<"connecting" | "open" | "closed">("connecting");
+  const [thinkingStreamPacketCount, setThinkingStreamPacketCount] = useState(0);
+  const [thinkingStreamLastPacketAt, setThinkingStreamLastPacketAt] = useState(0);
   const [thinkingWarmConversationId, setThinkingWarmConversationId] = useState("");
   const [thinkingWarmUntil, setThinkingWarmUntil] = useState(0);
   const [clockMs, setClockMs] = useState(() => Date.now());
@@ -171,8 +288,24 @@ export default function ChatPage() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const thinkingScrollRef = useRef<HTMLDivElement | null>(null);
+  const thinkingWsRef = useRef<WebSocket | null>(null);
+  const thinkingReconnectTimerRef = useRef<number | null>(null);
+  const thinkingActiveRef = useRef(false);
+  const loadConversationsInFlightRef = useRef(false);
+  const loadAgentStateInFlightRef = useRef(false);
+  const historyRequestSeqRef = useRef(0);
+  const historyCacheRef = useRef<Record<string, { items: ChatMessageItem[]; permission: ChatHistoryPermission }>>({});
+  const thinkingIslandDragOriginRef = useRef<ThinkingIslandOffset>({ x: 0, y: 0 });
+  const pendingThinkingLogsRef = useRef<PendingThinkingLog[]>([]);
+  const thinkingTypingQueueRef = useRef<string[]>([]);
+  const thinkingTypingTimerRef = useRef<number | null>(null);
+  const thinkingTypingCharsRef = useRef<string[]>([]);
+  const thinkingTypingIndexRef = useRef(0);
+  const thinkingAnimationCursorRef = useRef(0);
+  const autoStickToBottomRef = useRef(true);
   const traceRef = useRef("");
   const conversationRef = useRef("");
+  const thinkingDragControls = useDragControls();
   const scrollMessagesToBottom = useCallback(() => {
     const el = messagesScrollRef.current;
     if (!el) return;
@@ -187,6 +320,21 @@ export default function ChatPage() {
     () => agentStates.find((item) => item.conversation_id === selectedId) ?? null,
     [agentStates, selectedId],
   );
+  const filteredConversations = useMemo(() => {
+    const q = conversationKeyword.trim().toLowerCase();
+    if (!q) return conversations;
+    return conversations.filter((item) => {
+      const haystack = [
+        item.peer_name,
+        item.peer_id,
+        item.last_message,
+        item.chat_type,
+      ]
+        .map((part) => String(part || "").toLowerCase())
+        .join(" ");
+      return haystack.includes(q);
+    });
+  }, [conversationKeyword, conversations]);
   const isThinking = Boolean(selectedState && ((selectedState.running_count ?? 0) > 0 || (selectedState.pending_count ?? 0) > 0));
   const optimisticThinking = Boolean(
     selected
@@ -194,15 +342,24 @@ export default function ChatPage() {
     && thinkingWarmUntil > clockMs,
   );
   const thinkingActive = Boolean(isThinking || optimisticThinking);
-  const thinkingIslandVisible = Boolean(selected && thinkingPanelOpen && (thinkingActive || thinkingLines.length > 0));
-  const latestThinkingLine = useMemo(
-    () => thinkingLines[thinkingLines.length - 1] || (thinkingActive ? "正在建立计划..." : "刚刚处理完成"),
-    [thinkingActive, thinkingLines],
+  const thinkingIslandVisible = Boolean(selected && thinkingPanelOpen);
+  const displayedThinkingLines = useMemo(
+    () => (thinkingLiveLine ? [...thinkingRenderedLines, thinkingLiveLine] : thinkingRenderedLines),
+    [thinkingLiveLine, thinkingRenderedLines],
   );
-  const thinkingPreviewLines = useMemo(() => thinkingLines.slice(-6), [thinkingLines]);
+  const latestThinkingLine = useMemo(
+    () => displayedThinkingLines[displayedThinkingLines.length - 1] || (thinkingActive ? "正在建立计划..." : "刚刚处理完成"),
+    [displayedThinkingLines, thinkingActive],
+  );
+  const thinkingPreviewLines = useMemo(() => displayedThinkingLines.slice(-6), [displayedThinkingLines]);
+  const lastStreamPacketLabel = useMemo(
+    () => (thinkingStreamLastPacketAt > 0 ? new Date(thinkingStreamLastPacketAt).toLocaleTimeString() : "-"),
+    [thinkingStreamLastPacketAt],
+  );
   const canRecallInMenu = Boolean(selected?.chat_type === "group" && permission.can_recall);
   const canSetEssenceInMenu = Boolean(selected?.chat_type === "group" && permission.can_set_essence);
   const contextMessageIsEssence = Boolean(contextMenu.message?.is_essence);
+  const refreshPausedHint = pauseAutoRefresh ? "自动刷新已暂停" : "自动刷新中";
   const closeContextMenu = useCallback(() => {
     setContextMenu((prev) => (prev.open ? { open: false, x: 0, y: 0, message: null } : prev));
   }, []);
@@ -212,11 +369,86 @@ export default function ChatPage() {
     setThinkingWarmConversationId(conversationId);
     setThinkingWarmUntil(Date.now() + ttlMs);
     setThinkingPanelOpen(true);
-    setThinkingIslandExpanded(true);
+  }, []);
+  const pushThinkingLine = useCallback((line: string) => {
+    const content = String(line || "").trim();
+    if (!content) return;
+    setThinkingLines((prev) => {
+      if (prev[prev.length - 1] === content) return prev;
+      return [...prev.slice(-80), content];
+    });
+  }, []);
+  const clearThinkingTypingTimer = useCallback(() => {
+    if (thinkingTypingTimerRef.current != null) {
+      window.clearInterval(thinkingTypingTimerRef.current);
+      thinkingTypingTimerRef.current = null;
+    }
+    thinkingTypingCharsRef.current = [];
+    thinkingTypingIndexRef.current = 0;
+  }, []);
+  const startThinkingTyping = useCallback(() => {
+    if (thinkingTypingTimerRef.current != null) return;
+
+    const tick = () => {
+      if (thinkingTypingCharsRef.current.length === 0) {
+        const next = thinkingTypingQueueRef.current.shift();
+        if (!next) {
+          clearThinkingTypingTimer();
+          setThinkingLiveLine("");
+          setThinkingTypingActive(false);
+          return;
+        }
+        thinkingTypingCharsRef.current = Array.from(next);
+        thinkingTypingIndexRef.current = 0;
+        setThinkingLiveLine("");
+        setThinkingTypingActive(true);
+      }
+
+      const chars = thinkingTypingCharsRef.current;
+      const step = thinkingTypingStepSize(chars.join(""));
+      const nextIndex = Math.min(chars.length, thinkingTypingIndexRef.current + step);
+      thinkingTypingIndexRef.current = nextIndex;
+      const partial = chars.slice(0, nextIndex).join("");
+      setThinkingLiveLine(partial);
+
+      if (nextIndex >= chars.length) {
+        setThinkingRenderedLines((prev) => [...prev.slice(-79), partial]);
+        setThinkingLiveLine("");
+        thinkingTypingCharsRef.current = [];
+        thinkingTypingIndexRef.current = 0;
+      }
+    };
+
+    tick();
+    thinkingTypingTimerRef.current = window.setInterval(tick, THINKING_TYPING_INTERVAL_MS);
+  }, [clearThinkingTypingTimer]);
+  const clearThinkingReconnectTimer = useCallback(() => {
+    if (thinkingReconnectTimerRef.current != null) {
+      window.clearTimeout(thinkingReconnectTimerRef.current);
+      thinkingReconnectTimerRef.current = null;
+    }
+  }, []);
+  const beginThinkingIslandDrag = useCallback((evt: ReactPointerEvent<HTMLDivElement>) => {
+    thinkingIslandDragOriginRef.current = thinkingIslandOffset;
+    thinkingDragControls.start(evt, { snapToCursor: false });
+  }, [thinkingDragControls, thinkingIslandOffset]);
+  const growThinkingIsland = useCallback(() => {
+    setThinkingIslandSize((prev) => {
+      const idx = THINKING_ISLAND_SIZE_ORDER.indexOf(prev);
+      return THINKING_ISLAND_SIZE_ORDER[Math.min(THINKING_ISLAND_SIZE_ORDER.length - 1, idx + 1)];
+    });
+  }, []);
+  const shrinkThinkingIsland = useCallback(() => {
+    setThinkingIslandSize((prev) => {
+      const idx = THINKING_ISLAND_SIZE_ORDER.indexOf(prev);
+      return THINKING_ISLAND_SIZE_ORDER[Math.max(0, idx - 1)];
+    });
   }, []);
 
-  const loadConversations = useCallback(async () => {
-    setLoadingConvs(true);
+  const loadConversations = useCallback(async (opts?: { silent?: boolean }) => {
+    if (loadConversationsInFlightRef.current) return;
+    loadConversationsInFlightRef.current = true;
+    if (!opts?.silent) setLoadingConvs(true);
     try {
       const res = await api.getChatConversations({ limit: 200 });
       const items = Array.isArray(res.items) ? res.items : [];
@@ -227,39 +459,62 @@ export default function ChatPage() {
       if (items.length === 0) {
         setSelectedId("");
       }
+      setBotRuntimeStatus("online");
       setError("");
     } catch (e: unknown) {
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
       setError(e instanceof Error ? e.message : "读取会话失败");
     } finally {
-      setLoadingConvs(false);
+      loadConversationsInFlightRef.current = false;
+      if (!opts?.silent) setLoadingConvs(false);
     }
   }, [selectedId]);
 
-  const loadHistory = useCallback(async () => {
-    if (!selected) {
+  const loadHistory = useCallback(async (opts?: { silent?: boolean }) => {
+    const target = selected;
+    if (!target) {
       setMessages([]);
       setPermission(DEFAULT_CHAT_PERMISSION);
       return;
     }
-    setLoadingHistory(true);
+    const reqSeq = ++historyRequestSeqRef.current;
+    if (!opts?.silent) setLoadingHistory(true);
     try {
       const res = await api.getChatHistory({
-        chatType: selected.chat_type,
-        peerId: selected.peer_id,
+        chatType: target.chat_type,
+        peerId: target.peer_id,
         limit: 60,
       });
-      setMessages(Array.isArray(res.items) ? res.items : []);
-      setPermission(res.permission ?? DEFAULT_CHAT_PERMISSION);
+      if (reqSeq !== historyRequestSeqRef.current) return;
+      const items = Array.isArray(res.items) ? res.items : [];
+      const nextPermission = res.permission ?? DEFAULT_CHAT_PERMISSION;
+      setMessages(items);
+      setPermission(nextPermission);
+      historyCacheRef.current[target.conversation_id] = {
+        items,
+        permission: nextPermission,
+      };
+      setBotRuntimeStatus("online");
       setError("");
     } catch (e: unknown) {
+      if (reqSeq !== historyRequestSeqRef.current) return;
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
       setError(e instanceof Error ? e.message : "读取聊天记录失败");
     } finally {
-      setLoadingHistory(false);
+      if (reqSeq === historyRequestSeqRef.current && !opts?.silent) {
+        setLoadingHistory(false);
+      }
     }
   }, [selected]);
 
-  const loadAgentState = useCallback(async () => {
-    setLoadingState(true);
+  const loadAgentState = useCallback(async (opts?: { silent?: boolean }) => {
+    if (loadAgentStateInFlightRef.current) return;
+    loadAgentStateInFlightRef.current = true;
+    if (!opts?.silent) setLoadingState(true);
     try {
       const res = await api.getChatAgentState({ limit: 200 });
       setAgentStates(Array.isArray(res.items) ? res.items : []);
@@ -267,7 +522,8 @@ export default function ChatPage() {
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "读取运行状态失败");
     } finally {
-      setLoadingState(false);
+      loadAgentStateInFlightRef.current = false;
+      if (!opts?.silent) setLoadingState(false);
     }
   }, []);
 
@@ -277,23 +533,55 @@ export default function ChatPage() {
   }, [loadConversations, loadAgentState]);
 
   useEffect(() => {
-    loadHistory();
-  }, [loadHistory]);
+    if (!selected) {
+      setMessages([]);
+      setPermission(DEFAULT_CHAT_PERMISSION);
+      return;
+    }
+    const cached = historyCacheRef.current[selected.conversation_id];
+    if (cached) {
+      setMessages(cached.items);
+      setPermission(cached.permission);
+    } else {
+      setMessages([]);
+      setPermission(DEFAULT_CHAT_PERMISSION);
+    }
+    void loadHistory();
+  }, [loadHistory, selected]);
 
   useEffect(() => {
+    if (pauseAutoRefresh) return undefined;
+    const intervalMs = thinkingActive || optimisticThinking ? 8000 : 16000;
     const timer = window.setInterval(() => {
-      loadConversations();
-      if (selectedId) {
-        loadHistory();
-      }
-      loadAgentState();
-    }, 8000);
+      void loadConversations({ silent: true });
+    }, intervalMs);
     return () => window.clearInterval(timer);
-  }, [loadConversations, loadHistory, loadAgentState, selectedId]);
+  }, [loadConversations, optimisticThinking, pauseAutoRefresh, thinkingActive]);
+
+  useEffect(() => {
+    if (pauseAutoRefresh) return undefined;
+    if (!selectedId) return undefined;
+    const intervalMs = thinkingActive || optimisticThinking ? 3200 : 15000;
+    const timer = window.setInterval(() => {
+      void loadHistory({ silent: true });
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [loadHistory, optimisticThinking, pauseAutoRefresh, selectedId, thinkingActive]);
+
+  useEffect(() => {
+    if (pauseAutoRefresh) return undefined;
+    const intervalMs = selectedId && (thinkingActive || optimisticThinking) ? 1200 : 3500;
+    const timer = window.setInterval(() => {
+      void loadAgentState({ silent: true });
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [loadAgentState, optimisticThinking, pauseAutoRefresh, selectedId, thinkingActive]);
 
   useEffect(() => {
     setReplyToMessage(null);
     closeContextMenu();
+    autoStickToBottomRef.current = true;
+    setShowScrollToBottom(false);
   }, [selectedId, closeContextMenu]);
 
   useEffect(() => {
@@ -302,6 +590,7 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (loadingHistory) return;
+    if (!autoStickToBottomRef.current) return;
     scrollMessagesToBottom();
   }, [messages, loadingHistory, scrollMessagesToBottom]);
 
@@ -330,18 +619,67 @@ export default function ChatPage() {
   }, [contextMenu.open, closeContextMenu]);
 
   useEffect(() => {
-    traceRef.current = String(selectedState?.latest_trace_id || selectedState?.last_trace_id || "");
+    traceRef.current = String(selectedState?.last_trace_id || selectedState?.latest_trace_id || "");
     conversationRef.current = String(selected?.conversation_id || "");
   }, [selectedState, selected]);
 
   useEffect(() => {
+    thinkingActiveRef.current = thinkingActive;
+  }, [thinkingActive]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(THINKING_ISLAND_STORAGE_KEY, JSON.stringify(thinkingIslandOffset));
+  }, [thinkingIslandOffset]);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(THINKING_ISLAND_SIZE_STORAGE_KEY, thinkingIslandSize);
+  }, [thinkingIslandSize]);
+
+  useEffect(() => {
+    const handleResize = () => {
+      setThinkingIslandOffset((prev) => clampThinkingIslandOffset(prev));
+    };
+    window.addEventListener("resize", handleResize);
+    return () => window.removeEventListener("resize", handleResize);
+  }, []);
+
+  useEffect(() => {
     setThinkingLines([]);
+    setThinkingRenderedLines([]);
+    setThinkingLiveLine("");
+    setThinkingTypingActive(false);
     setThinkingDraft("");
     setThinkingPanelOpen(true);
-    setThinkingIslandExpanded(true);
+    setThinkingIslandExpanded(false);
+    setThinkingStreamPacketCount(0);
+    setThinkingStreamLastPacketAt(0);
     setThinkingWarmConversationId("");
     setThinkingWarmUntil(0);
-  }, [selectedId]);
+    pendingThinkingLogsRef.current = [];
+    thinkingTypingQueueRef.current = [];
+    thinkingAnimationCursorRef.current = 0;
+    clearThinkingTypingTimer();
+  }, [clearThinkingTypingTimer, selectedId]);
+
+  useEffect(() => {
+    if (thinkingLines.length < thinkingAnimationCursorRef.current) {
+      thinkingAnimationCursorRef.current = 0;
+      thinkingTypingQueueRef.current = [];
+      setThinkingRenderedLines([]);
+      setThinkingLiveLine("");
+      setThinkingTypingActive(false);
+      clearThinkingTypingTimer();
+    }
+    if (thinkingLines.length <= thinkingAnimationCursorRef.current) return;
+    const freshLines = thinkingLines.slice(thinkingAnimationCursorRef.current);
+    thinkingAnimationCursorRef.current = thinkingLines.length;
+    if (freshLines.length === 0) return;
+    thinkingTypingQueueRef.current.push(...freshLines);
+    setThinkingTypingActive(true);
+    startThinkingTyping();
+  }, [clearThinkingTypingTimer, startThinkingTyping, thinkingLines]);
 
   useEffect(() => {
     if (!selected?.conversation_id) return;
@@ -356,50 +694,193 @@ export default function ChatPage() {
   }, [clockMs, thinkingWarmUntil]);
 
   useEffect(() => {
-    const ws = new WebSocket(api.logsStreamUrl());
-    ws.onmessage = (evt) => {
-      let payload: { line?: string } | null = null;
-      try {
-        payload = JSON.parse(String(evt.data || "{}"));
-      } catch {
-        payload = null;
-      }
-      const line = String(payload?.line || "");
-      if (!line) return;
+    let disposed = false;
 
-      const trace = traceRef.current;
-      const conversationId = conversationRef.current;
-      if (trace) {
-        if (!line.includes(trace)) return;
-      } else if (conversationId && !line.includes(conversationId)) {
-        return;
-      } else if (!conversationId) {
-        return;
-      }
+    const connect = () => {
+      if (disposed || thinkingWsRef.current) return;
+      setThinkingStreamState("connecting");
+      const ws = new WebSocket(api.logsStreamUrl());
+      thinkingWsRef.current = ws;
 
-      touchThinkingPresence(conversationId, 14000);
-      const parsed = parseThinkingLine(line);
-      if (!parsed) return;
-      setThinkingLines((prev) => {
-        if (prev[prev.length - 1] === parsed) return prev;
-        return [...prev.slice(-80), parsed];
-      });
+      ws.onopen = () => {
+        setThinkingStreamState("open");
+      };
+
+      ws.onmessage = (evt) => {
+        let payload: { line?: string; lines?: string[] } | null = null;
+        try {
+          payload = JSON.parse(String(evt.data || "{}"));
+        } catch {
+          payload = null;
+        }
+        const incoming = Array.isArray(payload?.lines)
+          ? payload.lines.filter((line): line is string => typeof line === "string" && !!line.trim())
+          : [String(payload?.line || "")].filter((line) => !!line.trim());
+        if (incoming.length === 0) return;
+        setThinkingStreamPacketCount((prev) => prev + incoming.length);
+        setThinkingStreamLastPacketAt(Date.now());
+
+        for (const raw of incoming) {
+          const line = String(raw || "").trim();
+          if (!line) continue;
+          const trace = traceRef.current;
+          const conversationId = conversationRef.current;
+          const matchesTrace = !!trace && line.includes(trace);
+          const matchesConversation = !trace && !!conversationId && line.includes(conversationId);
+          const looksAgentLine = /(agent_|queue_|tool_call|tool_result|interrupt)/.test(line);
+          const display = parseThinkingLine(line) || compactThinkingRawLine(line);
+
+          if ((matchesTrace || matchesConversation) && display) {
+            touchThinkingPresence(conversationId, 15000);
+            pushThinkingLine(display);
+            continue;
+          }
+
+          if (!trace && conversationId && thinkingActiveRef.current && looksAgentLine) {
+            pendingThinkingLogsRef.current = [
+              ...pendingThinkingLogsRef.current.slice(-119),
+              { raw: line, at: Date.now() },
+            ];
+          }
+        }
+      };
+
+      ws.onerror = () => {
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onclose = () => {
+        if (thinkingWsRef.current === ws) {
+          thinkingWsRef.current = null;
+        }
+        setThinkingStreamState("closed");
+        if (disposed) return;
+        clearThinkingReconnectTimer();
+        thinkingReconnectTimerRef.current = window.setTimeout(() => {
+          thinkingReconnectTimerRef.current = null;
+          connect();
+        }, 1500);
+      };
     };
+
+    connect();
     return () => {
-      try {
-        ws.close();
-      } catch {
-        // ignore
+      disposed = true;
+      clearThinkingReconnectTimer();
+      if (thinkingWsRef.current) {
+        try {
+          thinkingWsRef.current.close();
+        } catch {
+          // ignore
+        }
+        thinkingWsRef.current = null;
       }
     };
-  }, [touchThinkingPresence]);
+  }, [clearThinkingReconnectTimer, pushThinkingLine, touchThinkingPresence]);
+
+  useEffect(() => {
+    const trace = traceRef.current;
+    const conversationId = conversationRef.current;
+    if (!trace || !conversationId || pendingThinkingLogsRef.current.length === 0) return;
+    const keep: PendingThinkingLog[] = [];
+    for (const item of pendingThinkingLogsRef.current) {
+      if (Date.now() - item.at > 25000) continue;
+      if (!item.raw.includes(trace)) {
+        keep.push(item);
+        continue;
+      }
+      const parsed = parseThinkingLine(item.raw) || compactThinkingRawLine(item.raw);
+      if (!parsed) continue;
+      touchThinkingPresence(conversationId, 15000);
+      pushThinkingLine(parsed);
+    }
+    pendingThinkingLogsRef.current = keep.slice(-120);
+  }, [pushThinkingLine, selectedState?.last_trace_id, selectedState?.latest_trace_id, touchThinkingPresence]);
 
   useEffect(() => {
     if (!thinkingScrollRef.current) return;
     thinkingScrollRef.current.scrollTop = thinkingScrollRef.current.scrollHeight;
-  }, [thinkingLines]);
+  }, [displayedThinkingLines]);
+
+  useEffect(() => () => {
+    clearThinkingTypingTimer();
+  }, [clearThinkingTypingTimer]);
+
+  const agentContextUser = useMemo(() => {
+    const recentPeerMessage = [...messages].reverse().find((item) => !item.is_self);
+    if (recentPeerMessage) {
+      return {
+        userId: String(recentPeerMessage.sender_id || "").trim(),
+        userName: String(recentPeerMessage.sender_name || recentPeerMessage.sender_id || "").trim(),
+        senderRole: String(recentPeerMessage.sender_role || "").trim(),
+      };
+    }
+    if (replyToMessage && !replyToMessage.is_self) {
+      return {
+        userId: String(replyToMessage.sender_id || "").trim(),
+        userName: String(replyToMessage.sender_name || replyToMessage.sender_id || "").trim(),
+        senderRole: String(replyToMessage.sender_role || "").trim(),
+      };
+    }
+    if (selected?.chat_type === "private") {
+      return {
+        userId: String(selected.peer_id || "").trim(),
+        userName: String(selected.peer_name || selected.peer_id || "").trim(),
+        senderRole: "member",
+      };
+    }
+    return {
+      userId: "",
+      userName: "",
+      senderRole: "",
+    };
+  }, [messages, replyToMessage, selected]);
 
   const sendText = async () => {
+    const content = text.trim();
+    if (!selected || !content) return;
+    setSending(true);
+    try {
+      const inFlight = Boolean(thinkingActive || isThinking);
+      touchThinkingPresence(selected.conversation_id, 18000);
+      if (inFlight) {
+        setThinkingLines((prev) => [...prev.slice(-79), `追加需求: ${clip(content, 80)}`]);
+      } else {
+        setThinkingLines((prev) => [...prev.slice(-79), `已交给 AI: ${clip(content, 80)}`]);
+      }
+      await api.sendChatAgentText({
+        chatType: selected.chat_type,
+        peerId: selected.peer_id,
+        text: content,
+        replyToMessageId: replyToMessage?.message_id || undefined,
+        contextUserId: agentContextUser.userId || undefined,
+        contextUserName: agentContextUser.userName || undefined,
+        contextSenderRole: agentContextUser.senderRole || undefined,
+      });
+      setText("");
+      setReplyToMessage(null);
+      setBotRuntimeStatus("online");
+      await Promise.all([
+        loadAgentState({ silent: true }),
+        loadHistory({ silent: true }),
+        loadConversations({ silent: true }),
+      ]);
+      setError(inFlight ? "[OK] 已向当前任务追加需求（不中断）" : "");
+    } catch (e: unknown) {
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
+      setError(e instanceof Error ? e.message : "发送文本失败");
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const sendRawText = async () => {
     const content = text.trim();
     if (!selected || !content) return;
     setSending(true);
@@ -412,11 +893,17 @@ export default function ChatPage() {
       });
       setText("");
       setReplyToMessage(null);
-      await loadHistory();
-      await loadConversations();
-      setError("");
+      setBotRuntimeStatus("online");
+      await Promise.all([
+        loadHistory({ silent: true }),
+        loadConversations({ silent: true }),
+      ]);
+      setError("[OK] 已原样发送文本");
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "发送文本失败");
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
+      setError(e instanceof Error ? e.message : "原样发送文本失败");
     } finally {
       setSending(false);
     }
@@ -438,10 +925,16 @@ export default function ChatPage() {
       setImageBase64("");
       setImageFileName("");
       setImagePreviewUrl("");
-      await loadHistory();
-      await loadConversations();
+      setBotRuntimeStatus("online");
+      await Promise.all([
+        loadHistory({ silent: true }),
+        loadConversations({ silent: true }),
+      ]);
       setError("");
     } catch (e: unknown) {
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
       setError(e instanceof Error ? e.message : "发送图片失败");
     } finally {
       setSending(false);
@@ -504,15 +997,34 @@ export default function ChatPage() {
   const pendingImageSrc = imagePreviewUrl || imageUrl.trim();
   const pendingImageLabel = imageFileName || clip(imageUrl.trim(), 48) || "待发送图片";
 
+  const onMessagesScroll = useCallback(() => {
+    const el = messagesScrollRef.current;
+    if (!el) return;
+    const distanceToBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    const atBottom = distanceToBottom <= 24;
+    autoStickToBottomRef.current = atBottom;
+    setShowScrollToBottom(!atBottom);
+  }, []);
+
+  const scrollToLatest = useCallback(() => {
+    autoStickToBottomRef.current = true;
+    setShowScrollToBottom(false);
+    scrollMessagesToBottom();
+  }, [scrollMessagesToBottom]);
+
   const interruptConversation = async () => {
     if (!selected) return;
     setSending(true);
     try {
       await api.interruptChat(selected.conversation_id);
       setThinkingWarmUntil(0);
+      setBotRuntimeStatus("online");
       await loadAgentState();
       setError("");
     } catch (e: unknown) {
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
       setError(e instanceof Error ? e.message : "中断会话失败");
     } finally {
       setSending(false);
@@ -643,61 +1155,124 @@ export default function ChatPage() {
       touchThinkingPresence(selected.conversation_id, 18000);
       if (isThinking) {
         await api.interruptChat(selected.conversation_id);
+        setThinkingLines((prev) => [...prev.slice(-79), "已中断当前任务，切换到新目标"]);
       }
-      await api.sendChatText({
+      await api.sendChatAgentText({
         chatType: selected.chat_type,
         peerId: selected.peer_id,
         text: goal,
+        contextUserId: agentContextUser.userId || undefined,
+        contextUserName: agentContextUser.userName || undefined,
+        contextSenderRole: agentContextUser.senderRole || undefined,
       });
-      setThinkingLines((prev) => [...prev.slice(-80), `临时改目标: ${clip(goal, 150)}`]);
+      setThinkingLines((prev) => [...prev.slice(-79), `临时改目标: ${clip(goal, 150)}`]);
       setThinkingDraft("");
-      await loadAgentState();
-      await loadHistory();
+      setBotRuntimeStatus("online");
+      await Promise.all([
+        loadAgentState({ silent: true }),
+        loadHistory({ silent: true }),
+      ]);
       setError("[OK] 已发送临时目标");
     } catch (e: unknown) {
+      if (isOneBotUnavailableError(e)) {
+        setBotRuntimeStatus("offline");
+      }
       setError(e instanceof Error ? e.message : "临时改目标失败");
     } finally {
       setRetargeting(false);
     }
   };
 
+  const onMainInputKeyDown = useCallback((evt: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (evt.key === "Escape") {
+      evt.preventDefault();
+      evt.stopPropagation();
+      if (text.trim()) setText("");
+      if (replyToMessage) setReplyToMessage(null);
+      return;
+    }
+    if (evt.key !== "Enter") return;
+    if (evt.nativeEvent.isComposing || evt.repeat) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    if (!selected || sending || !text.trim()) return;
+    if (evt.ctrlKey || evt.metaKey) {
+      void sendText();
+      return;
+    }
+    void sendRawText();
+  }, [replyToMessage, selected, sendRawText, sendText, sending, text]);
+
+  const onRetargetInputKeyDown = useCallback((evt: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (evt.key !== "Enter") return;
+    if (evt.nativeEvent.isComposing || evt.repeat) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    if (retargeting || !thinkingDraft.trim()) return;
+    void retargetConversation();
+  }, [retargetConversation, retargeting, thinkingDraft]);
+
   return (
-    <section className="h-[calc(100vh-96px)] min-h-0 flex flex-col gap-3 overflow-hidden">
-      <div className="flex items-center justify-between gap-2">
+    <section className="h-[calc(100vh-96px)] min-h-0 flex flex-col gap-2 overflow-hidden">
+      <div className="flex items-center justify-between gap-1.5">
         <div className="flex items-center gap-2">
-          <MessageSquare size={20} />
-          <h2 className="text-xl font-bold">聊天控制台</h2>
+          <MessageSquare size={18} />
+          <h2 className="text-lg font-semibold">聊天控制台</h2>
           <Chip size="sm" variant="flat">{conversations.length} 会话</Chip>
         </div>
         <div className="flex items-center gap-2">
-          <Button size="sm" variant="flat" startContent={<RefreshCw size={14} />} onPress={loadConversations} isLoading={loadingConvs}>
+          <Chip size="sm" variant="flat" color={pauseAutoRefresh ? "warning" : "success"}>
+            {refreshPausedHint}
+          </Chip>
+          <Button
+            size="sm"
+            variant={pauseAutoRefresh ? "solid" : "flat"}
+            color={pauseAutoRefresh ? "warning" : "default"}
+            startContent={pauseAutoRefresh ? <Play size={14} /> : <Pause size={14} />}
+            onPress={() => setPauseAutoRefresh((prev) => !prev)}
+          >
+            {pauseAutoRefresh ? "恢复自动刷新" : "暂停自动刷新"}
+          </Button>
+          <Button size="sm" variant="flat" startContent={<RefreshCw size={14} />} onPress={() => { void loadConversations(); }} isLoading={loadingConvs}>
             刷新会话
           </Button>
-          <Button size="sm" variant="flat" startContent={<RefreshCw size={14} />} onPress={loadHistory} isLoading={loadingHistory} isDisabled={!selected}>
+          <Button size="sm" variant="flat" startContent={<RefreshCw size={14} />} onPress={() => { void loadHistory(); }} isLoading={loadingHistory} isDisabled={!selected}>
             刷新消息
           </Button>
-          <Button size="sm" variant="flat" startContent={<RefreshCw size={14} />} onPress={loadAgentState} isLoading={loadingState}>
+          <Button size="sm" variant="flat" startContent={<RefreshCw size={14} />} onPress={() => { void loadAgentState(); }} isLoading={loadingState}>
             刷新状态
           </Button>
         </div>
       </div>
 
       {error && (
-        <p className={`${error.startsWith("[OK]") ? "text-success" : "text-danger"} text-sm whitespace-pre-wrap`}>
-          {error.replace(/^\[OK\]\s*/, "")}
-        </p>
+        <div className="rounded-lg border border-default-300/35 bg-content2/30 px-3 py-2 flex items-start justify-between gap-3">
+          <p className={`${error.startsWith("[OK]") ? "text-success" : "text-danger"} text-sm whitespace-pre-wrap`}>
+            {error.replace(/^\[OK\]\s*/, "")}
+          </p>
+          <Button size="sm" variant="light" isIconOnly onPress={() => setError("")}>
+            <X size={14} />
+          </Button>
+        </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-[320px_minmax(0,1fr)] gap-3 flex-1 min-h-0">
+      <div className="grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-2 flex-1 min-h-0">
         <Card className="h-full overflow-hidden">
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between w-full">
               <span className="text-sm font-semibold">会话列表</span>
               {loadingConvs && <Spinner size="sm" />}
             </div>
+            <Input
+              size="sm"
+              placeholder="搜索会话（名称/ID/内容）"
+              value={conversationKeyword}
+              onValueChange={setConversationKeyword}
+              classNames={INPUT_CLASSES}
+            />
           </CardHeader>
           <CardBody className="pt-1 overflow-auto space-y-2">
-            {conversations.map((item) => {
+            {filteredConversations.map((item) => {
               const active = selectedId === item.conversation_id;
               return (
                 <button
@@ -724,10 +1299,13 @@ export default function ChatPage() {
               );
             })}
             {conversations.length === 0 && <p className="text-default-400 text-sm">暂无最近会话</p>}
+            {conversations.length > 0 && filteredConversations.length === 0 && (
+              <p className="text-default-400 text-sm">没有匹配会话，试试更短关键词。</p>
+            )}
           </CardBody>
         </Card>
 
-        <div className="grid grid-rows-[auto_minmax(0,1fr)_auto] gap-3 h-full min-h-0">
+        <div className="grid grid-rows-[auto_minmax(0,1fr)_auto] gap-2 h-full min-h-0">
           <Card>
             <CardBody className="py-3">
               <div className="flex flex-wrap items-center gap-2 justify-between">
@@ -742,6 +1320,9 @@ export default function ChatPage() {
                   )}
                 </div>
                 <div className="flex items-center gap-2">
+                  <Chip size="sm" variant="flat" color={botRuntimeStatus === "online" ? "success" : "warning"}>
+                    Bot: {botRuntimeStatus === "online" ? "在线" : "重连中"}
+                  </Chip>
                   <Chip size="sm" variant="flat" color={selectedState && selectedState.pending_count > 0 ? "warning" : "success"}>
                     队列: {selectedState?.pending_count ?? 0}
                   </Chip>
@@ -781,7 +1362,11 @@ export default function ChatPage() {
           </Card>
 
           <Card className="h-full min-h-0 overflow-hidden relative">
-            <CardBody ref={messagesScrollRef} className="min-h-0 overflow-auto space-y-2">
+            <CardBody
+              ref={messagesScrollRef}
+              className="min-h-0 overflow-auto space-y-1.5"
+              onScroll={onMessagesScroll}
+            >
               {loadingHistory && <Spinner size="sm" />}
               {!loadingHistory && messages.length === 0 && (
                 <p className="text-default-400 text-sm">暂无聊天记录</p>
@@ -821,6 +1406,20 @@ export default function ChatPage() {
                 </div>
               ))}
             </CardBody>
+            {showScrollToBottom && (
+              <div className="pointer-events-none absolute bottom-3 right-3 z-30">
+                <Button
+                  size="sm"
+                  color="primary"
+                  variant="shadow"
+                  className="pointer-events-auto"
+                  startContent={<ChevronDown size={14} />}
+                  onPress={scrollToLatest}
+                >
+                  回到底部
+                </Button>
+              </div>
+            )}
             <AnimatePresence>
               {thinkingIslandVisible && (
                 <motion.div
@@ -828,35 +1427,109 @@ export default function ChatPage() {
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: -12, scale: 0.98 }}
                   transition={{ type: "spring", stiffness: 320, damping: 28 }}
-                  className="pointer-events-none absolute inset-x-0 top-3 z-20 flex justify-center px-3"
+                  className="pointer-events-none fixed inset-x-0 top-3 z-[90] flex justify-center px-3"
                 >
-                  <div className="pointer-events-auto w-[min(640px,100%)] overflow-hidden rounded-[28px] border border-white/10 bg-[radial-gradient(circle_at_top,rgba(92,145,255,0.32),rgba(15,23,42,0.96)_48%,rgba(2,6,23,0.98)_100%)] shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur-2xl">
-                    <div className="flex items-start gap-3 px-4 py-3">
-                      <div className="mt-0.5 flex h-11 w-11 shrink-0 items-center justify-center rounded-full bg-white/8 ring-1 ring-white/10">
-                        <BrainCircuit size={18} className={`${thinkingActive ? "text-sky-200" : "text-emerald-200"}`} />
-                      </div>
-                      <div className="min-w-0 flex-1">
+                  <motion.div
+                    drag
+                    dragControls={thinkingDragControls}
+                    dragListener={false}
+                    dragMomentum={false}
+                    dragElastic={0.08}
+                    style={{
+                      x: thinkingIslandOffset.x,
+                      y: thinkingIslandOffset.y,
+                      width: THINKING_ISLAND_SIZE_WIDTH[thinkingIslandSize],
+                    }}
+                    whileDrag={{ scale: 1.015 }}
+                    onDragStart={() => {
+                      thinkingIslandDragOriginRef.current = thinkingIslandOffset;
+                    }}
+                    onDragEnd={(_, info) => {
+                      setThinkingIslandOffset(clampThinkingIslandOffset({
+                        x: thinkingIslandDragOriginRef.current.x + info.offset.x,
+                        y: thinkingIslandDragOriginRef.current.y + info.offset.y,
+                      }));
+                    }}
+                    className="pointer-events-auto overflow-hidden rounded-xl border border-primary/20 bg-content1/95 shadow-md backdrop-blur"
+                  >
+                    <div className="flex items-start gap-2 px-3 py-2">
+                      <div
+                        className="flex min-w-0 flex-1 cursor-grab items-start gap-3 active:cursor-grabbing select-none touch-none"
+                        onPointerDown={beginThinkingIslandDrag}
+                        onDoubleClick={() => setThinkingIslandOffset({ x: 0, y: 0 })}
+                      >
+                        <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 ring-1 ring-primary/20">
+                          <BrainCircuit size={16} className={`${thinkingActive ? "text-primary" : "text-success"}`} />
+                        </div>
+                        <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-sm font-semibold text-white">YuKiKo Thinking</span>
+                          <span className="text-sm font-semibold text-default-800">YuKiKo Thinking</span>
                           <Chip size="sm" variant="flat" color={thinkingActive ? "primary" : "success"}>
                             {thinkingStatusLabel(thinkingActive)}
                           </Chip>
                           <Chip size="sm" variant="flat">
                             {thinkingLines.length} 条
                           </Chip>
+                          <Chip size="sm" variant="flat" color={thinkingStreamState === "open" ? "success" : thinkingStreamState === "connecting" ? "warning" : "default"}>
+                            {thinkingStreamLabel(thinkingStreamState)}
+                          </Chip>
+                          <Chip size="sm" variant="flat">
+                            流包 {thinkingStreamPacketCount}
+                          </Chip>
+                          <Chip size="sm" variant="flat">
+                            尺寸 {thinkingIslandSize.toUpperCase()}
+                          </Chip>
                         </div>
-                        <div className="mt-1 flex items-center gap-1.5 text-[11px] text-sky-100/80">
-                          <span className="h-1.5 w-1.5 rounded-full bg-sky-300 animate-pulse" />
+                        <div className="mt-1 flex items-center gap-1.5 text-[11px] text-default-600">
+                          <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
                           <span className="truncate">{latestThinkingLine}</span>
+                          {thinkingTypingActive && (
+                            <motion.span
+                              aria-hidden="true"
+                              animate={{ opacity: [0.22, 1, 0.22] }}
+                              transition={{ duration: 0.9, repeat: Infinity, ease: "easeInOut" }}
+                              className="inline-block h-3 w-[3px] rounded-full bg-primary/70"
+                            />
+                          )}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-default-500">
+                          拖动标题栏可移动，双击可回中。当前 trace: {selectedState?.last_trace_id || selectedState?.latest_trace_id || "等待分配"}
+                        </div>
+                        <div className="mt-0.5 text-[10px] text-default-500">
+                          最近流包时间: {lastStreamPacketLabel}
+                        </div>
+                        <div className="text-[10px] text-default-400">
+                          live animated replay over task logs
+                        </div>
                         </div>
                       </div>
-                      <div className="flex items-center gap-1">
+                      <div className="flex items-center gap-1" onPointerDown={(evt) => evt.stopPropagation()}>
+                        <Button
+                          size="sm"
+                          variant="light"
+                          isIconOnly
+                          onPress={shrinkThinkingIsland}
+                          className="text-default-600"
+                          isDisabled={thinkingIslandSize === "sm"}
+                        >
+                          <Minus size={13} />
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="light"
+                          isIconOnly
+                          onPress={growThinkingIsland}
+                          className="text-default-600"
+                          isDisabled={thinkingIslandSize === "lg"}
+                        >
+                          <Plus size={13} />
+                        </Button>
                         <Button
                           size="sm"
                           variant="light"
                           isIconOnly
                           onPress={() => setThinkingIslandExpanded((prev) => !prev)}
-                          className="text-white/85"
+                          className="text-default-600"
                         >
                           {thinkingIslandExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
                         </Button>
@@ -865,7 +1538,7 @@ export default function ChatPage() {
                           variant="light"
                           isIconOnly
                           onPress={() => setThinkingPanelOpen(false)}
-                          className="text-white/85"
+                          className="text-default-600"
                         >
                           <X size={14} />
                         </Button>
@@ -878,11 +1551,14 @@ export default function ChatPage() {
                           animate={{ height: "auto", opacity: 1 }}
                           exit={{ height: 0, opacity: 0 }}
                           transition={{ duration: 0.18 }}
-                          className="overflow-hidden border-t border-white/10"
+                          className="overflow-hidden border-t border-default-200"
                         >
-                          <div ref={thinkingScrollRef} className="max-h-48 space-y-2 overflow-auto px-4 py-3">
+                          <div
+                            ref={thinkingScrollRef}
+                            className={`${THINKING_ISLAND_PREVIEW_HEIGHT_CLASS[thinkingIslandSize]} space-y-1.5 overflow-auto px-3 py-2`}
+                          >
                             {thinkingPreviewLines.length === 0 && (
-                              <p className="text-xs text-sky-100/70">已接入会话，等待更具体的思考流。</p>
+                              <p className="text-xs text-default-500">已接入会话，等待更具体的思考流。</p>
                             )}
                             {thinkingPreviewLines.map((line, idx) => (
                               <motion.div
@@ -890,19 +1566,28 @@ export default function ChatPage() {
                                 initial={{ opacity: 0, y: 4 }}
                                 animate={{ opacity: 1, y: 0 }}
                                 transition={{ duration: 0.14 }}
-                                className="rounded-2xl border border-white/8 bg-white/6 px-3 py-2 text-xs text-slate-100"
+                                className="rounded-2xl border border-default-200 bg-content2/80 px-3 py-2 text-xs text-default-700"
                               >
-                                {line}
+                                <span>{line}</span>
+                                {thinkingTypingActive && idx === thinkingPreviewLines.length - 1 && line === latestThinkingLine && (
+                                  <motion.span
+                                    aria-hidden="true"
+                                    animate={{ opacity: [0.22, 1, 0.22] }}
+                                    transition={{ duration: 0.9, repeat: Infinity, ease: "easeInOut" }}
+                                    className="ml-1 inline-block h-3 w-[3px] rounded-full bg-primary/70 align-middle"
+                                  />
+                                )}
                               </motion.div>
                             ))}
                           </div>
-                          <div className="space-y-2 px-4 pb-4">
+                          <div className="space-y-2 px-3 pb-3">
                             <Textarea
                               label="临时改目标"
                               labelPlacement="outside"
-                              minRows={2}
+                              minRows={1}
                               value={thinkingDraft}
                               onValueChange={setThinkingDraft}
+                              onKeyDown={onRetargetInputKeyDown}
                               placeholder="比如：先别继续搜图，先给我3个候选并说明理由"
                               classNames={INPUT_CLASSES}
                             />
@@ -924,21 +1609,21 @@ export default function ChatPage() {
                                 isDisabled={!thinkingDraft.trim() || retargeting}
                                 isLoading={retargeting}
                               >
-                                发送临时目标
+                                强制改目标
                               </Button>
                             </div>
                           </div>
                         </motion.div>
                       )}
                     </AnimatePresence>
-                  </div>
+                  </motion.div>
                 </motion.div>
               )}
             </AnimatePresence>
           </Card>
 
-          <Card>
-            <CardBody className="space-y-2">
+          <Card className="border border-primary/15 bg-content1">
+            <CardBody className="space-y-2.5">
               {replyToMessage && (
                 <div className="rounded-lg border border-primary/35 bg-primary/10 px-3 py-2 flex items-start justify-between gap-3">
                   <div className="text-xs min-w-0">
@@ -957,14 +1642,30 @@ export default function ChatPage() {
                   </Button>
                 </div>
               )}
+              {selected && (
+                <div className={`rounded-lg border px-3 py-2 text-xs ${
+                  thinkingActive
+                    ? "border-warning/35 bg-warning/10 text-warning-700"
+                    : "border-primary/30 bg-primary/10 text-primary-700"
+                }`}>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Chip size="sm" variant="flat" color={thinkingActive ? "warning" : "primary"}>
+                      {thinkingActive ? "处理中途沟通模式" : "普通提问模式"}
+                    </Chip>
+                    <span>Enter 原样发送 · Ctrl+Enter 交给AI · Esc 清空输入</span>
+                    {thinkingActive && <span>“交给AI”会追加需求，不中断；要改方向请点“取消当前任务”</span>}
+                  </div>
+                </div>
+              )}
               <Textarea
-                label="发送文本"
+                label="对 AI 说"
                 labelPlacement="outside"
-                minRows={2}
+                minRows={1}
                 value={text}
                 onValueChange={setText}
                 onPaste={onTextPaste}
-                placeholder={selected ? "输入要发送到当前会话的文字..." : "请先选择会话"}
+                onKeyDown={onMainInputKeyDown}
+                placeholder={selected ? "输入要交给 AI 处理的话，它会按当前会话上下文继续完成..." : "请先选择会话"}
                 isDisabled={!selected || sending}
                 classNames={INPUT_CLASSES}
               />
@@ -972,11 +1673,18 @@ export default function ChatPage() {
                 <Button
                   color="primary"
                   startContent={<SendHorizontal size={14} />}
-                  onPress={sendText}
+                  onPress={sendRawText}
                   isDisabled={!selected || !text.trim() || sending}
                   isLoading={sending}
                 >
-                  发送文本
+                  原样发送
+                </Button>
+                <Button
+                  variant="flat"
+                  onPress={sendText}
+                  isDisabled={!selected || !text.trim() || sending}
+                >
+                  交给AI
                 </Button>
                 <Input
                   className="flex-1"
