@@ -1,8 +1,10 @@
 ﻿from __future__ import annotations
 
 import io
+import contextlib
 import logging
 import os
+import socket
 import sys
 
 # Windows GBK 环境下强制 UTF-8，防止中文日志/消息变成 ????
@@ -33,8 +35,30 @@ def _disable_uvicorn_access_log() -> None:
     logging.getLogger("uvicorn.access").propagate = False
 
 
+def _log_onebot_reverse_ws_hint() -> None:
+    """启动时打印 OneBot 反向 WS 地址提示，便于排查 NapCat 连接拒绝。"""
+    host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
+    port_raw = os.environ.get("PORT", "8081").strip() or "8081"
+    try:
+        port = int(port_raw)
+    except Exception:
+        port = 8081
+    ws_path = "/onebot/v11/ws"
+    show_host = host
+    if host in {"0.0.0.0", "::"}:
+        show_host = "127.0.0.1"
+    print(f"[INFO] OneBot Reverse WS: ws://{show_host}:{port}{ws_path}")
+    if host in {"0.0.0.0", "::"}:
+        lan_ip = ""
+        with contextlib.suppress(Exception):
+            lan_ip = socket.gethostbyname(socket.gethostname())
+        if lan_ip and lan_ip not in {"127.0.0.1", "0.0.0.0"}:
+            print(f"[INFO] Cross-host NapCat use: ws://{lan_ip}:{port}{ws_path}")
+
+
 _load_env_files()
 _disable_uvicorn_access_log()
+_log_onebot_reverse_ws_hint()
 
 # 首次运行向导：
 #   config.yml 不存在 → 启动 WebUI 配置页面

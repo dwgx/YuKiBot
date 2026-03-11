@@ -48,6 +48,9 @@ router = APIRouter(prefix="/api/webui", tags=["webui"])
 _engine: Any = None
 _start_time: float = time.time()
 _LOG_SPLIT_RE = re.compile(r'(?=(?:\d{4}-\d{2}-\d{2}|(?<!\d{4}-)\d{2}-\d{2}) \d{2}:\d{2}:\d{2} (?:\||\[))')
+_GROUP_ROLE_CACHE: dict[str, tuple[float, str]] = {}
+_GROUP_ROLE_CACHE_OK_TTL_SECONDS = 30
+_GROUP_ROLE_CACHE_MISS_TTL_SECONDS = 300
 _SENSITIVE_PATHS = frozenset({
     "api.api_key",
     "api.openai_key",
@@ -1429,9 +1432,21 @@ def _format_chat_message_item(item: dict[str, Any], *, bot_self_id: str) -> dict
 
 async def _resolve_group_bot_role(group_id: int, *, bot_id: str = "") -> str:
     """查询当前机器人在群内的角色（owner/admin/member）。"""
+    if group_id <= 0:
+        return ""
+
+    cache_key = f"{normalize_text(bot_id) or '-'}:{int(group_id)}"
+    cached = _GROUP_ROLE_CACHE.get(cache_key)
+    if cached:
+        expires_at, cached_role = cached
+        if time.time() < float(expires_at):
+            return cached_role
+        _GROUP_ROLE_CACHE.pop(cache_key, None)
+
     bot = await _get_onebot_runtime(bot_id=bot_id)
     self_id = normalize_text(str(getattr(bot, "self_id", "")))
     if not self_id.isdigit():
+        _GROUP_ROLE_CACHE[cache_key] = (time.time() + 60, "")
         return ""
     try:
         info = await _onebot_call(
@@ -1441,11 +1456,24 @@ async def _resolve_group_bot_role(group_id: int, *, bot_id: str = "") -> str:
             user_id=int(self_id),
             no_cache=True,
         )
-    except Exception:
+    except Exception as exc:
+        err_text = normalize_text(str(exc))
+        err_lower = err_text.lower()
+        miss_ttl = 60
+        if ("成员" in err_text and "不存在" in err_text) or (
+            "member" in err_lower and ("not exists" in err_lower or "not exist" in err_lower or "not found" in err_lower)
+        ):
+            # 机器人不在群里时，前端轮询会频繁命中该接口；加长负缓存避免刷屏日志。
+            miss_ttl = _GROUP_ROLE_CACHE_MISS_TTL_SECONDS
+        _GROUP_ROLE_CACHE[cache_key] = (time.time() + miss_ttl, "")
         return ""
     if not isinstance(info, dict):
+        _GROUP_ROLE_CACHE[cache_key] = (time.time() + 60, "")
         return ""
-    return normalize_text(str(info.get("role", ""))).lower()
+    role = normalize_text(str(info.get("role", ""))).lower()
+    ttl = _GROUP_ROLE_CACHE_OK_TTL_SECONDS if role else 60
+    _GROUP_ROLE_CACHE[cache_key] = (time.time() + ttl, role)
+    return role
 
 
 async def _resolve_group_essence_message_ids(group_id: int, *, bot_id: str = "") -> set[str]:

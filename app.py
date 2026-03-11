@@ -48,6 +48,7 @@ _log = logging.getLogger("yukiko.app")
 _GROUP_SEND_BLOCK_UNTIL: dict[int, datetime] = {}
 _GROUP_SEND_BLOCK_REASON: dict[int, str] = {}
 _GROUP_SEND_BLOCK_DEFAULT_SECONDS = 180
+_GROUP_MEMBER_PROBE_SKIP_UNTIL: dict[int, datetime] = {}
 _BOT_SEND_SUSPEND_UNTIL: dict[str, datetime] = {}
 _BOT_SEND_SUSPEND_REASON: dict[str, str] = {}
 _BOT_ONLINE_STATE: dict[str, bool] = {}
@@ -177,6 +178,36 @@ def _mark_group_send_block(group_id: int, until: datetime, reason: str) -> None:
         group_id,
         until.astimezone(timezone.utc).isoformat(),
         reason,
+    )
+
+
+def _should_skip_group_member_probe(group_id: int) -> bool:
+    if group_id <= 0:
+        return False
+    until = _GROUP_MEMBER_PROBE_SKIP_UNTIL.get(group_id)
+    if not isinstance(until, datetime):
+        return False
+    now = datetime.now(timezone.utc)
+    if now >= until:
+        _GROUP_MEMBER_PROBE_SKIP_UNTIL.pop(group_id, None)
+        return False
+    return True
+
+
+def _mark_group_member_probe_skip(group_id: int, *, seconds: int = 900, reason: str = "") -> None:
+    if group_id <= 0:
+        return
+    now = datetime.now(timezone.utc)
+    until = now + timedelta(seconds=max(30, int(seconds)))
+    prev = _GROUP_MEMBER_PROBE_SKIP_UNTIL.get(group_id)
+    if isinstance(prev, datetime) and prev > until:
+        until = prev
+    _GROUP_MEMBER_PROBE_SKIP_UNTIL[group_id] = until
+    _log.info(
+        "group_member_probe_skip_set | group=%s | until=%s | reason=%s",
+        group_id,
+        until.astimezone(timezone.utc).isoformat(),
+        normalize_text(reason) or "-",
     )
 
 
@@ -318,12 +349,15 @@ async def _maybe_block_group_send_on_error(bot: Bot, event: MessageEvent, exc: E
     # 尝试读取机器人在该群的禁言结束时间，尽量给出精确停发窗口。
     try:
         if not is_rate_limited:
-            info = await bot.call_api(
-                "get_group_member_info",
-                group_id=group_id,
-                user_id=int(bot.self_id),
-                no_cache=True,
-            )
+            if _should_skip_group_member_probe(group_id):
+                info = {}
+            else:
+                info = await bot.call_api(
+                    "get_group_member_info",
+                    group_id=group_id,
+                    user_id=int(bot.self_id),
+                    no_cache=True,
+                )
         else:
             info = {}
         payload: dict[str, Any] = {}
@@ -345,6 +379,13 @@ async def _maybe_block_group_send_on_error(bot: Bot, event: MessageEvent, exc: E
                 until = datetime.fromtimestamp(shut_ts, timezone.utc)
                 reason = f"group_member_muted_until:{shut_ts}"
     except Exception as probe_exc:
+        probe_text = normalize_text(str(probe_exc))
+        probe_lower = probe_text.lower()
+        if ("成员" in probe_text and "不存在" in probe_text) or (
+            "member" in probe_lower and ("not exists" in probe_lower or "not exist" in probe_lower or "not found" in probe_lower)
+        ):
+            # 机器人不在群里时，停止短期内重复探测，避免持续触发 NapCat 错误日志。
+            _mark_group_member_probe_skip(group_id, reason="member_not_found")
         _log.debug("group_send_block_probe_fail | group=%s | %s", group_id, probe_exc)
 
     _mark_group_send_block(group_id=group_id, until=until, reason=reason)
