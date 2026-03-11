@@ -36,7 +36,7 @@ from utils.intent import (
     looks_like_repo_readme_request as _shared_repo_readme_request,
     looks_like_video_request as _shared_video_request,
 )
-from utils.text import clip_text, normalize_text
+from utils.text import clip_text, normalize_matching_text, normalize_text
 
 try:
     from yt_dlp import YoutubeDL
@@ -4724,13 +4724,17 @@ class ToolExecutor:
         content = normalize_text(text)
         if not content:
             return True
-        weak_cues = (
-            "这张图我这次没法稳定识别完整内容",
-            "这张图识别到了部分内容，但结果不够稳定",
-            "请发更清晰的图片",
-            "结果不够稳定",
+        plain = re.sub(r"\s+", "", content).lower()
+        explicit_markers = (
+            "???",
+            "n/a",
+            "unknown",
+            "无法识别???",
+            "识别失败???",
         )
-        return any(cue in content for cue in weak_cues)
+        if any(marker in plain for marker in explicit_markers):
+            return True
+        return False
 
     @staticmethod
     def _candidate_openai_bases(base_url: str, prefer_v1: bool) -> list[str]:
@@ -5132,34 +5136,28 @@ class ToolExecutor:
         if not content:
             return False
         plain = re.sub(r"\s+", "", content)
-        cues = (
-            "不需要本地下载发我",
-            "不需要下载发我",
-            "不用下载发我",
-            "不要发视频",
-            "不用发我",
-            "不需要发我",
-            "只要总结",
-            "只总结",
-            "只要文字总结",
-            "只要文本总结",
-            "只需要总结",
-            "不需要本地下載發我",
-            "不需要下載發我",
-            "不用下載發我",
-            "不要發視頻",
-            "只要文字總結",
-            "只需要總結",
+        explicit_tokens = (
+            "output=text",
+            "format=text",
+            "response=text",
+            "mode=text",
+            "text_only=1",
+            "textonly=1",
+            "only_text=1",
+            "onlytext=1",
+            "/summary",
+            "/text",
+            "--text-only",
         )
-        if any(cue in plain for cue in cues):
+        if any(token in plain for token in explicit_tokens):
             return True
-        patterns = (
-            r"不(?:需要|用|要)?(?:本地)?(?:下载|下載).{0,8}(?:发我|發我|给我|給我|发送|發送)",
-            r"(?:不要|别|別|不需要|不用).{0,4}(?:发|發|发送|發送).{0,4}(?:视频|視頻|影片)",
-            r"(?:只要|只需|仅要|僅要|仅需|僅需).{0,4}(?:文字|文本|总结|總結|结论|結論)",
-            r"(?:只总结|只總結|仅总结|僅總結)",
+        explicit_patterns = (
+            r"(?:^|\s)/(?:summary|text)(?:\s|$)",
+            r"(?:^|\s)output\s*=\s*text(?:\s|$)",
+            r"(?:^|\s)format\s*=\s*text(?:\s|$)",
+            r"(?:^|\s)mode\s*=\s*text(?:\s|$)",
         )
-        return any(re.search(pattern, content) for pattern in patterns)
+        return any(re.search(pattern, content) for pattern in explicit_patterns)
 
     def _compose_video_result_text(
         self,
@@ -5605,18 +5603,32 @@ class ToolExecutor:
             return []
         lower = content.lower()
         out: list[str] = []
+        plain = re.sub(r"\s+", "", lower)
 
-        # 优先按用户提及平台
-        if ("b站" in content) or ("bilibili" in lower) or ("哔哩哔哩" in content):
+        # 只在显式参数中收窄平台，避免把普通描述词当成强约束。
+        explicit_platform = ""
+        m = re.search(r"(?:^|\s)platform\s*=\s*(bilibili|douyin|kuaishou|acfun)(?:\s|$)", lower)
+        if m:
+            explicit_platform = normalize_text(m.group(1)).lower()
+        elif "site:douyin.com" in plain:
+            explicit_platform = "douyin"
+        elif "site:bilibili.com" in plain:
+            explicit_platform = "bilibili"
+        elif "site:kuaishou.com" in plain:
+            explicit_platform = "kuaishou"
+        elif "site:acfun.cn" in plain:
+            explicit_platform = "acfun"
+
+        if explicit_platform == "bilibili":
             out.append(f"{content} site:bilibili.com/video")
-        if ("抖音" in content) or ("douyin" in lower):
+        elif explicit_platform == "douyin":
             out.append(f"{content} site:douyin.com/video")
-        if ("快手" in content) or ("kuaishou" in lower):
+        elif explicit_platform == "kuaishou":
             out.append(f"{content} site:kuaishou.com/short-video")
-        if ("acfun" in lower) or ("a站" in content) or ("ac娘" in content):
+        elif explicit_platform == "acfun":
             out.append(f"{content} site:acfun.cn/v/ac")
 
-        # 未指定平台时给一组通用详情页搜索
+        # 未显式指定平台时给一组通用详情页搜索
         if not out:
             out.extend(
                 [
@@ -5669,38 +5681,77 @@ class ToolExecutor:
     # ── 音乐搜索 & 播放 ──────────────────────────────────────────────
 
     async def _music_search(self, tool_args: dict[str, Any], message_text: str) -> ToolResult:
-        keyword = normalize_text(str(tool_args.get("keyword", "")))
-        title = normalize_text(str(tool_args.get("title", "")))
-        artist = normalize_text(str(tool_args.get("artist", "")))
+        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        title = normalize_matching_text(str(tool_args.get("title", "")))
+        artist = normalize_matching_text(str(tool_args.get("artist", "")))
         if not keyword and title:
             keyword = f"{title} {artist}".strip()
         if not keyword:
-            keyword = normalize_text(message_text)
+            keyword = normalize_matching_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
         # 去掉常见前缀
-        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
+        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱", "/music", "/song"):
             if keyword.startswith(prefix):
                 keyword = keyword[len(prefix):].strip()
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
 
-        results = await self._music_engine.search(keyword, limit=5)
+        results = await self._music_engine.search(keyword, limit=5, title=title, artist=artist)
         if not results:
             return ToolResult(
                 ok=False, tool_name="music_search",
                 payload={"text": f"没找到「{keyword}」相关的歌曲。"},
                 error="no_results",
             )
-        lines = [f"🎵 搜索「{keyword}」找到 {len(results)} 首歌："]
-        for i, s in enumerate(results, 1):
+
+        filtered_results = results
+        if title:
+            intent = self._music_engine._build_keyword_intent(keyword=keyword, title=title, artist=artist)
+            exact: list[MusicSearchResult] = []
+            title_hits: list[MusicSearchResult] = []
+            for row in results:
+                if self._music_engine._title_match_level(intent.title_hint, row.name) < 2:
+                    continue
+                if self._music_engine._should_avoid_version(row.name, intent.title_hint):
+                    continue
+                title_hits.append(row)
+                if artist and not self._music_engine._artist_matches_intent(row.artist, intent):
+                    continue
+                exact.append(row)
+
+            if exact:
+                filtered_results = exact
+            else:
+                if artist and title_hits:
+                    return ToolResult(
+                        ok=False,
+                        tool_name="music_search",
+                        payload={
+                            "text": f"找到同名候选，但和歌手「{artist}」不一致，不能直接替你播。",
+                            "results": [],
+                        },
+                        error="artist_mismatch",
+                    )
+                return ToolResult(
+                    ok=False,
+                    tool_name="music_search",
+                    payload={
+                        "text": f"没找到和《{title}》明确匹配的歌曲，近似名称不能直接当成同一首播。",
+                        "results": [],
+                    },
+                    error="no_exact_match",
+                )
+
+        lines = [f"🎵 搜索「{keyword}」找到 {len(filtered_results)} 首歌："]
+        for i, s in enumerate(filtered_results, 1):
             dur = f" ({s.duration_ms // 1000 // 60}:{s.duration_ms // 1000 % 60:02d})" if s.duration_ms else ""
             lines.append(f"{i}. {s.name} - {s.artist}{dur}")
         lines.append("\n发送「点歌 歌名」可以直接播放。")
         return ToolResult(
             ok=True, tool_name="music_search",
             payload={"text": "\n".join(lines), "results": [
-                {"id": s.song_id, "name": s.name, "artist": s.artist} for s in results
+                {"id": s.song_id, "name": s.name, "artist": s.artist} for s in filtered_results
             ]},
         )
 
@@ -5713,8 +5764,31 @@ class ToolExecutor:
             return ToolResult(ok=False, tool_name="music_play_by_id", error="invalid_song_id")
 
         # 从 tool_args 获取歌曲信息
-        song_name = normalize_text(str(tool_args.get("song_name", "")))
-        artist = normalize_text(str(tool_args.get("artist", "")))
+        song_name = normalize_matching_text(str(tool_args.get("song_name", "")))
+        artist = normalize_matching_text(str(tool_args.get("artist", "")))
+        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        require_checker = getattr(self._music_engine, "_requires_verified_original", None)
+        if callable(require_checker):
+            require_verified_original = bool(require_checker(keyword))
+        else:
+            require_verified_original = bool(MusicEngine._requires_verified_original(keyword))
+
+        matched_row: MusicSearchResult | None = None
+        if keyword or song_name:
+            query = keyword or f"{song_name} {artist}".strip()
+            try:
+                candidates = await self._music_engine.search(query, limit=12, title=song_name, artist=artist)
+            except Exception:
+                candidates = []
+            for row in candidates:
+                if int(getattr(row, "song_id", 0) or 0) != song_id:
+                    continue
+                matched_row = row
+                if normalize_text(getattr(row, "name", "")):
+                    song_name = normalize_matching_text(str(row.name))
+                if normalize_text(getattr(row, "artist", "")):
+                    artist = normalize_matching_text(str(row.artist))
+                break
 
         # 直接根据 ID 播放
         from core.music import MusicSearchResult
@@ -5726,7 +5800,18 @@ class ToolExecutor:
             duration_ms=0,
             source="netease",
         )
-        result = await self._music_engine._play_song(song, as_voice=True)
+        if matched_row is not None:
+            song.name = normalize_text(str(getattr(matched_row, "name", song.name))) or song.name
+            song.artist = normalize_text(str(getattr(matched_row, "artist", song.artist))) or song.artist
+            song.duration_ms = int(getattr(matched_row, "duration_ms", 0) or 0)
+            song.source = normalize_text(str(getattr(matched_row, "source", song.source))) or song.source
+            song.source_url = normalize_text(str(getattr(matched_row, "source_url", "")))
+
+        result = await self._music_engine._play_song(
+            song,
+            as_voice=True,
+            require_verified_original=require_verified_original,
+        )
 
         if not result.ok:
             return ToolResult(
@@ -5753,22 +5838,22 @@ class ToolExecutor:
         self, tool_args: dict[str, Any], message_text: str,
         api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
     ) -> ToolResult:
-        keyword = normalize_text(str(tool_args.get("keyword", "")))
-        title = normalize_text(str(tool_args.get("title", "")))
-        artist = normalize_text(str(tool_args.get("artist", "")))
+        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        title = normalize_matching_text(str(tool_args.get("title", "")))
+        artist = normalize_matching_text(str(tool_args.get("artist", "")))
         if not keyword and title:
             keyword = f"{title} {artist}".strip()
         if not keyword:
-            keyword = normalize_text(message_text)
+            keyword = normalize_matching_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
-        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
+        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱", "/music", "/song"):
             if keyword.startswith(prefix):
                 keyword = keyword[len(prefix):].strip()
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
 
-        result = await self._music_engine.play(keyword, as_voice=True)
+        result = await self._music_engine.play(keyword, as_voice=True, title=title, artist=artist)
         if not result.ok:
             return ToolResult(
                 ok=False, tool_name="music_play",
@@ -8093,16 +8178,32 @@ class ToolExecutor:
         return normalize_text(content)
 
     def _looks_like_github_request(self, text: str) -> bool:
-        return _shared_github_request(text, config=self._raw_config)
+        content = normalize_text(text)
+        if not content:
+            return False
+        if _shared_github_request(content, config=self._raw_config):
+            return True
+        return bool(re.search(r"https?://(?:www\.)?github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", content, flags=re.IGNORECASE))
 
     def _looks_like_repo_readme_request(self, text: str) -> bool:
-        return _shared_repo_readme_request(text, config=self._raw_config)
+        content = normalize_text(text)
+        if not content:
+            return False
+        if _shared_repo_readme_request(content, config=self._raw_config):
+            return True
+        plain = re.sub(r"\s+", "", content.lower())
+        if "/readme" in plain:
+            return True
+        return bool(re.search(r"(?:^|\s)readme\s+[a-z0-9_.-]+/[a-z0-9_.-]+(?:\s|$)", content, flags=re.IGNORECASE))
 
     @staticmethod
     def _looks_like_download_request_text(text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
+        plain = re.sub(r"\s+", "", content)
+        if "/download" in plain:
+            return True
         cues = (
             "下载",
             "发给我",
@@ -8683,6 +8784,9 @@ class ToolExecutor:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
+        if re.search(r"(?:^|\s)/(?:analyze|analyse|summary|summarize)(?:\s|$)", content):
+            if re.search(r"https?://\S+\.(png|jpg|jpeg|webp|bmp|gif)(?:\?\S*)?$", content):
+                return True
         cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
         if not cues:
             return False
@@ -8748,18 +8852,35 @@ class ToolExecutor:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        cues = _prompt_cues(
-            "music_request_cues",
-            (
-                "点歌", "听歌", "放歌", "搜歌", "播放歌", "来首", "来一首",
-                "唱一首", "唱首", "音乐", "歌曲", "网易云", "qq音乐",
-            ),
+        plain = re.sub(r"\s+", "", content)
+        explicit_tokens = (
+            "/music",
+            "/song",
+            "action=music",
+            "tool=music",
+            "intent=music",
+            "music=1",
         )
-        return any(cue in content for cue in cues)
+        if any(token in plain for token in explicit_tokens):
+            return True
+        explicit_patterns = (
+            r"(?:^|\s)/(?:music|song)(?:\s|$)",
+            r"(?:^|\s)(?:action|tool|intent)\s*=\s*music(?:\s|$)",
+        )
+        return any(re.search(pattern, content) for pattern in explicit_patterns)
 
     def _looks_like_video_request(self, text: str) -> bool:
         content = self._normalize_multimodal_query(text)
-        return _shared_video_request(content, config=self._raw_config)
+        if _shared_video_request(content, config=self._raw_config):
+            return True
+        lower = normalize_text(content).lower()
+        if not lower:
+            return False
+        if re.search(r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$", lower):
+            return True
+        if re.search(r"(?:^|\s)/(?:video|vid)(?:\s|$)", lower):
+            return True
+        return False
 
     def _looks_like_douyin_search_request(self, text: str) -> bool:
         content = self._normalize_multimodal_query(text).lower()
@@ -8776,6 +8897,11 @@ class ToolExecutor:
         content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
+        if re.search(r"(?:^|\s)/(?:analyze|analyse|summary|summarize)(?:\s|$)", content):
+            if re.search(r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$", content):
+                return True
+        if "output=text" in re.sub(r"\s+", "", content):
+            return True
         cues = _prompt_cues(
             "video_analysis_cues",
             (
@@ -8797,6 +8923,9 @@ class ToolExecutor:
         content = normalize_text(text).lower()
         if not content:
             return False
+        plain = re.sub(r"\s+", "", content)
+        if "/avatar" in plain and ("target=self" in plain or "target=me" in plain):
+            return True
         avatar_cues = _prompt_cues("qq_avatar_request_cues", ("头像", "avatar", "profile"))
         qq_cues = _prompt_cues("qq_identity_cues", ("qq", "q号", "企鹅号", "uin"))
         self_avatar_cues = _prompt_cues("self_avatar_cues", ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"))
@@ -8919,6 +9048,9 @@ class ToolExecutor:
             return []
 
         raw_hits: list[str] = []
+        cmd_match = re.search(r"(?:^|\s)/(?:avatar|qqavatar)\s+([a-z0-9_.-]{2,20})(?:\s|$)", content, flags=re.IGNORECASE)
+        if cmd_match:
+            raw_hits.append(cmd_match.group(1))
         patterns = (
             r"([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})的头像",
             r"头像\s*[:：]?\s*([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})",

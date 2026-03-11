@@ -693,11 +693,17 @@ def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
     cfg_map = getattr(registry, "_plugin_configs", {}) if registry else {}
     if not isinstance(cfg_map, dict):
         cfg_map = {}
+    plugin_meta_map = getattr(registry, "_plugin_meta", {}) if registry else {}
+    if not isinstance(plugin_meta_map, dict):
+        plugin_meta_map = {}
 
     payload: list[dict[str, Any]] = []
     for name in sorted(plugin_map.keys(), key=lambda x: normalize_text(str(x)).lower()):
         plugin_obj = plugin_map.get(name)
         schema = schema_map.get(name, {})
+        meta = plugin_meta_map.get(name, {})
+        if not isinstance(meta, dict):
+            meta = {}
 
         config = copy.deepcopy(cfg_map.get(name, {}))
         if not isinstance(config, dict):
@@ -729,6 +735,14 @@ def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
             "rules": rules,
             "internal_only": bool(getattr(plugin_obj, "internal_only", False)),
             "agent_tool": bool(getattr(plugin_obj, "agent_tool", False)),
+            "configurable": bool(meta.get("configurable", False)),
+            "config_target": normalize_text(str(meta.get("config_target", ""))),
+            "config_guide": [normalize_text(str(item)) for item in (meta.get("config_guide") or []) if normalize_text(str(item))],
+            "editable_keys": [normalize_text(str(item)) for item in (meta.get("editable_keys") or []) if normalize_text(str(item))],
+            "supports_interactive_setup": bool(meta.get("supports_interactive_setup", False)),
+            "needs_setup": bool(meta.get("needs_setup", False)),
+            "using_defaults": bool(meta.get("using_defaults", False)),
+            "setup_mode": normalize_text(str(meta.get("setup_mode", ""))),
         })
 
     return payload

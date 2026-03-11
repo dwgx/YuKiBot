@@ -15,6 +15,10 @@ Architecture and design notes:
 
 If you are new, start from the GUIDE file in your language first.
 
+Release and operations deep dive (CN, 1000+ lines checklist + SOP):
+
+- [docs/zh-CN/RELEASE_PLAYBOOK.md](docs/zh-CN/RELEASE_PLAYBOOK.md)
+
 ## Linux One-Click Deploy
 
 For a 1Panel-like interactive deploy flow (custom host/port + optional systemd):

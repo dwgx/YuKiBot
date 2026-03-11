@@ -1765,17 +1765,23 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        cues = (
-            "这个网页",
-            "这个链接",
-            "就这个",
-            "这个吧",
-            "上一个",
-            "刚才那个",
-            "那个链接",
-            "按这个",
+        plain = re.sub(r"\s+", "", t)
+        explicit_tokens = (
+            "/source",
+            "source=previous",
+            "source=last",
+            "from=previous",
+            "from=last",
+            "use_previous_url=1",
+            "use_last_url=1",
         )
-        return any(cue in t for cue in cues)
+        if any(token in plain for token in explicit_tokens):
+            return True
+        patterns = (
+            r"(?:^|\s)/source(?:\s|$)",
+            r"(?:^|\s)(?:source|from)\s*=\s*(?:previous|last)(?:\s|$)",
+        )
+        return any(re.search(pattern, t) for pattern in patterns)
 
     def _extract_recent_url(self, ctx: AgentContext) -> str:
         # 优先从最近上下文里找 URL（通常包含机器人上一条发出的链接）
@@ -1862,6 +1868,12 @@ class AgentLoop:
     @staticmethod
     def _infer_search_mode(text: str) -> str:
         t = normalize_text(text).lower()
+        if re.search(r"(?:^|\s)/image(?:\s|$)", t):
+            return "image"
+        if re.search(r"(?:^|\s)/(?:video|vid)(?:\s|$)", t):
+            return "video"
+        if re.search(r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$", t):
+            return "video"
         if any(k in t for k in ("gif", "动图", "图片", "照片", "壁纸", "头像", "表情包")):
             return "image"
         if any(k in t for k in ("视频", "mv", "短片", "片段", "剪辑", "video")):
@@ -1871,34 +1883,33 @@ class AgentLoop:
     @staticmethod
     def _infer_media_type(text: str) -> str:
         t = normalize_text(text).lower()
-        if "gif" in t or "动图" in t:
+        if "type=gif" in re.sub(r"\s+", "", t):
             return "gif"
-        if "视频" in t or "video" in t:
+        if "type=video" in re.sub(r"\s+", "", t):
             return "video"
-        return "image"
+        if "type=image" in re.sub(r"\s+", "", t):
+            return "image"
+        return ""
 
     @staticmethod
     def _infer_resource_file_type(text: str) -> str:
         t = normalize_text(text).lower()
-        # 平台特征优先，避免“安装包”被硬编码成 exe 导致安卓场景误判。
-        if any(c in t for c in ("apk", "安卓", "android", "手机端")):
+        plain = re.sub(r"\s+", "", t)
+        if "prefer_ext=apk" in plain or re.search(r"\.apk(?:\?|#|$)", t):
             return "apk"
-        if any(c in t for c in ("ipa", "ios", "iphone", "ipad")):
+        if "prefer_ext=ipa" in plain or re.search(r"\.ipa(?:\?|#|$)", t):
             return "ipa"
-        if any(c in t for c in (".exe", "windows", "win32", "win64", "电脑版", "电脑板", "pc端", "pc版", "电脑端", "桌面版")):
+        if "prefer_ext=exe" in plain or re.search(r"\.exe(?:\?|#|$)", t):
             return "exe"
 
         mapping = (
-            ("msi", "msi"),
-            ("zip", "zip"),
-            ("压缩包", "zip"),
-            ("pdf", "pdf"),
-            ("数据集", "zip"),
-            ("模组", "mod"),
-            ("资源包", "zip"),
+            ("prefer_ext=msi", "msi"),
+            ("prefer_ext=zip", "zip"),
+            ("prefer_ext=pdf", "pdf"),
+            ("prefer_ext=mod", "mod"),
         )
         for cue, ft in mapping:
-            if cue in t:
+            if cue in plain:
                 return ft
         return ""
 
@@ -1907,13 +1918,14 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return ""
-        if any(k in t for k in ("提取音频", "导出音频", "导出音轨", "音频", "音轨", "转mp3", "audio")):
+        plain = re.sub(r"\s+", "", t)
+        if "mode=audio" in plain:
             return "audio"
-        if any(k in t for k in ("封面", "缩略图", "截图", "画面", "thumbnail", "cover")):
+        if "mode=cover" in plain:
             return "cover"
-        if any(k in t for k in ("关键帧", "抽帧", "多帧", "frames", "frame")):
+        if "mode=frames" in plain or "mode=frame" in plain:
             return "frames"
-        if any(k in t for k in ("分割", "切片", "片段", "截取", "剪一段", "clip", "segment")):
+        if "mode=clip" in plain or re.search(r"\b\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\s*-\s*\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\b", t):
             return "clip"
         return ""
 
@@ -1945,7 +1957,7 @@ class AgentLoop:
             return {}
 
         range_patterns = (
-            r"(?:从|from)?\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?\s*(?:秒|s)?)\s*(?:到|至|~|～|-|—|–|to)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?\s*(?:秒|s)?)",
+            r"(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?\s*(?:秒|s))\s*(?:-|—|–|~|～|to)\s*(\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?\s*(?:秒|s))",
         )
         for pattern in range_patterns:
             m = re.search(pattern, t)
@@ -1954,24 +1966,13 @@ class AgentLoop:
             start = cls._parse_time_token_to_seconds(m.group(1))
             end = cls._parse_time_token_to_seconds(m.group(2))
             if start is not None and end is not None and end > start:
-                return {"start": start, "end": end, "point": start}
+                return {"start": start, "end": end}
 
-        tokens: list[float] = []
-        for m in re.finditer(r"\d{1,2}:\d{1,2}(?::\d{1,2})?", t):
-            sec = cls._parse_time_token_to_seconds(m.group(0))
+        first_token = re.search(r"\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?", t)
+        if first_token:
+            sec = cls._parse_time_token_to_seconds(first_token.group(0))
             if sec is not None:
-                tokens.append(sec)
-        for m in re.finditer(r"\d+(?:\.\d+)?\s*(?:秒|s)", t):
-            sec = cls._parse_time_token_to_seconds(m.group(0))
-            if sec is not None:
-                tokens.append(sec)
-        if len(tokens) >= 2 and ("到" in t or "至" in t or "from" in t or "to" in t or "-" in t or "~" in t or "～" in t):
-            start = min(tokens[0], tokens[1])
-            end = max(tokens[0], tokens[1])
-            if end > start:
-                return {"start": start, "end": end, "point": start}
-        if tokens:
-            return {"point": tokens[0]}
+                return {"point": sec}
         return {}
 
     @staticmethod
@@ -1979,7 +1980,11 @@ class AgentLoop:
         t = normalize_text(text)
         if not t:
             return 0
-        m = re.search(r"(\d{1,2})\s*(?:张|幀|帧|frames?)", t, flags=re.IGNORECASE)
+        m = re.search(r"(?:max_frames|frame_count)\s*=\s*(\d{1,2})", t, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"(\d{1,2})\s*(?:screenshots?|frames?)", t, flags=re.IGNORECASE)
+        if not m:
+            m = re.search(r"(\d{1,2})\s*(?:张|幀|帧)", t, flags=re.IGNORECASE)
         if not m:
             return 0
         try:
@@ -2019,6 +2024,10 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
+        plain = re.sub(r"\s+", "", t)
+        explicit_tokens = ("/next", "next=1", "continue=1", "context=continue")
+        if any(token in plain for token in explicit_tokens):
+            return True
         if len(t) <= 16 and re.fullmatch(r"[?？!！,，.。~\-\s]*", t):
             return True
         starters = (
@@ -2029,6 +2038,7 @@ class AgentLoop:
     @staticmethod
     def _strip_continuation_prefix(text: str) -> str:
         t = normalize_text(text)
+        t = re.sub(r"^(?i:/(?:next|continue))\s*[?？:：,，]?\s*", "", t)
         t = re.sub(r"^(?i:so)\s*[?？:：,，]?\s*", "", t)
         t = re.sub(r"^(所以(?:呢|说)?|然后(?:呢)?|那(?:然后|么)?呢?)\s*[?？:：,，]?\s*", "", t)
         t = re.sub(r"^(我要|我想要|我想|给我|来个|来一个|帮我)\s*", "", t)
@@ -2081,10 +2091,10 @@ class AgentLoop:
         err = normalize_text(error).lower()
         if tool_name in {"smart_download", "download_file"} and err.startswith("download_untrusted_source"):
             if query:
-                return "web_search", {"query": f"{query} 官方下载 官网", "mode": "text"}
+                return "web_search", {"query": query, "mode": "text"}
             url = normalize_text(str(args.get("url", "")))
             if url:
-                return "web_search", {"query": f"{url} 官方下载", "mode": "text"}
+                return "web_search", {"query": url, "mode": "text"}
             return None
         if not query:
             return None
