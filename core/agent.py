@@ -125,6 +125,13 @@ class AgentLoop:
         "extract_links_and_content",
         "fetch_webpage",
     })
+    _DOWNLOAD_LLM_EXTRACT_TOOLS = frozenset({
+        "scrape_extract",
+        "scrape_summarize",
+        "scrape_structured",
+        "extract_structured",
+        "extract_links_and_content",
+    })
 
     def __init__(
         self,
@@ -607,6 +614,7 @@ class AgentLoop:
             tool_args = parsed.get("args", {})
             if not isinstance(tool_args, dict):
                 tool_args = {}
+            tool_name, tool_args = self._rewrite_download_tool_if_needed(tool_name, tool_args, ctx)
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
             if force_image_tool_first and tool_calls_made == 0 and tool_name not in {"analyze_image", "think"}:
                 _log.info(
@@ -2206,6 +2214,97 @@ class AgentLoop:
             "zip",
         )
         return any(cue in t for cue in cues)
+
+    @staticmethod
+    def _looks_like_download_file_request(text: str) -> bool:
+        t = normalize_text(text).lower()
+        if not t:
+            return False
+        explicit_file = any(
+            cue in t
+            for cue in (
+                "安装包",
+                "资源包",
+                "客户端",
+                ".apk",
+                ".exe",
+                ".msi",
+                ".zip",
+                ".7z",
+                ".rar",
+                "apk",
+                "exe",
+                "msi",
+                "电脑版",
+                "电脑板",
+                "pc版",
+                "pc端",
+                "windows",
+                "安卓",
+                "android",
+            )
+        )
+        if explicit_file:
+            return True
+        return "下载" in t and any(cue in t for cue in ("游戏", "软件", "客户端", "安装", "发我", "上传"))
+
+    def _rewrite_download_tool_if_needed(
+        self,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        ctx: AgentContext,
+    ) -> tuple[str, dict[str, Any]]:
+        name = normalize_text(tool_name)
+        if name not in self._DOWNLOAD_LLM_EXTRACT_TOOLS:
+            return name, tool_args
+
+        merged_text = normalize_text(f"{ctx.message_text}\n{ctx.reply_to_text}")
+        if not self._looks_like_download_file_request(merged_text):
+            return name, tool_args
+
+        url_from_args = normalize_text(str(tool_args.get("url", "")))
+        candidate_url = (
+            url_from_args
+            or self._extract_first_url(normalize_text(ctx.message_text))
+            or self._extract_first_url(normalize_text(ctx.reply_to_text))
+            or self._extract_recent_url(ctx)
+        )
+        contextual_query = self._rebuild_query_with_context(normalize_text(ctx.message_text), ctx) or normalize_text(
+            ctx.message_text
+        )
+        inferred_ext = self._infer_resource_file_type(contextual_query)
+
+        if candidate_url:
+            rewritten_args: dict[str, Any] = {
+                "url": candidate_url,
+                "query": contextual_query or merged_text,
+                "kind": "auto",
+            }
+            if inferred_ext:
+                rewritten_args["prefer_ext"] = inferred_ext
+            if self._looks_like_file_send_request(merged_text):
+                rewritten_args["upload"] = True
+                if ctx.group_id:
+                    rewritten_args["group_id"] = int(ctx.group_id)
+            _log.info(
+                "agent_download_tool_rewrite | trace=%s | from=%s | to=smart_download | url=%s",
+                ctx.trace_id,
+                name,
+                clip_text(candidate_url, 160),
+            )
+            return "smart_download", rewritten_args
+
+        rewritten_query = contextual_query or merged_text
+        rewritten_args = {"query": rewritten_query}
+        if inferred_ext:
+            rewritten_args["file_type"] = inferred_ext
+        _log.info(
+            "agent_download_tool_rewrite | trace=%s | from=%s | to=search_download_resources | query=%s",
+            ctx.trace_id,
+            name,
+            clip_text(rewritten_query, 160),
+        )
+        return "search_download_resources", rewritten_args
 
     def _looks_like_profile_analysis_request(self, text: str) -> bool:
         return _shared_qq_profile_request(text, config=self.config)
