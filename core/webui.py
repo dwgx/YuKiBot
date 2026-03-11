@@ -322,7 +322,7 @@ def _quote_ident(name: str) -> str:
     """安全引用 SQL 标识符。"""
     if _SQL_IDENT_RE.match(name):
         return name
-    return f'"{name.replace('"', '""')}"'
+    return '"' + name.replace('"', '""') + '"'
 
 
 def _list_tables(conn: sqlite3.Connection, include_system: bool = False) -> list[str]:
