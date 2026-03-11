@@ -578,7 +578,7 @@ class MemoryEngine:
         game_kw = ("游戏", "原神", "lol", "mc", "steam", "ps5", "xbox", "switch",
                     "副本", "抽卡", "氪金", "段位", "rank", "fps", "moba")
         anime_kw = ("动漫", "番剧", "漫画", "二次元", "cos", "声优", "新番",
-                     "轻小说", "bilibili", "b站", "mad", "amv")
+                    "轻小说", "bilibili", "b站", "mad", "amv")
         life_kw = ("吃饭", "睡觉", "上班", "下班", "周末", "天气", "外卖",
                     "快递", "出门", "回家", "累了", "休息")
         music_kw = ("歌", "音乐", "专辑", "歌手", "演唱会", "网易云", "qq音乐")
@@ -1686,7 +1686,7 @@ class MemoryEngine:
             rows = conn.execute(
                 f"""
                 SELECT id, record_id, action, actor, note, reason, before_content, after_content,
-                       conversation_id, user_id, role, created_at
+                        conversation_id, user_id, role, created_at
                 FROM memory_audit_log
                 {where_sql}
                 ORDER BY id DESC

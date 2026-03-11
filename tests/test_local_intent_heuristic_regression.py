@@ -84,7 +84,7 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
 
     def test_trigger_and_router_drop_local_keyword_defaults(self) -> None:
         trigger = TriggerEngine({}, {"name": "YuKiKo", "nicknames": []})
-        self.assertFalse(hasattr(trigger, "ai_listen_keywords"))
+        self.assertEqual(trigger.ai_listen_keywords, [])
         self.assertEqual(trigger.explicit_request_cues, ())
         self.assertEqual(trigger._explicit_request_signal("\u5e2e\u6211\u67e5\u4e00\u4e0b"), 0.0)
         self.assertGreater(trigger._explicit_request_signal("/lookup test"), 0.0)

@@ -21,6 +21,17 @@ interface Plugin {
       enum?: unknown[];
     }>;
   };
+  config_schema?: {
+    type: string;
+    properties?: Record<string, {
+      type: string;
+      description?: string;
+      default?: unknown;
+      enum?: unknown[];
+      minimum?: number;
+      maximum?: number;
+    }>;
+  };
   agent_tool: boolean;
   internal_only: boolean;
 }
@@ -78,7 +89,7 @@ export default function PluginsPage() {
   const renderConfigField = (
     plugin: Plugin,
     key: string,
-    schema: { type: string; description?: string; default?: unknown; enum?: unknown[] }
+    schema: { type: string; description?: string; default?: unknown; enum?: unknown[]; minimum?: number; maximum?: number }
   ) => {
     const value = plugin.config[key];
     const label = schema.description || key;
@@ -132,6 +143,25 @@ export default function PluginsPage() {
       );
     }
 
+    if (schema.type === "array") {
+      const arrayValue = Array.isArray(value) ? value : (schema.default as any[]) || [];
+      return (
+        <Textarea
+          key={key}
+          label={label}
+          value={arrayValue.join(", ")}
+          onValueChange={(v) => {
+            const items = v.split(",").map(s => s.trim()).filter(Boolean);
+            updateConfig(items);
+          }}
+          minRows={2}
+          maxRows={4}
+          size="sm"
+          description="用逗号分隔多个值"
+        />
+      );
+    }
+
     return (
       <Textarea
         key={key}
@@ -143,6 +173,22 @@ export default function PluginsPage() {
         size="sm"
       />
     );
+  };
+
+  const groupConfigFields = (properties: Record<string, any>) => {
+    const groups: Record<string, Array<[string, any]>> = {};
+
+    Object.entries(properties).forEach(([key, schema]) => {
+      const parts = key.split(".");
+      const groupName = parts.length > 1 ? parts[0] : "基础设置";
+
+      if (!groups[groupName]) {
+        groups[groupName] = [];
+      }
+      groups[groupName].push([key, schema]);
+    });
+
+    return groups;
   };
 
   if (loading) {
@@ -204,13 +250,24 @@ export default function PluginsPage() {
                 </div>
               </CardHeader>
               <CardBody className="space-y-3">
-                {plugin.args_schema?.properties &&
+                {plugin.config_schema?.properties ? (
+                  <>
+                    {Object.entries(groupConfigFields(plugin.config_schema.properties)).map(([groupName, fields]) => (
+                      <div key={groupName} className="space-y-2">
+                        <div className="text-xs font-semibold text-primary uppercase tracking-wide border-b border-default-200 pb-1">
+                          {groupName}
+                        </div>
+                        <div className="space-y-3 pl-2">
+                          {fields.map(([key, schema]) => renderConfigField(plugin, key, schema))}
+                        </div>
+                      </div>
+                    ))}
+                  </>
+                ) : plugin.args_schema?.properties ? (
                   Object.entries(plugin.args_schema.properties).map(([key, schema]) =>
                     renderConfigField(plugin, key, schema)
-                  )}
-
-                {Object.keys(plugin.config).length > 0 &&
-                  !plugin.args_schema?.properties &&
+                  )
+                ) : Object.keys(plugin.config).length > 0 ? (
                   Object.entries(plugin.config).map(([key, value]) => (
                     <Textarea
                       key={key}
@@ -229,7 +286,10 @@ export default function PluginsPage() {
                       maxRows={8}
                       size="sm"
                     />
-                  ))}
+                  ))
+                ) : (
+                  <p className="text-sm text-default-500">此插件无可配置项</p>
+                )}
 
                 <div className="flex justify-end pt-2">
                   <Button

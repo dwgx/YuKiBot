@@ -28,7 +28,7 @@ from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     record_recalled_message as _record_recalled_message,
 )
-from utils.text import clip_text, normalize_text, tokenize
+from utils.text import clip_text, normalize_matching_text, normalize_text, tokenize
 
 _log = logging.getLogger("yukiko.agent_tools")
 
@@ -56,9 +56,9 @@ class PromptHint:
     """插件注入到 Agent 系统提示的静态文本块。
 
     section:
-      - "rules": 出现在 ## 规则 区域
-      - "tools_guidance": 出现在 ## 工具使用指南 区域
-      - "context": 出现在 ## 上下文 区域
+        - "rules": 出现在 ## 规则 区域
+        - "tools_guidance": 出现在 ## 工具使用指南 区域
+        - "context": 出现在 ## 上下文 区域
     priority: 数字越小越靠前，默认 50
     """
     source: str
@@ -1822,287 +1822,287 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
 
     _ext_tools = [
         ("group_poke", "在群里戳一戳某人。\n使用场景: 用户说'戳他一下'、'poke某人'、'拍一拍'时使用。\n效果: 对方会收到戳一戳动画提示",
-         {"group_id": ("integer", "群号"), "user_id": ("integer", "要戳的人的QQ号")},
-         ["group_id", "user_id"], _handle_group_poke),
+        {"group_id": ("integer", "群号"), "user_id": ("integer", "要戳的人的QQ号")},
+        ["group_id", "user_id"], _handle_group_poke),
 
         ("friend_poke", "私聊中戳一戳好友。\n使用场景: 用户说'戳他'且在私聊场景时使用",
-         {"user_id": ("integer", "要戳的好友QQ号")},
-         ["user_id"], _handle_friend_poke),
+        {"user_id": ("integer", "要戳的好友QQ号")},
+        ["user_id"], _handle_friend_poke),
 
         ("set_msg_emoji_like", "给一条消息添加表情回应(emoji reaction)。\n使用场景: 用户说'给这条消息点个赞/点个表情'时使用。\n常用emoji_id: 76=赞, 63=玫瑰, 66=爱心, 4=得意, 124=OK手势",
-         {"message_id": ("integer", "目标消息ID"), "emoji_id": ("integer", "表情ID，如76=赞, 66=爱心"), "set": ("boolean", "true=添加, false=取消，默认true")},
-         ["message_id", "emoji_id"], _handle_set_msg_emoji_like),
+        {"message_id": ("integer", "目标消息ID"), "emoji_id": ("integer", "表情ID，如76=赞, 66=爱心"), "set": ("boolean", "true=添加, false=取消，默认true")},
+        ["message_id", "emoji_id"], _handle_set_msg_emoji_like),
 
         ("get_group_msg_history", "获取群的历史聊天记录(最近19条)。\n使用场景: 用户问'刚才群里说了什么'、'看看聊天记录'时使用。\n返回消息列表，每条包含发送者、时间、内容",
-         {"group_id": ("integer", "群号"), "message_seq": ("integer", "起始消息序号，不填则获取最新的")},
-         ["group_id"], _handle_get_group_msg_history),
+        {"group_id": ("integer", "群号"), "message_seq": ("integer", "起始消息序号，不填则获取最新的")},
+        ["group_id"], _handle_get_group_msg_history),
 
         ("get_friend_msg_history", "获取与某好友的私聊历史记录。\n使用场景: 需要查看之前和某人的聊天内容时使用",
-         {"user_id": ("integer", "好友QQ号"), "message_seq": ("integer", "起始消息序号，不填则获取最新的"), "count": ("integer", "获取条数，默认20")},
-         ["user_id"], _handle_get_friend_msg_history),
+        {"user_id": ("integer", "好友QQ号"), "message_seq": ("integer", "起始消息序号，不填则获取最新的"), "count": ("integer", "获取条数，默认20")},
+        ["user_id"], _handle_get_friend_msg_history),
 
         ("forward_group_single_msg", "把一条消息转发到指定群。\n使用场景: 用户说'把这条消息转发到XX群'时使用",
-         {"message_id": ("integer", "要转发的消息ID"), "group_id": ("integer", "目标群号")},
-         ["message_id", "group_id"], _handle_forward_group_single_msg),
+        {"message_id": ("integer", "要转发的消息ID"), "group_id": ("integer", "目标群号")},
+        ["message_id", "group_id"], _handle_forward_group_single_msg),
 
         ("forward_friend_single_msg", "把一条消息转发给好友私聊。\n使用场景: 用户说'把这条消息转发给XX'时使用",
-         {"message_id": ("integer", "要转发的消息ID"), "user_id": ("integer", "目标好友QQ号")},
-         ["message_id", "user_id"], _handle_forward_friend_single_msg),
+        {"message_id": ("integer", "要转发的消息ID"), "user_id": ("integer", "目标好友QQ号")},
+        ["message_id", "user_id"], _handle_forward_friend_single_msg),
 
         ("get_essence_msg_list", "获取群精华消息列表。\n使用场景: 用户问'群精华有什么'、'看看精华消息'时使用",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_essence_msg_list),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_essence_msg_list),
 
         ("set_essence_msg", "将一条消息设为群精华。需要管理员权限。\n使用场景: 用户说'把这条消息设为精华'时使用",
-         {"message_id": ("integer", "要设为精华的消息ID")},
-         ["message_id"], _handle_set_essence_msg),
+        {"message_id": ("integer", "要设为精华的消息ID")},
+        ["message_id"], _handle_set_essence_msg),
 
         ("ocr_image", "识别图片中的文字(OCR)。\n使用场景: 用户发了图片问'图片里写了什么'、'识别文字'时使用。\n参数image是图片的file字段(从消息段中获取)",
-         {"image": ("string", "图片file标识(从消息的image段data.file获取)")},
-         ["image"], _handle_ocr_image),
+        {"image": ("string", "图片file标识(从消息的image段data.file获取)")},
+        ["image"], _handle_ocr_image),
 
         ("get_ai_characters", "获取AI语音可用的角色列表。\n使用场景: 用户问'有哪些AI语音角色'时使用。\n返回角色ID和名称，用于 send_group_ai_record",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_ai_characters),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_ai_characters),
 
         ("send_group_ai_record", "用AI角色语音在群里发送一段语音消息(TTS文字转语音)。\n使用场景: 用户说'用XX角色说一段话'、'发个语音'时使用。\n先用 get_ai_characters 获取可用角色ID",
-         {"group_id": ("integer", "目标群号"), "character": ("string", "角色ID(从get_ai_characters获取)"), "text": ("string", "要转为语音的文本内容")},
-         ["group_id", "character", "text"], _handle_send_group_ai_record),
+        {"group_id": ("integer", "目标群号"), "character": ("string", "角色ID(从get_ai_characters获取)"), "text": ("string", "要转为语音的文本内容")},
+        ["group_id", "character", "text"], _handle_send_group_ai_record),
 
         ("mark_msg_as_read", "标记一条消息为已读",
-         {"message_id": ("integer", "消息ID")},
-         ["message_id"], _handle_mark_msg_as_read),
+        {"message_id": ("integer", "消息ID")},
+        ["message_id"], _handle_mark_msg_as_read),
 
         ("get_group_shut_list", "获取群内当前被禁言的成员列表。\n使用场景: 用户问'谁被禁言了'、'禁言列表'时使用",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_group_shut_list),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_group_shut_list),
 
         ("get_group_member_info", "获取群内某个成员的详细信息。\n返回: 昵称、群名片、角色、入群时间、最后发言时间等。\n使用场景: 用户问'XX是什么时候进群的'、'查一下XX的信息'时使用",
-         {"group_id": ("integer", "群号"), "user_id": ("integer", "成员QQ号")},
-         ["group_id", "user_id"], _handle_get_group_member_info),
+        {"group_id": ("integer", "群号"), "user_id": ("integer", "成员QQ号")},
+        ["group_id", "user_id"], _handle_get_group_member_info),
 
         ("set_input_status", "设置对某用户显示'正在输入'状态。\nevent_type: 1=正在输入",
-         {"user_id": ("integer", "目标用户QQ号"), "event_type": ("integer", "1=正在输入")},
-         ["user_id", "event_type"], _handle_set_input_status),
+        {"user_id": ("integer", "目标用户QQ号"), "event_type": ("integer", "1=正在输入")},
+        ["user_id", "event_type"], _handle_set_input_status),
 
         ("download_file", "下载URL文件到本地缓存，返回本地路径。\n兼容入口：内部会自动走智能下载链路（视频解析/网页提取下载链接）。\n使用场景: 需要先下载文件再上传到群文件时使用",
-         {"url": ("string", "文件下载URL"), "thread_count": ("integer", "下载线程数，默认1"),
-           "kind": ("string", "auto/video/audio/file，默认auto"),
-           "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
-           "query": ("string", "原始用户需求文本(可选，用于下载来源可信度判断)"),
-           "allow_third_party": ("boolean", "是否允许切换到第三方下载源（默认false，需先征得用户同意）"),
-           "upload": ("boolean", "是否下载后直接上传群文件，默认false"),
-           "group_id": ("integer", "upload=true 时目标群号"),
-           "file_name": ("string", "下载后/上传时文件名(可选)")},
-         ["url"], _handle_download_file),
+        {"url": ("string", "文件下载URL"), "thread_count": ("integer", "下载线程数，默认1"),
+            "kind": ("string", "auto/video/audio/file，默认auto"),
+            "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
+            "query": ("string", "原始用户需求文本(可选，用于下载来源可信度判断)"),
+            "allow_third_party": ("boolean", "是否允许切换到第三方下载源（默认false，需先征得用户同意）"),
+            "upload": ("boolean", "是否下载后直接上传群文件，默认false"),
+            "group_id": ("integer", "upload=true 时目标群号"),
+            "file_name": ("string", "下载后/上传时文件名(可选)")},
+        ["url"], _handle_download_file),
 
         ("smart_download", "母下载方法(统一下载入口)。\n会自动执行：媒体解析 -> 网页提取直链 -> 下载到可上传目录。\n可直接 upload=true 上传群文件。\n使用场景: 用户要你'直接发安装包/视频/音频文件'时优先用这个。",
-         {"url": ("string", "资源链接(网页/视频链接/直链)"),
-           "kind": ("string", "auto/video/audio/file，默认auto"),
-           "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
-           "thread_count": ("integer", "下载线程数，默认1"),
-           "query": ("string", "原始用户需求文本(可选，用于下载来源可信度判断)"),
-           "allow_third_party": ("boolean", "是否允许切换到第三方下载源（默认false，需先征得用户同意）"),
-           "upload": ("boolean", "是否下载后直接上传群文件，默认false"),
-           "group_id": ("integer", "upload=true 时目标群号"),
-           "file_name": ("string", "下载后/上传时文件名(可选)")},
-         ["url"], _handle_smart_download),
+        {"url": ("string", "资源链接(网页/视频链接/直链)"),
+            "kind": ("string", "auto/video/audio/file，默认auto"),
+            "prefer_ext": ("string", "优先扩展名，如 apk/mp4/mp3"),
+            "thread_count": ("integer", "下载线程数，默认1"),
+            "query": ("string", "原始用户需求文本(可选，用于下载来源可信度判断)"),
+            "allow_third_party": ("boolean", "是否允许切换到第三方下载源（默认false，需先征得用户同意）"),
+            "upload": ("boolean", "是否下载后直接上传群文件，默认false"),
+            "group_id": ("integer", "upload=true 时目标群号"),
+            "file_name": ("string", "下载后/上传时文件名(可选)")},
+        ["url"], _handle_smart_download),
 
         ("nc_get_user_status", "查询某QQ用户的在线状态。\n使用场景: 用户问'XX在线吗'时使用",
-         {"user_id": ("integer", "目标QQ号")},
-         ["user_id"], _handle_nc_get_user_status),
+        {"user_id": ("integer", "目标QQ号")},
+        ["user_id"], _handle_nc_get_user_status),
 
         ("translate_en2zh", "将英文文本翻译为中文(QQ内置翻译)。\n使用场景: 用户发了英文让你翻译时可以用",
-         {"words": ("array", "要翻译的英文文本数组，如 [\"hello\",\"world\"]")},
-         ["words"], _handle_translate_en2zh),
+        {"words": ("array", "要翻译的英文文本数组，如 [\"hello\",\"world\"]")},
+        ["words"], _handle_translate_en2zh),
 
         # ── 合并转发 ──
         ("send_group_forward_msg", "向群发送合并转发消息(多条消息合并成一个卡片)。\n"
-         "使用场景: 用户说'把这些消息合并转发'、'发个合并消息'时使用。\n"
-         "messages 是 node 数组，每个 node 格式:\n"
-         '  引用已有消息: {"type":"node","data":{"id":"消息ID"}}\n'
-         '  自定义内容: {"type":"node","data":{"name":"发送者名","uin":"发送者QQ","content":"内容"}}',
-         {"group_id": ("integer", "目标群号"), "messages": ("array", "node数组，见描述")},
-         ["group_id", "messages"], _handle_send_group_forward_msg),
+        "使用场景: 用户说'把这些消息合并转发'、'发个合并消息'时使用。\n"
+        "messages 是 node 数组，每个 node 格式:\n"
+        '  引用已有消息: {"type":"node","data":{"id":"消息ID"}}\n'
+        '  自定义内容: {"type":"node","data":{"name":"发送者名","uin":"发送者QQ","content":"内容"}}',
+        {"group_id": ("integer", "目标群号"), "messages": ("array", "node数组，见描述")},
+        ["group_id", "messages"], _handle_send_group_forward_msg),
 
         ("send_private_forward_msg", "向好友发送合并转发消息。参数同 send_group_forward_msg",
-         {"user_id": ("integer", "目标好友QQ号"), "messages": ("array", "node数组")},
-         ["user_id", "messages"], _handle_send_private_forward_msg),
+        {"user_id": ("integer", "目标好友QQ号"), "messages": ("array", "node数组")},
+        ["user_id", "messages"], _handle_send_private_forward_msg),
 
         ("get_forward_msg", "根据转发消息ID获取合并转发的完整内容。\n使用场景: 收到合并转发消息后查看里面的内容",
-         {"message_id": ("string", "合并转发消息的ID(从消息段的forward字段获取)")},
-         ["message_id"], _handle_get_forward_msg),
+        {"message_id": ("string", "合并转发消息的ID(从消息段的forward字段获取)")},
+        ["message_id"], _handle_get_forward_msg),
 
         # ── 群操作 ──
         ("set_group_leave", "退出群聊。如果是群主可以解散群。\n使用场景: 用户说'退群'、'离开这个群'时使用。\n注意: 这是不可逆操作!",
-         {"group_id": ("integer", "要退出的群号"), "is_dismiss": ("boolean", "是否解散群(仅群主)，默认false")},
-         ["group_id"], _handle_set_group_leave),
+        {"group_id": ("integer", "要退出的群号"), "is_dismiss": ("boolean", "是否解散群(仅群主)，默认false")},
+        ["group_id"], _handle_set_group_leave),
 
         ("delete_essence_msg", "取消一条群精华消息。需要管理员权限。\n使用场景: 用户说'取消精华'、'移除精华消息'时使用",
-         {"message_id": ("integer", "要取消精华的消息ID")},
-         ["message_id"], _handle_delete_essence_msg),
+        {"message_id": ("integer", "要取消精华的消息ID")},
+        ["message_id"], _handle_delete_essence_msg),
 
         ("get_group_at_all_remain", "获取群内@全体成员的剩余次数。\n使用场景: 用户问'还能@全体几次'时使用",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_group_at_all_remain),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_group_at_all_remain),
 
         # ── 请求处理 ──
         ("set_friend_add_request", "处理好友添加请求(同意/拒绝)。\n使用场景: 用户说'同意好友请求'、'拒绝加好友'时使用。\nflag 从好友请求事件中获取",
-         {"flag": ("string", "请求标识(从事件获取)"), "approve": ("boolean", "true=同意, false=拒绝"), "remark": ("string", "好友备注(同意时可选)")},
-         ["flag"], _handle_set_friend_add_request),
+        {"flag": ("string", "请求标识(从事件获取)"), "approve": ("boolean", "true=同意, false=拒绝"), "remark": ("string", "好友备注(同意时可选)")},
+        ["flag"], _handle_set_friend_add_request),
 
         ("set_group_add_request", "处理加群请求或邀请(同意/拒绝)。\n使用场景: 用户说'同意入群'、'拒绝加群请求'时使用。\nflag 从加群请求事件中获取",
-         {"flag": ("string", "请求标识(从事件获取)"), "sub_type": ("string", "'add'=主动加群, 'invite'=被邀请"), "approve": ("boolean", "true=同意, false=拒绝"), "reason": ("string", "拒绝理由(拒绝时可选)")},
-         ["flag", "sub_type"], _handle_set_group_add_request),
+        {"flag": ("string", "请求标识(从事件获取)"), "sub_type": ("string", "'add'=主动加群, 'invite'=被邀请"), "approve": ("boolean", "true=同意, false=拒绝"), "reason": ("string", "拒绝理由(拒绝时可选)")},
+        ["flag", "sub_type"], _handle_set_group_add_request),
 
         # ── 好友操作 ──
         ("delete_friend", "删除好友。不可逆操作!\n使用场景: 用户说'删除好友XX'时使用",
-         {"user_id": ("integer", "要删除的好友QQ号")},
-         ["user_id"], _handle_delete_friend),
+        {"user_id": ("integer", "要删除的好友QQ号")},
+        ["user_id"], _handle_delete_friend),
 
         # ── 群文件系统 ──
         ("get_group_file_system_info", "获取群文件系统信息(文件数量、已用空间等)。\n使用场景: 用户问'群文件还有多少空间'时使用",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_group_file_system_info),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_group_file_system_info),
 
         ("get_group_root_files", "获取群文件根目录的文件和文件夹列表。\n使用场景: 用户说'看看群文件'、'群文件有什么'时使用",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_group_root_files),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_group_root_files),
 
         ("get_group_file_url", "获取群文件的下载链接。\n使用场景: 用户说'下载群文件XX'时使用。\nfile_id 和 busid 从文件列表中获取",
-         {"group_id": ("integer", "群号"), "file_id": ("string", "文件ID"), "busid": ("integer", "文件业务ID")},
-         ["group_id", "file_id", "busid"], _handle_get_group_file_url),
+        {"group_id": ("integer", "群号"), "file_id": ("string", "文件ID"), "busid": ("integer", "文件业务ID")},
+        ["group_id", "file_id", "busid"], _handle_get_group_file_url),
 
         ("upload_private_file", "向好友发送文件(私聊文件)。\n使用场景: 用户说'给XX发个文件'时使用",
-         {"user_id": ("integer", "好友QQ号"), "file": ("string", "本地文件路径"), "name": ("string", "文件名")},
-         ["user_id", "file", "name"], _handle_upload_private_file),
+        {"user_id": ("integer", "好友QQ号"), "file": ("string", "本地文件路径"), "name": ("string", "文件名")},
+        ["user_id", "file", "name"], _handle_upload_private_file),
 
         # ── NapCat 扩展 ──
         ("set_qq_avatar", "设置机器人的QQ头像。\n使用场景: 用户说'换个头像'时使用。\n参数是本地图片路径或图片URL",
-         {"file": ("string", "图片路径或URL")},
-         ["file"], _handle_set_qq_avatar),
+        {"file": ("string", "图片路径或URL")},
+        ["file"], _handle_set_qq_avatar),
 
         ("set_group_portrait", "设置群头像。需要管理员权限。\n使用场景: 用户说'换群头像'时使用",
-         {"group_id": ("integer", "群号"), "file": ("string", "图片路径或URL")},
-         ["group_id", "file"], _handle_set_group_portrait),
+        {"group_id": ("integer", "群号"), "file": ("string", "图片路径或URL")},
+        ["group_id", "file"], _handle_set_group_portrait),
 
         ("set_online_status", "设置机器人的在线状态。\n使用场景: 用户说'设置在线/隐身/忙碌'时使用。\n"
-         "status值: 11=在线, 21=离开, 31=隐身, 41=忙碌, 50=Q我吧, 60=请勿打扰",
-         {"status": ("integer", "状态码: 11=在线, 21=离开, 31=隐身, 41=忙碌, 50=Q我吧, 60=请勿打扰"),
-          "ext_status": ("integer", "扩展状态码，默认0"), "battery_status": ("integer", "电量状态，默认0")},
-         ["status"], _handle_set_online_status),
+        "status值: 11=在线, 21=离开, 31=隐身, 41=忙碌, 50=Q我吧, 60=请勿打扰",
+        {"status": ("integer", "状态码: 11=在线, 21=离开, 31=隐身, 41=忙碌, 50=Q我吧, 60=请勿打扰"),
+        "ext_status": ("integer", "扩展状态码，默认0"), "battery_status": ("integer", "电量状态，默认0")},
+        ["status"], _handle_set_online_status),
 
         ("send_msg", "通用发消息接口，可发群消息或私聊消息。\n"
-         "使用场景: 当不确定是群还是私聊时使用，或需要发送富文本(CQ码)消息时使用。\n"
-         "message 支持 CQ 码，如:\n"
-         '  图片: [CQ:image,file=https://xxx.jpg]\n'
-         '  @某人: [CQ:at,qq=123456]\n'
-         '  语音: [CQ:record,file=https://xxx.mp3]\n'
-         '  表情: [CQ:face,id=178]',
-         {"message_type": ("string", "'private'或'group'"), "user_id": ("integer", "私聊时的QQ号"),
-          "group_id": ("integer", "群聊时的群号"), "message": ("string", "消息内容，支持CQ码")},
-         ["message"], _handle_send_msg),
+        "使用场景: 当不确定是群还是私聊时使用，或需要发送富文本(CQ码)消息时使用。\n"
+        "message 支持 CQ 码，如:\n"
+        '  图片: [CQ:image,file=https://xxx.jpg]\n'
+        '  @某人: [CQ:at,qq=123456]\n'
+        '  语音: [CQ:record,file=https://xxx.mp3]\n'
+        '  表情: [CQ:face,id=178]',
+        {"message_type": ("string", "'private'或'group'"), "user_id": ("integer", "私聊时的QQ号"),
+        "group_id": ("integer", "群聊时的群号"), "message": ("string", "消息内容，支持CQ码")},
+        ["message"], _handle_send_msg),
 
         ("check_url_safely", "检查URL是否安全(QQ安全检测)。\n使用场景: 用户发了链接想确认是否安全时使用",
-         {"url": ("string", "要检查的URL")},
-         ["url"], _handle_check_url_safely),
+        {"url": ("string", "要检查的URL")},
+        ["url"], _handle_check_url_safely),
 
         ("get_status", "获取NapCat/OneBot运行状态。\n使用场景: 用户问'机器人状态怎么样'时使用。\n返回是否在线、收发消息统计等",
-         {}, [], _handle_get_status),
+        {}, [], _handle_get_status),
 
         ("get_version_info", "获取NapCat/OneBot版本信息。\n使用场景: 用户问'什么版本'时使用",
-         {}, [], _handle_get_version_info),
+        {}, [], _handle_get_version_info),
 
         # ── 第二批 NapCat 扩展 API ──
 
         ("set_self_longnick", "设置机器人的个性签名(长昵称)。\n使用场景: 用户说'改签名'、'设置个签'时使用",
-         {"longnick": ("string", "新的个性签名内容")},
-         ["longnick"], _handle_set_self_longnick),
+        {"longnick": ("string", "新的个性签名内容")},
+        ["longnick"], _handle_set_self_longnick),
 
         ("get_recent_contact", "获取最近的聊天联系人列表。\n使用场景: 用户问'最近和谁聊过'、'最近联系人'时使用",
-         {"count": ("integer", "获取数量，默认10")},
-         [], _handle_get_recent_contact),
+        {"count": ("integer", "获取数量，默认10")},
+        [], _handle_get_recent_contact),
 
         ("get_profile_like", "获取谁给机器人点了赞(名片赞列表)。\n使用场景: 用户问'谁给我点赞了'时使用",
-         {}, [], _handle_get_profile_like),
+        {}, [], _handle_get_profile_like),
 
         ("fetch_custom_face", "获取机器人收藏的自定义表情列表。\n使用场景: 用户问'有什么收藏表情'时使用",
-         {"count": ("integer", "获取数量，默认48")},
-         [], _handle_fetch_custom_face),
+        {"count": ("integer", "获取数量，默认48")},
+        [], _handle_fetch_custom_face),
 
         ("fetch_emoji_like", "获取某条消息的表情回应详情(谁回应了什么表情)。\n使用场景: 用户问'这条消息谁点了表情'时使用",
-         {"message_id": ("integer", "消息ID"), "emoji_id": ("string", "表情ID(可选)"), "emoji_type": ("string", "表情类型(可选)")},
-         ["message_id"], _handle_fetch_emoji_like),
+        {"message_id": ("integer", "消息ID"), "emoji_id": ("string", "表情ID(可选)"), "emoji_type": ("string", "表情类型(可选)")},
+        ["message_id"], _handle_fetch_emoji_like),
 
         ("get_group_info_ex", "获取群的扩展详细信息(比 get_group_info 更详细)。\n返回: 群等级、创建时间、最大成员数等。\n使用场景: 需要群的详细元数据时使用",
-         {"group_id": ("integer", "群号")},
-         ["group_id"], _handle_get_group_info_ex),
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_get_group_info_ex),
 
         ("get_group_files_by_folder", "获取群文件指定文件夹内的文件列表。\n使用场景: 用户说'看看XX文件夹里有什么'时使用。\nfolder_id 从 get_group_root_files 获取",
-         {"group_id": ("integer", "群号"), "folder_id": ("string", "文件夹ID(从文件列表获取)")},
-         ["group_id", "folder_id"], _handle_get_group_files_by_folder),
+        {"group_id": ("integer", "群号"), "folder_id": ("string", "文件夹ID(从文件列表获取)")},
+        ["group_id", "folder_id"], _handle_get_group_files_by_folder),
 
         ("delete_group_file", "删除群文件。需要管理员权限。\n使用场景: 用户说'删除群文件XX'时使用",
-         {"group_id": ("integer", "群号"), "file_id": ("string", "文件ID"), "busid": ("integer", "文件业务ID")},
-         ["group_id", "file_id"], _handle_delete_group_file),
+        {"group_id": ("integer", "群号"), "file_id": ("string", "文件ID"), "busid": ("integer", "文件业务ID")},
+        ["group_id", "file_id"], _handle_delete_group_file),
 
         ("create_group_file_folder", "在群文件中创建文件夹。\n使用场景: 用户说'在群文件里建个文件夹'时使用",
-         {"group_id": ("integer", "群号"), "name": ("string", "文件夹名称"), "parent_id": ("string", "父文件夹ID，默认'/'(根目录)")},
-         ["group_id", "name"], _handle_create_group_file_folder),
+        {"group_id": ("integer", "群号"), "name": ("string", "文件夹名称"), "parent_id": ("string", "父文件夹ID，默认'/'(根目录)")},
+        ["group_id", "name"], _handle_create_group_file_folder),
 
         ("get_group_system_msg", "获取群系统消息(加群请求、邀请等待处理的通知)。\n使用场景: 用户问'有没有人申请加群'、'群通知'时使用",
-         {}, [], _handle_get_group_system_msg),
+        {}, [], _handle_get_group_system_msg),
 
         ("send_forward_msg", "通用合并转发消息接口(支持群和私聊)。\n"
-         "使用场景: 需要发送合并转发消息时使用。\n"
-         "messages 是 node 数组，格式同 send_group_forward_msg",
-         {"message_type": ("string", "'group'或'private'"), "group_id": ("integer", "群号(群聊时)"),
-          "user_id": ("integer", "QQ号(私聊时)"), "messages": ("array", "node数组")},
-         ["messages"], _handle_send_forward_msg),
+        "使用场景: 需要发送合并转发消息时使用。\n"
+        "messages 是 node 数组，格式同 send_group_forward_msg",
+        {"message_type": ("string", "'group'或'private'"), "group_id": ("integer", "群号(群聊时)"),
+        "user_id": ("integer", "QQ号(私聊时)"), "messages": ("array", "node数组")},
+        ["messages"], _handle_send_forward_msg),
 
         ("mark_all_as_read", "标记所有消息为已读。\n使用场景: 用户说'全部已读'、'清除未读'时使用",
-         {}, [], _handle_mark_all_as_read),
+        {}, [], _handle_mark_all_as_read),
 
         ("get_friends_with_category", "获取带分组信息的好友列表。\n使用场景: 用户问'好友分组'、'哪些好友在哪个分组'时使用",
-         {}, [], _handle_get_friends_with_category),
+        {}, [], _handle_get_friends_with_category),
 
         ("get_image", "获取图片文件信息(本地路径和URL)。\n使用场景: 需要获取图片的实际文件路径或下载URL时使用。\nfile 参数从消息的 image 段获取",
-         {"file": ("string", "图片file标识(从消息段获取)")},
-         ["file"], _handle_get_image),
+        {"file": ("string", "图片file标识(从消息段获取)")},
+        ["file"], _handle_get_image),
 
         ("get_record", "获取语音文件信息(转换格式并返回路径)。\n使用场景: 需要获取语音文件的本地路径时使用。\nfile 参数从消息的 record 段获取",
-         {"file": ("string", "语音file标识(从消息段获取)"), "out_format": ("string", "输出格式: mp3/amr/wma/m4a/spx/ogg/wav/flac，默认mp3")},
-         ["file"], _handle_get_record),
+        {"file": ("string", "语音file标识(从消息段获取)"), "out_format": ("string", "输出格式: mp3/amr/wma/m4a/spx/ogg/wav/flac，默认mp3")},
+        ["file"], _handle_get_record),
 
         ("get_ai_record", "生成AI语音(TTS)但不直接发送，返回语音文件信息。\n使用场景: 需要先生成语音再做其他处理时使用。\n先用 get_ai_characters 获取角色ID",
-         {"group_id": ("integer", "群号(用于获取语音权限)"), "character": ("string", "角色ID"), "text": ("string", "要转为语音的文本")},
-         ["group_id", "character", "text"], _handle_get_ai_record),
+        {"group_id": ("integer", "群号(用于获取语音权限)"), "character": ("string", "角色ID"), "text": ("string", "要转为语音的文本")},
+        ["group_id", "character", "text"], _handle_get_ai_record),
 
         ("ark_share_peer", "生成推荐联系人/群的分享卡片(Ark消息)。\n使用场景: 用户说'推荐XX给某人'、'分享群名片'时使用",
-         {"user_id": ("string", "推荐的用户QQ号(可选)"), "group_id": ("string", "推荐的群号(可选)"), "phone_number": ("string", "手机号(可选)")},
-         [], _handle_ark_share_peer),
+        {"user_id": ("string", "推荐的用户QQ号(可选)"), "group_id": ("string", "推荐的群号(可选)"), "phone_number": ("string", "手机号(可选)")},
+        [], _handle_ark_share_peer),
 
         ("get_mini_app_ark", "签名小程序卡片(Ark消息)。\n使用场景: 需要发送小程序分享卡片时使用。\ncontent 是小程序的 JSON 配置",
-         {"content": ("string", "小程序JSON配置字符串")},
-         ["content"], _handle_get_mini_app_ark),
+        {"content": ("string", "小程序JSON配置字符串")},
+        ["content"], _handle_get_mini_app_ark),
 
         ("create_collection", "创建QQ收藏。\n使用场景: 用户说'收藏这段话'、'帮我收藏'时使用",
-         {"raw_data": ("string", "要收藏的文本内容"), "brief": ("string", "收藏摘要(可选)")},
-         ["raw_data"], _handle_create_collection),
+        {"raw_data": ("string", "要收藏的文本内容"), "brief": ("string", "收藏摘要(可选)")},
+        ["raw_data"], _handle_create_collection),
 
         ("get_collection_list", "获取QQ收藏列表。\n使用场景: 用户问'我的收藏有什么'时使用",
-         {"category": ("integer", "收藏分类，0=全部"), "count": ("integer", "获取数量，默认20")},
-         [], _handle_get_collection_list),
+        {"category": ("integer", "收藏分类，0=全部"), "count": ("integer", "获取数量，默认20")},
+        [], _handle_get_collection_list),
 
         ("del_group_notice", "删除群公告。需要管理员权限。\n使用场景: 用户说'删除群公告'时使用。\nnotice_id 从 get_group_notice 获取",
-         {"group_id": ("integer", "群号"), "notice_id": ("string", "公告ID(从 get_group_notice 获取)")},
-         ["group_id", "notice_id"], _handle_del_group_notice),
+        {"group_id": ("integer", "群号"), "notice_id": ("string", "公告ID(从 get_group_notice 获取)")},
+        ["group_id", "notice_id"], _handle_del_group_notice),
 
         ("nc_get_packet_status", "获取NapCat PacketServer状态(扩展功能是否可用)。\n使用场景: 需要检查戳一戳、AI语音等扩展功能是否可用时使用",
-         {}, [], _handle_nc_get_packet_status),
+        {}, [], _handle_nc_get_packet_status),
 
         ("clean_cache", "清理NapCat缓存。\n使用场景: 用户说'清理缓存'、'清除缓存'时使用",
-         {}, [], _handle_clean_cache),
+        {}, [], _handle_clean_cache),
     ]
 
     for name, desc, props, required, handler in _ext_tools:
@@ -5438,11 +5438,11 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
                 "搜索歌曲，返回搜索结果列表供选择。\n"
                 "使用场景: 用户说'点歌 XXX'、'放歌 XXX'、'来首 XXX' 时先调用此工具搜索。\n"
                 "返回结果包含歌曲 ID、歌名、歌手、专辑等信息。\n"
-                "重要：你需要仔细分析用户的真实意图，从搜索结果中选择最符合用户需求的歌曲：\n"
-                "- 如果用户指定了歌手名，优先选择该歌手的原版歌曲\n"
-                "- 避免选择翻唱版、柔情版、女声版、男声版等改编版本，除非用户明确要求\n"
-                "- 如果用户只说歌名，选择最知名的原唱版本\n"
-                "- 注意歌曲的完整性，避免选择铃声版、片段版\n"
+                "重要：不要依赖本地固定词表或主观印象猜歌，必须先做结果自检：\n"
+                "- 先拆出 title / artist，再验证搜索结果是否真的命中标题与歌手\n"
+                "- 除非用户明确要求，否则不要擅自改成翻唱版、DJ 版、伴奏版、Live、Remix 或片段\n"
+                "- 搜索结果里只要存在标题/歌手不一致，就不能当成同一首歌直接播\n"
+                "- 多个候选都像时，优先保留给后续 music_play_by_id 精确播放，不要拍脑袋猜\n"
                 "选择后使用 music_play_by_id 工具播放。"
             ),
             parameters={
@@ -5466,8 +5466,9 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
             description=(
                 "按关键词直接点歌并播放（优先 Alger API，自动下载可播音频并发送语音）。\n"
                 "使用场景: 用户说“点歌 XXX”“来首 XXX”“放歌 XXX”时优先使用本工具。\n"
-                "注意：如果用户明确指定歌手/版本，请把歌手和版本一起放进 keyword。\n"
-                "仅当本工具返回 preview_only/no_url/play_failed/download_failed 且用户同意第三方来源时，才考虑 B 站回退。"
+                "注意：如果用户明确指定歌手或版本，请优先分开传 title / artist，再把补充限定词放进 keyword。\n"
+                "内部音源顺序应理解为：Alger/官方优先，其次站内正规替代音源，再其次 SoundCloud，最后才是 B 站。\n"
+                "如果标题或歌手对不上，不要为了“能播”就换歌。"
             ),
             parameters={
                 "type": "object",
@@ -5490,7 +5491,8 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
             description=(
                 "根据歌曲 ID 播放歌曲（发送 SILK 语音消息）。\n"
                 "使用场景: 在 music_search 返回结果后，选择合适的歌曲 ID 调用此工具播放。\n"
-                "你需要根据用户需求（如要原版、不要 DJ 版等）从搜索结果中选择最合适的歌曲。"
+                "只有在你已经确认标题、歌手、版本都匹配用户要求时才调用；不要靠本地词表主观猜测。\n"
+                "如果 music_search 结果里带有 source / source_url，调用本工具时也要原样带上，避免把跨平台结果误当成网易云 ID。"
             ),
             parameters={
                 "type": "object",
@@ -5498,6 +5500,8 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
                     "song_id": {"type": "integer", "description": "歌曲 ID（从 music_search 结果中获取）"},
                     "song_name": {"type": "string", "description": "歌曲名称（用于显示）"},
                     "artist": {"type": "string", "description": "歌手名称（用于显示）"},
+                    "source": {"type": "string", "description": "可选，music_search 返回的音源类型，例如 soundcloud"},
+                    "source_url": {"type": "string", "description": "可选，music_search 返回的原始页面地址，跨平台音源时必须原样透传"},
                 },
                 "required": ["song_id"],
             },
@@ -5632,9 +5636,9 @@ async def _handle_config_update(args: dict[str, Any], context: dict[str, Any]) -
 
 async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """搜索歌曲，返回结果列表。"""
-    keyword = normalize_text(str(args.get("keyword", "")))
-    title = normalize_text(str(args.get("title", "")))
-    artist = normalize_text(str(args.get("artist", "")))
+    keyword = normalize_matching_text(str(args.get("keyword", "")))
+    title = normalize_matching_text(str(args.get("title", "")))
+    artist = normalize_matching_text(str(args.get("artist", "")))
     if not keyword and title:
         keyword = f"{title} {artist}".strip()
     if not keyword:
@@ -5648,7 +5652,7 @@ async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) ->
         result = await tool_executor.execute(
             action="music_search",
             tool_name="music_search",
-            tool_args={"keyword": keyword, "limit": 8},  # 增加到8条，给Agent更多选择
+            tool_args={"keyword": keyword, "title": title, "artist": artist, "limit": 8},
             message_text=keyword,
             conversation_id=str(context.get("conversation_id", "")),
             user_id=str(context.get("user_id", "")),
@@ -5657,17 +5661,29 @@ async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) ->
             api_call=context.get("api_call"),
         )
         if not result.ok:
-            return ToolCallResult(ok=False, error=result.error or "search_failed")
+            payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+            return ToolCallResult(
+                ok=False,
+                error=result.error or "search_failed",
+                display=str(payload.get("text", "")),
+            )
 
         # 返回搜索结果列表
-        results = result.payload.get("results", [])
+        payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+        results = payload.get("results", [])
         if not results:
-            return ToolCallResult(ok=False, error="no_results", display="没找到相关歌曲")
+            return ToolCallResult(
+                ok=False,
+                error="no_results",
+                display=str(payload.get("text", "")) or "没找到相关歌曲",
+            )
 
         # 格式化结果供 Agent 选择
         lines = [f"找到 {len(results)} 首歌曲："]
         for i, r in enumerate(results, 1):
-            lines.append(f"{i}. {r['name']} - {r['artist']} (ID: {r['id']})")
+            source = normalize_text(str(r.get("source", ""))).lower()
+            source_tag = f" [{source}]" if source and source != "netease" else ""
+            lines.append(f"{i}. {r['name']} - {r['artist']} (ID: {r['id']}){source_tag}")
 
         return ToolCallResult(
             ok=True,
@@ -5684,8 +5700,11 @@ async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]
     if song_id <= 0:
         return ToolCallResult(ok=False, error="invalid song_id")
 
-    song_name = normalize_text(str(args.get("song_name", "")))
-    artist = normalize_text(str(args.get("artist", "")))
+    song_name = normalize_matching_text(str(args.get("song_name", "")))
+    artist = normalize_matching_text(str(args.get("artist", "")))
+    keyword = normalize_matching_text(str(args.get("keyword", "")))
+    source = normalize_matching_text(str(args.get("source", "")))
+    source_url = normalize_text(str(args.get("source_url", "")))
 
     tool_executor = context.get("tool_executor")
     group_id = int(context.get("group_id", 0) or 0)
@@ -5698,7 +5717,14 @@ async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]
         result = await tool_executor.execute(
             action="music_play_by_id",
             tool_name="music_play_by_id",
-            tool_args={"song_id": song_id, "song_name": song_name, "artist": artist},
+            tool_args={
+                "song_id": song_id,
+                "song_name": song_name,
+                "artist": artist,
+                "keyword": keyword,
+                "source": source,
+                "source_url": source_url,
+            },
             message_text="",
             conversation_id=str(context.get("conversation_id", "")),
             user_id=str(context.get("user_id", "")),
@@ -5709,14 +5735,24 @@ async def _handle_music_play_by_id(args: dict[str, Any], context: dict[str, Any]
         if not result.ok:
             return ToolCallResult(ok=False, error=result.error or "play_failed")
 
-        # 返回音频信息
-        display_name = song_name if song_name else result.payload.get("text", "")
+        payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+        audio_file = payload.get("audio_file")
+        audio_file_silk = payload.get("audio_file_silk")
+        record_b64 = payload.get("record_b64")
+        if not any((audio_file, audio_file_silk, record_b64)):
+            return ToolCallResult(
+                ok=False,
+                error="voice_prepare_failed",
+                display=str(payload.get("text", "")) or (song_name or "语音准备失败"),
+            )
+
+        display_name = song_name if song_name else str(payload.get("text", ""))
         return ToolCallResult(
             ok=True,
             data={
-                "audio_file": result.payload.get("audio_file"),
-                "audio_file_silk": result.payload.get("audio_file_silk"),
-                "record_b64": result.payload.get("record_b64"),
+                "audio_file": audio_file,
+                "audio_file_silk": audio_file_silk,
+                "record_b64": record_b64,
             },
             display=display_name,
         )
@@ -5773,9 +5809,9 @@ async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> T
     不在此处直接发送语音，避免与 app.py 发送层重复发送。
     音频文件路径通过 data 字段传递，由 engine → app.py 的 send_response 统一处理。
     """
-    keyword = normalize_text(str(args.get("keyword", "")))
-    title = normalize_text(str(args.get("title", "")))
-    artist = normalize_text(str(args.get("artist", "")))
+    keyword = normalize_matching_text(str(args.get("keyword", "")))
+    title = normalize_matching_text(str(args.get("title", "")))
+    artist = normalize_matching_text(str(args.get("artist", "")))
     if not keyword and title:
         keyword = f"{title} {artist}".strip()
     if not keyword:
@@ -5792,7 +5828,7 @@ async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> T
         result = await tool_executor.execute(
             action="music_play",
             tool_name="music_play",
-            tool_args={"keyword": keyword},
+            tool_args={"keyword": keyword, "title": title, "artist": artist},
             message_text=keyword,
             conversation_id=str(context.get("conversation_id", "")),
             user_id=str(context.get("user_id", "")),
@@ -6077,7 +6113,7 @@ async def _handle_list_faces(args: dict[str, Any], context: dict[str, Any]) -> T
         faces = sticker_mgr.find_face(query)
     else:
         faces = [sticker_mgr._faces[fid] for fid in [13, 14, 5, 9, 11, 76, 179, 271, 264, 182]
-                 if fid in sticker_mgr._faces]
+                if fid in sticker_mgr._faces]
 
     lines = [f"id={f.face_id} {f.desc}" for f in faces]
     return ToolCallResult(
@@ -6722,7 +6758,7 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 f"可去重 {payload.get('duplicates', 0)} 条"
                 if dry_run
                 else f"记忆整理已执行：扫描 {payload.get('scanned', 0)} 条，"
-                     f"已去重 {payload.get('duplicates', 0)} 条（备注: {note}）"
+                    f"已去重 {payload.get('duplicates', 0)} 条（备注: {note}）"
             ),
         )
 
@@ -6993,7 +7029,7 @@ async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) 
                 heat = f" ({item.heat})" if item.heat else ""
                 lines.append(f"{i}. {item.title}{heat}")
             return ToolCallResult(ok=True, data={"platform": platform, "count": len(items)},
-                                  display="\n".join(lines))
+                                display="\n".join(lines))
         else:
             trends = await crawler_hub.get_trends_cached()
             text = crawler_hub.format_trends_text(trends, limit=limit)
@@ -7003,7 +7039,7 @@ async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) 
                 for plat, items in trends.items():
                     for item in items[:limit]:
                         kb.add("trend", item.title, item.snippet or "", source=plat,
-                               tags=[plat], extra={"heat": item.heat, "url": item.url})
+                                tags=[plat], extra={"heat": item.heat, "url": item.url})
             return ToolCallResult(ok=True, data={"platforms": list(trends.keys())}, display=text)
     except Exception as e:
         _log.warning("get_hot_trends_error | %s", e)
@@ -7282,7 +7318,7 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
 
     try:
         entry_id = kb.add(category=category, title=title, content=content,
-                          source="chat", tags=tags)
+                        source="chat", tags=tags)
         return ToolCallResult(
             ok=True,
             data={"id": entry_id, "category": category},

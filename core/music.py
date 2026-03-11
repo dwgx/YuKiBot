@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
+from core.soundcloud import SoundCloudClient
 from utils.text import has_unrequested_title_qualifier, normalize_matching_text, normalize_text
 
 _log = logging.getLogger("yukiko.music")
@@ -85,7 +86,6 @@ class MusicEngine:
     _DEFAULT_MAX_VOICE_DURATION_S = 0  # 0 means no truncation
     _DEFAULT_TRIAL_MAX_DURATION_MS = 35_000
     _BREAK_LIMIT_MIN_FULL_MS = 90_000
-    _SUPPORTED_SOURCE_ORDER = ("qq", "kuwo", "kugou", "migu")
 
     def __init__(self, cfg: dict[str, Any] | None = None):
         cfg = cfg or {}
@@ -120,18 +120,14 @@ class MusicEngine:
         )
 
         # UnblockNeteaseMusic 配置
-        self._unblock_enable = bool(music_cfg.get("unblock_enable", True))
+        self._unblock_enable = bool(music_cfg.get("unblock_enable", False))
         self._unblock_api_base = str(music_cfg.get("unblock_api_base", "")).rstrip("/")
-        self._unblock_source_list = self._parse_source_csv(
-            music_cfg.get("unblock_sources", "qq,kuwo,kugou,migu")
-        )
-        self._unblock_sources = ",".join(self._unblock_source_list)
+        self._unblock_sources = str(
+            music_cfg.get("unblock_sources", "qq,kuwo,kugou,migu,soundcloud")
+        ).strip()
 
         # 本地音源匹配器
         self._local_source_enable = bool(music_cfg.get("local_source_enable", True))
-        self._alternative_source_list = self._parse_source_csv(
-            music_cfg.get("alternative_sources", music_cfg.get("unblock_sources", "qq,kuwo,kugou,migu"))
-        )
         self._source_matcher = None
         if self._local_source_enable:
             try:
@@ -143,6 +139,7 @@ class MusicEngine:
 
         self._alger_web_base = self._derive_alger_web_base(self._api_base)
         self._alger_discovered_api_bases: list[str] = []
+        self._soundcloud_client = SoundCloudClient(timeout=max(8.0, self._timeout))
 
     @staticmethod
     def _find_bundled_ffmpeg() -> str:
@@ -170,22 +167,6 @@ class MusicEngine:
             return True
         except Exception:
             return False
-
-    @classmethod
-    def _parse_source_csv(cls, raw_value: Any) -> list[str]:
-        raw = normalize_text(str(raw_value or ""))
-        if not raw:
-            return list(cls._SUPPORTED_SOURCE_ORDER)
-
-        seen: set[str] = set()
-        out: list[str] = []
-        for item in raw.split(","):
-            source = normalize_text(item).lower()
-            if not source or source not in cls._SUPPORTED_SOURCE_ORDER or source in seen:
-                continue
-            seen.add(source)
-            out.append(source)
-        return out or list(cls._SUPPORTED_SOURCE_ORDER)
 
     async def aclose(self) -> None:
         """Compatibility hook."""
@@ -224,6 +205,13 @@ class MusicEngine:
         if not results or not found_precise:
             for query_variant in query_variants:
                 rows = await self._search_netease(query_variant, fetch_limit)
+                results = self._merge_unique_results(results, rows, merge_limit)
+                if self._contains_precise_match(rows, intent=intent):
+                    break
+
+        if intent.title_hint and not self._contains_precise_match(results, intent=intent):
+            for query_variant in query_variants:
+                rows = await self._search_soundcloud(query_variant, fetch_limit)
                 results = self._merge_unique_results(results, rows, merge_limit)
                 if self._contains_precise_match(rows, intent=intent):
                     break
@@ -641,6 +629,59 @@ class MusicEngine:
             return []
         return self._parse_search_songs(data)
 
+    async def _search_soundcloud(self, keyword: str, limit: int) -> list[MusicSearchResult]:
+        query = normalize_matching_text(keyword)
+        if not query:
+            return []
+        try:
+            rows = await self._soundcloud_client.search_tracks(query, limit=max(5, min(limit, 20)))
+        except Exception as exc:
+            _log.warning("soundcloud_search_fail | keyword=%s | %s", query, exc)
+            return []
+
+        results: list[MusicSearchResult] = []
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            title = normalize_text(str(item.get("title", "")))
+            page_url = normalize_text(str(item.get("permalink_url", "")))
+            if not title or not page_url:
+                continue
+            artist = self._extract_soundcloud_artist(item)
+            try:
+                song_id = int(item.get("id", 0) or 0)
+            except Exception:
+                song_id = 0
+            try:
+                duration_ms = int(item.get("duration", 0) or 0)
+            except Exception:
+                duration_ms = 0
+            results.append(
+                MusicSearchResult(
+                    song_id=song_id,
+                    name=title,
+                    artist=artist,
+                    duration_ms=duration_ms,
+                    source="soundcloud",
+                    source_url=page_url,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _extract_soundcloud_artist(item: dict[str, Any]) -> str:
+        publisher = item.get("publisher_metadata", {})
+        if isinstance(publisher, dict):
+            artist = normalize_text(str(publisher.get("artist", "")))
+            if artist:
+                return artist
+        user = item.get("user", {})
+        if isinstance(user, dict):
+            artist = normalize_text(str(user.get("username", "")))
+            if artist:
+                return artist
+        return ""
+
     @staticmethod
     def _parse_search_songs(data: dict[str, Any]) -> list[MusicSearchResult]:
         songs = data.get("result", {}).get("songs", [])
@@ -818,7 +859,7 @@ class MusicEngine:
                 "trying_alternative_source | id=%d | song=%s | artist=%s",
                 song.song_id, song.name, song.artist,
             )
-            sources = list(self._alternative_source_list) or None
+            sources = self._unblock_sources.split(",") if self._unblock_sources else None
             alternative = await self._source_matcher.find_alternative(
                 song.name,
                 song.artist,
@@ -835,6 +876,26 @@ class MusicEngine:
                 )
 
         return netease_url
+
+    async def _get_soundcloud_play_url(self, song: MusicSearchResult) -> MusicPlayUrl:
+        page_url = normalize_text(song.source_url)
+        if not page_url:
+            return MusicPlayUrl()
+        try:
+            audio = await self._soundcloud_client.resolve_page_audio(page_url)
+        except Exception as exc:
+            _log.warning("soundcloud_resolve_fail | url=%s | %s", page_url[:160], exc)
+            return MusicPlayUrl()
+        if not audio or not audio.audio_url:
+            return MusicPlayUrl()
+        return MusicPlayUrl(
+            url=audio.audio_url,
+            duration_ms=int(song.duration_ms or 0),
+            is_trial=False,
+            source="soundcloud",
+            level=audio.protocol or audio.mime_type or "soundcloud",
+        )
+
     async def _get_alger_url(self, song_id: int) -> MusicPlayUrl:
         best = MusicPlayUrl()
         tried: set[str] = set()
@@ -1132,10 +1193,13 @@ class MusicEngine:
         *,
         require_verified_original: bool = False,
     ) -> MusicPlayResult:
-        play_url = await self._get_play_url_with_alternative(
-            song,
-            require_verified_original=require_verified_original,
-        )
+        if normalize_text(song.source).lower() == "soundcloud":
+            play_url = await self._get_soundcloud_play_url(song)
+        else:
+            play_url = await self._get_play_url_with_alternative(
+                song,
+                require_verified_original=require_verified_original,
+            )
         if not play_url.url:
             return MusicPlayResult(ok=False, song=song, error="no_url")
         if play_url.is_trial:

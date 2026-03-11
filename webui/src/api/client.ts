@@ -232,6 +232,31 @@ class ApiClient {
     });
   }
 
+  sendChatAgentText(payload: {
+    chatType: "group" | "private";
+    peerId: string;
+    text: string;
+    botId?: string;
+    replyToMessageId?: string;
+    contextUserId?: string;
+    contextUserName?: string;
+    contextSenderRole?: string;
+  }) {
+    return this.request<{ ok: boolean; status?: string; reason?: string; conversation_id?: string; trace_id?: string; seq?: number }>("/chat/agent-text", {
+      method: "POST",
+      body: JSON.stringify({
+        chat_type: payload.chatType,
+        peer_id: payload.peerId,
+        text: payload.text,
+        bot_id: payload.botId ?? "",
+        reply_to_message_id: payload.replyToMessageId ?? "",
+        context_user_id: payload.contextUserId ?? "",
+        context_user_name: payload.contextUserName ?? "",
+        context_sender_role: payload.contextSenderRole ?? "",
+      }),
+    });
+  }
+
   sendChatImage(payload: { chatType: "group" | "private"; peerId: string; imageUrl?: string; imageBase64?: string; botId?: string }) {
     return this.request<{ ok: boolean; message_id?: string }>("/chat/send-image", {
       method: "POST",

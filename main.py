@@ -32,9 +32,32 @@ _load_env_files()
 
 def _tune_runtime_logging() -> None:
     # Keep startup/runtime diagnostics, suppress noisy per-request HTTP access logs.
-    uvicorn_access = logging.getLogger("uvicorn.access")
-    uvicorn_access.disabled = True
-    uvicorn_access.propagate = False
+    def _silence_logger(name: str) -> None:
+        logger = logging.getLogger(name)
+        logger.handlers.clear()
+        logger.filters.clear()
+        logger.disabled = True
+        logger.propagate = False
+        logger.setLevel(logging.CRITICAL + 1)
+
+    for name in ("uvicorn.access", "uvicorn.asgi", "uvicorn.protocols.http.h11_impl"):
+        _silence_logger(name)
+
+    try:
+        import uvicorn.config
+
+        loggers = uvicorn.config.LOGGING_CONFIG.get("loggers", {})
+        handlers = uvicorn.config.LOGGING_CONFIG.get("handlers", {})
+        for name in ("uvicorn.access", "uvicorn.asgi"):
+            if name in loggers:
+                loggers[name]["handlers"] = []
+                loggers[name]["propagate"] = False
+                loggers[name]["level"] = "CRITICAL"
+        if "access" in handlers:
+            handlers["access"]["class"] = "logging.NullHandler"
+    except Exception:
+        pass
+
     logging.getLogger("websockets.server").setLevel(logging.WARNING)
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
 
@@ -142,4 +165,6 @@ async def _root_redirect():
 
 
 if __name__ == "__main__":
-    nonebot.run()
+    # NoneBot FastAPI driver rebuilds its own uvicorn logging config, so
+    # access_log must be disabled at the run() call site to silence GET noise.
+    nonebot.run(access_log=False)

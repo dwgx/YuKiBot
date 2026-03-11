@@ -5,6 +5,7 @@
 - 酷狗音乐 (KuGou)
 - 酷我音乐 (KuWo)
 - 咪咕音乐 (Migu)
+- SoundCloud
 
 参考项目:
 - https://github.com/UnblockNeteaseMusic/server
@@ -12,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -21,6 +23,8 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+
+from core.soundcloud import SoundCloudClient
 from utils.text import normalize_matching_text
 
 _log = logging.getLogger("yukiko.music_sources")
@@ -30,7 +34,7 @@ _log = logging.getLogger("yukiko.music_sources")
 class AlternativeSource:
     """替代音源信息。"""
     url: str = ""
-    source: str = ""  # qq / kuwo / kugou / migu
+    source: str = ""  # qq / kuwo / kugou / migu / soundcloud
     quality: str = ""
     duration_ms: int = 0
     size: int = 0
@@ -50,6 +54,115 @@ class MusicSourceMatcher:
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
+        self._preferred_sources = ("kuwo", "kugou", "migu", "soundcloud", "qq")
+        self._secondary_sources = {"qq"}
+        self._soundcloud = SoundCloudClient(timeout=max(8.0, timeout))
+
+    _BLOCKED_VERSION_MARKERS = (
+        "伴奏",
+        "纯音乐",
+        "instrumental",
+        "inst",
+        "karaoke",
+        "卡拉ok",
+        "原版伴奏",
+    )
+
+    def _normalize_sources(self, sources: list[str] | None) -> list[str]:
+        requested = [self._normalize_text(x) for x in (sources or []) if self._normalize_text(x)]
+        if not requested:
+            requested = list(self._preferred_sources)
+        deduped = list(dict.fromkeys(requested))
+        ordered = [src for src in self._preferred_sources if src in deduped]
+        ordered.extend(src for src in deduped if src not in ordered)
+        return ordered
+
+    async def _search_one_source(
+        self,
+        source: str,
+        song_name: str,
+        artist: str,
+        duration_ms: int,
+    ) -> AlternativeSource | None:
+        try:
+            _log.info("searching_source | source=%s | song=%s | artist=%s", source, song_name, artist)
+            if source == "qq":
+                timeout = min(self._timeout, 6.0)
+            elif source == "soundcloud":
+                timeout = min(14.0, max(self._timeout, 12.0))
+            else:
+                timeout = min(self._timeout, 8.0)
+            result = await asyncio.wait_for(
+                self._search_source(source, song_name, artist, duration_ms),
+                timeout=timeout,
+            )
+            if result and result.url:
+                _log.info(
+                    "alternative_found | source=%s | song=%s | artist=%s | br=%dk",
+                    source, song_name, artist, result.br // 1000 if result.br else 0,
+                )
+                return result
+            _log.info("source_no_result | source=%s | song=%s", source, song_name)
+            return None
+        except asyncio.TimeoutError:
+            _log.warning("source_search_timeout | source=%s | song=%s", source, song_name)
+            return None
+        except Exception as exc:
+            _log.warning("source_search_fail | source=%s | song=%s | error=%s", source, song_name, exc)
+            return None
+
+    async def _search_source_batch(
+        self,
+        batch_sources: list[str],
+        song_name: str,
+        artist: str,
+        duration_ms: int,
+    ) -> AlternativeSource | None:
+        if not batch_sources:
+            return None
+
+        async def _runner(source: str) -> tuple[str, AlternativeSource | None]:
+            return source, await self._search_one_source(source, song_name, artist, duration_ms)
+
+        tasks = [asyncio.create_task(_runner(source)) for source in batch_sources]
+        successes: dict[str, AlternativeSource] = {}
+        try:
+            for task in asyncio.as_completed(tasks):
+                source, result = await task
+                if result and result.url:
+                    successes[source] = result
+                    best = self._pick_best_source(successes, batch_sources)
+                    if best is not None:
+                        return best
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        return self._pick_best_source(successes, batch_sources)
+
+    @staticmethod
+    def _pick_best_source(
+        successes: dict[str, AlternativeSource],
+        source_order: list[str],
+    ) -> AlternativeSource | None:
+        for source in source_order:
+            result = successes.get(source)
+            if result and result.url:
+                return result
+        return None
+
+    @classmethod
+    def _should_avoid_candidate_name(cls, candidate_name: str, requested_name: str) -> bool:
+        candidate_norm = normalize_matching_text(candidate_name).lower()
+        requested_norm = normalize_matching_text(requested_name).lower()
+        if not candidate_norm:
+            return False
+        for marker in cls._BLOCKED_VERSION_MARKERS:
+            if marker in candidate_norm and marker not in requested_norm:
+                return True
+        return False
 
     async def find_alternative(
         self,
@@ -66,8 +179,7 @@ class MusicSourceMatcher:
             duration_ms: 歌曲时长（用于匹配验证）
             sources: 音源优先级列表，如 ["qq", "kuwo", "kugou", "migu"]
         """
-        if not sources:
-            sources = ["qq", "kuwo", "kugou", "migu"]
+        sources = self._normalize_sources(sources)
 
         # 清理歌曲名和歌手名
         song_name = self._normalize_text(song_name)
@@ -76,23 +188,13 @@ class MusicSourceMatcher:
         if not song_name:
             return None
 
-        for source in sources:
-            try:
-                _log.info("searching_source | source=%s | song=%s | artist=%s", source, song_name, artist)
-                result = await self._search_source(source, song_name, artist, duration_ms)
-                if result and result.url:
-                    _log.info(
-                        "alternative_found | source=%s | song=%s | artist=%s | br=%dk",
-                        source, song_name, artist, result.br // 1000 if result.br else 0,
-                    )
-                    return result
-                else:
-                    _log.info("source_no_result | source=%s | song=%s", source, song_name)
-            except Exception as exc:
-                _log.warning("source_search_fail | source=%s | song=%s | error=%s", source, song_name, exc)
-                continue
+        primary_batch = [src for src in sources if src not in self._secondary_sources]
+        secondary_batch = [src for src in sources if src in self._secondary_sources]
 
-        return None
+        result = await self._search_source_batch(primary_batch, song_name, artist, duration_ms)
+        if result and result.url:
+            return result
+        return await self._search_source_batch(secondary_batch, song_name, artist, duration_ms)
 
     async def _search_source(
         self,
@@ -110,7 +212,83 @@ class MusicSourceMatcher:
             return await self._search_kuwo(song_name, artist, duration_ms)
         elif source == "qq":
             return await self._search_qq(song_name, artist, duration_ms)
+        elif source == "soundcloud":
+            return await self._search_soundcloud(song_name, artist, duration_ms)
         return None
+
+    async def _search_soundcloud(
+        self,
+        song_name: str,
+        artist: str,
+        duration_ms: int,
+    ) -> AlternativeSource | None:
+        """从 SoundCloud 搜索歌曲并解析真实播放地址。"""
+        keyword = f"{song_name} {artist}".strip()
+
+        try:
+            songs = await self._soundcloud.search_tracks(keyword, limit=8)
+            if not songs:
+                return None
+
+            best_match = self._find_best_match(songs, song_name, artist, duration_ms, "soundcloud")
+            if not best_match:
+                return None
+
+            ordered_candidates: list[dict[str, Any]] = [best_match]
+            for row in songs[:5]:
+                if row is best_match:
+                    continue
+                ordered_candidates.append(row)
+
+            audio = None
+            resolved_match = best_match
+            for row in ordered_candidates:
+                audio = await self._soundcloud.get_track_audio(row)
+                if audio and audio.audio_url:
+                    resolved_match = row
+                    break
+            if not audio or not audio.audio_url:
+                return None
+
+            preset = ""
+            transcodings = ((resolved_match.get("media") or {}).get("transcodings") or [])
+            if isinstance(transcodings, list):
+                for item in transcodings:
+                    if not isinstance(item, dict):
+                        continue
+                    fmt = item.get("format", {})
+                    protocol = ""
+                    if isinstance(fmt, dict):
+                            protocol = self._normalize_text(str(fmt.get("protocol", ""))).lower()
+                    if protocol == audio.protocol:
+                        preset = self._normalize_text(str(item.get("preset", "")))
+                        break
+
+            br = 128000
+            if "160" in preset:
+                br = 160000
+            elif "256" in preset:
+                br = 256000
+            elif "320" in preset:
+                br = 320000
+
+            duration_value = resolved_match.get("duration", 0) or resolved_match.get("full_duration", 0)
+            try:
+                resolved_duration_ms = int(duration_value)
+            except (ValueError, TypeError):
+                resolved_duration_ms = 0
+
+            return AlternativeSource(
+                url=audio.audio_url,
+                source="soundcloud",
+                quality=audio.protocol or "stream",
+                duration_ms=resolved_duration_ms,
+                size=0,
+                br=br,
+            )
+        except Exception as exc:
+            _log.warning("soundcloud_search_fail | %s", exc)
+            return None
 
     async def _search_kugou(
         self,
@@ -696,7 +874,24 @@ class MusicSourceMatcher:
                 if not artist:
                     artist = song.get("singerName", "") or song.get("singer", "") or song.get("artist", "")
                 duration = 0
+            elif source == "soundcloud":
+                if not bool(song.get("streamable", True)):
+                    continue
+                name = song.get("title", "")
+                publisher = song.get("publisher_metadata", {})
+                if isinstance(publisher, dict):
+                    artist = publisher.get("artist", "")
+                else:
+                    artist = ""
+                if not artist:
+                    user = song.get("user", {})
+                    if isinstance(user, dict):
+                        artist = user.get("username", "")
+                duration = song.get("duration", 0) or song.get("full_duration", 0)
             else:
+                continue
+
+            if self._should_avoid_candidate_name(str(name), target_name):
                 continue
 
             name_norm = self._normalize_text(name)
@@ -705,6 +900,13 @@ class MusicSourceMatcher:
             # 计算相似度 - 参考 UnblockNeteaseMusic 的算法
             name_score = self._similarity(target_name_norm, name_norm)
             artist_score = self._similarity(target_artist_norm, artist_norm)
+            direct_name_hit = bool(
+                target_name_norm and name_norm
+                and (target_name_norm in name_norm or name_norm in target_name_norm)
+            )
+            min_name_score = 0.85 if len(target_name_norm) <= 4 else 0.72
+            if target_name_norm and not direct_name_hit and name_score < min_name_score:
+                continue
 
             # 时长匹配（允许 ±10 秒误差）
             duration_score = 1.0
@@ -738,11 +940,14 @@ class MusicSourceMatcher:
             return ""
         # 处理 HTML 实体
         import html
-        text = html.unescape(text)
+        text = normalize_matching_text(html.unescape(text))
         # 移除括号内容（如 (DJ版)、(伴奏) 等）
         text = re.sub(r'\([^)]*\)', '', text)
         text = re.sub(r'（[^）]*）', '', text)
-        return normalize_matching_text(text).strip().lower().replace(" ", "")
+        # 移除特殊字符
+        text = re.sub(r'[^\w\s]', '', text)
+        # 移除空格并转小写
+        return text.strip().lower().replace(" ", "")
 
     @staticmethod
     def _similarity(a: str, b: str) -> float:

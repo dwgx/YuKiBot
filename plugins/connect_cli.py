@@ -26,6 +26,20 @@ _IS_WINDOWS = platform.system() == "Windows"
 _CONFIG_DIR = Path(__file__).resolve().parent / "config"
 
 
+def _safe_input(prompt: str, default: str = "") -> str:
+    """安全的 input，处理 KeyboardInterrupt 和 EOFError。"""
+    import sys
+    try:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        return input().strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\n  [已取消配置]")
+        return default
+    except Exception:
+        return default
+
+
 @dataclass
 class CLIProvider:
     name: str
@@ -70,7 +84,7 @@ class Plugin:
         print("\n┌─ ConnectCLI 插件配置 ─┐")
 
         # 1. 启用?
-        ans = input("  启用 CLI 工具调用? (Y/n): ").strip().lower()
+        ans = _safe_input("  启用 CLI 工具调用? (Y/n): ", "y").lower()
         if ans in ("n", "no"):
             cfg: dict[str, Any] = {"enabled": False}
             _write_plugin_config(cfg)
@@ -84,7 +98,7 @@ class Plugin:
 
         if claude_bin:
             print(f"  检测到 Claude CLI: {claude_bin}")
-            ans = input("  启用 Claude CLI? (Y/n): ").strip().lower()
+            ans = _safe_input("  启用 Claude CLI? (Y/n): ", "n").lower()
             if ans not in ("n", "no"):
                 model = _ask_claude_model()
                 providers["claude_cli"] = {
@@ -99,7 +113,7 @@ class Plugin:
 
         if codex_bin:
             print(f"  检测到 Codex CLI: {codex_bin}")
-            ans = input("  启用 Codex CLI? (Y/n): ").strip().lower()
+            ans = _safe_input("  启用 Codex CLI? (Y/n): ", "y").lower()
             if ans not in ("n", "no"):
                 model = _ask_codex_model()
                 providers["codex_cli"] = {
@@ -107,7 +121,7 @@ class Plugin:
                     "command": "codex",
                     "model": model,
                     "api_key": "",
-                    "extra_args": [],
+                    "extra_args": ["--skip-git-repo-check"],
                 }
         else:
             print("  未检测到 Codex CLI (codex 命令不在 PATH 中)")
@@ -126,7 +140,7 @@ class Plugin:
             for i, p in enumerate(pnames, 1):
                 mark = " *" if i == 1 else ""
                 print(f"    {i}. {p}{mark}")
-            ans = input(f"  选择 [1-{len(pnames)}，默认 1]: ").strip()
+            ans = _safe_input(f"  选择 [1-{len(pnames)}，默认 1]: ", "1")
             if ans.isdigit() and 1 <= int(ans) <= len(pnames):
                 default = pnames[int(ans) - 1]
 
@@ -134,32 +148,32 @@ class Plugin:
         print("\n  CLI 运行模式:")
         print("    1. embedded — 后台运行，输出返回给 Agent (默认)")
         print("    2. cmd — 打开独立 CMD 窗口 (调试用)")
-        ans = input("  选择 [1-2，默认 1]: ").strip()
+        ans = _safe_input("  选择 [1-2，默认 1]: ", "1")
         open_mode = "cmd" if ans == "2" else "embedded"
 
         # 5. 节省 token
         print("\n  节省 Token 模式:")
-        print("    开启后 Claude 降级为 haiku+low effort，Codex 降级为 o4-mini")
-        ans = input("  启用节省 Token? (y/N): ").strip().lower()
+        print("    开启后 Claude 降级为 haiku+low effort，Codex 降级为 gpt-5.3")
+        ans = _safe_input("  启用节省 Token? (y/N): ", "n").lower()
         token_saving = ans in ("y", "yes")
 
         # 6. 安全模式
         print("\n  安全模式:")
         print("    开启: Claude 只规划不执行，Codex 只读沙箱")
         print("    关闭: Claude 跳过权限，Codex 全自动")
-        ans = input("  启用安全模式? (Y/n): ").strip().lower()
+        ans = _safe_input("  启用安全模式? (Y/n): ", "y").lower()
         safety_mode = ans not in ("n", "no")
 
         # 7. 上下文注入
         print("\n  上下文注入:")
         print("    开启后 Agent 调用 CLI 时会自动附带用户消息和对话上下文")
-        ans = input("  启用上下文注入? (Y/n): ").strip().lower()
+        ans = _safe_input("  启用上下文注入? (Y/n): ", "y").lower()
         inject_context = ans not in ("n", "no")
 
         # 8. 输出过滤
         print("\n  输出过滤:")
         print("    开启后 CLI 返回的内容会经过安全过滤再给用户")
-        ans = input("  启用输出过滤? (Y/n): ").strip().lower()
+        ans = _safe_input("  启用输出过滤? (Y/n): ", "y").lower()
         filter_output = ans not in ("n", "no")
 
         cfg = {
@@ -485,7 +499,7 @@ class Plugin:
             # 模型: token_saving 时降级
             model = provider.model
             if self._token_saving:
-                model = "o4-mini"
+                model = "gpt-5.3"  # 使用 gpt-5.3 作为节省模式
             if model:
                 cmd.extend(["--model", model])
 
@@ -494,6 +508,10 @@ class Plugin:
                 cmd.extend(["--sandbox", "read-only"])
             else:
                 cmd.append("--full-auto")
+
+            # 自动添加 --skip-git-repo-check（如果 extra_args 中没有）
+            if "--skip-git-repo-check" not in provider.extra_args:
+                cmd.append("--skip-git-repo-check")
 
             cmd.extend(provider.extra_args)
             cmd.append(prompt)
@@ -525,7 +543,7 @@ class Plugin:
         elif is_codex:
             model = provider.model
             if self._token_saving:
-                model = "o4-mini"
+                model = "gpt-5.3"  # 使用 gpt-5.3 作为节省模式
             if model:
                 cmd.extend(["--model", model])
             if self._safety_mode:
@@ -896,27 +914,30 @@ def _ask_claude_model() -> str:
     print("    2. claude-opus-4-6")
     print("    3. haiku")
     print("    4. 自定义")
-    ans = input("  选择 [1-4，默认 1]: ").strip()
+    ans = _safe_input("  选择 [1-4，默认 1]: ", "1")
     if ans == "2":
         return "claude-opus-4-6"
     if ans == "3":
         return "haiku"
     if ans == "4":
-        return input("  输入模型名: ").strip() or "claude-sonnet-4-20250514"
+        return _safe_input("  输入模型名: ", "claude-sonnet-4-20250514") or "claude-sonnet-4-20250514"
     return "claude-sonnet-4-20250514"
 
 
 def _ask_codex_model() -> str:
     print("  Codex CLI 模型:")
-    print("    1. 自动(留空, 默认)")
-    print("    2. o3")
-    print("    3. 自定义")
-    ans = input("  选择 [1-3，默认 1]: ").strip()
+    print("    1. gpt-5.4 (默认，推荐)")
+    print("    2. gpt-5.3-codex")
+    print("    3. gpt-5.3")
+    print("    4. 自定义")
+    ans = _safe_input("  选择 [1-4，默认 1]: ", "1")
     if ans == "2":
-        return "o3"
+        return "gpt-5.3-codex"
     if ans == "3":
-        return input("  输入模型名(留空表示自动): ").strip()
-    return ""
+        return "gpt-5.3"
+    if ans == "4":
+        return _safe_input("  输入模型名: ", "gpt-5.4") or "gpt-5.4"
+    return "gpt-5.4"
 
 
 def _write_plugin_config(cfg: dict[str, Any]) -> None:

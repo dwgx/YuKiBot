@@ -72,10 +72,10 @@ config:
     multi_image_interval_ms: 350
     voice_send_max_seconds: 60
     voice_send_try_full_first: true
-    voice_send_split_enable: false
+    voice_send_split_enable: true
     voice_send_split_max_segments: 8
     voice_send_music_force_full: true
-    voice_send_music_disable_split: true
+    voice_send_music_disable_split: false
     video_send_strategy: direct_first
     mention_only_reply_mode: ai
     mention_only_reply_template: 在。
@@ -168,11 +168,11 @@ config:
       max_tokens: 1200
       temperature: 0.2
   search_followup:
-    enable: false
+    enable: true
     ttl_minutes: 30
-    number_choice_enable: false
-    rotate_choice_enable: false
-    resend_enable: false
+    number_choice_enable: true
+    rotate_choice_enable: true
+    resend_enable: true
     max_choices: 12
   safety:
     scale: 2
@@ -188,8 +188,8 @@ config:
     whitelist_groups: []
     non_whitelist_mode: silent
   trigger:
-    ai_listen_enable: true
-    delegate_undirected_to_ai: true
+    ai_listen_enable: false
+    delegate_undirected_to_ai: false
     ai_listen_min_messages: 2
     ai_listen_min_score: 1.2
     followup_reply_window_seconds: 30
@@ -202,7 +202,7 @@ config:
     followup_fast_path_enable: false
     zero_threshold_disables_undirected: true
     mode: ai_full
-    trust_ai_fully: true
+    trust_ai_fully: false
   self_check:
     enable: true
     block_at_other: true
@@ -253,10 +253,9 @@ config:
     timeout_seconds: 15
     cache_keep_files: 50
     local_source_enable: true
-    unblock_enable: true
+    unblock_enable: false
     unblock_api_base: ''
-    unblock_sources: qq,kuwo,kugou,migu
-    alternative_sources: qq,kuwo,kugou,migu
+    unblock_sources: qq,kuwo,migu,soundcloud
   affinity:
     enable: true
     storage_dir: storage/affinity
@@ -417,6 +416,8 @@ prompts:
 
 
       点歌破限策略：
+
+      - 点歌时优先识别 title / artist，不要只拼 keyword 猜歌
 
       - music_search + music_play_by_id 失败 → 自动尝试 B站音频提取
 

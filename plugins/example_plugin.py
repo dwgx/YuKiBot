@@ -12,20 +12,20 @@
 发现规则:  自动扫描 plugins/*.py，跳过 _开头 和 __init__.py
 
 生命周期:
-  1. 发现 → import 模块，找到 Plugin 类
-  2. 首次配置 → needs_setup() → interactive_setup()  (可选)
-  3. 实例化 → Plugin()
-  4. 初始化 → setup(config, context)  (可选，异步)
-  5. 运行中 → handle(message, context)  被 Router/Agent 调用
-  6. 关闭 → teardown()  (可选，异步)
+1. 发现 → import 模块，找到 Plugin 类
+2. 首次配置 → needs_setup() → interactive_setup()  (可选)
+3. 实例化 → Plugin()
+4. 初始化 → setup(config, context)  (可选，异步)
+5. 运行中 → handle(message, context)  被 Router/Agent 调用
+6. 关闭 → teardown()  (可选，异步)
 
 插件能力:
-  - handle()        : 处理用户消息，返回文本回复
-  - Agent 工具注册  : 通过 context.agent_tool_registry 注册工具让 Agent 自主调用
-  - Prompt 注入     : 注册 PromptHint 影响 Agent 的系统提示词
-  - 动态上下文      : 注册 ContextProvider 在每次对话时注入实时信息
-  - 独立配置        : plugins/config/<name>.yml 独立管理，热重载友好
-  - 交互式向导      : needs_setup() + interactive_setup() 首次运行引导
+- handle()        : 处理用户消息，返回文本回复
+- Agent 工具注册  : 通过 context.agent_tool_registry 注册工具让 Agent 自主调用
+- Prompt 注入     : 注册 PromptHint 影响 Agent 的系统提示词
+- 动态上下文      : 注册 ContextProvider 在每次对话时注入实时信息
+- 独立配置        : plugins/config/<name>.yml 独立管理，热重载友好
+- 交互式向导      : needs_setup() + interactive_setup() 首次运行引导
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
@@ -45,15 +45,15 @@ class Plugin:
     """示例插件 —— 展示所有可用的插件接口。
 
     必须属性:
-      name            : str          插件唯一标识 (与文件名对应)
-      description     : str          功能描述 (Router 用来判断是否调用)
-      intent_examples : list[str]    触发意图示例 (帮助 Router 识别)
-      rules           : list[str]    行为约束 (注入到 Agent/Router 提示词)
-      args_schema     : dict         参数说明 (告诉 Agent 如何传参)
+        name            : str          插件唯一标识 (与文件名对应)
+        description     : str          功能描述 (Router 用来判断是否调用)
+        intent_examples : list[str]    触发意图示例 (帮助 Router 识别)
+        rules           : list[str]    行为约束 (注入到 Agent/Router 提示词)
+        args_schema     : dict         参数说明 (告诉 Agent 如何传参)
 
     可选属性:
-      agent_tool      : bool = False   True 时注册为 Agent 内部工具，不走 Router
-      internal_only   : bool = False   True 时对 Router schema 隐藏
+        agent_tool      : bool = False   True 时注册为 Agent 内部工具，不走 Router
+        internal_only   : bool = False   True 时对 Router schema 隐藏
     """
 
     # ── 必须属性 ──

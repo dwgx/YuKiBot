@@ -1,0 +1,19 @@
+# NewAPI 插件配置 (自动生成，可手动编辑)
+enabled: true
+display_name: skiapi
+response:
+  force_plain_text: true
+  strip_markdown_chars: true
+payment:
+  auto_require_method_selection_when_multiple: true
+  auto_prefer_methods:
+  - alipay
+  auto_fallback_method_when_info_unavailable: wxpay
+  include_epay_submit_url: true
+  show_amount_unit_hint: true
+  show_topup_command_hints: true
+privacy_guard:
+  enabled: true
+  recall_message: true
+  notify_group: true
+  notify_private: true

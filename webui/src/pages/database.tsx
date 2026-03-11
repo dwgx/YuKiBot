@@ -18,6 +18,8 @@ import {
   DbRowsResponse,
   DbTableInfo,
 } from "../api/client";
+import { NotificationContainer } from "../components/notification";
+import { useNotifications } from "../hooks/useNotifications";
 
 function formatBytes(value: number): string {
   if (!Number.isFinite(value) || value <= 0) return "0 B";
@@ -49,6 +51,7 @@ function renderCell(value: unknown): string {
 }
 
 export default function DatabasePage() {
+  const { notifications, confirm, success, danger } = useNotifications();
   const [overview, setOverview] = useState<DbOverviewItem[]>([]);
   const [selectedDb, setSelectedDb] = useState("knowledge");
   const [tables, setTables] = useState<DbTableInfo[]>([]);
@@ -160,29 +163,40 @@ export default function DatabasePage() {
   }, []);
   const clearCurrentTable = useCallback(async () => {
     if (!selectedDb || !selectedTable || clearingTable) return;
-    const confirmed = window.confirm(`确认清空 ${selectedDb}.${selectedTable} 的全部数据？此操作不可撤销。`);
-    if (!confirmed) return;
 
-    setClearingTable(true);
-    try {
-      const res = await api.clearDbTable(selectedDb, selectedTable);
-      setError(`[OK] ${res.message}，共删除 ${res.deleted} 行`);
-      setPage(1);
-      setQueryInput("");
-      setExecutedQuery("");
-      setQueryRefreshToken((v) => v + 1);
-      await loadOverview();
-      await loadTables();
-      await loadRows();
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "清空数据失败");
-    } finally {
-      setClearingTable(false);
-    }
-  }, [clearingTable, loadOverview, loadRows, loadTables, selectedDb, selectedTable]);
+    confirm(
+      "危险操作：清空数据表",
+      `你即将清空 ${selectedDb}.${selectedTable} 的全部数据。这是一个删库操作，此操作不可撤销！你真的要执行吗？`,
+      async () => {
+        setClearingTable(true);
+        try {
+          const res = await api.clearDbTable(selectedDb, selectedTable);
+          success("清空成功", `共删除 ${res.deleted} 行数据`);
+          setPage(1);
+          setQueryInput("");
+          setExecutedQuery("");
+          setQueryRefreshToken((v) => v + 1);
+          await loadOverview();
+          await loadTables();
+          await loadRows();
+        } catch (e: unknown) {
+          danger("清空失败", e instanceof Error ? e.message : "清空数据失败");
+        } finally {
+          setClearingTable(false);
+        }
+      },
+      {
+        type: "danger",
+        confirmText: "确认删除",
+        cancelText: "取消",
+      }
+    );
+  }, [clearingTable, loadOverview, loadRows, loadTables, selectedDb, selectedTable, confirm, success, danger]);
 
   return (
-    <section className="space-y-4">
+    <>
+      <NotificationContainer notifications={notifications} />
+      <section className="space-y-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <Database size={20} />
@@ -382,6 +396,7 @@ export default function DatabasePage() {
         </CardBody>
       </Card>
     </section>
+    </>
   );
 }
 

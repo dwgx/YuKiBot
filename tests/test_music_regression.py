@@ -204,8 +204,8 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
                     name="黑-in3",
                     artist="IN3",
                     duration_ms=225000,
-                    source="qq",
-                    source_url="https://y.qq.com/n/ryqq/songDetail/00123456789",
+                    source="soundcloud",
+                    source_url="https://soundcloud.com/in3/hei",
                 )
             ]
 
@@ -234,8 +234,8 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
             normalize_matching_text("黑-in3"),
         )
         self.assertEqual(captured["artist"], "IN3")
-        self.assertEqual(captured["source"], "qq")
-        self.assertEqual(captured["source_url"], "https://y.qq.com/n/ryqq/songDetail/00123456789")
+        self.assertEqual(captured["source"], "soundcloud")
+        self.assertEqual(captured["source_url"], "https://soundcloud.com/in3/hei")
         self.assertEqual(captured["duration_ms"], 225000)
 
     async def test_search_bilibili_videos_filters_multi_token_mismatch(self) -> None:
@@ -369,15 +369,7 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source_calls["count"], 0)
 
     async def test_get_play_url_with_alternative_respects_configured_source_order(self) -> None:
-        engine = MusicEngine(
-            {
-                "music": {
-                    "enable": True,
-                    "local_source_enable": True,
-                    "alternative_sources": " QQ , invalid , kugou , kuwo , qq ",
-                },
-            }
-        )
+        engine = MusicEngine({"music": {"enable": True, "local_source_enable": True, "unblock_sources": "soundcloud"}})
         song = MusicSearchResult(song_id=76897, name="热水澡", artist="蛋堡", duration_ms=180000)
         seen_sources: list[list[str] | None] = []
 
@@ -396,21 +388,7 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         await engine._get_play_url_with_alternative(song)
 
-        self.assertEqual(seen_sources, [["qq", "kugou", "kuwo"]])
-
-    def test_music_source_csv_keeps_only_supported_sources(self) -> None:
-        engine = MusicEngine(
-            {
-                "music": {
-                    "enable": True,
-                    "unblock_sources": " QQ , soundcloud , migu, invalid , kuwo , qq ",
-                    "alternative_sources": " kugou , invalid , Migu ",
-                },
-            }
-        )
-
-        self.assertEqual(engine._unblock_sources, "qq,migu,kuwo")
-        self.assertEqual(engine._alternative_source_list, ["kugou", "migu"])
+        self.assertEqual(seen_sources, [["soundcloud"]])
 
     async def test_music_play_with_exact_title_does_not_drift_to_other_song_after_preview_only(self) -> None:
         engine = MusicEngine({"music": {"enable": True, "local_source_enable": False}})

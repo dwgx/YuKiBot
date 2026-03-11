@@ -2,9 +2,9 @@
 
 B站: 使用 bilibili-api-python 的 QrCodeLogin，终端显示二维码扫码
 抖音/快手: 多策略提取浏览器 cookie:
-  1. rookiepy (需管理员权限，支持 Chrome v130+ App-Bound Encryption)
-  2. Chrome DevTools Protocol (无需管理员，需关闭浏览器后重开)
-  3. browser_cookie3 (仅 Firefox 可靠，Chrome/Edge 已失效)
+1. rookiepy (需管理员权限，支持 Chrome v130+ App-Bound Encryption)
+2. Chrome DevTools Protocol (无需管理员，需关闭浏览器后重开)
+3. browser_cookie3 (仅 Firefox 可靠，Chrome/Edge 已失效)
 """
 from __future__ import annotations
 
@@ -708,9 +708,9 @@ def _extract_via_cdp(browser: str, domain: str, auto_close: bool = False) -> dic
     """通过 Chrome DevTools Protocol 提取 cookie。
 
     策略优先级:
-      1. 尝试连接已运行浏览器的 debug 端口（无需关闭浏览器）
-      2. 复制 cookie 数据库到临时目录，用新 profile 启动 headless 解密
-      3. 如果以上都失败且 auto_close=True，关闭浏览器后用原 profile 启动
+        1. 尝试连接已运行浏览器的 debug 端口（无需关闭浏览器）
+        2. 复制 cookie 数据库到临时目录，用新 profile 启动 headless 解密
+        3. 如果以上都失败且 auto_close=True，关闭浏览器后用原 profile 启动
     """
     exe = _find_browser_exe(browser)
     if not exe:
@@ -1210,9 +1210,9 @@ def _cdp_get_cookies(ws_url: str, domain: str) -> dict[str, str]:
     """通过 CDP WebSocket 获取指定域名的 cookie。
 
     策略:
-      1. 先尝试 Network.getAllCookies（快速路径）
-      2. 如果目标域名是 QZone 相关且结果不足，导航到目标页面后重试
-      3. 用 Network.getCookies + 具体 URL 作为补充
+        1. 先尝试 Network.getAllCookies（快速路径）
+        2. 如果目标域名是 QZone 相关且结果不足，导航到目标页面后重试
+        3. 用 Network.getCookies + 具体 URL 作为补充
     """
     import websockets.sync.client as ws_client
 
@@ -1325,10 +1325,10 @@ def _extract_via_sqlite_direct(browser: str, domain: str) -> dict[str, str]:
     """直接读取 Chromium SQLite cookie 数据库（无需关闭浏览器）。
 
     策略:
-      1. 复制 Cookies 数据库到临时文件（避免锁冲突）
-      2. 读取 SQLite 数据库中的加密 cookie
-      3. 用 DPAPI 解密（Windows）或 keyring（Linux/Mac）
-      4. 仅适用于 Chrome < v130（v130+ 需要 App-Bound Encryption）
+        1. 复制 Cookies 数据库到临时文件（避免锁冲突）
+        2. 读取 SQLite 数据库中的加密 cookie
+        3. 用 DPAPI 解密（Windows）或 keyring（Linux/Mac）
+        4. 仅适用于 Chrome < v130（v130+ 需要 App-Bound Encryption）
     """
     if os.name != "nt":
         return {}  # 目前仅支持 Windows DPAPI
@@ -1484,18 +1484,18 @@ def extract_browser_cookies_with_source(
     """从指定浏览器提取指定域名 cookie，并返回命中来源。
 
     策略优先级:
-      1. rookiepy（需管理员，支持 Chrome v130+）
-      2. CDP 三级策略:
-         a. 连接已有 debug 端口（无需关闭浏览器）
-         b. 复制 cookie 到临时 profile 解密（无需关闭浏览器）
-         c. 关闭浏览器后用原 profile（最后手段）
-      2.5. SQLite 直接读取 + DPAPI 解密（Chromium 系，无需关闭浏览器）
-      3. browser_cookie3（仅 Firefox 可靠）
+        1. rookiepy（需管理员，支持 Chrome v130+）
+        2. CDP 三级策略:
+        a. 连接已有 debug 端口（无需关闭浏览器）
+        b. 复制 cookie 到临时 profile 解密（无需关闭浏览器）
+        c. 关闭浏览器后用原 profile（最后手段）
+        2.5. SQLite 直接读取 + DPAPI 解密（Chromium 系，无需关闭浏览器）
+        3. browser_cookie3（仅 Firefox 可靠）
 
     QZone 特殊处理:
-      - CDP 会先导航到 user.qzone.qq.com 触发 cookie 加载
-      - 使用 Network.getCookies + 具体 URL 补充提取
-      - 检查关键 cookie (p_skey/skey) 是否存在
+        - CDP 会先导航到 user.qzone.qq.com 触发 cookie 加载
+        - 使用 Network.getCookies + 具体 URL 补充提取
+        - 检查关键 cookie (p_skey/skey) 是否存在
     """
     qzone_related = _is_qzone_related_domain(domain)
     partial_candidates: list[tuple[str, dict[str, str]]] = []
@@ -1566,8 +1566,8 @@ def smart_extract_all_cookies_no_restart(
     """无重启提取所有平台 Cookie（默认策略）。
 
     说明:
-      - 不会关闭/重开浏览器。
-      - 每个域独立提取，优先 rookiepy/CDP，必要时 browser_cookie3 回退。
+        - 不会关闭/重开浏览器。
+        - 每个域独立提取，优先 rookiepy/CDP，必要时 browser_cookie3 回退。
     """
     if domains is None:
         domains = [".bilibili.com", ".douyin.com", ".kuaishou.com", ".qq.com", ".qzone.qq.com"]
@@ -1622,10 +1622,10 @@ def smart_extract_all_cookies(
     """智能重启浏览器提取所有平台 Cookie（v130+ 唯一可靠方案）。
 
     流程:
-      1. 关闭目标浏览器
-      2. 用 --remote-debugging-port 重新启动（保留原 profile，自动恢复标签页）
-      3. 通过 CDP Network.getAllCookies 一次性拿到所有 cookie
-      4. 保持浏览器运行（用户继续使用，debug 端口无害）
+        1. 关闭目标浏览器
+        2. 用 --remote-debugging-port 重新启动（保留原 profile，自动恢复标签页）
+        3. 通过 CDP Network.getAllCookies 一次性拿到所有 cookie
+        4. 保持浏览器运行（用户继续使用，debug 端口无害）
 
     返回: {domain: {cookie_name: cookie_value}}
     """
@@ -1810,7 +1810,7 @@ def _cdp_get_all_cookies(ws_url: str) -> list[tuple[str, str, str]]:
             _cdp_send_and_recv(ws, msg_id, "Page.enable", timeout=2)
             msg_id += 1
             _cdp_send_and_recv(ws, msg_id, "Page.navigate",
-                               {"url": "https://user.qzone.qq.com"}, timeout=8)
+                                {"url": "https://user.qzone.qq.com"}, timeout=8)
             time.sleep(2.0)
 
             # 获取所有 cookie
@@ -1822,7 +1822,7 @@ def _cdp_get_all_cookies(ws_url: str) -> list[tuple[str, str, str]]:
             msg_id += 1
             result = _cdp_send_and_recv(ws, msg_id, "Network.getCookies", {
                 "urls": ["https://user.qzone.qq.com", "https://qzone.qq.com",
-                         "https://i.qq.com", "https://qq.com"]
+                        "https://i.qq.com", "https://qq.com"]
             }, timeout=5)
             _collect(result.get("cookies", []))
 
@@ -1863,8 +1863,8 @@ def extract_qzone_cookies(browser: str = "edge", auto_close: bool = False) -> st
     关键字段: p_skey / skey, uin, p_uin
 
     策略:
-      1. 分域提取 (.qq.com + .i.qq.com + .qzone.qq.com) 并合并
-      2. 如果分域提取缺少关键 cookie，尝试 smart_extract 一次性提取
+        1. 分域提取 (.qq.com + .i.qq.com + .qzone.qq.com) 并合并
+        2. 如果分域提取缺少关键 cookie，尝试 smart_extract 一次性提取
     """
     # ── 策略 1: 分域提取 ──
     qq_cookies = extract_browser_cookies(browser, ".qq.com", auto_close=auto_close)

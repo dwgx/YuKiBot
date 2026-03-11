@@ -140,7 +140,7 @@ def _register_card_tools(registry: AgentToolRegistry) -> None:
             return ToolCallResult(ok=False, error="缺少 title")
         card = CardBuilder.json_card(title=title, desc=desc, url=url, image=image)
         return ToolCallResult(ok=True, data={"segments": card.segments, "preview": card.preview_text},
-                              display=f"已构建卡片: {title}")
+                                display=f"已构建卡片: {title}")
 
     async def _handle_send_music_card(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         title = str(args.get("title", ""))
@@ -158,7 +158,7 @@ def _register_card_tools(registry: AgentToolRegistry) -> None:
         else:
             return ToolCallResult(ok=False, error="需要 (platform+song_id) 或 (title+audio_url)")
         return ToolCallResult(ok=True, data={"segments": card.segments, "preview": card.preview_text},
-                              display=card.preview_text)
+                                display=card.preview_text)
 
     async def _handle_send_forward(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         nodes = args.get("nodes", [])
@@ -199,7 +199,7 @@ def _register_card_tools(registry: AgentToolRegistry) -> None:
         description="发送合并转发消息（多条消息合并为一条）。\n使用场景: 需要发送长内容、多段信息时使用",
         parameters={"type": "object", "properties": {
             "nodes": {"type": "array", "description": "消息节点列表，每个节点: {nickname, user_id, content}",
-                      "items": {"type": "object"}},
+                        "items": {"type": "object"}},
         }, "required": ["nodes"]},
         category="napcat", group="messaging",
     ), _handle_send_forward)

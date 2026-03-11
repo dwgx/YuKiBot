@@ -32,17 +32,17 @@ class ModelClient:
 
     配置示例 (config.yml):
         api:
-          provider: skiapi
-          fallback_providers:
+        provider: skiapi
+        fallback_providers:
             - anthropic
             - openai
-          providers:
+        providers:
             anthropic:
-              api_key: sk-xxx
-              model: claude-sonnet-4-20250514
+                api_key: sk-xxx
+                model: claude-sonnet-4-20250514
             openai:
-              api_key: sk-xxx
-              model: gpt-4.1
+                api_key: sk-xxx
+                model: gpt-4.1
     """
 
     _ALIASES = {

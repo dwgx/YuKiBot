@@ -1,0 +1,21 @@
+# ConnectCLI 插件配置 (自动生成，可手动编辑)
+enabled: true
+default_provider: codex_cli
+timeout_seconds: 120
+max_output_chars: 8000
+token_saving: false
+safety_mode: true
+inject_context: true
+filter_output: true
+open_mode: embedded
+self_check_on_setup: true
+probe_before_invoke: false
+emit_provider_tag: true
+show_status_in_context: true
+providers:
+  codex_cli:
+    enabled: true
+    command: codex
+    model: gpt-5.4
+    api_key: ''
+    extra_args: []

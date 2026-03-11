@@ -86,16 +86,6 @@ const THINKING_ISLAND_PREVIEW_HEIGHT_CLASS: Record<ThinkingIslandSize, string> =
   lg: "max-h-44",
 };
 
-const THINKING_TYPING_INTERVAL_MS = 26;
-
-function thinkingTypingStepSize(text: string): number {
-  const length = Array.from(String(text || "")).length;
-  if (length <= 24) return 1;
-  if (length <= 72) return 2;
-  if (length <= 140) return 3;
-  return 4;
-}
-
 function clampThinkingIslandOffset(offset: ThinkingIslandOffset): ThinkingIslandOffset {
   if (typeof window === "undefined") return offset;
   const maxX = Math.max(0, Math.floor(window.innerWidth * 0.34));
@@ -264,9 +254,6 @@ export default function ChatPage() {
   const [permission, setPermission] = useState<ChatHistoryPermission>(DEFAULT_CHAT_PERMISSION);
   const [contextEgg, setContextEgg] = useState("");
   const [thinkingLines, setThinkingLines] = useState<string[]>([]);
-  const [thinkingRenderedLines, setThinkingRenderedLines] = useState<string[]>([]);
-  const [thinkingLiveLine, setThinkingLiveLine] = useState("");
-  const [thinkingTypingActive, setThinkingTypingActive] = useState(false);
   const [thinkingDraft, setThinkingDraft] = useState("");
   const [retargeting, setRetargeting] = useState(false);
   const [thinkingPanelOpen, setThinkingPanelOpen] = useState(true);
@@ -297,11 +284,6 @@ export default function ChatPage() {
   const historyCacheRef = useRef<Record<string, { items: ChatMessageItem[]; permission: ChatHistoryPermission }>>({});
   const thinkingIslandDragOriginRef = useRef<ThinkingIslandOffset>({ x: 0, y: 0 });
   const pendingThinkingLogsRef = useRef<PendingThinkingLog[]>([]);
-  const thinkingTypingQueueRef = useRef<string[]>([]);
-  const thinkingTypingTimerRef = useRef<number | null>(null);
-  const thinkingTypingCharsRef = useRef<string[]>([]);
-  const thinkingTypingIndexRef = useRef(0);
-  const thinkingAnimationCursorRef = useRef(0);
   const autoStickToBottomRef = useRef(true);
   const traceRef = useRef("");
   const conversationRef = useRef("");
@@ -342,16 +324,12 @@ export default function ChatPage() {
     && thinkingWarmUntil > clockMs,
   );
   const thinkingActive = Boolean(isThinking || optimisticThinking);
-  const thinkingIslandVisible = Boolean(selected && thinkingPanelOpen);
-  const displayedThinkingLines = useMemo(
-    () => (thinkingLiveLine ? [...thinkingRenderedLines, thinkingLiveLine] : thinkingRenderedLines),
-    [thinkingLiveLine, thinkingRenderedLines],
-  );
+  const thinkingIslandVisible = Boolean(selected && (thinkingPanelOpen || thinkingActive || thinkingLines.length > 0));
   const latestThinkingLine = useMemo(
-    () => displayedThinkingLines[displayedThinkingLines.length - 1] || (thinkingActive ? "正在建立计划..." : "刚刚处理完成"),
-    [displayedThinkingLines, thinkingActive],
+    () => thinkingLines[thinkingLines.length - 1] || (thinkingActive ? "正在建立计划..." : "刚刚处理完成"),
+    [thinkingActive, thinkingLines],
   );
-  const thinkingPreviewLines = useMemo(() => displayedThinkingLines.slice(-6), [displayedThinkingLines]);
+  const thinkingPreviewLines = useMemo(() => thinkingLines.slice(-6), [thinkingLines]);
   const lastStreamPacketLabel = useMemo(
     () => (thinkingStreamLastPacketAt > 0 ? new Date(thinkingStreamLastPacketAt).toLocaleTimeString() : "-"),
     [thinkingStreamLastPacketAt],
@@ -378,50 +356,6 @@ export default function ChatPage() {
       return [...prev.slice(-80), content];
     });
   }, []);
-  const clearThinkingTypingTimer = useCallback(() => {
-    if (thinkingTypingTimerRef.current != null) {
-      window.clearInterval(thinkingTypingTimerRef.current);
-      thinkingTypingTimerRef.current = null;
-    }
-    thinkingTypingCharsRef.current = [];
-    thinkingTypingIndexRef.current = 0;
-  }, []);
-  const startThinkingTyping = useCallback(() => {
-    if (thinkingTypingTimerRef.current != null) return;
-
-    const tick = () => {
-      if (thinkingTypingCharsRef.current.length === 0) {
-        const next = thinkingTypingQueueRef.current.shift();
-        if (!next) {
-          clearThinkingTypingTimer();
-          setThinkingLiveLine("");
-          setThinkingTypingActive(false);
-          return;
-        }
-        thinkingTypingCharsRef.current = Array.from(next);
-        thinkingTypingIndexRef.current = 0;
-        setThinkingLiveLine("");
-        setThinkingTypingActive(true);
-      }
-
-      const chars = thinkingTypingCharsRef.current;
-      const step = thinkingTypingStepSize(chars.join(""));
-      const nextIndex = Math.min(chars.length, thinkingTypingIndexRef.current + step);
-      thinkingTypingIndexRef.current = nextIndex;
-      const partial = chars.slice(0, nextIndex).join("");
-      setThinkingLiveLine(partial);
-
-      if (nextIndex >= chars.length) {
-        setThinkingRenderedLines((prev) => [...prev.slice(-79), partial]);
-        setThinkingLiveLine("");
-        thinkingTypingCharsRef.current = [];
-        thinkingTypingIndexRef.current = 0;
-      }
-    };
-
-    tick();
-    thinkingTypingTimerRef.current = window.setInterval(tick, THINKING_TYPING_INTERVAL_MS);
-  }, [clearThinkingTypingTimer]);
   const clearThinkingReconnectTimer = useCallback(() => {
     if (thinkingReconnectTimerRef.current != null) {
       window.clearTimeout(thinkingReconnectTimerRef.current);
@@ -647,9 +581,6 @@ export default function ChatPage() {
 
   useEffect(() => {
     setThinkingLines([]);
-    setThinkingRenderedLines([]);
-    setThinkingLiveLine("");
-    setThinkingTypingActive(false);
     setThinkingDraft("");
     setThinkingPanelOpen(true);
     setThinkingIslandExpanded(false);
@@ -658,28 +589,7 @@ export default function ChatPage() {
     setThinkingWarmConversationId("");
     setThinkingWarmUntil(0);
     pendingThinkingLogsRef.current = [];
-    thinkingTypingQueueRef.current = [];
-    thinkingAnimationCursorRef.current = 0;
-    clearThinkingTypingTimer();
-  }, [clearThinkingTypingTimer, selectedId]);
-
-  useEffect(() => {
-    if (thinkingLines.length < thinkingAnimationCursorRef.current) {
-      thinkingAnimationCursorRef.current = 0;
-      thinkingTypingQueueRef.current = [];
-      setThinkingRenderedLines([]);
-      setThinkingLiveLine("");
-      setThinkingTypingActive(false);
-      clearThinkingTypingTimer();
-    }
-    if (thinkingLines.length <= thinkingAnimationCursorRef.current) return;
-    const freshLines = thinkingLines.slice(thinkingAnimationCursorRef.current);
-    thinkingAnimationCursorRef.current = thinkingLines.length;
-    if (freshLines.length === 0) return;
-    thinkingTypingQueueRef.current.push(...freshLines);
-    setThinkingTypingActive(true);
-    startThinkingTyping();
-  }, [clearThinkingTypingTimer, startThinkingTyping, thinkingLines]);
+  }, [selectedId]);
 
   useEffect(() => {
     if (!selected?.conversation_id) return;
@@ -804,11 +714,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (!thinkingScrollRef.current) return;
     thinkingScrollRef.current.scrollTop = thinkingScrollRef.current.scrollHeight;
-  }, [displayedThinkingLines]);
-
-  useEffect(() => () => {
-    clearThinkingTypingTimer();
-  }, [clearThinkingTypingTimer]);
+  }, [thinkingLines]);
 
   const agentContextUser = useMemo(() => {
     const recentPeerMessage = [...messages].reverse().find((item) => !item.is_self);
@@ -1420,13 +1326,18 @@ export default function ChatPage() {
                 </Button>
               </div>
             )}
-            <AnimatePresence>
+            <AnimatePresence mode="wait">
               {thinkingIslandVisible && (
                 <motion.div
-                  initial={{ opacity: 0, y: -16, scale: 0.96 }}
+                  initial={{ opacity: 0, y: -20, scale: 0.92 }}
                   animate={{ opacity: 1, y: 0, scale: 1 }}
-                  exit={{ opacity: 0, y: -12, scale: 0.98 }}
-                  transition={{ type: "spring", stiffness: 320, damping: 28 }}
+                  exit={{ opacity: 0, y: -16, scale: 0.94 }}
+                  transition={{
+                    type: "spring",
+                    stiffness: 380,
+                    damping: 30,
+                    mass: 0.8
+                  }}
                   className="pointer-events-none fixed inset-x-0 top-3 z-[90] flex justify-center px-3"
                 >
                   <motion.div
@@ -1434,13 +1345,15 @@ export default function ChatPage() {
                     dragControls={thinkingDragControls}
                     dragListener={false}
                     dragMomentum={false}
-                    dragElastic={0.08}
+                    dragElastic={0.05}
+                    dragTransition={{ bounceStiffness: 600, bounceDamping: 30 }}
                     style={{
                       x: thinkingIslandOffset.x,
                       y: thinkingIslandOffset.y,
                       width: THINKING_ISLAND_SIZE_WIDTH[thinkingIslandSize],
                     }}
-                    whileDrag={{ scale: 1.015 }}
+                    whileDrag={{ scale: 1.02, boxShadow: "0 20px 40px rgba(0,0,0,0.15)" }}
+                    whileHover={{ scale: 1.005 }}
                     onDragStart={() => {
                       thinkingIslandDragOriginRef.current = thinkingIslandOffset;
                     }}
@@ -1450,18 +1363,18 @@ export default function ChatPage() {
                         y: thinkingIslandDragOriginRef.current.y + info.offset.y,
                       }));
                     }}
-                    className="pointer-events-auto overflow-hidden rounded-xl border border-primary/20 bg-content1/95 shadow-md backdrop-blur"
+                    className="pointer-events-auto overflow-hidden rounded-2xl border border-primary/20 bg-content1/95 shadow-lg backdrop-blur-xl"
                   >
                     <div className="flex items-start gap-2 px-3 py-2">
                       <div
-                        className="flex min-w-0 flex-1 cursor-grab items-start gap-3 active:cursor-grabbing select-none touch-none"
+                        className="flex h-9 w-9 shrink-0 cursor-grab items-center justify-center rounded-full bg-primary/10 ring-1 ring-primary/20 select-none touch-none active:cursor-grabbing"
                         onPointerDown={beginThinkingIslandDrag}
                         onDoubleClick={() => setThinkingIslandOffset({ x: 0, y: 0 })}
+                        title="拖动移动，双击回中"
                       >
-                        <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary/10 ring-1 ring-primary/20">
-                          <BrainCircuit size={16} className={`${thinkingActive ? "text-primary" : "text-success"}`} />
-                        </div>
-                        <div className="min-w-0 flex-1">
+                        <BrainCircuit size={16} className={`${thinkingActive ? "text-primary" : "text-success"}`} />
+                      </div>
+                      <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
                           <span className="text-sm font-semibold text-default-800">YuKiKo Thinking</span>
                           <Chip size="sm" variant="flat" color={thinkingActive ? "primary" : "success"}>
@@ -1483,24 +1396,15 @@ export default function ChatPage() {
                         <div className="mt-1 flex items-center gap-1.5 text-[11px] text-default-600">
                           <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
                           <span className="truncate">{latestThinkingLine}</span>
-                          {thinkingTypingActive && (
-                            <motion.span
-                              aria-hidden="true"
-                              animate={{ opacity: [0.22, 1, 0.22] }}
-                              transition={{ duration: 0.9, repeat: Infinity, ease: "easeInOut" }}
-                              className="inline-block h-3 w-[3px] rounded-full bg-primary/70"
-                            />
-                          )}
                         </div>
-                        <div className="mt-0.5 text-[10px] text-default-500">
-                          拖动标题栏可移动，双击可回中。当前 trace: {selectedState?.last_trace_id || selectedState?.latest_trace_id || "等待分配"}
+                        <div className="mt-0.5 text-[10px] text-default-500 select-text">
+                          当前 trace: {selectedState?.last_trace_id || selectedState?.latest_trace_id || "等待分配"}
                         </div>
                         <div className="mt-0.5 text-[10px] text-default-500">
                           最近流包时间: {lastStreamPacketLabel}
                         </div>
                         <div className="text-[10px] text-default-400">
-                          live animated replay over task logs
-                        </div>
+                          log stream mode (not token-by-token)
                         </div>
                       </div>
                       <div className="flex items-center gap-1" onPointerDown={(evt) => evt.stopPropagation()}>
@@ -1537,8 +1441,15 @@ export default function ChatPage() {
                           size="sm"
                           variant="light"
                           isIconOnly
-                          onPress={() => setThinkingPanelOpen(false)}
+                          onPress={() => {
+                            if (thinkingActive) {
+                              setThinkingIslandExpanded(false);
+                            } else {
+                              setThinkingPanelOpen(false);
+                            }
+                          }}
                           className="text-default-600"
+                          title={thinkingActive ? "最小化" : "关闭"}
                         >
                           <X size={14} />
                         </Button>
@@ -1550,7 +1461,10 @@ export default function ChatPage() {
                           initial={{ height: 0, opacity: 0 }}
                           animate={{ height: "auto", opacity: 1 }}
                           exit={{ height: 0, opacity: 0 }}
-                          transition={{ duration: 0.18 }}
+                          transition={{
+                            height: { type: "spring", stiffness: 400, damping: 32 },
+                            opacity: { duration: 0.2 }
+                          }}
                           className="overflow-hidden border-t border-default-200"
                         >
                           <div
@@ -1563,20 +1477,18 @@ export default function ChatPage() {
                             {thinkingPreviewLines.map((line, idx) => (
                               <motion.div
                                 key={`${idx}-${line}`}
-                                initial={{ opacity: 0, y: 4 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                transition={{ duration: 0.14 }}
-                                className="rounded-2xl border border-default-200 bg-content2/80 px-3 py-2 text-xs text-default-700"
+                                initial={{ opacity: 0, y: 8, scale: 0.96 }}
+                                animate={{ opacity: 1, y: 0, scale: 1 }}
+                                exit={{ opacity: 0, scale: 0.96 }}
+                                transition={{
+                                  type: "spring",
+                                  stiffness: 500,
+                                  damping: 35,
+                                  delay: idx * 0.02
+                                }}
+                                className="rounded-2xl border border-default-200 bg-content2/80 px-3 py-2 text-xs text-default-700 backdrop-blur-sm"
                               >
-                                <span>{line}</span>
-                                {thinkingTypingActive && idx === thinkingPreviewLines.length - 1 && line === latestThinkingLine && (
-                                  <motion.span
-                                    aria-hidden="true"
-                                    animate={{ opacity: [0.22, 1, 0.22] }}
-                                    transition={{ duration: 0.9, repeat: Infinity, ease: "easeInOut" }}
-                                    className="ml-1 inline-block h-3 w-[3px] rounded-full bg-primary/70 align-middle"
-                                  />
-                                )}
+                                {line}
                               </motion.div>
                             ))}
                           </div>

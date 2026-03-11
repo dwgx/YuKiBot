@@ -241,7 +241,7 @@ class HybridVideoResolver:
         self.bilix_resolver = BilixResolver(cache_dir, ffmpeg_location)
         self.douyin_resolver = DouyinResolver(cache_dir)
         _log.info("hybrid_resolver_init | bilix=%s | douyin=%s",
-                   self.bilix_resolver._bilix_available, self.douyin_resolver._available)
+                    self.bilix_resolver._bilix_available, self.douyin_resolver._available)
 
     async def download_video(self, url: str) -> Optional[Path]:
         """

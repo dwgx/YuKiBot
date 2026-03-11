@@ -67,6 +67,12 @@ const SECTIONS: SectionDef[] = [
     { path: "agent.llm_step_timeout_seconds_after_tool", label: "工具后 LLM 超时(秒)", type: "number", min: 5, max: 300 },
     { path: "agent.total_timeout_seconds", label: "总超时(0=不限制)", type: "number", min: 0, max: 900 },
     { path: "agent.queue_timeout_margin_seconds", label: "队列超时裕量(秒)", type: "number", min: 1, max: 60 },
+    { path: "agent.context_retention", label: "上下文保留", type: "select", options: [
+      { value: "minimal", label: "很少 (300字符)" },
+      { value: "medium", label: "中等 (800字符)" },
+      { value: "large", label: "很大 (1500字符)" },
+    ]},
+    { path: "agent.auto_compress_to_memory", label: "自动压缩上下文到记忆库", type: "switch" },
     { path: "agent.music_fast_path_enable", label: "音乐本地快速通道", type: "switch" },
     { path: "agent.runtime_rules", label: "Agent 运行时规则注入", type: "textarea", rows: 8 },
     { path: "agent.high_risk_control.enable", label: "高风险二次确认", type: "switch" },
@@ -75,6 +81,8 @@ const SECTIONS: SectionDef[] = [
   { key: "knowledge_update", label: "知识学习规则", fields: [
     { path: "knowledge_update.llm_extractor_enable", label: "启用 LLM 抽取器", type: "switch" },
     { path: "knowledge_update.llm_timeout_seconds", label: "LLM 抽取超时(秒)", type: "number", min: 6, max: 60 },
+    { path: "knowledge_update.trend_fetch_enable", label: "启用热搜抓取", type: "switch" },
+    { path: "knowledge_update.trend_fetch_interval_seconds", label: "热搜抓取间隔(秒)", type: "number", min: 300, max: 7200 },
   ]},
   { key: "bot", label: "Bot 设置", fields: [
     { path: "bot.name", label: "Bot 名称", type: "text" },

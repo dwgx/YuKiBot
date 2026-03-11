@@ -140,6 +140,24 @@ class TriggerEngine:
 
         self.ai_listen_min_unique_users = max(1, int(trigger_config.get("ai_listen_min_unique_users", 3)))
 
+        self.ai_listen_keyword_enable = bool(trigger_config.get("ai_listen_keyword_enable", True))
+
+        keywords_raw = trigger_config.get("ai_listen_keywords", [])
+
+        if not isinstance(keywords_raw, list):
+
+            keywords_raw = []
+
+        self.ai_listen_keywords = [
+
+            normalize_text(str(item)).lower()
+
+            for item in keywords_raw
+
+            if normalize_text(str(item))
+
+        ]
+
         explicit_request_cues_raw = trigger_config.get("explicit_request_cues", [])
 
         if not isinstance(explicit_request_cues_raw, list):
@@ -155,6 +173,8 @@ class TriggerEngine:
             if normalize_text(str(item))
 
         )
+
+        self.ai_listen_min_keyword_hits = max(1, int(trigger_config.get("ai_listen_min_keyword_hits", 1)))
 
         self.ai_listen_min_score = max(0.5, float(trigger_config.get("ai_listen_min_score", 1.2)))
 
@@ -864,11 +884,21 @@ class TriggerEngine:
 
 
 
+        keyword_hits = self._count_listen_keyword_hits(clean_text)
+
         explicit_signal = self._explicit_request_signal(clean_text)
 
 
 
         heat_ok = busy_messages >= self.ai_listen_min_messages and busy_users >= self.ai_listen_min_unique_users
+
+        keyword_ok = (
+
+            self.ai_listen_keyword_enable
+
+            and keyword_hits >= self.ai_listen_min_keyword_hits
+
+        )
 
         score = self._build_listen_score(
 
@@ -878,13 +908,15 @@ class TriggerEngine:
 
             busy_users,
 
+            keyword_hits,
+
             explicit_signal=explicit_signal,
 
         )
 
 
 
-        if not heat_ok and score < self.ai_listen_min_score:
+        if not heat_ok and not keyword_ok and score < self.ai_listen_min_score:
 
             return ""
 
@@ -895,6 +927,10 @@ class TriggerEngine:
         if explicit_signal >= 1.35:
 
             return "ai_listen_probe_task"
+
+        if keyword_ok:
+
+            return "ai_listen_probe_keyword"
 
         if heat_ok:
 
@@ -950,6 +986,38 @@ class TriggerEngine:
 
 
 
+    def _count_listen_keyword_hits(self, text: str) -> int:
+
+        if not text or not self.ai_listen_keyword_enable:
+
+            return 0
+
+        matched: set[str] = set()
+
+        for word in self.ai_listen_keywords:
+
+            if not word:
+
+                continue
+
+            # 英文关键词按词边界匹配，避免 "research" 命中 "search" 这类误判。
+
+            if re.fullmatch(r"[a-z0-9_]+", word):
+
+                if re.search(rf"(?<![a-z0-9_]){re.escape(word)}(?![a-z0-9_])", text):
+
+                    matched.add(word)
+
+                continue
+
+            if word in text:
+
+                matched.add(word)
+
+        return len(matched)
+
+
+
     @classmethod
 
     @classmethod
@@ -987,12 +1055,13 @@ class TriggerEngine:
         text: str,
         busy_messages: int,
         busy_users: int,
+        keyword_hits: int,
         *,
         explicit_signal: float = 0.0,
     ) -> float:
         msg_ratio = busy_messages / max(1, self.ai_listen_min_messages)
         user_ratio = busy_users / max(1, self.ai_listen_min_unique_users)
-        score = msg_ratio * 1.0 + user_ratio * 1.0
+        score = msg_ratio * 0.9 + user_ratio * 0.9 + float(keyword_hits) * 1.1
 
         if ("?" in text or "?" in text) or re.search(r"^[!/][a-z0-9_.:-]+", text, flags=re.IGNORECASE):
             score += 0.5
@@ -1212,3 +1281,4 @@ class TriggerEngine:
             if not queue:
 
                 self._recent_group_messages.pop(cid, None)
+

@@ -1039,7 +1039,7 @@ class StickerManager:
                     manual_override=info.get("manual_override", False),
                 )
             _log.info("knowledge_loaded | emojis=%d learned=%d registered=%d",
-                      len(self._emojis), self.learned_count, self.registered_count)
+                        len(self._emojis), self.learned_count, self.registered_count)
             if migrated > 0:
                 self._save_knowledge()
                 _log.info("knowledge_path_migrated | migrated=%d", migrated)

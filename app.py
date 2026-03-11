@@ -3697,7 +3697,7 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
             compressed.unlink(missing_ok=True)
 
     _log.info("video_compress | src=%s | size=%.1fMB | threshold=%.1fMB",
-              src.name, size / 1024 / 1024, max_bytes / 1024 / 1024)
+                src.name, size / 1024 / 1024, max_bytes / 1024 / 1024)
 
     # 先探测时长，用于计算目标码率
     target_bitrate = "1500k"  # 默认 1.5Mbps
@@ -3749,10 +3749,10 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
                 return src
             new_size = compressed.stat().st_size
             _log.info("video_compress_ok | %s | %.1fMB -> %.1fMB",
-                      src.name, size / 1024 / 1024, new_size / 1024 / 1024)
+                        src.name, size / 1024 / 1024, new_size / 1024 / 1024)
             return compressed
         _log.warning("video_compress_fail | rc=%d | stderr=%s",
-                     proc.returncode, (proc.stderr or b"")[:300])
+                    proc.returncode, (proc.stderr or b"")[:300])
     except subprocess.TimeoutExpired:
         _log.warning("video_compress_timeout | %s", src.name)
     except Exception as exc:

@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import re
+from functools import lru_cache
 from typing import Iterable
 
 _SPLIT_PATTERN = re.compile(r"[。！？!?；;\n]+")
@@ -33,9 +34,29 @@ def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
 
 
+@lru_cache(maxsize=1)
+def _get_opencc():
+    try:
+        from opencc import OpenCC
+
+        return OpenCC("t2s")
+    except Exception:
+        return None
+
+
+def _to_simplified(text: str) -> str:
+    converter = _get_opencc()
+    if converter is None:
+        return text
+    try:
+        return str(converter.convert(text))
+    except Exception:
+        return text
+
+
 def normalize_matching_text(text: str) -> str:
     """规范化用于匹配的文本（更激进的清理）。"""
-    normalized = normalize_text(text)
+    normalized = _to_simplified(normalize_text(text))
     # 移除常见的标点和特殊字符，保留字母数字和中文
     normalized = re.sub(r"[^\w\s\u4e00-\u9fff]", " ", normalized)
     return re.sub(r"\s+", " ", normalized).strip()

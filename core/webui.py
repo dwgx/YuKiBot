@@ -24,7 +24,7 @@ from urllib.parse import unquote
 import httpx
 import yaml
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 
 from core.recalled_messages import (
@@ -1968,6 +1968,122 @@ async def chat_agent_text(request: Request):
     if not isinstance(result, dict):
         result = {}
     return {"ok": bool(result.get("ok", True)), **result}
+
+
+@router.post("/chat/agent-text-stream", dependencies=[Depends(_check_auth)])
+async def chat_agent_text_stream(request: Request):
+    """流式响应版本的 agent-text，使用 SSE (Server-Sent Events)。"""
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+    resolved_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    text = str(body.get("text", ""))
+    reply_to_message_id = normalize_text(str(body.get("reply_to_message_id", "")))
+    if resolved_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+    if not peer_id:
+        raise HTTPException(400, "peer_id 不能为空")
+    if not normalize_text(text):
+        raise HTTPException(400, "text 不能为空")
+    if reply_to_message_id and not reply_to_message_id.isdigit():
+        raise HTTPException(400, "reply_to_message_id 必须是数字")
+
+    # 创建一个队列来接收流式更新
+    stream_queue: asyncio.Queue = asyncio.Queue()
+    conversation_id = f"{resolved_type}:{peer_id}"
+
+    # 注册流式回调
+    if _engine is not None:
+        bridge = getattr(_engine, "_runtime_webui_bridge", None) or {}
+        if "stream_callbacks" not in bridge:
+            bridge["stream_callbacks"] = {}
+        bridge["stream_callbacks"][conversation_id] = stream_queue
+
+    async def event_generator():
+        try:
+            # 发送初始事件
+            yield f"data: {json.dumps({'type': 'start', 'conversation_id': conversation_id})}\n\n"
+
+            # 提交任务
+            submit = getattr(_engine, "runtime_webui_agent_submit", None) if _engine is not None else None
+            if not callable(submit):
+                yield f"data: {json.dumps({'type': 'error', 'message': '当前运行时不支持聊天控制台 AI 对话'})}\n\n"
+                return
+
+            bot_id = normalize_text(str(body.get("bot_id", "")))
+            context_user_id = normalize_text(str(body.get("context_user_id", "")))
+            context_user_name = normalize_text(str(body.get("context_user_name", "")))
+            context_sender_role = normalize_text(str(body.get("context_sender_role", "")))
+
+            # 启动任务（不等待完成）
+            task = asyncio.create_task(_run_agent_with_stream(
+                submit, resolved_type, peer_id, text, bot_id, reply_to_message_id,
+                context_user_id, context_user_name, context_sender_role, stream_queue
+            ))
+
+            # 持续从队列读取更新
+            while True:
+                try:
+                    event = await asyncio.wait_for(stream_queue.get(), timeout=60.0)
+                    if event is None:  # 结束信号
+                        break
+                    yield f"data: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    # 发送心跳
+                    yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+
+            # 等待任务完成
+            await task
+
+        except Exception as e:
+            _log.error(f"stream_error | {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+        finally:
+            # 清理回调
+            if _engine is not None:
+                bridge = getattr(_engine, "_runtime_webui_bridge", None) or {}
+                if "stream_callbacks" in bridge:
+                    bridge["stream_callbacks"].pop(conversation_id, None)
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+async def _run_agent_with_stream(
+    submit, chat_type, peer_id, text, bot_id, reply_to_message_id,
+    context_user_id, context_user_name, context_sender_role, stream_queue
+):
+    """运行 Agent 并将更新推送到流式队列。"""
+    try:
+        result = submit(
+            chat_type=chat_type,
+            peer_id=peer_id,
+            text=text,
+            bot_id=bot_id,
+            reply_to_message_id=reply_to_message_id,
+            context_user_id=context_user_id,
+            context_user_name=context_user_name,
+            context_sender_role=context_sender_role,
+        )
+        if inspect.isawaitable(result):
+            result = await result
+
+        # 发送最终结果
+        if isinstance(result, dict):
+            await stream_queue.put({"type": "result", "data": result})
+    except Exception as e:
+        await stream_queue.put({"type": "error", "message": str(e)})
+    finally:
+        await stream_queue.put(None)  # 结束信号
 
 
 @router.post("/chat/send-image", dependencies=[Depends(_check_auth)])
@@ -4249,7 +4365,7 @@ async def setup_smart_extract(request: Request):
                 # If allow_close and some platforms missing, try restart approach
                 if allow_close:
                     missing = [d for d in [".bilibili.com", ".douyin.com", ".kuaishou.com", ".qq.com", ".qzone.qq.com"]
-                               if d not in raw or not raw[d]]
+                                if d not in raw or not raw[d]]
                     if missing:
                         restart_attempted = True
                         restarted = smart_extract_all_cookies(

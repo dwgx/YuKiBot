@@ -1,14 +1,14 @@
 """安全引擎 — 可调尺度的内容管控 + QQ 输出敏感词过滤。
 
 尺度等级 (scale):
-  0 = 无限制  — 仅拦截绝对红线（儿童色情、恐怖主义等）
-  1 = 宽松    — 拦截违法实施意图（黑客/毒品/武器 + 教程/方法）
-  2 = 标准    — 拦截违法 + 自伤 + 露骨内容（默认）
-  3 = 严格    — 拦截所有敏感词，不需要意图线索
+0 = 无限制  — 仅拦截绝对红线（儿童色情、恐怖主义等）
+1 = 宽松    — 拦截违法实施意图（黑客/毒品/武器 + 教程/方法）
+2 = 标准    — 拦截违法 + 自伤 + 露骨内容（默认）
+3 = 严格    — 拦截所有敏感词，不需要意图线索
 
 输出过滤 (output_filter):
-  独立于尺度，始终生效。将 bot 回复中的 QQ 敏感词替换为安全文本，
-  防止因 bot 输出导致群被封。
+独立于尺度，始终生效。将 bot 回复中的 QQ 敏感词替换为安全文本，
+防止因 bot 输出导致群被封。
 """
 from __future__ import annotations
 
@@ -110,7 +110,7 @@ class SafetyEngine:
         }
 
         _log.info("SafetyEngine 初始化: scale=%d (%s), 输出敏感词=%d 条",
-                   self.scale, self.SCALE_NAMES.get(self.scale, "?"), len(self._output_sensitive))
+                    self.scale, self.SCALE_NAMES.get(self.scale, "?"), len(self._output_sensitive))
 
     # ── 输入评估 ──────────────────────────────────────────────
 

@@ -167,6 +167,7 @@ def _check_trigger() -> list[_Check]:
         "delegate_undirected_to_ai": True,
         "ai_listen_min_messages": 2,
         "ai_listen_min_unique_users": 2,
+        "ai_listen_min_keyword_hits": 1,
         "ai_listen_min_score": 1.0,
         "ai_listen_interval_seconds": 1,
     }

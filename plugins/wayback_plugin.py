@@ -8,6 +8,7 @@ This plugin registers Agent-only tools for:
 from __future__ import annotations
 
 import contextlib
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
@@ -314,7 +315,7 @@ class Plugin:
 
     def __init__(self) -> None:
         self._enabled = True
-        self._timeout_seconds = 18.0
+        self._timeout_seconds = 8.0  # 减少超时时间从 18 秒到 8 秒
         self._default_limit = 8
         self._max_text_chars = 12000
         self._llm_input_chars = 6500
@@ -324,6 +325,8 @@ class Plugin:
         self._ua = _DEFAULT_UA
         self._client: httpx.AsyncClient | None = None
         self._model_client: Any = None
+        self._cache: dict[str, tuple[list[_Snapshot], float]] = {}  # 添加缓存
+        self._cache_ttl = 300.0  # 缓存 5 分钟
 
     async def setup(self, config: dict[str, Any], context: Any) -> None:
         self._enabled = bool(config.get("enabled", True))
@@ -480,6 +483,15 @@ class Plugin:
         limit: int = 8,
         include_non_200: bool = False,
     ) -> list[_Snapshot]:
+        # 检查缓存
+        import time
+        cache_key = f"{url}:{from_ts}:{to_ts}:{limit}:{include_non_200}"
+        if cache_key in self._cache:
+            cached_data, cached_time = self._cache[cache_key]
+            if time.time() - cached_time < self._cache_ttl:
+                _log.debug("wayback_cdx_cache_hit | url=%s", url)
+                return cached_data
+
         client = await self._get_client()
         params: dict[str, str] = {
             "url": url,
@@ -524,6 +536,17 @@ class Plugin:
                     digest=normalize_text(_cell(row, idx, "digest")),
                 )
             )
+
+        # 保存到缓存
+        import time
+        self._cache[cache_key] = (out, time.time())
+        # 清理过期缓存
+        if len(self._cache) > 100:
+            now = time.time()
+            expired = [k for k, (_, t) in self._cache.items() if now - t > self._cache_ttl]
+            for k in expired:
+                self._cache.pop(k, None)
+
         return out
 
     async def _lookup_closest(self, *, url: str, timestamp: str = "") -> _Snapshot | None:
@@ -550,6 +573,10 @@ class Plugin:
             return None
         return _Snapshot(timestamp=snap_ts, original=url)
 
+    async def _query_available_years(self, *, url: str, from_year: int = 0, to_year: int = 0) -> list[int]:
+        _ = (url, from_year, to_year)
+        return []
+
     async def _resolve_snapshot(self, *, url: str, year: int | None, timestamp: str) -> tuple[_Snapshot | None, str]:
         parsed_wayback = _parse_wayback_url(url)
         if parsed_wayback:
@@ -566,12 +593,31 @@ class Plugin:
         if target_ts:
             ts_target_int = int(target_ts)
             closest_hits: list[tuple[int, _Snapshot, str]] = []
-            for variant in variants:
-                with contextlib.suppress(Exception):
-                    closest = await self._lookup_closest(url=variant, timestamp=target_ts)
-                    if closest and closest.timestamp:
+
+            async def _lookup_variant(variant: str) -> tuple[str, _Snapshot | None]:
+                return variant, await self._lookup_closest(url=variant, timestamp=target_ts)
+
+            tasks = [asyncio.create_task(_lookup_variant(variant)) for variant in variants]
+            try:
+                for done in asyncio.as_completed(tasks):
+                    try:
+                        variant, closest = await done
+                    except Exception:
+                        continue
+                    if not closest or not closest.timestamp:
+                        continue
+                    with contextlib.suppress(Exception):
                         diff = abs(int(closest.timestamp) - ts_target_int)
                         closest_hits.append((diff, closest, f"available_closest:{variant}"))
+                    # First successful closest match should not wait for slow variants.
+                    if closest_hits:
+                        break
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                with contextlib.suppress(Exception):
+                    await asyncio.gather(*tasks, return_exceptions=True)
             if closest_hits:
                 closest_hits.sort(key=lambda x: x[0])
                 _, snap, mode = closest_hits[0]
@@ -779,7 +825,9 @@ class Plugin:
 
         rows_all: list[_Snapshot] = []
         errors: list[str] = []
-        for variant in variants:
+        source_variant = ""
+
+        async def _run_variant(variant: str) -> tuple[str, list[_Snapshot] | None, Exception | None]:
             try:
                 rows = await self._query_cdx(
                     url=variant,
@@ -788,9 +836,29 @@ class Plugin:
                     limit=max(limit, 20),
                     include_non_200=include_non_200,
                 )
-                rows_all.extend(rows)
+                return variant, rows, None
             except Exception as exc:
-                errors.append(f"{variant}:{exc}")
+                return variant, None, exc
+
+        tasks = [asyncio.create_task(_run_variant(variant)) for variant in variants]
+        try:
+            for done in asyncio.as_completed(tasks):
+                variant, rows, err = await done
+                if err is not None:
+                    errors.append(f"{variant}:{err}")
+                    continue
+                if not rows:
+                    continue
+                source_variant = variant
+                rows_all.extend(rows)
+                # Do not block on slow variants once we have a successful source.
+                break
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            with contextlib.suppress(Exception):
+                await asyncio.gather(*tasks, return_exceptions=True)
 
         rows = _dedupe_snapshots(rows_all)
         rows.sort(key=lambda s: s.timestamp, reverse=True)
@@ -829,6 +897,7 @@ class Plugin:
                 "from_ts": from_ts,
                 "to_ts": to_ts,
                 "count": len(rows),
+                "source_variant": source_variant,
                 "snapshots": [_snapshot_dict(s) for s in rows],
                 "recommended": _snapshot_dict(recommended),
             },
@@ -935,6 +1004,21 @@ class Plugin:
                 include_non_200=self._include_non_200_default,
             )
         except Exception as exc:
+            with contextlib.suppress(Exception):
+                years = await self._query_available_years(url=url, from_year=from_year, to_year=to_year)
+                if years:
+                    years = sorted({int(y) for y in years if int(y) >= 1900})
+                    return ToolCallResult(
+                        ok=True,
+                        data={
+                            "url": url,
+                            "approximate": True,
+                            "years": years,
+                            "counts_by_year": {},
+                            "scanned": 0,
+                        },
+                        display=f"available-years fallback for {url}: {', '.join(str(y) for y in years)}",
+                    )
             return ToolCallResult(ok=False, error=f"timeline_failed:{exc}", display=f"timeline failed: {exc}")
 
         if not rows:
