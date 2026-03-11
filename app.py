@@ -2303,6 +2303,20 @@ def register_handlers(engine: YukikoEngine) -> None:
             reply_to_bot,
             clip_text(text, 80),
         )
+        dispatch_interruptible = not _looks_like_sticker_learning_request(
+            text=text,
+            raw_segments=raw_segments,
+            reply_media_segments=reply_media_segments,
+        )
+        engine.logger.info(
+            "queue_submit | trace=%s | conversation=%s | seq=%d | pending_before=%d | high_priority=%s | interruptible=%s",
+            payload.trace_id,
+            payload.conversation_id,
+            int(payload.seq or 0),
+            int(payload.queue_depth or 0),
+            high_priority,
+            dispatch_interruptible,
+        )
         dispatch_result = await dispatcher.submit(
             conversation_id=conversation_id,
             seq=seq,
@@ -2311,11 +2325,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             send=send_response,
             high_priority=high_priority,
             allow_cancel_previous=allow_cancel_previous,
-            interruptible=not _looks_like_sticker_learning_request(
-                text=text,
-                raw_segments=raw_segments,
-                reply_media_segments=reply_media_segments,
-            ),
+            interruptible=dispatch_interruptible,
             process_timeout_seconds=process_timeout_override,
             trace_id=payload.trace_id,
             send_overload_notice=send_overload_notice,

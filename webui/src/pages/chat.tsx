@@ -169,6 +169,7 @@ function loadThinkingIslandSize(): ThinkingIslandSize {
 function parseThinkingLine(rawLine: string): string {
   const line = String(rawLine || "").trim();
   if (!line) return "";
+  if (line.includes("queue_submit")) return "消息已进入队列";
   if (line.includes("qq_recv")) return "收到新消息，正在开始处理";
   if (line.includes("router_llm")) return "AI 正在理解问题并做路由判断";
   if (line.includes("router_decision")) {
@@ -197,7 +198,9 @@ function parseThinkingLine(rawLine: string): string {
     if (status === "cancelled") return "任务已取消";
     return status ? `队列状态: ${status}` : "队列处理完成";
   }
+  if (line.includes("queue_cancelled")) return "队列已取消当前任务";
   if (line.includes("agent_done")) return "任务完成";
+  if (line.includes("agent_timeout_budget")) return "正在分配思考预算";
   if (line.includes("cancelled_by_webui_interrupt")) return "已收到中断请求";
   if (line.includes("agent_direct_reply")) return "准备直接回复";
   if (line.includes("agent_unparseable_json")) return "正在修正模型输出";
@@ -249,6 +252,24 @@ function compactThinkingRawLine(rawLine: string): string {
     .trim();
   if (!compact) return "";
   return `日志: ${clip(compact, 150)}`;
+}
+
+function extractConversationHint(rawLine: string): string {
+  const line = String(rawLine || "");
+  const fromConversation = line.match(/\|\s*conversation=([^|]+)/)?.[1] || "";
+  if (fromConversation.trim()) return fromConversation.trim();
+  const fromConversationCn = line.match(/\|\s*会话=([^|]+)/)?.[1] || "";
+  if (fromConversationCn.trim()) return fromConversationCn.trim();
+  return "";
+}
+
+function decorateThinkingLine(displayLine: string, rawLine: string, selectedConversationId: string): string {
+  const base = String(displayLine || "").trim();
+  if (!base) return "";
+  const conversationHint = extractConversationHint(rawLine);
+  if (!conversationHint) return base;
+  if (stateBelongsToConversation(conversationHint, selectedConversationId)) return base;
+  return `[${conversationHint}] ${base}`;
 }
 
 function thinkingStatusLabel(active: boolean): string {
@@ -792,10 +813,20 @@ export default function ChatPage() {
             || traceCandidates.some((candidate) => !!candidate && line.includes(candidate));
           const matchesConversation = !!conversationId && line.includes(conversationId);
           const looksAgentLine = /(agent_|queue_|router_|tool_dispatch|tool_call|tool_result|send_final|effective_threshold_trace|interrupt)/.test(line);
-          const display = parseThinkingLine(line) || compactThinkingRawLine(line);
+          const rawDisplay = parseThinkingLine(line) || compactThinkingRawLine(line);
+          const display = decorateThinkingLine(rawDisplay, line, conversationId);
 
           if ((matchesTrace || matchesConversation) && display) {
             touchThinkingPresence(conversationId, 15000);
+            pushThinkingLine(display);
+            continue;
+          }
+
+          // 全局 thinking 流：即使不是当前会话，也在灵动岛显示，避免“有处理但看不到”。
+          if (looksAgentLine && display) {
+            if (conversationId) {
+              touchThinkingPresence(conversationId, 15000);
+            }
             pushThinkingLine(display);
             continue;
           }
