@@ -81,10 +81,10 @@ const THINKING_STAGE_STEPS: Array<{ key: "routing" | "planning" | "executing" | 
   { key: "replying", label: "回复" },
 ];
 
-const THINKING_ISLAND_SIZE_WIDTH: Record<ThinkingIslandSize, string> = {
-  sm: "min(520px,100%)",
-  md: "min(640px,100%)",
-  lg: "min(780px,100%)",
+const THINKING_ISLAND_MAX_WIDTH: Record<ThinkingIslandSize, number> = {
+  sm: 520,
+  md: 640,
+  lg: 780,
 };
 
 const THINKING_ISLAND_PREVIEW_HEIGHT_CLASS: Record<ThinkingIslandSize, string> = {
@@ -134,9 +134,24 @@ function mergeAgentStates(states: ChatAgentStateItem[], selectedConversationId: 
   };
 }
 
-function clampThinkingIslandOffset(offset: ThinkingIslandOffset): ThinkingIslandOffset {
+function getThinkingIslandRenderWidth(size: ThinkingIslandSize): number {
+  const maxWidth = THINKING_ISLAND_MAX_WIDTH[size];
+  if (typeof window === "undefined") return maxWidth;
+  return Math.max(320, Math.min(maxWidth, window.innerWidth - 24));
+}
+
+function getThinkingIslandWidthStyle(size: ThinkingIslandSize): string {
+  const maxWidth = THINKING_ISLAND_MAX_WIDTH[size];
+  return `min(${maxWidth}px, calc(100vw - 24px))`;
+}
+
+function clampThinkingIslandOffset(
+  offset: ThinkingIslandOffset,
+  size: ThinkingIslandSize = "md",
+): ThinkingIslandOffset {
   if (typeof window === "undefined") return offset;
-  const maxX = Math.max(0, Math.floor(window.innerWidth * 0.34));
+  const islandWidth = getThinkingIslandRenderWidth(size);
+  const maxX = Math.max(0, Math.floor((window.innerWidth - islandWidth) / 2) - 8);
   const maxY = Math.max(0, Math.floor(window.innerHeight * 0.42));
   return {
     x: Math.max(-maxX, Math.min(maxX, Number.isFinite(offset.x) ? offset.x : 0)),
@@ -144,7 +159,7 @@ function clampThinkingIslandOffset(offset: ThinkingIslandOffset): ThinkingIsland
   };
 }
 
-function loadThinkingIslandOffset(): ThinkingIslandOffset {
+function loadThinkingIslandOffset(size: ThinkingIslandSize = "md"): ThinkingIslandOffset {
   if (typeof window === "undefined") return { x: 0, y: 0 };
   try {
     const raw = window.localStorage.getItem(THINKING_ISLAND_STORAGE_KEY);
@@ -153,7 +168,7 @@ function loadThinkingIslandOffset(): ThinkingIslandOffset {
     return clampThinkingIslandOffset({
       x: Number(data?.x ?? 0),
       y: Number(data?.y ?? 0),
-    });
+    }, size);
   } catch {
     return { x: 0, y: 0 };
   }
@@ -398,7 +413,7 @@ export default function ChatPage() {
   const [retargeting, setRetargeting] = useState(false);
   const [thinkingPanelOpen, setThinkingPanelOpen] = useState(true);
   const [thinkingIslandExpanded, setThinkingIslandExpanded] = useState(false);
-  const [thinkingIslandOffset, setThinkingIslandOffset] = useState<ThinkingIslandOffset>(() => loadThinkingIslandOffset());
+  const [thinkingIslandOffset, setThinkingIslandOffset] = useState<ThinkingIslandOffset>(() => loadThinkingIslandOffset("md"));
   const [thinkingIslandSize, setThinkingIslandSize] = useState<ThinkingIslandSize>(() => loadThinkingIslandSize());
   const [thinkingStreamState, setThinkingStreamState] = useState<"connecting" | "open" | "closed">("connecting");
   const [thinkingStreamPacketCount, setThinkingStreamPacketCount] = useState(0);
@@ -746,11 +761,15 @@ export default function ChatPage() {
 
   useEffect(() => {
     const handleResize = () => {
-      setThinkingIslandOffset((prev) => clampThinkingIslandOffset(prev));
+      setThinkingIslandOffset((prev) => clampThinkingIslandOffset(prev, thinkingIslandSize));
     };
     window.addEventListener("resize", handleResize);
     return () => window.removeEventListener("resize", handleResize);
-  }, []);
+  }, [thinkingIslandSize]);
+
+  useEffect(() => {
+    setThinkingIslandOffset((prev) => clampThinkingIslandOffset(prev, thinkingIslandSize));
+  }, [thinkingIslandSize]);
 
   useEffect(() => {
     setThinkingLines([]);
@@ -1539,7 +1558,8 @@ export default function ChatPage() {
                     style={{
                       x: thinkingIslandOffset.x,
                       y: thinkingIslandOffset.y,
-                      width: THINKING_ISLAND_SIZE_WIDTH[thinkingIslandSize],
+                      width: getThinkingIslandWidthStyle(thinkingIslandSize),
+                      maxWidth: "calc(100vw - 24px)",
                       touchAction: "none",
                     }}
                     whileDrag={{ scale: 1.02, boxShadow: "0 20px 40px rgba(0,0,0,0.15)" }}
@@ -1551,7 +1571,7 @@ export default function ChatPage() {
                       setThinkingIslandOffset(clampThinkingIslandOffset({
                         x: thinkingIslandDragOriginRef.current.x + info.offset.x,
                         y: thinkingIslandDragOriginRef.current.y + info.offset.y,
-                      }));
+                      }, thinkingIslandSize));
                     }}
                     className={`pointer-events-auto select-none overflow-hidden rounded-2xl border border-primary/20 bg-content1/95 shadow-lg backdrop-blur-xl ${thinkingActive ? "thinking-island-live" : ""}`}
                     onWheel={(e) => {
