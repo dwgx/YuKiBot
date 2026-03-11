@@ -45,6 +45,18 @@ Copy-Item .env.example .env
 bash install.sh
 ```
 
+GitHub 遠端腳本直裝（不用先手動 clone）：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+```
+
+非互動直裝範例：
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+```
+
 你會逐步設定：
 
 - `HOST`（監聽位址）

@@ -46,6 +46,18 @@ Minimum values to set first:
 bash install.sh
 ```
 
+Direct remote bootstrap from GitHub (no manual clone required):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+```
+
+Non-interactive remote install example:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+```
+
 The installer asks for:
 
 - `HOST`

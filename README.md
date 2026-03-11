@@ -23,6 +23,18 @@ For a 1Panel-like interactive deploy flow (custom host/port + optional systemd):
 bash install.sh
 ```
 
+Remote bootstrap directly from GitHub:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+```
+
+Pass installer args (for non-interactive deploy):
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+```
+
 Non-interactive example:
 
 ```bash
