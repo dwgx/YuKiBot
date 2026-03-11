@@ -14,3 +14,17 @@ Architecture and design notes:
 - English architecture notes: [docs/en/ARCHITECTURE.md](docs/en/ARCHITECTURE.md)
 
 If you are new, start from the GUIDE file in your language first.
+
+## Linux One-Click Deploy
+
+For a 1Panel-like interactive deploy flow (custom host/port + optional systemd):
+
+```bash
+bash install.sh
+```
+
+Non-interactive example:
+
+```bash
+bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+```

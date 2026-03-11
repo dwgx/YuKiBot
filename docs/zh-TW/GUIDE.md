@@ -39,13 +39,49 @@ Copy-Item .env.example .env
 
 ## 2. 快速部署啟動（建議）
 
-### 2.1 Windows 一鍵啟動
+### 2.1 Linux 一鍵部署（1Panel 風格）
+
+```bash
+bash install.sh
+```
+
+你會逐步設定：
+
+- `HOST`（監聽位址）
+- `PORT`（自訂端口）
+- `WEBUI_TOKEN`
+- systemd 服務名稱
+- 是否自動放行防火牆端口
+
+腳本會自動完成：
+
+- 系統依賴安裝（Python/Node.js/npm/ffmpeg 等）
+- 虛擬環境與 Python 套件部署
+- WebUI 建置
+- 寫入 `.env` 的 `HOST/PORT`
+- 可選建立並啟動 systemd 服務
+
+非互動模式範例：
+
+```bash
+bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+```
+
+常用維運命令：
+
+```bash
+sudo systemctl status yukiko
+sudo journalctl -u yukiko -f
+sudo systemctl restart yukiko
+```
+
+### 2.2 Windows 一鍵啟動
 
 ```bat
 start.bat
 ```
 
-### 2.2 Linux / macOS 一鍵啟動
+### 2.3 Linux / macOS 一鍵啟動（輕量模式）
 
 ```bash
 bash start.sh
@@ -54,7 +90,7 @@ bash start.sh
 以上腳本會先檢查 `.venv` 健康狀態。  
 若虛擬環境缺失或壞掉，會自動走 `scripts/deploy.py --run` 重新部署。
 
-### 2.3 手動部署
+### 2.4 手動部署
 
 ```bash
 python scripts/deploy.py

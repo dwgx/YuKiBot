@@ -40,7 +40,43 @@ Minimum values to set first:
 
 ## 2. Quick Deploy and Start
 
-### 2.1 One-command startup scripts
+### 2.1 Linux one-click deploy (1Panel-like)
+
+```bash
+bash install.sh
+```
+
+The installer asks for:
+
+- `HOST`
+- `PORT` (fully custom)
+- `WEBUI_TOKEN`
+- systemd service name
+- whether to open firewall port automatically
+
+It then performs:
+
+- system package install
+- Python venv + requirements bootstrap
+- WebUI build
+- `.env` updates for `HOST`/`PORT`
+- optional systemd create + start
+
+Non-interactive example:
+
+```bash
+bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+```
+
+Service operations:
+
+```bash
+sudo systemctl status yukiko
+sudo journalctl -u yukiko -f
+sudo systemctl restart yukiko
+```
+
+### 2.2 One-command startup scripts
 
 Windows:
 
@@ -57,7 +93,7 @@ bash start.sh
 Both scripts validate local `.venv`.  
 If missing/unhealthy, they auto-run `scripts/deploy.py --run`.
 
-### 2.2 Manual bootstrap
+### 2.3 Manual bootstrap
 
 ```bash
 python scripts/deploy.py
