@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import io
+import logging
 import os
 import sys
 
@@ -26,7 +27,14 @@ def _load_env_files() -> None:
     load_dotenv(root / ".env.prod", override=False, encoding="utf-8")
 
 
+def _disable_uvicorn_access_log() -> None:
+    """禁用 uvicorn.access 日志，减少控制台噪音"""
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").propagate = False
+
+
 _load_env_files()
+_disable_uvicorn_access_log()
 
 # 首次运行向导：
 #   config.yml 不存在 → 启动 WebUI 配置页面
