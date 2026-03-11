@@ -71,9 +71,14 @@ bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yuk
 Service operations:
 
 ```bash
-sudo systemctl status yukiko
-sudo journalctl -u yukiko -f
-sudo systemctl restart yukiko
+yukiko --help
+yukiko status
+yukiko logs --lines 200
+yukiko stop
+yukiko start
+yukiko register --service-name yukiko
+yukiko unregister --service-name yukiko
+yukiko uninstall --purge-runtime --purge-env
 ```
 
 ### 2.2 One-command startup scripts

@@ -5,11 +5,13 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$ROOT_DIR/.env"
 ENV_EXAMPLE="$ROOT_DIR/.env.example"
 SERVICE_TEMPLATE="$ROOT_DIR/deploy/systemd/yukiko.service.template"
+MANAGER_SCRIPT="$ROOT_DIR/scripts/yukiko_manager.sh"
 
 NON_INTERACTIVE=0
 AUTO_INSTALL_SERVICE=1
 AUTO_OPEN_FIREWALL=0
 SKIP_WEBUI_BUILD=0
+SKIP_CLI_INSTALL=0
 
 HOST_INPUT=""
 PORT_INPUT=""
@@ -34,6 +36,7 @@ Options:
   --open-firewall           Try opening selected port in firewall
   --no-firewall             Do not touch firewall (default)
   --skip-webui-build        Skip npm build step
+  --skip-cli-install        Skip installing /usr/local/bin/yukiko
   --non-interactive         Use defaults and CLI arguments, no prompts
   -h, --help                Show this help
 
@@ -319,6 +322,30 @@ install_systemd_service() {
   info "systemd service ready: $service_name"
 }
 
+install_cli_command() {
+  local service_name="$1"
+  local cli_path="/usr/local/bin/yukiko"
+  local wrapper
+  wrapper="$(mktemp)"
+
+  if [[ ! -f "$MANAGER_SCRIPT" ]]; then
+    error "Manager script missing: $MANAGER_SCRIPT"
+    exit 1
+  fi
+
+  cat >"$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export YUKIKO_ROOT="$ROOT_DIR"
+export YUKIKO_SERVICE_NAME="$service_name"
+exec /usr/bin/env bash "$MANAGER_SCRIPT" "\$@"
+EOF
+
+  run_root install -m 0755 "$wrapper" "$cli_path"
+  rm -f "$wrapper"
+  info "CLI installed: yukiko -> $MANAGER_SCRIPT"
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -356,6 +383,10 @@ parse_args() {
         ;;
       --skip-webui-build)
         SKIP_WEBUI_BUILD=1
+        shift
+        ;;
+      --skip-cli-install)
+        SKIP_CLI_INSTALL=1
         shift
         ;;
       --non-interactive)
@@ -459,6 +490,12 @@ main() {
   bootstrap_python
   build_webui
 
+  if [[ "$SKIP_CLI_INSTALL" -eq 0 ]]; then
+    install_cli_command "$service_name"
+  else
+    warn "Skipping CLI install (--skip-cli-install)."
+  fi
+
   if [[ "$open_firewall" -eq 1 ]]; then
     open_firewall_port "$port"
   fi
@@ -480,6 +517,7 @@ main() {
   echo "Host: $host"
   echo "Port: $port"
   echo "WebUI: http://${host}:${port}/webui/login"
+  echo "CLI: yukiko --help"
   if [[ "$install_service" -eq 1 ]]; then
     echo "Service: $service_name"
     echo "Status:  sudo systemctl status $service_name"

@@ -28,3 +28,14 @@ Non-interactive example:
 ```bash
 bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
 ```
+
+After install, use the unified manager command:
+
+```bash
+yukiko --help
+yukiko status
+yukiko logs --lines 200
+yukiko stop
+yukiko start
+yukiko uninstall --purge-runtime --purge-env
+```
