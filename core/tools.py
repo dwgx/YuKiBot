@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import asyncio
 import base64
 import hashlib
@@ -20,44 +21,77 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, unquote, urljoin, urlparse
 from urllib.parse import urlencode
+
 import httpx
+
+from core import prompt_loader as _pl
 from core.image import ImageEngine
-from core.music import MusicEngine, MusicPlayResult, build_music_keyword
+from core.music import MusicEngine, MusicPlayResult
 from core.prompt_policy import PromptPolicy
-from core.soundcloud import SoundCloudClient
 from core.search import SearchEngine, SearchResult
 from core.system_prompts import SystemPromptRelay
 from core.video_analyzer import VideoAnalyzer, VideoAnalysisResult
-from utils.text import clip_text, normalize_matching_text, normalize_text
+from utils.intent import (
+    looks_like_github_request as _shared_github_request,
+    looks_like_repo_readme_request as _shared_repo_readme_request,
+    looks_like_video_request as _shared_video_request,
+)
+from utils.text import clip_text, normalize_text
+
 try:
     from yt_dlp import YoutubeDL
 except Exception:  # pragma: no cover - optional runtime dependency
     YoutubeDL = None
+
 try:  # pragma: no cover - optional runtime dependency
     from PIL import Image
 except Exception:  # pragma: no cover - optional runtime dependency
     Image = None
+
+
 import logging as _logging
+
 _ytdlp_log = _logging.getLogger("yukiko.ytdlp")
 _tool_log = _logging.getLogger("yukiko.tools")
 _tool_trace_id_ctx: ContextVar[str] = ContextVar("yukiko_tool_trace_id", default="")
 _ytdlp_error_dedupe: set[tuple[str, str]] = set()
-def _tool_trace_tag() -> str:
+_TOOLS_HEURISTIC_CUES_ENABLED = False
 
+
+def _tool_trace_tag() -> str:
     trace_id = normalize_text(_tool_trace_id_ctx.get(""))
     if not trace_id:
         return ""
     return f" | trace={trace_id}"
+
+
+def _prompt_cues(key: str, defaults: tuple[str, ...], lowercase: bool = True) -> tuple[str, ...]:
+    """Load cue list from prompts.yml.
+
+    In LLM-first mode, keyword/regex cue routing is disabled globally.
+    """
+    _ = defaults
+    if not _TOOLS_HEURISTIC_CUES_ENABLED:
+        return ()
+    raw = _pl.get_list(key)
+    items = raw if isinstance(raw, list) else []
+    normalized: list[str] = []
+    for item in items:
+        value = normalize_text(str(item))
+        if not value:
+            continue
+        normalized.append(value.lower() if lowercase else value)
+    return tuple(normalized)
+
+
 class _SilentYTDLPLogger:
-
     def debug(self, msg: str) -> None:
-
         return
+
     def warning(self, msg: str) -> None:
-
         _ytdlp_log.debug("ytdlp_warn%s: %s", _tool_trace_tag(), msg[:200])
-    def error(self, msg: str) -> None:
 
+    def error(self, msg: str) -> None:
         # 同一 trace 内重复错误（常见于 cookiesfrombrowser 不可用）只打印一次，避免刷屏
         trace_id = normalize_text(_tool_trace_id_ctx.get(""))
         message = normalize_text(str(msg))[:220]
@@ -76,16 +110,18 @@ class _SilentYTDLPLogger:
             _ytdlp_error_dedupe.clear()
         _ytdlp_error_dedupe.add(key)
         _ytdlp_log.warning("ytdlp_error%s: %s", _tool_trace_tag(), msg[:300])
+
+
 @dataclass(slots=True)
 class ToolResult:
-
     ok: bool
     tool_name: str
     payload: dict[str, Any] = field(default_factory=dict)
     evidence: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
-def _find_ffmpeg() -> str:
 
+
+def _find_ffmpeg() -> str:
     """Locate ffmpeg executable, including common winget install locations."""
     found = shutil.which("ffmpeg")
     if found:
@@ -116,6 +152,7 @@ def _find_ffmpeg() -> str:
     # 最后兜底：imageio-ffmpeg 打包的可执行文件
     try:
         import imageio_ffmpeg
+
         bundled = imageio_ffmpeg.get_ffmpeg_exe()
         if bundled and os.path.isfile(bundled):
             bundled_dir = str(Path(bundled).resolve().parent)
@@ -124,8 +161,9 @@ def _find_ffmpeg() -> str:
     except Exception:
         pass
     return ""
-def _write_netscape_cookie_file(cookie_str: str, domain: str) -> str:
 
+
+def _write_netscape_cookie_file(cookie_str: str, domain: str) -> str:
     """Write cookies into a temporary Netscape-format file and return its path."""
     if not cookie_str.strip():
         return ""
@@ -146,10 +184,10 @@ def _write_netscape_cookie_file(cookie_str: str, domain: str) -> str:
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     return path
+
+
 class ToolExecutor:
-
     def __init__(
-
         self,
         search_engine: SearchEngine,
         image_engine: ImageEngine,
@@ -163,11 +201,18 @@ class ToolExecutor:
             search_cfg = raw_cfg
         if not isinstance(search_cfg, dict):
             search_cfg = {}
+
         cfg = search_cfg
         video_cfg = search_cfg.get("video_resolver", raw_cfg.get("video_resolver", {}))
         if not isinstance(video_cfg, dict):
             video_cfg = {}
         self._raw_config = raw_cfg
+        control_cfg = raw_cfg.get("control", {}) if isinstance(raw_cfg, dict) else {}
+        if not isinstance(control_cfg, dict):
+            control_cfg = {}
+        global _TOOLS_HEURISTIC_CUES_ENABLED
+        _TOOLS_HEURISTIC_CUES_ENABLED = bool(control_cfg.get("heuristic_rules_enable", False))
+
         self.search_engine = search_engine
         self.image_engine = image_engine
         self.plugin_runner = plugin_runner
@@ -241,8 +286,8 @@ class ToolExecutor:
                 self._ffmpeg_probe_dir = ""
         self._video_analyzer = VideoAnalyzer(raw_cfg)
         self._music_engine = MusicEngine(raw_cfg)
-        self._soundcloud_client = SoundCloudClient(timeout=max(10.0, self._video_metadata_timeout_seconds))
         self._prompt_policy = PromptPolicy.from_config(raw_cfg)
+
         # 初始化混合视频解析器（bilix + yt-dlp）
         self._hybrid_resolver = None
         try:
@@ -253,9 +298,10 @@ class ToolExecutor:
                 ffmpeg_location=self._ffmpeg_location
             )
             _tool_log.info("hybrid_resolver_enabled | bilix_available=%s",
-                    self._hybrid_resolver.bilix_resolver._bilix_available)
+                     self._hybrid_resolver.bilix_resolver._bilix_available)
         except Exception as e:
             _tool_log.warning("hybrid_resolver_init_failed | error=%s", str(e)[:100])
+
         # 平台专属 cookie（抖音/快手）
         va_cfg = raw_cfg.get("video_analysis", search_cfg.get("video_analysis", {})) or {}
         bili_cfg = va_cfg.get("bilibili", {}) or {}
@@ -293,11 +339,22 @@ class ToolExecutor:
             tool_iface_cfg = {}
         self._tool_interface_enable = bool(tool_iface_cfg.get("enable", True))
         self._tool_interface_browser_enable = bool(tool_iface_cfg.get("browser_enable", True))
-        self._tool_interface_auto_method_enable = False
+        self._tool_interface_local_enable = bool(tool_iface_cfg.get("local_enable", True))
+        self._tool_interface_auto_method_enable = bool(tool_iface_cfg.get("auto_method_enable", True))
         self._tool_interface_allow_private_network = bool(tool_iface_cfg.get("allow_private_network", False))
+        self._tool_interface_local_allow_project_root = bool(tool_iface_cfg.get("local_allow_project_root", False))
+        self._tool_interface_local_allow_sensitive_files = bool(tool_iface_cfg.get("local_allow_sensitive_files", False))
+        self._tool_interface_local_read_max_chars = max(200, int(tool_iface_cfg.get("local_read_max_chars", 2000)))
         self._web_fetch_timeout_seconds = max(6, int(tool_iface_cfg.get("web_fetch_timeout_seconds", 12)))
         self._web_fetch_max_chars = max(280, int(tool_iface_cfg.get("web_fetch_max_chars", 1100)))
         self._web_fetch_max_pages = max(1, min(3, int(tool_iface_cfg.get("web_fetch_max_pages", 2))))
+        roots_raw = tool_iface_cfg.get(
+            "local_allowed_roots",
+            ["storage", "config", "docs", "core", "services", "plugins"],
+        )
+        if not isinstance(roots_raw, list):
+            roots_raw = ["storage", "config", "docs"]
+        self._tool_interface_local_roots = self._resolve_local_roots(roots_raw)
         self._url_host_safety_cache: dict[str, bool] = {}
         self._tool_interface_github_enable = bool(tool_iface_cfg.get("github_enable", True))
         self._github_api_base = normalize_text(str(tool_iface_cfg.get("github_api_base", "https://api.github.com")))
@@ -311,8 +368,12 @@ class ToolExecutor:
         self._language_preference = normalize_text(
             str(search_cfg.get("language_preference", raw_cfg.get("language_preference", "zh")))
         ).lower() or "zh"
-        self._search_intent_shortcut_enable = False
-        self._qq_avatar_shortcut_enable = False
+        self._search_intent_shortcut_enable = bool(
+            search_cfg.get("intent_shortcut_enable", raw_cfg.get("intent_shortcut_enable", True))
+        )
+        self._qq_avatar_shortcut_enable = bool(
+            search_cfg.get("qq_avatar_shortcut_enable", raw_cfg.get("qq_avatar_shortcut_enable", False))
+        )
         self._last_video_download_error: dict[str, str] = {}
         self._last_video_resolve_diagnostic: dict[str, str] = {}
         self._github_headers = {
@@ -321,6 +382,7 @@ class ToolExecutor:
         }
         if self._github_token:
             self._github_headers["Authorization"] = f"Bearer {self._github_token}"
+
         self._platform_video_domains = {
             "douyin.com",
             "iesdouyin.com",
@@ -334,6 +396,7 @@ class ToolExecutor:
             "v.qq.com",
             "qq.com",
         }
+
         self._blocked_image_domain_keywords = {
             "porn",
             "xvideos",
@@ -420,15 +483,15 @@ class ToolExecutor:
             "18禁",
         }
         self._ai_method_schemas = self._build_ai_method_schemas()
+
     def get_ai_method_schemas(self) -> list[dict[str, Any]]:
-
         return [dict(item) for item in self._ai_method_schemas]
-    def remember_incoming_media(self, conversation_id: str, raw_segments: list[dict[str, Any]] | None) -> None:
 
+    def remember_incoming_media(self, conversation_id: str, raw_segments: list[dict[str, Any]] | None) -> None:
         """Record recent media from any incoming message for follow-up image/video operations."""
         self._remember_recent_media(conversation_id=conversation_id, raw_segments=raw_segments or [])
-    async def execute(
 
+    async def execute(
         self,
         action: str,
         tool_name: str,
@@ -492,8 +555,8 @@ class ToolExecutor:
             return ToolResult(ok=False, tool_name=action or "unknown", error="unsupported_action")
         finally:
             _tool_trace_id_ctx.reset(token)
-    async def _search(
 
+    async def _search(
         self,
         tool_args: dict[str, Any],
         message_text: str,
@@ -527,6 +590,7 @@ class ToolExecutor:
             for seg in raw_segments
             if isinstance(seg, dict)
         )
+
         if image_candidates and not method_name_peek and self._looks_like_image_analysis_request(intent_text):
             analyzed = await self._analyze_image_from_message(
                 query=query,
@@ -537,6 +601,7 @@ class ToolExecutor:
             )
             if analyzed is not None:
                 return analyzed
+
         if image_candidates and not method_name_peek and self._is_passive_multimodal_text(raw_message_text):
             has_intent = self._looks_like_image_analysis_request(intent_text) or self._looks_like_image_send_request(intent_text)
             mentioned_event = "MULTIMODAL_EVENT_AT" in raw_message_text.upper()
@@ -553,6 +618,7 @@ class ToolExecutor:
                     payload={"silent_ignore": True},
                     error="passive_multimodal_no_intent",
                 )
+
         if self._tool_interface_enable and self._tool_interface_auto_method_enable and not method_name_peek:
             inferred_method, inferred_args, inferred_reason = self._infer_auto_method_plan(
                 query=query,
@@ -590,6 +656,7 @@ class ToolExecutor:
                         inferred_method,
                         normalize_text(str(getattr(auto_method_result, "error", ""))),
                     )
+
         method_name = normalize_text(str(tool_args.get("method", "")))
         if self._tool_interface_enable and method_name:
             method_args = tool_args.get("method_args", {})
@@ -610,20 +677,25 @@ class ToolExecutor:
             )
             if method_result is not None:
                 return method_result
+
         github_shortcut = await self._try_github_shortcut(query=query, message_text=message_text)
         if github_shortcut is not None:
             return github_shortcut
+
         if self._looks_like_image_send_request(intent_text) and not self._extract_urls(query):
             picked = await self._method_media_pick_image("media.pick_image_from_message", raw_segments)
             if picked.ok:
                 return picked
+
         if self._looks_like_video_send_request(intent_text) and not self._extract_urls(query):
             picked = await self._method_media_pick_video("media.pick_video_from_message", raw_segments)
             if picked.ok:
                 return picked
+
         direct_image = await self._try_direct_image_fetch(query=query, message_text=message_text)
         if direct_image is not None:
             return direct_image
+
         if self._qq_avatar_shortcut_enable:
             avatar_quick = await self._search_qq_avatar(
                 query=query,
@@ -637,6 +709,7 @@ class ToolExecutor:
             )
             if avatar_quick is not None:
                 return avatar_quick
+
         deep_web_analysis = self._looks_like_deep_web_analysis_request(f"{raw_message_text}\n{query}")
         if deep_web_analysis and not self._looks_like_media_request(intent_text):
             direct_urls = [self._unwrap_redirect_url(u) for u in self._extract_urls(merged_text)]
@@ -657,6 +730,7 @@ class ToolExecutor:
                         },
                         evidence=page_evidence,
                     )
+
         mode = normalize_text(str(tool_args.get("mode", "text"))).lower() or "text"
         if mode in {"image", "img", "picture", "photo"}:
             return await self._search_image(
@@ -672,6 +746,7 @@ class ToolExecutor:
             )
         if mode in {"video", "movie", "clip"}:
             return await self._search_video(query)
+
         if self._search_intent_shortcut_enable and self._looks_like_image_request(intent_text):
             image_try = await self._search_image(
                 query=query,
@@ -686,6 +761,7 @@ class ToolExecutor:
             )
             if image_try.ok:
                 return image_try
+
         if self._search_intent_shortcut_enable and self._looks_like_music_request(intent_text):
             music_try = await self._music_play(
                 tool_args={"keyword": query}, message_text=message_text,
@@ -693,15 +769,18 @@ class ToolExecutor:
             )
             if music_try.ok:
                 return music_try
+
         if self._search_intent_shortcut_enable and self._looks_like_video_request(intent_text):
             video_try = await self._search_video(query)
             if video_try.ok:
                 return video_try
+
         try:
             results = await self._search_text_with_variants(query=query, query_type=query_type)
         except Exception as exc:
             return ToolResult(ok=False, tool_name="search", error=f"search_failed:{exc}")
         results = self._filter_and_rank_results(query, results, query_type=query_type)
+
         evidence = self._build_evidence_from_results(results)
         text = self._format_search_text(query, results, evidence=evidence, query_type=query_type)
         should_deep_analyze = (
@@ -730,13 +809,14 @@ class ToolExecutor:
             "evidence": evidence,
         }
         return ToolResult(ok=True, tool_name="search", payload=payload, evidence=evidence)
-    async def _search_text_with_variants(self, query: str, query_type: str) -> list[SearchResult]:
 
+    async def _search_text_with_variants(self, query: str, query_type: str) -> list[SearchResult]:
         variants = self._build_query_variants(query=query, query_type=query_type)
         merged: list[SearchResult] = []
         seen: set[str] = set()
         max_keep = max(8, int(getattr(self.search_engine, "max_results", 8)) * 2)
         first_error: Exception | None = None
+
         for item in variants:
             try:
                 rows = await self.search_engine.search(item)
@@ -752,13 +832,14 @@ class ToolExecutor:
                 merged.append(row)
                 if len(merged) >= max_keep:
                     return merged
+
         if merged:
             return merged
         if first_error is not None:
             raise first_error
         return []
-    async def _search_image(
 
+    async def _search_image(
         self,
         query: str,
         conversation_id: str,
@@ -783,6 +864,7 @@ class ToolExecutor:
             )
             if avatar_quick is not None:
                 return avatar_quick
+
         if self._is_blocked_image_text(f"{query}\n{message_text}"):
             return ToolResult(
                 ok=False,
@@ -790,6 +872,7 @@ class ToolExecutor:
                 payload={"text": "这类图片我不能发 换一个合规主题我可以继续帮你找"},
                 error="blocked_image_request",
             )
+
         try:
             image_results = await self.search_engine.search_images(query, max_results=3)
         except Exception as exc:
@@ -797,6 +880,7 @@ class ToolExecutor:
             search_error = f"image_search_failed:{exc}"
         else:
             search_error = ""
+
         if image_results:
             first = await self._pick_sendable_image(image_results, conversation_id=conversation_id)
             if first is None:
@@ -827,6 +911,7 @@ class ToolExecutor:
                 ],
             }
             return ToolResult(ok=True, tool_name="search_image", payload=payload, evidence=evidence)
+
         try:
             generated = await self.image_engine.generate(prompt=query)
         except Exception as exc:
@@ -834,6 +919,7 @@ class ToolExecutor:
             generated = None
         else:
             gen_error = ""
+
         if generated and generated.ok and normalize_text(generated.url):
             payload = {
                 "query": query,
@@ -843,6 +929,7 @@ class ToolExecutor:
                 "results": [],
             }
             return ToolResult(ok=True, tool_name="search_image_fallback_generate", payload=payload)
+
         error = search_error or gen_error or "image_result_unavailable"
         return ToolResult(
             ok=False,
@@ -850,12 +937,13 @@ class ToolExecutor:
             payload={"text": "这次没拿到可发送的图片，换一个更具体的描述我再试一次"},
             error=error,
         )
-    async def _try_direct_image_fetch(self, query: str, message_text: str) -> ToolResult | None:
 
+    async def _try_direct_image_fetch(self, query: str, message_text: str) -> ToolResult | None:
         merged = normalize_text(f"{query}\n{message_text}")
         urls = self._extract_urls(merged)
         if not urls:
             return None
+
         if self._is_blocked_image_text(merged):
             return ToolResult(
                 ok=False,
@@ -863,6 +951,7 @@ class ToolExecutor:
                 payload={"text": "这类图片我不能发 换一个合规主题我可以继续帮你找"},
                 error="blocked_image_request",
             )
+
         for url in urls:
             if self._is_direct_video_url(url):
                 continue
@@ -881,15 +970,17 @@ class ToolExecutor:
                     },
                 )
         return None
-    async def _try_github_shortcut(self, query: str, message_text: str) -> ToolResult | None:
 
+    async def _try_github_shortcut(self, query: str, message_text: str) -> ToolResult | None:
         if not self._tool_interface_enable or not self._tool_interface_browser_enable:
             return None
         if not self._tool_interface_github_enable:
             return None
+
         merged = normalize_text(f"{query}\n{message_text}")
         if not self._looks_like_github_request(merged):
             return None
+
         repo = self._extract_github_repo_from_text(merged)
         if repo and self._looks_like_repo_readme_request(merged):
             return await self._method_browser_github_readme(
@@ -897,13 +988,14 @@ class ToolExecutor:
                 {"repo": repo},
                 merged,
             )
+
         return await self._method_browser_github_search(
             "browser.github_search",
             {"query": query},
             merged,
         )
-    async def _search_qq_avatar(
 
+    async def _search_qq_avatar(
         self,
         query: str,
         message_text: str,
@@ -917,6 +1009,7 @@ class ToolExecutor:
         merged = normalize_text(f"{query}\n{message_text}")
         if not self._looks_like_qq_avatar_request(merged):
             return None
+
         target = (
             self._extract_qq_number(merged)
             or self._extract_qq_from_at_segments(raw_segments, bot_id=bot_id)
@@ -929,6 +1022,7 @@ class ToolExecutor:
                 group_id=group_id,
                 api_call=api_call,
             )
+
         api_tmpl_1 = "https://q1.qlogo.cn/g?b=qq&nk=QQ号&s=640"
         api_tmpl_2 = "https://q2.qlogo.cn/headimg_dl?dst_uin=QQ号&spec=640"
         if not target:
@@ -943,13 +1037,16 @@ class ToolExecutor:
                     )
                 },
             )
+
         url_1 = f"https://q1.qlogo.cn/g?b=qq&nk={target}&s=640"
         url_2 = f"https://q2.qlogo.cn/headimg_dl?dst_uin={target}&spec=640"
+
         image_url = ""
         if await self._is_sendable_image_url(url_1):
             image_url = url_1
         elif await self._is_sendable_image_url(url_2):
             image_url = url_2
+
         text = (
             f"抓到了，QQ {target} 的头像已经发给你。\n"
             f"接口模板1：{api_tmpl_1}\n"
@@ -961,15 +1058,17 @@ class ToolExecutor:
                 tool_name="search_qq_avatar",
                 payload={"mode": "image", "query": f"qq澶村儚 {target}", "text": text, "image_url": image_url},
             )
+
         return ToolResult(
             ok=False,
             tool_name="search_qq_avatar",
             payload={"text": f"识别到 QQ {target}，但头像链接暂不可达，请稍后重试。"},
             error="qq_avatar_unavailable",
         )
-    async def _pick_sendable_image(self, candidates: list[Any], conversation_id: str) -> Any | None:
 
+    async def _pick_sendable_image(self, candidates: list[Any], conversation_id: str) -> Any | None:
         source_history = set(self._recent_image_sources.get(conversation_id, []))
+
         # 第一轮：优先"可发送 + 没发过"
         for item in candidates[:8]:
             image_url = normalize_text(str(getattr(item, "image_url", "")))
@@ -982,6 +1081,7 @@ class ToolExecutor:
                 continue
             if await self._is_sendable_image_url(image_url):
                 return item
+
         # 第二轮：可发送即可（允许重复作为兜底）
         for item in candidates[:8]:
             image_url = normalize_text(str(getattr(item, "image_url", "")))
@@ -992,8 +1092,8 @@ class ToolExecutor:
             if await self._is_sendable_image_url(image_url):
                 return item
         return None
-    async def _is_sendable_image_url(self, url: str) -> bool:
 
+    async def _is_sendable_image_url(self, url: str) -> bool:
         if not re.match(r"^https?://", url, flags=re.IGNORECASE):
             return False
         if not self._is_safe_public_http_url(url):
@@ -1015,8 +1115,8 @@ class ToolExecutor:
         if "image/" not in content_type:
             return False
         return bool(response.content)
-    def _remember_image_source(self, conversation_id: str, item: Any) -> None:
 
+    def _remember_image_source(self, conversation_id: str, item: Any) -> None:
         source = normalize_text(str(getattr(item, "source_url", ""))) or normalize_text(
             str(getattr(item, "image_url", ""))
         )
@@ -1027,17 +1127,73 @@ class ToolExecutor:
         if len(history) > 20:
             history = history[-20:]
         self._recent_image_sources[conversation_id] = history
-    def _rewrite_query_with_context(self, query: str, conversation_id: str, user_id: str) -> str:
 
+    def _rewrite_query_with_context(self, query: str, conversation_id: str, user_id: str) -> str:
         key = f"{conversation_id}:{user_id}"
         q = normalize_text(query)
-        self._last_search_query[key] = q
-        return q
+        prev = normalize_text(self._last_search_query.get(key, ""))
+        followup_cfg = self._raw_config.get("search_followup", {})
+        if not isinstance(followup_cfg, dict):
+            followup_cfg = {}
+        resend_media_cues_raw = followup_cfg.get("resend_media_cues", [])
+        if not isinstance(resend_media_cues_raw, list):
+            resend_media_cues_raw = []
+        resend_media_cues = tuple(
+            normalize_text(str(item))
+            for item in resend_media_cues_raw
+            if normalize_text(str(item))
+        )
+
+        short_followup_cues = (
+            "人物",
+            "二次元人物",
+            "再找",
+            "你找一个",
+            "继续",
+            "下载发给我",
+            "下载发我",
+            "给我下载",
+            "帮我下载",
+            "下载一下",
+            *resend_media_cues,
+        )
+
+        merged = q
+        if prev:
+            # 只在明确“延续上一条搜索”时拼接，避免跨话题串台（例如人物搜索被串成搜图）。
+            if any(cue in q for cue in short_followup_cues):
+                if q not in prev:
+                    merged = f"{prev} {q}".strip()
+            elif self._is_generic_search_command(q) and not self._looks_like_media_request(prev):
+                merged = prev
+
+        # 规范壁纸需求
+        if "动漫" in merged and "壁纸" not in merged:
+            merged = f"{merged} 壁纸".strip()
+        if "二次元" in merged and "壁纸" not in merged:
+            merged = f"{merged} 壁纸".strip()
+
+        self._last_search_query[key] = merged
+        return merged
+
     def _rewrite_safe_beauty_query(self, query: str) -> str:
+        content = normalize_text(query)
+        lower = content.lower()
+        if not content:
+            return content
 
-        return normalize_text(query)
+        beauty_cues = ("美女", "帅哥", "颜值", "人像", "舞蹈", "小姐姐", "小哥哥")
+        adult_cues = ("成人", "18禁", "无码", "porn", "nsfw", "r18", "露点", "性行为", "黄网站", "里番")
+        if any(cue in lower for cue in adult_cues):
+            return content
+        if any(cue in lower for cue in beauty_cues):
+            if "非成人" not in content and "合规" not in content:
+                video_cues = ("视频", "video", "clip", "b站", "bilibili", "抖音", "快手")
+                suffix = " 短视频 非成人 合规" if any(v in lower for v in video_cues) else " 非成人 合规 日常"
+                return f"{content}{suffix}"
+        return content
+
     def _build_ai_method_schemas(self) -> list[dict[str, Any]]:
-
         return [
             {
                 "name": "browser.fetch_url",
@@ -1048,7 +1204,7 @@ class ToolExecutor:
             {
                 "name": "browser.resolve_video",
                 "scope": "browser",
-                "description": "解析抖音/快手/B站/AcFun 或直链视频；也支持 SoundCloud track/playlist/discover，返回 video_url 或 audio_url",
+                "description": "解析抖音/快手/B站/AcFun 或直链视频，返回可发送 video_url",
                 "args_schema": {"url": "string"},
             },
             {
@@ -1086,6 +1242,18 @@ class ToolExecutor:
                     "url": "string(optional)",
                     "max_chars": "int(optional)",
                 },
+            },
+            {
+                "name": "local.read_text",
+                "scope": "local",
+                "description": "读取本地文本文件（受 allowlist 限制）",
+                "args_schema": {"path": "string", "max_chars": "int(optional)"},
+            },
+            {
+                "name": "local.media_from_path",
+                "scope": "local",
+                "description": "从本地路径发送图片或视频（受 allowlist 限制）",
+                "args_schema": {"path": "string"},
             },
             {
                 "name": "media.qq_avatar",
@@ -1132,8 +1300,8 @@ class ToolExecutor:
                 },
             },
         ]
-    def _infer_auto_method_plan(
 
+    def _infer_auto_method_plan(
         self,
         query: str,
         message_text: str,
@@ -1145,28 +1313,45 @@ class ToolExecutor:
         urls = [self._unwrap_redirect_url(item) for item in self._extract_urls(merged)]
         image_url = self._pick_best_image_url(urls)
         video_url = self._pick_best_video_url(urls, merged)
+        local_path = self._pick_local_path_candidate(merged)
+
         if self._looks_like_image_analysis_request(intent_text) and (has_image_media or bool(image_url)):
             args: dict[str, Any] = {"url": image_url} if image_url else {}
             return "media.analyze_image", args, "auto_image_analyze"
+
         if self._looks_like_video_send_request(intent_text) or self._looks_like_video_analysis_request(intent_text):
             if video_url:
                 return "browser.resolve_video", {"url": video_url}, "auto_video_resolve"
             if has_video_media:
                 return "media.pick_video_from_message", {}, "auto_pick_video"
+
         if self._looks_like_douyin_search_request(intent_text):
             return "douyin.search_video", {"query": query}, "auto_douyin_search_video"
+
         if self._looks_like_image_send_request(intent_text) and has_image_media:
             return "media.pick_image_from_message", {}, "auto_pick_image"
+
+        if local_path and self._looks_like_local_file_request(merged):
+            if self._looks_like_local_media_request(merged) or self._looks_like_media_file_path(local_path):
+                return "local.media_from_path", {"path": local_path}, "auto_local_media_from_path"
+            return "local.read_text", {"path": local_path}, "auto_local_read_text"
+
         if self._looks_like_software_download_request(merged):
             return "browser.github_search", {"query": query, "sort": "stars"}, "auto_software_download_search"
-        if self._looks_like_github_request(merged):
-            repo = self._extract_github_repo_from_text(merged)
-            if repo and self._looks_like_repo_readme_request(merged):
-                return "browser.github_readme", {"repo": repo}, "auto_github_readme"
-            return "browser.github_search", {"query": query}, "auto_github_search"
-        return "", {}, ""
-    def _pick_best_image_url(self, urls: list[str]) -> str:
 
+        if self._looks_like_github_request(merged):
+            # 多意图检测：如果同时包含其他平台关键词，不强制走 github
+            multi_intent_cues = ("哔哩哔哩", "b站", "bilibili", "抖音", "douyin", "快手", "kuaishou", "视频", "搜索")
+            has_other_intent = any(cue in merged.lower() for cue in multi_intent_cues)
+            if not has_other_intent:
+                repo = self._extract_github_repo_from_text(merged)
+                if repo and self._looks_like_repo_readme_request(merged):
+                    return "browser.github_readme", {"repo": repo}, "auto_github_readme"
+                return "browser.github_search", {"query": query}, "auto_github_search"
+
+        return "", {}, ""
+
+    def _pick_best_image_url(self, urls: list[str]) -> str:
         for item in urls:
             url = normalize_text(item)
             if not url:
@@ -1177,8 +1362,8 @@ class ToolExecutor:
             if "multimedia.nt.qq.com.cn" in lower:
                 return url
         return ""
-    def _pick_best_video_url(self, urls: list[str], text: str) -> str:
 
+    def _pick_best_video_url(self, urls: list[str], text: str) -> str:
         for item in urls:
             url = normalize_text(item)
             if not url:
@@ -1195,8 +1380,8 @@ class ToolExecutor:
         if bv_match:
             return f"https://www.bilibili.com/video/{bv_match.group(1)}"
         return ""
-    async def _execute_ai_method(
 
+    async def _execute_ai_method(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -1219,6 +1404,7 @@ class ToolExecutor:
             name,
             clip_text(normalize_text(repr(method_args)), 220),
         )
+
         if name.startswith("browser.") and not self._tool_interface_browser_enable:
             return ToolResult(
                 ok=False,
@@ -1226,13 +1412,14 @@ class ToolExecutor:
                 payload={"text": "浏览器方法已关闭"},
                 error="browser_method_disabled",
             )
-        if name.startswith("local."):
+        if name.startswith("local.") and not self._tool_interface_local_enable:
             return ToolResult(
                 ok=False,
                 tool_name=name,
-                payload={"text": "本地方法已移除，请改用网络工具或媒体工具"},
-                error="local_method_removed",
+                payload={"text": "本地方法已关闭"},
+                error="local_method_disabled",
             )
+
         if name == "browser.fetch_url":
             return await self._method_browser_fetch_url(name, method_args, query)
         if name == "browser.resolve_video":
@@ -1252,6 +1439,10 @@ class ToolExecutor:
             )
         if name == "browser.github_readme":
             return await self._method_browser_github_readme(name, method_args, query)
+        if name == "local.read_text":
+            return await self._method_local_read_text(name, method_args)
+        if name == "local.media_from_path":
+            return await self._method_local_media_from_path(name, method_args)
         if name == "media.qq_avatar":
             qq = normalize_text(str(method_args.get("qq", "")))
             avatar_query = f"qq澶村儚 {qq}" if qq else query
@@ -1290,14 +1481,15 @@ class ToolExecutor:
                 raw_segments=raw_segments,
                 conversation_id=conversation_id,
             )
+
         return ToolResult(
             ok=False,
             tool_name=name,
             payload={"text": f"方法 {name} 不存在。"},
             error=f"unsupported_ai_method:{name}",
         )
-    async def _method_browser_fetch_url(self, method_name: str, method_args: dict[str, Any], query: str) -> ToolResult:
 
+    async def _method_browser_fetch_url(self, method_name: str, method_args: dict[str, Any], query: str) -> ToolResult:
         url = normalize_text(str(method_args.get("url", "")))
         if not url:
             urls = self._extract_urls(query)
@@ -1324,6 +1516,7 @@ class ToolExecutor:
                 payload={"text": "这个链接命中了安全限制（内网/本地地址不可访问）"},
                 error="unsafe_url",
             )
+
         page = await self._fetch_webpage_summary(url)
         if not page:
             return ToolResult(
@@ -1332,6 +1525,7 @@ class ToolExecutor:
                 payload={"text": "网页访问失败。"},
                 error="fetch_failed",
             )
+
         status_code = int(page.get("status_code", 0) or 0)
         final_url = normalize_text(str(page.get("final_url", "")))
         content_type = normalize_text(str(page.get("content_type", "")))
@@ -1340,6 +1534,7 @@ class ToolExecutor:
         paragraphs = page.get("paragraphs", [])
         if not isinstance(paragraphs, list):
             paragraphs = []
+
         lines = [f"抓取完成：{status_code}", f"最终链接：{final_url}", f"内容类型：{content_type or 'unknown'}"]
         if title:
             lines.append(f"标题：{title}")
@@ -1358,6 +1553,7 @@ class ToolExecutor:
                 "final_url": final_url,
             }
         )
+
         return ToolResult(
             ok=True,
             tool_name=method_name,
@@ -1373,8 +1569,8 @@ class ToolExecutor:
             },
             evidence=evidence,
         )
-    async def _fetch_webpage_summary(self, url: str) -> dict[str, Any] | None:
 
+    async def _fetch_webpage_summary(self, url: str) -> dict[str, Any] | None:
         target = self._unwrap_redirect_url(url)
         if not re.match(r"^https?://", target, flags=re.IGNORECASE):
             return None
@@ -1382,6 +1578,7 @@ class ToolExecutor:
             return None
         if not self._is_safe_public_http_url(target):
             return None
+
         timeout = httpx.Timeout(float(self._web_fetch_timeout_seconds), connect=min(8.0, float(self._web_fetch_timeout_seconds)))
         try:
             async with httpx.AsyncClient(
@@ -1392,14 +1589,17 @@ class ToolExecutor:
                 resp = await client.get(target)
         except Exception:
             return None
+
         final_url = normalize_text(str(resp.url))
         content_type = normalize_text(str(resp.headers.get("content-type", ""))).lower()
         status_code = int(resp.status_code)
         if status_code <= 0:
             return None
+
         title = ""
         summary = ""
         paragraphs: list[str] = []
+
         if "html" in content_type:
             html = resp.text or ""
             title, summary, paragraphs = self._extract_html_summary(html)
@@ -1413,6 +1613,7 @@ class ToolExecutor:
             summary = clip_text(normalize_text(resp.text or ""), self._web_fetch_max_chars)
         else:
             summary = f"二进制内容，大小约 {len(resp.content)} 字节。"
+
         summary = normalize_text(summary)
         if not summary and paragraphs:
             summary = clip_text(normalize_text(paragraphs[0]), self._web_fetch_max_chars // 2)
@@ -1426,6 +1627,7 @@ class ToolExecutor:
             content_type=content_type,
         ):
             return None
+
         return {
             "status_code": status_code,
             "final_url": final_url or target,
@@ -1434,15 +1636,17 @@ class ToolExecutor:
             "summary": summary,
             "paragraphs": paragraphs[:4],
         }
-    def _extract_html_summary(self, html: str) -> tuple[str, str, list[str]]:
 
+    def _extract_html_summary(self, html: str) -> tuple[str, str, list[str]]:
         raw = str(html or "")
         if not raw:
             return "", "", []
+
         title = ""
         title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", raw)
         if title_match:
             title = self._clean_html_fragment(title_match.group(1))
+
         meta_desc = ""
         meta_match = re.search(
             r'(?is)<meta[^>]+(?:name|property)=["\'](?:description|og:description)["\'][^>]+content=["\'](.*?)["\']',
@@ -1450,10 +1654,12 @@ class ToolExecutor:
         )
         if meta_match:
             meta_desc = self._clean_html_fragment(meta_match.group(1))
+
         cleaned = re.sub(r"(?is)<!--.*?-->", " ", raw)
         cleaned = re.sub(r"(?is)<(script|style|noscript|svg|canvas|iframe)[^>]*>.*?</\1>", " ", cleaned)
         primary_block = self._extract_primary_html_block(cleaned)
         working = primary_block or cleaned
+
         paragraphs: list[str] = []
         seen: set[str] = set()
         for match in re.findall(r"(?is)<p[^>]*>(.*?)</p>", working):
@@ -1467,6 +1673,7 @@ class ToolExecutor:
             paragraphs.append(text)
             if len(paragraphs) >= 6:
                 break
+
         if len(paragraphs) < 2:
             for match in re.findall(r"(?is)<li[^>]*>(.*?)</li>", working):
                 text = self._clean_html_fragment(match)
@@ -1479,15 +1686,17 @@ class ToolExecutor:
                 paragraphs.append(text)
                 if len(paragraphs) >= 6:
                     break
+
         if not paragraphs:
             whole = self._clean_html_fragment(cleaned)
             paragraphs = self._split_text_to_paragraphs(whole, max_paragraphs=4)
+
         summary = meta_desc or (paragraphs[0] if paragraphs else "")
         summary = clip_text(normalize_text(summary), self._web_fetch_max_chars // 2)
         return title, summary, paragraphs
+
     @staticmethod
     def _extract_primary_html_block(cleaned_html: str) -> str:
-
         if not cleaned_html:
             return ""
         patterns = (
@@ -1502,9 +1711,9 @@ class ToolExecutor:
             return ""
         blocks = sorted(blocks, key=lambda x: len(x), reverse=True)
         return blocks[0]
+
     @staticmethod
     def _split_text_to_paragraphs(text: str, max_paragraphs: int = 4) -> list[str]:
-
         content = normalize_text(text)
         if not content:
             return []
@@ -1517,9 +1726,9 @@ class ToolExecutor:
             if len(out) >= max(1, int(max_paragraphs)):
                 break
         return out
+
     @staticmethod
     def _clean_html_fragment(fragment: str) -> str:
-
         value = str(fragment or "")
         if not value:
             return ""
@@ -1528,8 +1737,8 @@ class ToolExecutor:
         value = unescape(value)
         value = re.sub(r"\s+", " ", value)
         return normalize_text(value)
-    def _summarize_json_like(self, data: Any) -> str:
 
+    def _summarize_json_like(self, data: Any) -> str:
         if isinstance(data, dict):
             keys = ("title", "name", "description", "summary", "content", "message", "result")
             parts: list[str] = []
@@ -1548,14 +1757,15 @@ class ToolExecutor:
             merged = " | ".join([item for item in preview if item])
             return clip_text(merged, self._web_fetch_max_chars)
         return clip_text(normalize_text(str(data)), self._web_fetch_max_chars)
-    def _compose_direct_web_summary_text(self, query: str, page: dict[str, Any]) -> str:
 
+    def _compose_direct_web_summary_text(self, query: str, page: dict[str, Any]) -> str:
         title = normalize_text(str(page.get("title", "")))
         summary = normalize_text(str(page.get("summary", "")))
         url = normalize_text(str(page.get("final_url", "")))
         paragraphs = page.get("paragraphs", [])
         if not isinstance(paragraphs, list):
             paragraphs = []
+
         lines = [f'我按网页正文看过了“{query}”。']
         if title:
             lines.append(f"主题：{clip_text(title, 64)}")
@@ -1569,8 +1779,8 @@ class ToolExecutor:
         if url:
             lines.append(f"来源：{url}")
         return "\n".join(lines)
-    async def _compose_result_web_analysis_text(
 
+    async def _compose_result_web_analysis_text(
         self,
         query: str,
         results: list[SearchResult],
@@ -1589,12 +1799,15 @@ class ToolExecutor:
             candidates.append((title, url))
             if len(candidates) >= self._web_fetch_max_pages:
                 break
+
         if not candidates:
             return "", []
+
         fetched = await asyncio.gather(
             *[self._fetch_webpage_summary(url) for _, url in candidates],
             return_exceptions=True,
         )
+
         lines = [f'我按网页正文查了“{query}”，先给你总结：']
         evidences: list[dict[str, str]] = []
         hit = 0
@@ -1624,11 +1837,12 @@ class ToolExecutor:
                     "source": source,
                 }
             )
+
         if hit == 0:
             return "", []
         return "\n".join(lines), evidences[:6]
-    def _is_low_signal_web_summary(
 
+    def _is_low_signal_web_summary(
         self,
         title: str,
         summary: str,
@@ -1641,6 +1855,7 @@ class ToolExecutor:
             return True
         if "html" in content_type and len(text) < 20:
             return True
+
         low_signal_cues = (
             "just a moment",
             "enable javascript",
@@ -1657,34 +1872,39 @@ class ToolExecutor:
         )
         if any(cue in text for cue in low_signal_cues):
             return True
+
         zh_pref = self._language_preference.startswith("zh")
         has_zh = bool(re.search(r"[\u4e00-\u9fff]", text))
         if zh_pref and not has_zh and len(text) < 64:
             return True
+
         url = normalize_text(final_url).lower()
         if any(token in url for token in ("/dy/article/", "tieba.baidu.com/p/", "zhidao.baidu.com")) and len(text) < 42:
             return True
         return False
+
     @staticmethod
     def _is_low_value_web_candidate(url: str, title: str, query_type: str) -> bool:
+        merged = normalize_text(f"{url} {title}").lower()
+        if not merged:
+            return True
+        hard_noise = (
+            "baijiahao.baidu.com",
+            "zhidao.baidu.com",
+            "tieba.baidu.com/p/",
+            "app下载",
+            "开户链接",
+        )
+        if any(token in merged for token in hard_noise):
+            return True
 
-        _ = query_type
-        raw_url = normalize_text(url).lower()
-        raw_title = normalize_text(title)
-        if not raw_url and not raw_title:
-            return True
-        parsed = urlparse(raw_url if re.match(r"https?://", raw_url) else f"https://{raw_url}")
-        host = normalize_text(parsed.netloc).lower()
-        path = normalize_text(parsed.path).lower()
-        if not host:
-            return True
-        if not raw_title and path in {"", "/"}:
-            return True
-        if host in {"baijiahao.baidu.com", "zhidao.baidu.com"}:
-            return True
+        if query_type == "person":
+            person_noise = ("开户", "户籍", "户口", "贷款", "银行", "订阅")
+            if any(token in merged for token in person_noise):
+                return True
         return False
-    async def _method_browser_github_search(
 
+    async def _method_browser_github_search(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -1700,6 +1920,7 @@ class ToolExecutor:
                 payload={"text": "GitHub 方法已关闭。"},
                 error="github_method_disabled",
             )
+
         raw_query = normalize_text(str(method_args.get("query", ""))) or normalize_text(query)
         if not raw_query:
             return ToolResult(
@@ -1708,10 +1929,12 @@ class ToolExecutor:
                 payload={"text": "请告诉我你要在 GitHub 搜什么。"},
                 error="empty_query",
             )
+
         search_query = raw_query
         language = normalize_text(str(method_args.get("language", "")))
         if language:
             search_query = f"{search_query} language:{language}"
+
         stars_min = method_args.get("stars_min", 0)
         try:
             stars_min = max(0, int(stars_min))
@@ -1719,15 +1942,18 @@ class ToolExecutor:
             stars_min = 0
         if stars_min > 0:
             search_query = f"{search_query} stars:>={stars_min}"
+
         sort = normalize_text(str(method_args.get("sort", ""))).lower()
         if sort not in {"updated", "stars"}:
             sort = "stars"
+
         params = {
             "q": search_query,
             "sort": sort,
             "order": "desc",
             "per_page": self._github_search_per_page,
         }
+
         endpoint = f"{self._github_api_base}/search/repositories"
         try:
             async with httpx.AsyncClient(
@@ -1743,6 +1969,7 @@ class ToolExecutor:
                 reason=f"github_search_failed:{exc}",
                 human_reason="GitHub API 暂时不可用，已改用网页搜索兜底。",
             )
+
         if response.status_code == 403:
             return await self._github_search_web_fallback(
                 method_name=method_name,
@@ -1757,6 +1984,7 @@ class ToolExecutor:
                 reason=f"github_search_http_{response.status_code}",
                 human_reason=f"GitHub API 返回 {response.status_code}，已改用网页搜索兜底。",
             )
+
         try:
             data = response.json()
         except Exception as exc:
@@ -1766,6 +1994,7 @@ class ToolExecutor:
                 reason=f"github_search_parse_failed:{exc}",
                 human_reason="GitHub 返回数据解析失败，已改用网页搜索兜底。",
             )
+
         items = data.get("items", []) if isinstance(data, dict) else []
         if (not isinstance(items, list) or not items):
             fallback_terms = re.findall(r"[A-Za-z0-9_.-]{2,}", raw_query)
@@ -1794,6 +2023,7 @@ class ToolExecutor:
                 reason="github_search_empty",
                 human_reason="GitHub API 未命中，已改用网页搜索兜底。",
             )
+
         results: list[dict[str, Any]] = []
         evidence: list[dict[str, str]] = []
         lines = [f'GitHub 里“{raw_query}”我先给你找了 {min(len(items), self._github_search_per_page)} 个：']
@@ -1808,6 +2038,7 @@ class ToolExecutor:
             updated = normalize_text(str(item.get("updated_at", "")))
             if not full_name or not html_url:
                 continue
+
             results.append(
                 {
                     "full_name": full_name,
@@ -1825,6 +2056,7 @@ class ToolExecutor:
             lines.append(f"   {desc_short}")
             lines.append(f"   {html_url}")
             evidence.append({"title": full_name, "point": desc_short, "source": html_url})
+
         auto_download_notice = ""
         should_auto_download = (
             bool(api_call)
@@ -1855,14 +2087,17 @@ class ToolExecutor:
                 )
             if auto_text:
                 auto_download_notice = auto_text
+
         if len(lines) == 1:
             return ToolResult(
                 ok=True,
                 tool_name=method_name,
                 payload={"text": f"GitHub 上没拿到可用仓库结果：{raw_query}"},
             )
+
         if auto_download_notice:
             lines.insert(1, auto_download_notice)
+
         return ToolResult(
             ok=True,
             tool_name=method_name,
@@ -1874,8 +2109,8 @@ class ToolExecutor:
             },
             evidence=evidence,
         )
-    async def _try_auto_upload_github_asset(
 
+    async def _try_auto_upload_github_asset(
         self,
         raw_query: str,
         results: list[dict[str, Any]],
@@ -1890,6 +2125,7 @@ class ToolExecutor:
             from core.agent_tools import _handle_smart_download
         except Exception as exc:
             return False, f"自动下载不可用（工具加载失败：{clip_text(str(exc), 80)}）", {}
+
         errors: list[str] = []
         for item in results[:3]:
             repo_url = normalize_text(str(item.get("url", "")))
@@ -1925,6 +2161,7 @@ class ToolExecutor:
             except Exception as exc:
                 errors.append(clip_text(f"{repo_name or repo_url}: {exc}", 120))
                 continue
+
             if not bool(getattr(dl_result, "ok", False)):
                 err_text = normalize_text(str(getattr(dl_result, "display", ""))) or normalize_text(
                     str(getattr(dl_result, "error", ""))
@@ -1932,6 +2169,7 @@ class ToolExecutor:
                 if err_text:
                     errors.append(clip_text(f"{repo_name or repo_url}: {err_text}", 120))
                 continue
+
             data = getattr(dl_result, "data", {}) or {}
             local_file = normalize_text(str(data.get("local_file", "")))
             download_url = normalize_text(str(data.get("download_url", "")))
@@ -1949,11 +2187,12 @@ class ToolExecutor:
                 "uploaded": True,
             }
             return True, text, payload
+
         if errors:
             return False, f"自动下载尝试失败：{errors[0]}。先给你可靠链接。", {}
         return False, "", {}
-    async def _github_search_web_fallback(
 
+    async def _github_search_web_fallback(
         self,
         method_name: str,
         raw_query: str,
@@ -1964,6 +2203,7 @@ class ToolExecutor:
             rows = await self.search_engine.search(f"site:github.com {raw_query}")
         except Exception:
             rows = []
+
         picked: list[dict[str, str]] = []
         seen: set[str] = set()
         for item in rows:
@@ -1978,6 +2218,7 @@ class ToolExecutor:
             picked.append({"title": title or "GitHub", "snippet": snippet, "url": url})
             if len(picked) >= self._github_search_per_page:
                 break
+
         if not picked:
             return ToolResult(
                 ok=False,
@@ -1985,6 +2226,7 @@ class ToolExecutor:
                 payload={},
                 error=reason,
             )
+
         lines = [f"{human_reason}", f"GitHub 相关结果（{raw_query}）："]
         evidence: list[dict[str, str]] = []
         for idx, item in enumerate(picked, start=1):
@@ -1995,6 +2237,7 @@ class ToolExecutor:
             lines.append(f"   {snippet}")
             lines.append(f"   {url}")
             evidence.append({"title": title, "point": snippet, "source": url})
+
         return ToolResult(
             ok=True,
             tool_name=method_name,
@@ -2007,8 +2250,8 @@ class ToolExecutor:
             },
             evidence=evidence,
         )
-    async def _method_browser_github_readme(
 
+    async def _method_browser_github_readme(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -2021,6 +2264,7 @@ class ToolExecutor:
                 payload={"text": "GitHub 方法已关闭。"},
                 error="github_method_disabled",
             )
+
         repo = normalize_text(str(method_args.get("repo", "")))
         if not repo:
             url_value = normalize_text(str(method_args.get("url", "")))
@@ -2035,11 +2279,13 @@ class ToolExecutor:
                 payload={"text": "请给我仓库名（owner/repo）或 GitHub 仓库链接。"},
                 error="repo_required",
             )
+
         max_chars = method_args.get("max_chars", self._github_readme_max_chars)
         try:
             max_chars = max(200, min(12000, int(max_chars)))
         except Exception:
             max_chars = self._github_readme_max_chars
+
         repo_endpoint = f"{self._github_api_base}/repos/{repo}"
         readme_endpoint = f"{repo_endpoint}/readme"
         repo_resp = None
@@ -2059,6 +2305,7 @@ class ToolExecutor:
                 payload={},
                 error=f"github_readme_failed:{exc}",
             )
+
         if repo_resp is None or repo_resp.status_code >= 400:
             status = repo_resp.status_code if repo_resp is not None else 0
             return ToolResult(
@@ -2067,15 +2314,18 @@ class ToolExecutor:
                 payload={"text": f"仓库 {repo} 不存在或不可访问。"},
                 error=f"github_repo_http_{status}",
             )
+
         try:
             repo_data = repo_resp.json()
         except Exception:
             repo_data = {}
+
         full_name = normalize_text(str(repo_data.get("full_name", ""))) or repo
         html_url = normalize_text(str(repo_data.get("html_url", ""))) or f"https://github.com/{repo}"
         description = normalize_text(str(repo_data.get("description", "")))
         stars = repo_data.get("stargazers_count", 0)
         language = normalize_text(str(repo_data.get("language", "")))
+
         readme_text = ""
         if readme_resp is not None and readme_resp.status_code < 400:
             try:
@@ -2090,8 +2340,10 @@ class ToolExecutor:
                     readme_text = decoded.decode("utf-8", errors="ignore")
                 except Exception:
                     readme_text = ""
+
         cleaned = self._clean_markdown_text(readme_text) if readme_text else ""
         cleaned = clip_text(normalize_text(cleaned), max_chars)
+
         summary_lines = [f"仓库：{full_name}"]
         if isinstance(stars, int):
             summary_lines.append(f"Stars：{stars}")
@@ -2111,6 +2363,7 @@ class ToolExecutor:
                 "source": html_url,
             }
         ]
+
         return ToolResult(
             ok=True,
             tool_name=method_name,
@@ -2123,52 +2376,8 @@ class ToolExecutor:
             },
             evidence=evidence,
         )
-    async def _resolve_soundcloud_audio_result(self, method_name: str, source_url: str) -> ToolResult:
 
-        try:
-            audio = await self._soundcloud_client.resolve_page_audio(source_url)
-        except Exception as exc:
-            _tool_log.warning("soundcloud_resolve_fail | url=%s | %s", source_url[:120], exc)
-            return ToolResult(
-                ok=False,
-                tool_name=method_name,
-                payload={"text": "这条 SoundCloud 链接这次没解析出来，你换个链接我继续试。"},
-                error="soundcloud_resolve_failed",
-            )
-        if audio is None or not audio.audio_url:
-            return ToolResult(
-                ok=False,
-                tool_name=method_name,
-                payload={"text": "这条 SoundCloud 链接里暂时没拿到可播音频。"},
-                error="soundcloud_audio_unavailable",
-            )
-        title = normalize_text(audio.title)
-        artist = normalize_text(audio.artist)
-        page_url = normalize_text(audio.page_url) or normalize_text(source_url)
-        playlist_title = normalize_text(audio.playlist_title)
-        text = f"已拿到 SoundCloud 音频：{title or '未命名曲目'}"
-        if artist:
-            text = f"{text} - {artist}"
-        if playlist_title and self._soundcloud_client.is_discover_url(source_url):
-            text = f"{text}（Discover / {playlist_title}）"
-        evidence = [{"title": title or "SoundCloud 音频", "point": text, "source": page_url}]
-        payload: dict[str, Any] = {
-            "mode": "audio",
-            "text": text,
-            "audio_url": audio.audio_url,
-            "url": page_url,
-            "jump_url": page_url,
-            "source_platform": "soundcloud",
-            "title": title,
-            "singer": artist,
-            "evidence": evidence,
-        }
-        if audio.artwork_url:
-            payload["image_url"] = audio.artwork_url
-            payload["cover_url"] = audio.artwork_url
-        return ToolResult(ok=True, tool_name=method_name, payload=payload, evidence=evidence)
     async def _method_browser_resolve_video(
-
         self, method_name: str, method_args: dict[str, Any], query: str
     ) -> ToolResult:
         url = normalize_text(str(method_args.get("url", "")))
@@ -2188,6 +2397,7 @@ class ToolExecutor:
                 payload={"text": "请给完整的视频 URL。"},
                 error="invalid_url",
             )
+
         if self._is_blocked_video_text(query) or self._is_blocked_video_url(url):
             return ToolResult(
                 ok=False,
@@ -2202,8 +2412,7 @@ class ToolExecutor:
                 payload={"text": "这个视频链接命中了安全限制（内网/本地地址不可访问）"},
                 error="unsafe_url",
             )
-        if self._soundcloud_client.is_soundcloud_url(url):
-            return await self._resolve_soundcloud_audio_result(method_name, url)
+
         if self._is_direct_video_url(url):
             resolved_direct = url
             resolved_local: Path | None = None
@@ -2245,6 +2454,7 @@ class ToolExecutor:
                 payload={"mode": "video", "text": "已拿到直链视频，马上发你", "video_url": resolved_direct, "evidence": evidence},
                 evidence=evidence,
             )
+
         if not self._is_supported_platform_video_url(url):
             return ToolResult(
                 ok=False,
@@ -2259,6 +2469,7 @@ class ToolExecutor:
                 payload={"text": "这个是平台搜索/频道页，不是视频详情链接 发我具体视频分享链接我就能解析"},
                 error="video_detail_url_required",
             )
+
         # 抖音图文（note/ 或 v.douyin.com 短链）先走图文分支，避免先下载视频导致高频 403 日志。
         try:
             parsed_url = urlparse(url)
@@ -2276,6 +2487,7 @@ class ToolExecutor:
             )
             if douyin_image_result is not None:
                 return douyin_image_result
+
         resolved, resolve_diag = await self._resolve_platform_video_safe_with_diagnostic(url)
         if not resolved:
             douyin_image_result = await self._try_resolve_douyin_image_post(
@@ -2295,6 +2507,7 @@ class ToolExecutor:
                 },
                 error="video_resolve_failed",
             )
+
         resolved_local: Path | None = None
         if resolved and not re.match(r"^https?://", resolved, flags=re.IGNORECASE):
             try:
@@ -2320,6 +2533,7 @@ class ToolExecutor:
                     payload={"text": "解析到的直链没通过下载校验（可能已过期或平台限流），请重发新链接。"},
                     error="resolved_direct_validate_failed",
                 )
+
         if resolved_local is not None and self._video_require_audio_for_send:
             if not self._video_has_audio_stream(resolved_local):
                 self._last_video_resolve_diagnostic[url] = "video_no_audio_all_formats"
@@ -2329,7 +2543,9 @@ class ToolExecutor:
                     payload={"text": "这条视频没有可用音轨，我已拦截，避免发出后没声音。"},
                     error="video_no_audio_all_formats",
                 )
+
         meta = await self._inspect_platform_video_metadata_safe(url)
+
         # 如果是分析请求，使用深度分析
         if self._looks_like_video_analysis_request(query):
             local_path = resolved if resolved and not resolved.startswith("http") and Path(resolved).exists() else ""
@@ -2347,18 +2563,20 @@ class ToolExecutor:
                 },
                 evidence=evidence,
             )
+
         text = self._compose_video_result_text(
             source_url=url, query=query, meta=meta, for_analysis=False,
         )
         evidence = self._build_video_evidence(source_url=url, meta=meta)
+
         return ToolResult(
             ok=True,
             tool_name=method_name,
             payload={"mode": "video", "text": text, "video_url": resolved, "evidence": evidence},
             evidence=evidence,
         )
-    async def _method_douyin_search_video(
 
+    async def _method_douyin_search_video(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -2380,11 +2598,13 @@ class ToolExecutor:
                 payload={"text": "这类视频我不能处理。"},
                 error="blocked_video_request",
             )
+
         limit_raw = method_args.get("limit", 5)
         try:
             limit = max(1, min(10, int(limit_raw)))
         except Exception:
             limit = 5
+
         results = await self._search_douyin_video_candidates(keyword, limit=limit)
         if not results:
             return ToolResult(
@@ -2393,6 +2613,7 @@ class ToolExecutor:
                 payload={"text": f"我按“{keyword}”查了抖音视频，暂时没拿到稳定结果。你可以换个更具体的关键词再试。"},
                 error="douyin_search_empty",
             )
+
         cookie_required = False
         try_count = 0
         max_resolve_attempts = 2
@@ -2400,9 +2621,11 @@ class ToolExecutor:
             candidate = self._unwrap_redirect_url(normalize_text(item.url))
             if not candidate or not self._is_douyin_video_or_note_url(candidate):
                 continue
+
             try_count += 1
             if try_count > max_resolve_attempts:
                 break
+
             resolved, resolve_diag = await self._resolve_platform_video_safe_with_diagnostic(candidate)
             if resolved:
                 meta = await self._inspect_platform_video_metadata_safe(candidate)
@@ -2418,6 +2641,7 @@ class ToolExecutor:
                         "results": [{"title": r.title, "snippet": r.snippet, "url": r.url} for r in results],
                     },
                 )
+
             image_post_result = await self._try_resolve_douyin_image_post(
                 url=candidate,
                 query=keyword,
@@ -2431,6 +2655,7 @@ class ToolExecutor:
                     {"title": r.title, "snippet": r.snippet, "url": r.url} for r in results
                 ]
                 return image_post_result
+
             diag_lower = normalize_text(resolve_diag).lower()
             if (
                 "fresh cookies" in diag_lower
@@ -2439,6 +2664,7 @@ class ToolExecutor:
             ):
                 cookie_required = True
                 break
+
         evidence = self._build_evidence_from_results(results)
         text = self._format_search_text(keyword, results, evidence=evidence, query_type="video")
         if cookie_required:
@@ -2462,29 +2688,33 @@ class ToolExecutor:
             },
             evidence=evidence,
         )
-    async def _search_douyin_video_candidates(self, query: str, limit: int = 5) -> list[SearchResult]:
 
+    async def _search_douyin_video_candidates(self, query: str, limit: int = 5) -> list[SearchResult]:
         base = normalize_text(query)
         if not base:
             return []
+
         cleaned = base
         for cue in ("抖音", "douyin", "视频", "video"):
             cleaned = re.sub(re.escape(cue), " ", cleaned, flags=re.IGNORECASE)
         cleaned = normalize_text(cleaned) or base
+
         query_variants: list[str] = [
             f"{cleaned} site:douyin.com/video",
             f"{cleaned} site:douyin.com/note",
             f"抖音 {cleaned} 视频",
         ]
-        async def _safe_search(q: str) -> list[SearchResult]:
 
+        async def _safe_search(q: str) -> list[SearchResult]:
             try:
                 return await self.search_engine.search(q)
             except Exception:
                 return []
+
         batches = await asyncio.gather(*[_safe_search(q) for q in query_variants])
         merged: list[SearchResult] = []
         seen: set[str] = set()
+
         for batch in batches:
             for row in batch:
                 candidate = self._unwrap_redirect_url(normalize_text(row.url))
@@ -2505,6 +2735,7 @@ class ToolExecutor:
                     break
             if len(merged) >= max(3, limit * 2):
                 break
+
         if len(merged) < max(2, limit):
             try:
                 bing_rows = await self.search_engine.search_bing_videos(f"{cleaned} 抖音 视频", limit=max(5, limit * 2))
@@ -2527,10 +2758,11 @@ class ToolExecutor:
                 )
                 if len(merged) >= max(3, limit * 2):
                     break
+
         merged = self._filter_safe_video_results(query, merged)
         return merged[: max(1, limit)]
-    async def _try_resolve_douyin_image_post(
 
+    async def _try_resolve_douyin_image_post(
         self,
         url: str,
         query: str,
@@ -2540,11 +2772,13 @@ class ToolExecutor:
         target = self._unwrap_redirect_url(url)
         if not self._is_douyin_video_or_note_url(target):
             return None
+
         detail = await self._fetch_douyin_image_post_detail(target)
         image_urls = [normalize_text(str(item)) for item in detail.get("image_urls", []) if normalize_text(str(item))]
         title = normalize_text(str(detail.get("title", "")))
         uploader = normalize_text(str(detail.get("uploader", "")))
         source = normalize_text(str(detail.get("source_url", ""))) or target
+
         if not image_urls:
             meta = await self._inspect_platform_video_metadata_safe(target)
             analysis = await self._video_analyzer.analyze(
@@ -2561,6 +2795,7 @@ class ToolExecutor:
             if not uploader:
                 uploader = normalize_text(analysis.uploader)
             source = normalize_text(analysis.webpage_url) or source
+
         sendable_image = ""
         for item in image_urls[:5]:
             if await self._is_sendable_image_url(item):
@@ -2568,6 +2803,7 @@ class ToolExecutor:
                 break
         if not sendable_image:
             sendable_image = image_urls[0]
+
         title = title or "抖音图文作品"
         evidence = [
             {
@@ -2600,11 +2836,12 @@ class ToolExecutor:
             payload=payload,
             evidence=evidence,
         )
-    async def _fetch_douyin_image_post_detail(self, source_url: str) -> dict[str, Any]:
 
+    async def _fetch_douyin_image_post_detail(self, source_url: str) -> dict[str, Any]:
         target = self._unwrap_redirect_url(source_url)
         final_url = target
         html = ""
+
         headers = {
             "User-Agent": self._DOUYIN_MOBILE_UA,
             "Referer": "https://www.douyin.com/",
@@ -2621,6 +2858,7 @@ class ToolExecutor:
                 html = resp.text or ""
         except Exception:
             pass
+
         # 重定向后如果是 /video/ 路径，说明是视频不是图文，直接返回空
         # /note/ 或 /share/note/ 视为图文（aweme_type 在不同版本可能不是固定值）。
         try:
@@ -2630,12 +2868,14 @@ class ToolExecutor:
         is_note_path = ("/note/" in final_path) or ("/share/note/" in final_path)
         if "/video/" in final_path:
             return {}
+
         decoded_html = (
             html.replace("\\u002F", "/")
             .replace("\\/", "/")
             .replace("\\u0026", "&")
             .replace("&amp;", "&")
         )
+
         # 从 HTML 检查 aweme_type。抖音不同版本对图文的 aweme_type 不稳定，
         # 已确认存在 aweme_type=2 的 note 图文；因此 note 路径优先，非 note 时再按类型拦截。
         aweme_type_match = re.search(r'"aweme_type"\s*:\s*(\d+)', decoded_html)
@@ -2644,6 +2884,7 @@ class ToolExecutor:
             # 常见图文类型: 2/68/150；其余通常是视频。
             if (not is_note_path) and aweme_type_val not in (2, 68, 150):
                 return {}
+
         aweme_id = self._extract_douyin_aweme_id(final_url) or self._extract_douyin_aweme_id(target)
         if not aweme_id and decoded_html:
             match = re.search(r'"aweme_id"\s*:\s*"(\d{8,24})"', decoded_html)
@@ -2653,6 +2894,7 @@ class ToolExecutor:
             match = re.search(r'"itemId"\s*:\s*"(\d{8,24})"', decoded_html)
             if match:
                 aweme_id = normalize_text(match.group(1))
+
         item: dict[str, Any] = {}
         if aweme_id:
             api_url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={aweme_id}"
@@ -2671,11 +2913,12 @@ class ToolExecutor:
                                 item = item_list[0]
             except Exception:
                 item = {}
+
         image_urls: list[str] = []
         seen_url: set[str] = set()
         seen_asset: set[str] = set()
-        def _image_key(url_value: str) -> str:
 
+        def _image_key(url_value: str) -> str:
             try:
                 parsed = urlparse(url_value)
             except Exception:
@@ -2688,8 +2931,8 @@ class ToolExecutor:
             if filename:
                 return filename
             return re.sub(r"[^a-z0-9]+", "", parsed.path.lower())
-        def _pick_best_image_url(urls: Any) -> str:
 
+        def _pick_best_image_url(urls: Any) -> str:
             if not isinstance(urls, list):
                 return ""
             for raw in urls:
@@ -2697,8 +2940,8 @@ class ToolExecutor:
                 if re.match(r"^https?://", value, flags=re.IGNORECASE):
                     return value
             return ""
-        def _add_image(url_value: Any) -> None:
 
+        def _add_image(url_value: Any) -> None:
             value = normalize_text(str(url_value))
             if not value:
                 return
@@ -2713,11 +2956,13 @@ class ToolExecutor:
             if asset_key:
                 seen_asset.add(asset_key)
             image_urls.append(value)
+
         if item:
             # 检查 aweme_type。note 路径优先按图文处理，避免误判后进入视频下载链。
             aweme_type = item.get("aweme_type")
             if isinstance(aweme_type, int) and (not is_note_path) and aweme_type not in (2, 68, 150):
                 return {}
+
             for row in item.get("images", []) if isinstance(item.get("images", []), list) else []:
                 if not isinstance(row, dict):
                     continue
@@ -2727,6 +2972,7 @@ class ToolExecutor:
                     _add_image(best)
                 if len(image_urls) >= 40:
                     break
+
             image_post_info = item.get("image_post_info", {})
             if isinstance(image_post_info, dict):
                 rows = image_post_info.get("images", [])
@@ -2746,8 +2992,8 @@ class ToolExecutor:
                                 break
                         if len(image_urls) >= 40:
                             break
-        def _looks_like_note_image(url_value: str) -> bool:
 
+        def _looks_like_note_image(url_value: str) -> bool:
             lower = url_value.lower()
             if not lower.startswith(("http://", "https://")):
                 return False
@@ -2772,6 +3018,7 @@ class ToolExecutor:
             if "/tos-cn-i-" in lower and re.search(r"\.(?:jpe?g|png|webp)(?:\?|$)", lower):
                 return True
             return False
+
         if not image_urls and decoded_html:
             html_candidates: list[str] = []
             for raw in re.findall(r"https?://[^\"'\s<>]{24,}", decoded_html):
@@ -2794,8 +3041,10 @@ class ToolExecutor:
                 _add_image(candidate)
                 if len(image_urls) >= 40:
                     break
+
         if not image_urls:
             return {}
+
         title = ""
         uploader = ""
         if item:
@@ -2815,6 +3064,7 @@ class ToolExecutor:
             if title_match:
                 title = normalize_text(unescape(title_match.group(1)))
                 title = title.split(" - ??", 1)[0].strip()
+
         source = normalize_text(final_url) or normalize_text(target)
         if aweme_id:
             source = f"https://www.douyin.com/note/{aweme_id}"
@@ -2826,9 +3076,9 @@ class ToolExecutor:
             "image_urls": image_urls,
             "is_note": is_note_path,
         }
+
     @staticmethod
     def _compose_douyin_image_post_text(title: str, uploader: str, source: str, image_urls: list[str]) -> str:
-
         lines = [f"识别到这是抖音图文作品，共 {len(image_urls)} 张图。"]
         if title:
             lines.append(f"标题：{title}")
@@ -2840,8 +3090,8 @@ class ToolExecutor:
         if len(image_urls) > 3:
             lines.append(f"其余 {len(image_urls) - 3} 张已省略。")
         return "\n".join(lines)
-    async def _method_browser_resolve_image(
 
+    async def _method_browser_resolve_image(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -2888,8 +3138,90 @@ class ToolExecutor:
             payload={"text": "这个链接不是可直发图片"},
             error="image_not_sendable",
         )
-    async def _method_media_pick_image(self, method_name: str, raw_segments: list[dict[str, Any]]) -> ToolResult:
 
+    async def _method_local_read_text(self, method_name: str, method_args: dict[str, Any]) -> ToolResult:
+        path_raw = normalize_text(str(method_args.get("path", "")))
+        path = self._resolve_local_path(path_raw)
+        if path is None:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "本地路径不在允许范围内"},
+                error="local_path_not_allowed",
+            )
+        if not path.exists() or not path.is_file():
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "本地文件不存在"},
+                error="local_file_not_found",
+            )
+        if self._is_sensitive_local_path(path):
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "该文件属于敏感配置，默认禁止直接读取。"},
+                error="local_sensitive_file_blocked",
+            )
+        max_chars = method_args.get("max_chars", self._tool_interface_local_read_max_chars)
+        try:
+            max_chars = max(200, min(20000, int(max_chars)))
+        except Exception:
+            max_chars = self._tool_interface_local_read_max_chars
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except Exception as exc:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "本地文件读取失败"},
+                error=f"local_read_failed:{exc}",
+            )
+        clean = clip_text(normalize_text(text), max_chars)
+        return ToolResult(
+            ok=True,
+            tool_name=method_name,
+            payload={"text": f"读取成功：{path}\n{clean}", "local_path": str(path)},
+        )
+
+    async def _method_local_media_from_path(self, method_name: str, method_args: dict[str, Any]) -> ToolResult:
+        path_raw = normalize_text(str(method_args.get("path", "")))
+        path = self._resolve_local_path(path_raw)
+        if path is None:
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "本地路径不在允许范围内"},
+                error="local_path_not_allowed",
+            )
+        if not path.exists() or not path.is_file():
+            return ToolResult(
+                ok=False,
+                tool_name=method_name,
+                payload={"text": "本地媒体文件不存在"},
+                error="local_media_not_found",
+            )
+        suffix = path.suffix.lower()
+        if suffix in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
+            return ToolResult(
+                ok=True,
+                tool_name=method_name,
+                payload={"mode": "image", "text": "本地图片已准备好", "image_url": path.as_uri()},
+            )
+        if suffix in {".mp4", ".webm", ".mov", ".m4v"}:
+            return ToolResult(
+                ok=True,
+                tool_name=method_name,
+                payload={"mode": "video", "text": "本地视频已准备好", "video_url": path.as_uri()},
+            )
+        return ToolResult(
+            ok=False,
+            tool_name=method_name,
+            payload={"text": "这个本地文件不是可发送的图片/视频格式"},
+            error="unsupported_local_media_type",
+        )
+
+    async def _method_media_pick_image(self, method_name: str, raw_segments: list[dict[str, Any]]) -> ToolResult:
         candidates = self._extract_message_media_urls(raw_segments, media_type="image")
         for url in candidates:
             if self._is_blocked_image_url(url):
@@ -2912,8 +3244,8 @@ class ToolExecutor:
             payload={"text": "这条消息里没拿到可发送图片"},
             error="message_image_not_found",
         )
-    async def _method_media_pick_video(self, method_name: str, raw_segments: list[dict[str, Any]]) -> ToolResult:
 
+    async def _method_media_pick_video(self, method_name: str, raw_segments: list[dict[str, Any]]) -> ToolResult:
         candidates = self._extract_message_media_urls(raw_segments, media_type="video")
         for url in candidates:
             if self._is_blocked_video_url(url):
@@ -2946,8 +3278,8 @@ class ToolExecutor:
             payload={"text": "这条消息里没拿到可发送视频"},
             error="message_video_not_found",
         )
-    async def _method_media_pick_audio(self, method_name: str, raw_segments: list[dict[str, Any]]) -> ToolResult:
 
+    async def _method_media_pick_audio(self, method_name: str, raw_segments: list[dict[str, Any]]) -> ToolResult:
         candidates = self._extract_message_media_urls(raw_segments, media_type="audio")
         if candidates:
             return ToolResult(
@@ -2961,8 +3293,8 @@ class ToolExecutor:
             payload={"text": "这条消息里没拿到音频链接"},
             error="message_audio_not_found",
         )
-    async def _method_media_analyze_image(
 
+    async def _method_media_analyze_image(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -2986,6 +3318,7 @@ class ToolExecutor:
                 payload={"text": "识图模型配置不完整（需要单独的 provider/base_url/model/api_key）"},
                 error="vision_config_incomplete",
             )
+
         explicit_url = normalize_text(str(method_args.get("url", "")))
         allow_recent_fallback = bool(method_args.get("allow_recent_fallback", False))
         recent_only_when_unique = bool(method_args.get("recent_only_when_unique", False))
@@ -3045,6 +3378,7 @@ class ToolExecutor:
                             "url": item,
                         }
                     )
+
         uniq: list[str] = []
         seen: set[str] = set()
         for raw in candidates:
@@ -3061,6 +3395,7 @@ class ToolExecutor:
                 error="image_not_found",
             )
         url_file_map = self._extract_image_url_file_map(raw_segments)
+
         if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
             _tool_log.info(
                 "vision_route_local%s | method=%s | reason=model_text_only_or_unsupported",
@@ -3082,6 +3417,7 @@ class ToolExecutor:
                 payload={"text": "当前模型不支持图片理解，已尝试本地识别但没拿到稳定结果。你可以切换支持图片的模型，或让我只做 OCR 文字提取。"},
                 error="vision_local_unavailable",
             )
+
         prompt = self._build_vision_prompt(query=query, message_text=message_text)
         _tool_log.info(
             "vision_analyze_start%s | method=%s | candidates=%d | explicit=%s | target_source=%s | target_mid=%s",
@@ -3111,8 +3447,6 @@ class ToolExecutor:
                 and api_call is not None
             ):
                 file_token = url_file_map.get(normalize_text(url)) or url_file_map.get(normalize_text(image_ref))
-                if not file_token:
-                    file_token = self._extract_first_image_file_token(raw_segments)
                 if file_token:
                     onebot_data_uri = await self._data_uri_from_onebot_image_file(
                         image_file=file_token,
@@ -3152,30 +3486,6 @@ class ToolExecutor:
                     "source": source,
                 }
             ]
-            web_lookup = await self._vision_answer_web_lookup(
-                query=query,
-                message_text=message_text,
-                vision_answer=answer,
-            )
-            if web_lookup is not None:
-                merged_evidence = evidence + [item for item in web_lookup.get("evidence", []) if isinstance(item, dict)]
-                text_out = (
-                    f"{answer}\n\n"
-                    f"我又联网核对了一轮（关键词：{web_lookup.get('query', query)}）：\n"
-                    f"{web_lookup.get('summary', '')}"
-                ).strip()
-                return ToolResult(
-                    ok=True,
-                    tool_name=method_name,
-                    payload={
-                        "text": text_out,
-                        "analysis": answer,
-                        "source": source,
-                        "evidence": merged_evidence[:5],
-                        "vision_web_lookup": web_lookup,
-                    },
-                    evidence=merged_evidence[:5],
-                )
             _tool_log.info(
                 "vision_analyze_ok%s | method=%s | source=%s",
                 _tool_trace_tag(),
@@ -3193,6 +3503,7 @@ class ToolExecutor:
                 },
                 evidence=evidence,
             )
+
         if low_confidence_seen:
             web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
             if web_fallback is not None:
@@ -3203,6 +3514,7 @@ class ToolExecutor:
                 payload={"text": "这张图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"},
                 error="vision_low_confidence",
             )
+
         web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
         if web_fallback is not None:
             return web_fallback
@@ -3212,8 +3524,8 @@ class ToolExecutor:
             payload={"text": "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"},
             error="vision_analyze_failed",
         )
-    async def _method_video_analyze(
 
+    async def _method_video_analyze(
         self,
         method_name: str,
         method_args: dict[str, Any],
@@ -3229,6 +3541,7 @@ class ToolExecutor:
             url = urls[0] if urls else ""
         url = self._unwrap_redirect_url(url)
         local_path = ""
+
         if not url:
             media_candidates = self._extract_message_media_urls(raw_segments or [], media_type="video")
             if conversation_id:
@@ -3252,6 +3565,7 @@ class ToolExecutor:
                     local_path = str(path.resolve())
                     url = path.resolve().as_uri()
                     break
+
         if not url:
             return ToolResult(
                 ok=False,
@@ -3259,6 +3573,7 @@ class ToolExecutor:
                 payload={"text": "请给完整的视频URL。"},
                 error="invalid_url",
             )
+
         is_remote_url = bool(re.match(r"^https?://", url, flags=re.IGNORECASE))
         if is_remote_url:
             if self._is_blocked_video_text(f"{query}\n{message_text}") or self._is_blocked_video_url(url):
@@ -3275,8 +3590,10 @@ class ToolExecutor:
                     payload={"text": "这个视频链接命中了安全限制（内网/本地地址不可访问）。"},
                     error="unsafe_url",
                 )
+
         depth = normalize_text(str(method_args.get("depth", "auto"))) or "auto"
         text_only_requested = self._looks_like_analysis_text_only_request(f"{query}\n{message_text}")
+
         resolved = ""
         if not text_only_requested:
             if local_path:
@@ -3285,9 +3602,11 @@ class ToolExecutor:
                 resolved = await self._resolve_platform_video_safe(url)
             elif self._is_direct_video_url(url):
                 resolved = url
+
         meta: dict[str, Any] = {}
         if is_remote_url:
             meta = await self._inspect_platform_video_metadata_safe(url)
+
         if not local_path and resolved and not resolved.startswith("http") and Path(resolved).exists():
             local_path = resolved
         analysis = await self._video_analyzer.analyze(
@@ -3296,6 +3615,7 @@ class ToolExecutor:
             depth=depth,
             yt_dlp_meta=meta,
         )
+
         context_block = analysis.to_context_block()
         strict_text = self._build_strict_video_analysis_text(analysis)
         evidence = self._build_video_analysis_evidence(analysis)
@@ -3318,10 +3638,11 @@ class ToolExecutor:
             payload["post_type"] = "image_text"
             payload["image_urls"] = image_urls
             payload["image_url"] = image_urls[0]
+
         return ToolResult(ok=True, tool_name=method_name, payload=payload, evidence=evidence)
+
     @staticmethod
     def _build_video_analysis_evidence(analysis: VideoAnalysisResult) -> list[dict[str, str]]:
-
         title = analysis.title or "视频分析"
         parts: list[str] = []
         if analysis.uploader:
@@ -3345,8 +3666,8 @@ class ToolExecutor:
                 "source": analysis.webpage_url or analysis.source_url,
             }
         ]
-    async def _vision_uncertain_web_fallback(self, query: str, message_text: str) -> ToolResult | None:
 
+    async def _vision_uncertain_web_fallback(self, query: str, message_text: str) -> ToolResult | None:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             return None
@@ -3357,11 +3678,13 @@ class ToolExecutor:
                 clip_text(merged, 80),
             )
             return None
+
         refined = re.sub(r"(image|picture|screenshot|analyze|analysis|identify|ocr)", " ", merged, flags=re.IGNORECASE)
         refined = normalize_text(re.sub(r"\s+", " ", refined))
         search_query = refined if len(refined) >= 2 else merged
         if len(search_query) < 2:
             return None
+
         query_type = "text"
         try:
             results = await self._search_text_with_variants(query=search_query, query_type=query_type)
@@ -3370,6 +3693,7 @@ class ToolExecutor:
         results = self._filter_and_rank_results(search_query, results, query_type=query_type)
         if not results:
             return None
+
         evidence = self._build_evidence_from_results(results)
         summary = self._format_search_text(search_query, results, evidence=evidence, query_type=query_type)
         text_out = f"图像识别不确定，已联网补查：\n{summary}"
@@ -3382,142 +3706,8 @@ class ToolExecutor:
             "vision_uncertain_fallback": True,
         }
         return ToolResult(ok=True, tool_name="vision_web_fallback", payload=payload, evidence=evidence)
-    @staticmethod
-    def _looks_like_cosplay_identity_request(text: str) -> bool:
 
-        content = normalize_text(text)
-        if not content:
-            return False
-        if not (
-            ToolExecutor._has_control_token(text, "/lookup", "mode=lookup")
-            or ToolExecutor._has_question_punctuation(content)
-        ):
-            return False
-        return bool(ToolExecutor._extract_cosplay_terms(content))
-    @staticmethod
-    def _extract_cosplay_terms(*texts: str) -> list[str]:
-
-        combined = normalize_text(" ".join(normalize_text(str(item)) for item in texts if normalize_text(str(item))))
-        if not combined:
-            return []
-        cleaned = re.sub(r"https?://\S+", " ", combined, flags=re.IGNORECASE)
-        cleaned = re.sub(r"(?i)(?<!\S)/(?:lookup|search|analyze|image|video)\b", " ", cleaned)
-        cleaned = re.sub(r"(?i)\b(?:mode|type|output|query)\s*=\s*[^\s]+", " ", cleaned)
-        candidates: list[str] = []
-        for pattern in (
-            r"`([^`]{2,80})`",
-            r"\*\*([^*]{2,80})\*\*",
-            r"[???\"]\s*([^???\"]{2,80})\s*[???\"]",
-        ):
-            for token in re.findall(pattern, cleaned):
-                value = normalize_text(token).strip(" ,.;:!???????`\"'[](){}<>")
-                if value:
-                    candidates.append(value)
-        for token in re.findall(r"[A-Za-z][A-Za-z0-9_\-]{2,31}", cleaned):
-            value = normalize_text(token).strip(" ,.;:!???????`\"'[](){}<>")
-            if value:
-                candidates.append(value)
-        out: list[str] = []
-        seen: set[str] = set()
-        for item in candidates:
-            key = normalize_text(item).lower()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            out.append(item)
-            if len(out) >= 6:
-                break
-        return out
-    async def _vision_answer_web_lookup(
-
-        self,
-        *,
-        query: str,
-        message_text: str,
-        vision_answer: str,
-    ) -> dict[str, Any] | None:
-        merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
-        if not merged:
-            return None
-        if not (
-            self._looks_like_vision_web_lookup_request(merged)
-            or self._looks_like_cosplay_identity_request(merged)
-        ):
-            return None
-        terms = self._extract_cosplay_terms(merged, vision_answer)
-        query_candidates: list[str] = []
-        if terms:
-            query_candidates.extend(terms[:3])
-            if len(terms) >= 2:
-                query_candidates.append(" ".join(terms[:2]))
-        if vision_answer:
-            query_candidates.append(clip_text(normalize_text(vision_answer), 80))
-        query_candidates.append(merged)
-        deduped_queries: list[str] = []
-        deduped_queries: list[str] = []
-        seen_queries: set[str] = set()
-        for q in query_candidates:
-            qn = normalize_text(q)
-            if not qn:
-                continue
-            key = qn.lower()
-            if key in seen_queries:
-                continue
-            seen_queries.add(key)
-            deduped_queries.append(qn)
-            if len(deduped_queries) >= 6:
-                break
-        def _score_rows(rows: list[SearchResult], cosplay_terms: list[str]) -> int:
-
-            if not rows:
-                return -1
-            strong_domains = ("weibo.com", "bilibili.com", "x.com", "xiaohongshu.com", "acfun.cn")
-            score = 0
-            term_keys = [normalize_text(item).lower() for item in cosplay_terms if normalize_text(item)]
-            for idx, item in enumerate(rows[:5]):
-                weight = max(1, 6 - idx)
-                blob = normalize_text(f"{item.title} {item.snippet}").lower()
-                term_hits = sum(1 for term in term_keys[:4] if term and term in blob)
-                if term_hits > 0:
-                    score += (8 + 3 * term_hits) * weight
-                url_lower = normalize_text(item.url).lower()
-                if any(domain in url_lower for domain in strong_domains):
-                    score += 2 * weight
-            return score
-        best_query = ""
-        best_query = ""
-        best_results: list[SearchResult] = []
-        best_score = -1
-        for candidate in deduped_queries:
-            try:
-                rows = await self._search_text_with_variants(query=candidate, query_type="text")
-            except Exception:
-                continue
-            rows = self._filter_and_rank_results(candidate, rows, query_type="text")
-            if rows:
-                score = _score_rows(rows, terms)
-                if score > best_score:
-                    best_score = score
-                    best_query = candidate
-                    best_results = rows
-                # 高分命中时提前收敛，减少联网开销
-                if score >= 36:
-                    break
-            if rows and not best_results:
-                best_query = candidate
-                best_results = rows
-        if not best_results:
-            return None
-        evidence = self._build_evidence_from_results(best_results)
-        summary = self._format_search_text(best_query, best_results, evidence=evidence, query_type="text")
-        return {
-            "query": best_query,
-            "summary": summary,
-            "evidence": evidence,
-            "results": [{"title": row.title, "snippet": row.snippet, "url": row.url} for row in best_results[:5]],
-        }
     async def _analyze_image_from_message(
-
         self,
         query: str,
         message_text: str,
@@ -3539,11 +3729,13 @@ class ToolExecutor:
                 payload={"text": "识图模型配置不完整（需要单独的 provider/base_url/model/api_key）"},
                 error="vision_config_incomplete",
             )
+
         candidates = self._extract_message_media_urls(raw_segments, media_type="image")
         if not candidates and conversation_id:
             candidates = self._get_recent_media(conversation_id=conversation_id, media_type="image")
         if not candidates:
             return None
+
         if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
             return await self._analyze_image_local_fallback(
                 method_name="vision_analyze_image",
@@ -3552,6 +3744,7 @@ class ToolExecutor:
                 raw_segments=raw_segments,
                 api_call=api_call,
             )
+
         prompt = self._build_vision_prompt(query=query, message_text=message_text)
         low_confidence_seen = False
         for url in candidates:
@@ -3580,36 +3773,13 @@ class ToolExecutor:
                         "source": source,
                     }
                 ]
-                web_lookup = await self._vision_answer_web_lookup(
-                    query=query,
-                    message_text=message_text,
-                    vision_answer=answer,
-                )
-                if web_lookup is not None:
-                    merged_evidence = evidence + [item for item in web_lookup.get("evidence", []) if isinstance(item, dict)]
-                    text_out = (
-                        f"{answer}\n\n"
-                        f"我又联网核对了一轮（关键词：{web_lookup.get('query', query)}）：\n"
-                        f"{web_lookup.get('summary', '')}"
-                    ).strip()
-                    return ToolResult(
-                        ok=True,
-                        tool_name="vision_analyze_image",
-                        payload={
-                            "text": text_out,
-                            "analysis": answer,
-                            "source": source,
-                            "evidence": merged_evidence[:5],
-                            "vision_web_lookup": web_lookup,
-                        },
-                        evidence=merged_evidence[:5],
-                    )
                 return ToolResult(
                     ok=True,
                     tool_name="vision_analyze_image",
                     payload={"text": answer, "source": source, "evidence": evidence},
                     evidence=evidence,
                 )
+
         if low_confidence_seen:
             web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
             if web_fallback is not None:
@@ -3620,6 +3790,7 @@ class ToolExecutor:
                 payload={"text": "这张图已尝试识别，但结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"},
                 error="vision_low_confidence",
             )
+
         web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
         if web_fallback is not None:
             return web_fallback
@@ -3629,13 +3800,14 @@ class ToolExecutor:
             payload={"text": "这张图这次没识别出来，请发更清晰的图片，或直接告诉我要识别哪部分。"},
             error="vision_analyze_failed",
         )
-    def _can_use_remote_vision_model(self) -> bool:
 
+    def _can_use_remote_vision_model(self) -> bool:
         mode = normalize_text(self._vision_model_supports_image).lower()
         if mode in {"1", "true", "yes", "on"}:
             return True
         if mode in {"0", "false", "no", "off"}:
             return False
+
         model_client = getattr(self.image_engine, "model_client", None)
         if model_client is None:
             return False
@@ -3650,8 +3822,8 @@ class ToolExecutor:
             except Exception:
                 return False
         return False
-    async def _analyze_image_local_fallback(
 
+    async def _analyze_image_local_fallback(
         self,
         method_name: str,
         query: str,
@@ -3666,6 +3838,7 @@ class ToolExecutor:
                 payload={"text": "当前模型不支持图片理解，且本地 OCR 通道不可用（缺少 OneBot API 上下文）。"},
                 error="local_ocr_api_unavailable",
             )
+
         file_tokens = self._extract_image_file_tokens(raw_segments)
         if not file_tokens:
             return ToolResult(
@@ -3674,6 +3847,7 @@ class ToolExecutor:
                 payload={"text": "当前模型不支持图片理解，本地 OCR 需要直接发送图片（含 file 标识）后再试。"},
                 error="local_ocr_image_token_missing",
             )
+
         for token in file_tokens[:3]:
             try:
                 result = await api_call("ocr_image", image=token)
@@ -3706,15 +3880,16 @@ class ToolExecutor:
                 },
                 evidence=evidence,
             )
+
         return ToolResult(
             ok=False,
             tool_name=method_name,
             payload={"text": "当前模型不支持图片理解，已尝试本地 OCR，但这张图没有提取到可用文字。"},
             error="local_ocr_empty",
         )
+
     @staticmethod
     def _extract_image_file_tokens(raw_segments: list[dict[str, Any]]) -> list[str]:
-
         tokens: list[str] = []
         seen: set[str] = set()
         for seg in raw_segments or []:
@@ -3734,9 +3909,9 @@ class ToolExecutor:
                 seen.add(value)
                 tokens.append(value)
         return tokens
+
     @staticmethod
     def _extract_ocr_text(result: Any) -> str:
-
         payload = result
         if isinstance(result, dict) and isinstance(result.get("data"), dict):
             payload = result.get("data")
@@ -3754,19 +3929,26 @@ class ToolExecutor:
             if txt:
                 rows.append(txt)
         return normalize_text("\n".join(rows))
-    def _build_vision_prompt(self, query: str, message_text: str) -> str:
 
+    def _build_vision_prompt(self, query: str, message_text: str) -> str:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             merged = "请描述这张图的主要内容，并提取可见文字。"
-        base = SystemPromptRelay.vision_main_prompt(user_query=merged, extra="")
+        extra = ""
+        merged_lower = merged.lower()
+        if any(cue in merged_lower for cue in ("软件", "应用", "程序", "开着哪些", "任务栏", "图标", "窗口")):
+            extra = (
+                "\n如果是桌面/任务栏截图："
+                "按从左到右列出可识别的软件或窗口名称；不确定的项标注“疑似”。"
+            )
+        base = SystemPromptRelay.vision_main_prompt(user_query=merged, extra=extra)
         return self._prompt_policy.compose_prompt(
             channel="vision",
             base_prompt=base,
             tool_name="media.analyze_image",
         )
-    def _build_vision_retry_prompt(self, query: str, message_text: str) -> str:
 
+    def _build_vision_retry_prompt(self, query: str, message_text: str) -> str:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             merged = "请识别这张图。"
@@ -3776,9 +3958,9 @@ class ToolExecutor:
             base_prompt=base,
             tool_name="media.analyze_image",
         )
+
     @staticmethod
     def _extract_image_url_file_map(raw_segments: list[dict[str, Any]]) -> dict[str, str]:
-
         mapping: dict[str, str] = {}
         for seg in raw_segments:
             if not isinstance(seg, dict):
@@ -3797,25 +3979,9 @@ class ToolExecutor:
                 if resolved:
                     mapping[resolved] = file_token
         return mapping
-    @staticmethod
-    def _extract_first_image_file_token(raw_segments: list[dict[str, Any]]) -> str:
 
-        for seg in raw_segments:
-            if not isinstance(seg, dict):
-                continue
-            seg_type = normalize_text(str(seg.get("type", ""))).lower()
-            if seg_type != "image":
-                continue
-            data = seg.get("data")
-            if not isinstance(data, dict):
-                continue
-            file_token = normalize_text(str(data.get("file", "")))
-            if file_token:
-                return file_token
-        return ""
     @staticmethod
     def _extract_api_data(payload: Any) -> dict[str, Any]:
-
         if isinstance(payload, dict):
             data = payload.get("data")
             if isinstance(data, dict):
@@ -3825,8 +3991,8 @@ class ToolExecutor:
         if isinstance(data_obj, dict):
             return data_obj
         return {}
-    def _to_data_uri_from_image_bytes(
 
+    def _to_data_uri_from_image_bytes(
         self,
         data: bytes,
         mime: str = "image/png",
@@ -3863,16 +4029,16 @@ class ToolExecutor:
             len(data),
         )
         return data_uri
+
     @staticmethod
     def _is_gif_payload(data: bytes, mime: str) -> bool:
-
         mime_l = normalize_text(mime).lower()
         if "gif" in mime_l:
             return True
         return data.startswith(b"GIF87a") or data.startswith(b"GIF89a")
+
     @staticmethod
     def _pick_gif_keyframe_indexes(frame_count: int) -> list[int]:
-
         if frame_count <= 1:
             return [0]
         picks = [0, frame_count // 2, frame_count - 1]
@@ -3884,8 +4050,8 @@ class ToolExecutor:
             seen.add(idx)
             out.append(idx)
         return out or [0]
-    def _gif_keyframes_to_data_uri(self, gif_bytes: bytes) -> str:
 
+    def _gif_keyframes_to_data_uri(self, gif_bytes: bytes) -> str:
         if Image is None:
             _tool_log.info("vision_gif_keyframes_skip%s | reason=pillow_unavailable", _tool_trace_tag())
             return ""
@@ -3902,14 +4068,17 @@ class ToolExecutor:
         except Exception as exc:
             _tool_log.warning("vision_gif_keyframes_fail%s | err=%s", _tool_trace_tag(), clip_text(str(exc), 160))
             return ""
+
         if not frames:
             return ""
+
         target_h = max(120, min(640, max(frame.height for frame in frames)))
         resized = []
         for frame in frames:
             src_h = max(1, int(frame.height))
             width = max(1, int(round(float(frame.width) * float(target_h) / float(src_h))))
             resized.append(frame.resize((width, target_h)))
+
         gap = 8
         total_w = sum(frame.width for frame in resized) + gap * max(0, len(resized) - 1)
         canvas = Image.new("RGB", (total_w, target_h), (12, 12, 12))
@@ -3917,6 +4086,7 @@ class ToolExecutor:
         for frame in resized:
             canvas.paste(frame, (offset, 0))
             offset += frame.width + gap
+
         buf = io.BytesIO()
         try:
             canvas.save(buf, format="JPEG", quality=86, optimize=True)
@@ -3934,8 +4104,8 @@ class ToolExecutor:
             source="gif_keyframes",
             allow_gif_keyframes=False,
         )
-    async def _data_uri_from_onebot_image_file(
 
+    async def _data_uri_from_onebot_image_file(
         self,
         image_file: str,
         api_call: Callable[..., Awaitable[Any]] | None,
@@ -3948,6 +4118,7 @@ class ToolExecutor:
                 result = await api_call("get_image", **kwargs)
             except Exception:
                 continue
+
             payload = self._extract_api_data(result)
             for key in ("file", "file_path", "path", "local_path", "filename"):
                 raw_path = normalize_text(str(payload.get(key, "")))
@@ -3976,6 +4147,7 @@ class ToolExecutor:
                 )
                 if data_uri:
                     return data_uri
+
             for key in ("url", "download_url", "src"):
                 remote_url = normalize_text(str(payload.get(key, "")))
                 if not remote_url:
@@ -3984,8 +4156,8 @@ class ToolExecutor:
                 if data_uri:
                     return data_uri
         return ""
-    async def _prepare_vision_image_ref(self, raw: str) -> str:
 
+    async def _prepare_vision_image_ref(self, raw: str) -> str:
         value = normalize_text(raw)
         if not value:
             return ""
@@ -4052,6 +4224,7 @@ class ToolExecutor:
             if re.match(r"^/[A-Za-z]:/", file_part):
                 file_part = file_part[1:]
             value = file_part
+
         path = Path(value)
         if not path.is_absolute():
             path = (self._project_root / path).resolve()
@@ -4078,8 +4251,8 @@ class ToolExecutor:
             mime=mime,
             source="local_file",
         )
-    async def _download_image_as_data_uri(self, url: str) -> str:
 
+    async def _download_image_as_data_uri(self, url: str) -> str:
         """下载远程图片并转为 data URI（base64），用于 vision API。"""
         if not self._is_safe_public_http_url(url):
             return ""
@@ -4116,20 +4289,24 @@ class ToolExecutor:
             )
         except Exception:
             return ""
-    async def _vision_describe(self, image_ref: str, prompt: str) -> str:
 
+    async def _vision_describe(self, image_ref: str, prompt: str) -> str:
         model_client = getattr(self.image_engine, "model_client", None)
         client = getattr(model_client, "client", None) if model_client is not None else None
+
         if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
             return ""
+
         if self._vision_require_independent_config and not self._has_independent_vision_config():
             return ""
+
         provider = self._vision_provider or normalize_text(str(getattr(model_client, "provider", ""))).lower()
         api_key = self._vision_api_key or normalize_text(str(getattr(client, "api_key", "")))
         base_url = (self._vision_base_url or normalize_text(str(getattr(client, "base_url", "")))).rstrip("/")
         model_name = self._vision_model or normalize_text(str(getattr(client, "model", "")))
         if not api_key or not base_url or not model_name:
             return ""
+
         timeout_seconds = float(
             getattr(client, "timeout_seconds", self._vision_timeout_seconds) if client is not None else self._vision_timeout_seconds
         )
@@ -4145,6 +4322,7 @@ class ToolExecutor:
             image_ref_kind,
             timeout_seconds,
         )
+
         if provider == "anthropic":
             text = await self._vision_describe_via_anthropic(
                 image_ref=image_ref,
@@ -4160,6 +4338,7 @@ class ToolExecutor:
             )
             if text:
                 return text
+
         if provider == "gemini":
             text = await self._vision_describe_via_gemini(
                 image_ref=image_ref,
@@ -4174,6 +4353,7 @@ class ToolExecutor:
             )
             if text:
                 return text
+
         if provider not in {
             "openai",
             "newapi",
@@ -4201,6 +4381,7 @@ class ToolExecutor:
                 )
             except Exception:
                 return ""
+
         payload = {
             "model": model_name,
             "messages": [
@@ -4221,6 +4402,7 @@ class ToolExecutor:
             "Content-Type": "application/json",
         }
         candidates = self._candidate_openai_bases(base_url=base_url, prefer_v1=prefer_v1)
+
         for base in candidates:
             url = f"{base}/chat/completions"
             try:
@@ -4230,6 +4412,7 @@ class ToolExecutor:
                 data = resp.json()
             except Exception:
                 continue
+
             choices = data.get("choices") if isinstance(data, dict) else None
             if not isinstance(choices, list) or not choices:
                 continue
@@ -4249,8 +4432,8 @@ class ToolExecutor:
                 if text:
                     return text
         return ""
-    async def _vision_describe_via_anthropic(
 
+    async def _vision_describe_via_anthropic(
         self,
         image_ref: str,
         prompt: str,
@@ -4266,6 +4449,7 @@ class ToolExecutor:
         mime, b64 = self._decode_data_image_ref(image_ref)
         if not mime or not b64:
             return ""
+
         payload = {
             "model": model_name,
             "max_tokens": max_tokens,
@@ -4310,8 +4494,8 @@ class ToolExecutor:
             if text:
                 return text
         return ""
-    async def _vision_describe_via_gemini(
 
+    async def _vision_describe_via_gemini(
         self,
         image_ref: str,
         prompt: str,
@@ -4326,6 +4510,7 @@ class ToolExecutor:
         mime, b64 = self._decode_data_image_ref(image_ref)
         if not mime or not b64:
             return ""
+
         base = normalize_text(base_url).rstrip("/")
         for suffix in ("/v1beta", "/v1"):
             if base.endswith(suffix):
@@ -4333,6 +4518,7 @@ class ToolExecutor:
                 break
         if not base:
             return ""
+
         payload = {
             "contents": [
                 {
@@ -4358,6 +4544,7 @@ class ToolExecutor:
             data = resp.json()
         except Exception:
             return ""
+
         candidates = data.get("candidates") if isinstance(data, dict) else None
         if not isinstance(candidates, list) or not candidates:
             return ""
@@ -4370,9 +4557,9 @@ class ToolExecutor:
             if isinstance(item, dict):
                 out.append(normalize_text(str(item.get("text", ""))))
         return normalize_text("".join(out))
+
     @staticmethod
     def _decode_data_image_ref(image_ref: str) -> tuple[str, str]:
-
         raw = normalize_text(image_ref)
         if not raw.startswith("data:image") or ";base64," not in raw:
             return "", ""
@@ -4382,17 +4569,18 @@ class ToolExecutor:
         if not mime or not data:
             return "", ""
         return mime, data
+
     def _has_independent_vision_config(self) -> bool:
-
         return bool(self._vision_provider and self._vision_base_url and self._vision_model and self._vision_api_key)
-    async def _normalize_vision_answer(self, answer: str, prompt: str) -> str:
 
+    async def _normalize_vision_answer(self, answer: str, prompt: str) -> str:
         content = normalize_text(answer)
         if not content:
             return ""
         content = re.sub(r"\s+", " ", content).strip()
         if self._looks_like_english_refusal(content):
             return "这张图我这次没法稳定识别完整内容。请发更清晰的图片，或告诉我要识别哪一部分。"
+
         if self._looks_like_non_chinese_text(content) and self._vision_retry_translate_enable:
             translated = await self._translate_to_chinese(content=content, prompt=prompt)
             if translated:
@@ -4400,8 +4588,8 @@ class ToolExecutor:
         if self._looks_like_non_chinese_text(content):
             return "这张图识别到了部分内容，但结果不够稳定。你可以让我继续聚焦识别图里的文字或图标。"
         return normalize_text(content)
-    async def _normalize_vision_answer_with_retry(
 
+    async def _normalize_vision_answer_with_retry(
         self,
         image_ref: str,
         answer: str,
@@ -4414,14 +4602,15 @@ class ToolExecutor:
             return ""
         if not self._vision_second_pass_enable or not self._looks_like_weak_vision_answer(normalized):
             return normalized
+
         retry_prompt = self._build_vision_retry_prompt(query=query, message_text=message_text)
         retry_raw = await self._vision_describe(image_ref=image_ref, prompt=retry_prompt)
         retry_norm = await self._normalize_vision_answer(retry_raw, prompt=retry_prompt)
         if retry_norm and not self._looks_like_weak_vision_answer(retry_norm):
             return retry_norm
         return normalized
-    async def _translate_to_chinese(self, content: str, prompt: str) -> str:
 
+    async def _translate_to_chinese(self, content: str, prompt: str) -> str:
         model_client = getattr(self.image_engine, "model_client", None)
         if model_client is None or not bool(getattr(model_client, "enabled", False)):
             return ""
@@ -4450,9 +4639,9 @@ class ToolExecutor:
         if self._looks_like_non_chinese_text(translated_text):
             return ""
         return translated_text
+
     @staticmethod
     def _looks_like_non_chinese_text(text: str) -> bool:
-
         content = normalize_text(text)
         if not content:
             return False
@@ -4461,21 +4650,37 @@ class ToolExecutor:
         if alpha_count < 8:
             return False
         return cjk_count / max(alpha_count, 1) < 0.25
-    @staticmethod
+
     @staticmethod
     def _looks_like_english_refusal(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        refusal_cues = (
+            "i can't discuss",
+            "i cannot discuss",
+            "i can't help with",
+            "i can help with coding",
+            "i am an ai assistant",
+            "built to help developers",
+        )
+        return any(cue in content for cue in refusal_cues)
 
-        _ = text
-        return False
-    @staticmethod
     @staticmethod
     def _looks_like_weak_vision_answer(text: str) -> bool:
         content = normalize_text(text)
         if not content:
             return True
-        return bool(re.fullmatch(r"[\u003f\uff1f\u0021\uff01\u007e\uff5e\u2026\u002c\u002e\uff0c\u003a\uff1a\u003b\uff1b/\\\-_=+*'\"`\s]{1,24}", content))
-    def _candidate_openai_bases(base_url: str, prefer_v1: bool) -> list[str]:
+        weak_cues = (
+            "这张图我这次没法稳定识别完整内容",
+            "这张图识别到了部分内容，但结果不够稳定",
+            "请发更清晰的图片",
+            "结果不够稳定",
+        )
+        return any(cue in content for cue in weak_cues)
 
+    @staticmethod
+    def _candidate_openai_bases(base_url: str, prefer_v1: bool) -> list[str]:
         base = normalize_text(base_url).rstrip("/")
         if not base:
             return []
@@ -4488,16 +4693,16 @@ class ToolExecutor:
             if value and value not in out:
                 out.append(value)
         return out
-    async def _inspect_platform_video_metadata(self, source_url: str) -> dict[str, Any]:
 
+    async def _inspect_platform_video_metadata(self, source_url: str) -> dict[str, Any]:
         if YoutubeDL is None:
             return {}
         url = self._unwrap_redirect_url(source_url)
         if not self._is_supported_platform_video_url(url):
             return {}
         return await asyncio.to_thread(self._inspect_platform_video_metadata_sync, url)
-    async def _inspect_platform_video_metadata_safe(self, source_url: str) -> dict[str, Any]:
 
+    async def _inspect_platform_video_metadata_safe(self, source_url: str) -> dict[str, Any]:
         try:
             return await asyncio.wait_for(
                 self._inspect_platform_video_metadata(source_url),
@@ -4505,16 +4710,23 @@ class ToolExecutor:
             )
         except Exception:
             return {}
-    def _pick_video_duration_limit(self, query: str) -> tuple[int, str]:
 
+    def _pick_video_duration_limit(self, query: str) -> tuple[int, str]:
         content = normalize_text(query).lower()
         if self._looks_like_video_analysis_request(content):
             return self._video_search_analysis_max_duration_seconds, "analysis"
-        if self._looks_like_video_send_request(content):
+        send_cues = [
+            normalize_text(cue).lower()
+            for cue in _pl.get_list("local_media_request_cues")
+            if normalize_text(cue)
+        ]
+        if not send_cues:
+            send_cues = ["发送", "发我", "发到群", "转发", "下载", "解析", "直发", "发视频", "把视频发"]
+        if any(cue in content for cue in send_cues):
             return self._video_search_send_max_duration_seconds, "send"
         return self._video_search_max_duration_seconds, "default"
-    def _is_video_duration_acceptable_for_search(
 
+    def _is_video_duration_acceptable_for_search(
         self, meta: dict[str, Any], query: str
     ) -> tuple[bool, int, int, str]:
         duration = int(meta.get("duration", 0) or 0)
@@ -4522,8 +4734,8 @@ class ToolExecutor:
         if duration <= 0:
             return True, limit, duration, scene
         return duration <= limit, limit, duration, scene
-    def _inspect_platform_video_metadata_sync(self, source_url: str) -> dict[str, Any]:
 
+    def _inspect_platform_video_metadata_sync(self, source_url: str) -> dict[str, Any]:
         if YoutubeDL is None:
             return {}
         options = {
@@ -4573,11 +4785,11 @@ class ToolExecutor:
             "subtitle_lang": subtitle_lang,
             "subtitle_source": subtitle_source,
         }
+
     def _extract_subtitle_text_from_info_sync(self, info: dict[str, Any], source_url: str) -> tuple[str, str, str]:
-
         candidates: list[tuple[int, str, str, str]] = []  # score, lang, ext, url
-        def _score_lang(lang: str) -> int:
 
+        def _score_lang(lang: str) -> int:
             value = normalize_text(lang).lower()
             score = 0
             if any(token in value for token in ("zh", "cn", "中文", "汉")):
@@ -4585,16 +4797,16 @@ class ToolExecutor:
             if "auto" in value:
                 score -= 2
             return score
-        def _score_ext(ext: str) -> int:
 
+        def _score_ext(ext: str) -> int:
             value = normalize_text(ext).lower()
             if value in {"json3", "json"}:
                 return 6
             if value in {"vtt", "srt"}:
                 return 4
             return 1
-        def _norm_url(raw: str) -> str:
 
+        def _norm_url(raw: str) -> str:
             url = normalize_text(raw)
             if not url:
                 return ""
@@ -4603,17 +4815,19 @@ class ToolExecutor:
             elif url.startswith("/"):
                 url = f"https://api.bilibili.com{url}"
             return url
-        def _add(lang: str, ext: str, raw_url: str, base_score: int) -> None:
 
+        def _add(lang: str, ext: str, raw_url: str, base_score: int) -> None:
             url = _norm_url(raw_url)
             if not url or not re.match(r"^https?://", url, flags=re.IGNORECASE):
                 return
             candidates.append((base_score + _score_lang(lang) + _score_ext(ext), lang, ext, url))
+
         requested = info.get("requested_subtitles", {})
         if isinstance(requested, dict):
             for lang, payload in requested.items():
                 if isinstance(payload, dict):
                     _add(str(lang), str(payload.get("ext", "")), str(payload.get("url", "")), 30)
+
         for source_name, base in (("subtitles", 20), ("automatic_captions", 10)):
             source = info.get(source_name, {})
             if not isinstance(source, dict):
@@ -4625,9 +4839,11 @@ class ToolExecutor:
                     if not isinstance(row, dict):
                         continue
                     _add(str(lang), str(row.get("ext", "")), str(row.get("url", "")), base)
+
         if not candidates:
             return "", "", ""
         candidates.sort(key=lambda x: x[0], reverse=True)
+
         headers = {
             "User-Agent": self._http_headers.get("User-Agent", "Mozilla/5.0"),
             "Referer": normalize_text(str(info.get("webpage_url", "") or source_url)),
@@ -4646,9 +4862,9 @@ class ToolExecutor:
                     continue
                 return clip_text(text, 8000), normalize_text(lang), url
         return "", "", ""
+
     @staticmethod
     def _subtitle_payload_to_text(ext: str, body: str, content_type: str) -> str:
-
         if not body:
             return ""
         ext_norm = normalize_text(ext).lower()
@@ -4687,6 +4903,7 @@ class ToolExecutor:
                     if rows:
                         return "\n".join(rows)
             return ""
+
         if ext_norm == "vtt" or "vtt" in ctype:
             lines = []
             for line in raw.splitlines():
@@ -4704,6 +4921,7 @@ class ToolExecutor:
                 if t:
                     lines.append(t)
             return "\n".join(lines)
+
         if ext_norm == "srt" or "srt" in ctype:
             lines = []
             for line in raw.splitlines():
@@ -4719,9 +4937,10 @@ class ToolExecutor:
                 if t:
                     lines.append(t)
             return "\n".join(lines)
-        return normalize_text(raw)
-    async def _build_video_result_with_analysis(
 
+        return normalize_text(raw)
+
+    async def _build_video_result_with_analysis(
         self,
         source_url: str,
         resolved: str,
@@ -4731,8 +4950,9 @@ class ToolExecutor:
         tool_name: str = "search_video",
         extra_payload: dict[str, Any] | None = None,
     ) -> ToolResult:
-        """??????????????? VideoAnalyzer?????????????"""
+        """视频搜索结果处理，优先使用 VideoAnalyzer 进行深度分析"""
         is_analysis = self._looks_like_video_analysis_request(query)
+
         if is_analysis:
             local_path = resolved if resolved and not resolved.startswith("http") and Path(resolved).exists() else ""
             analysis = await self._video_analyzer.analyze(
@@ -4761,14 +4981,16 @@ class ToolExecutor:
             )
             evidence = self._build_video_evidence(source_url=source_url, meta=meta)
             payload = {"mode": "video", "text": text, "video_url": resolved, "evidence": evidence}
+
         cover_url = normalize_text(str(meta.get("thumbnail", "")))
         if cover_url:
             payload["cover_url"] = cover_url
+
         if extra_payload:
             payload.update(extra_payload)
         return ToolResult(ok=True, tool_name=tool_name, payload=payload, evidence=evidence)
-    def _build_strict_video_analysis_text(self, analysis: VideoAnalysisResult) -> str:
 
+    def _build_strict_video_analysis_text(self, analysis: VideoAnalysisResult) -> str:
         lines: list[str] = ["视频分析（严格模式，不做无依据脑补）"]
         if analysis.title:
             lines.append(f"- 标题：{analysis.title}")
@@ -4778,6 +5000,7 @@ class ToolExecutor:
             lines.append(f"- 时长：{self._format_duration(analysis.duration) or str(analysis.duration)}")
         if analysis.webpage_url:
             lines.append(f"- 来源：{analysis.webpage_url}")
+
         if analysis.subtitle_text:
             highlights = self._extract_transcript_highlights(analysis.subtitle_text, max_items=8)
             lines.append("依据：视频字幕（可核验）")
@@ -4788,6 +5011,7 @@ class ToolExecutor:
             else:
                 lines.append(f"字幕摘录：{clip_text(analysis.subtitle_text, 260)}")
             return "\n".join(lines)
+
         if analysis.keyframe_descriptions:
             lines.append("当前未拿到可用字幕，只拿到画面关键帧。")
             lines.append("为避免瞎猜，我不能把画面当口播内容来总结。")
@@ -4795,12 +5019,13 @@ class ToolExecutor:
             for idx, row in enumerate(analysis.keyframe_descriptions[:4], 1):
                 lines.append(f"{idx}. {clip_text(normalize_text(row), 90)}")
             return "\n".join(lines)
+
         lines.append("当前未拿到字幕/转写内容，只能看到元数据。")
         lines.append("为保证准确性，我不会编造视频具体讲解内容。")
         return "\n".join(lines)
+
     @staticmethod
     def _extract_transcript_highlights(text: str, max_items: int = 8) -> list[str]:
-
         content = normalize_text(text)
         if not content:
             return []
@@ -4847,12 +5072,43 @@ class ToolExecutor:
             if len(out) >= max(1, int(max_items)):
                 break
         return out
+
     @staticmethod
     def _looks_like_analysis_text_only_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        plain = re.sub(r"\s+", "", content)
+        cues = (
+            "不需要本地下载发我",
+            "不需要下载发我",
+            "不用下载发我",
+            "不要发视频",
+            "不用发我",
+            "不需要发我",
+            "只要总结",
+            "只总结",
+            "只要文字总结",
+            "只要文本总结",
+            "只需要总结",
+            "不需要本地下載發我",
+            "不需要下載發我",
+            "不用下載發我",
+            "不要發視頻",
+            "只要文字總結",
+            "只需要總結",
+        )
+        if any(cue in plain for cue in cues):
+            return True
+        patterns = (
+            r"不(?:需要|用|要)?(?:本地)?(?:下载|下載).{0,8}(?:发我|發我|给我|給我|发送|發送)",
+            r"(?:不要|别|別|不需要|不用).{0,4}(?:发|發|发送|發送).{0,4}(?:视频|視頻|影片)",
+            r"(?:只要|只需|仅要|僅要|仅需|僅需).{0,4}(?:文字|文本|总结|總結|结论|結論)",
+            r"(?:只总结|只總結|仅总结|僅總結)",
+        )
+        return any(re.search(pattern, content) for pattern in patterns)
 
-        return ToolExecutor._has_control_token(text, "output=text", "mode=text", "text-only", "/text")
     def _compose_video_result_text(
-
         self,
         source_url: str,
         query: str,
@@ -4864,6 +5120,7 @@ class ToolExecutor:
         duration = self._format_duration(int(meta.get("duration", 0)))
         desc = normalize_text(str(meta.get("description", "")))
         source = normalize_text(str(meta.get("webpage_url", ""))) or normalize_text(source_url)
+
         if not for_analysis:
             parts = [f"标题：{title}"] if title else []
             if uploader:
@@ -4874,6 +5131,7 @@ class ToolExecutor:
                 parts.append(f"简介：{clip_text(desc, 120)}")
             parts.append(f"来源：{source}")
             return "视频信息：\n" + "\n".join(parts) if parts else f"来源：{source}"
+
         lines = ["解析完成，关键结果："]
         if title:
             lines.append(f"- 标题：{title}")
@@ -4890,9 +5148,9 @@ class ToolExecutor:
             lines.append("简介要点：这条视频没拿到完整简介。")
         lines.append("提示：这份分析基于标题/简介元数据，不是逐帧内容识别。")
         return "\n".join(lines)
+
     @staticmethod
     def _format_duration(seconds: int) -> str:
-
         sec = int(seconds or 0)
         if sec <= 0:
             return ""
@@ -4902,8 +5160,8 @@ class ToolExecutor:
         if h > 0:
             return f"{h:02d}:{m:02d}:{s:02d}"
         return f"{m:02d}:{s:02d}"
-    def _build_video_duration_filtered_text(self, query: str, candidates: list[dict[str, Any]]) -> str:
 
+    def _build_video_duration_filtered_text(self, query: str, candidates: list[dict[str, Any]]) -> str:
         if not candidates:
             return ""
         limit = min(int(item.get("limit", self._video_search_max_duration_seconds) or self._video_search_max_duration_seconds) for item in candidates)
@@ -4919,8 +5177,8 @@ class ToolExecutor:
             f"这次命中的候选视频里有 {len(candidates)} 条超出时长上限（{scene_label}上限 {limit} 秒，"
             f"最长约 {longest_text}），我先跳过了这些结果。"
         )
-    async def _search_video(self, query: str) -> ToolResult:
 
+    async def _search_video(self, query: str) -> ToolResult:
         if self._is_blocked_video_text(query):
             return ToolResult(
                 ok=False,
@@ -4928,6 +5186,7 @@ class ToolExecutor:
                 payload={"text": "这类视频我不能发 换一个合规主题我继续帮你找"},
                 error="blocked_video_request",
             )
+
         direct = self._extract_direct_video_url(query)
         if direct:
             evidence = [{"title": "视频直链", "point": "用户消息里已包含可发送视频直链", "source": direct}]
@@ -4943,6 +5202,7 @@ class ToolExecutor:
                 },
                 evidence=evidence,
             )
+
         platform_page_hint = ""
         douyin_cookie_required = False
         duration_filtered_candidates: list[dict[str, Any]] = []
@@ -4968,12 +5228,14 @@ class ToolExecutor:
             ):
                 douyin_cookie_required = True
                 break
+
         # ── 优先：Bilibili API 直接搜索（最可靠的中文视频来源）──
         try:
             bili_results = await self.search_engine.search_bilibili_videos(query, limit=5)
         except Exception:
             bili_results = []
         bili_results = self._filter_safe_video_results(query, bili_results)
+
         _dl_attempts_bili = 0
         for item in bili_results:
             candidate = normalize_text(item.url)
@@ -5011,13 +5273,14 @@ class ToolExecutor:
                 source_url=candidate, resolved=resolved, query=query, meta=meta,
                 extra_payload={"results": [{"title": r.title, "snippet": r.snippet, "url": r.url} for r in bili_results]},
             )
+
         # ── 回退：DuckDuckGo 并行搜索 ──
         async def _safe_search(q: str) -> list[SearchResult]:
-
             try:
                 return await self.search_engine.search(q)
             except Exception:
                 return []
+
         search_queries = [query]
         q_lower = query.lower()
         if "视频" not in query and "video" not in q_lower:
@@ -5040,6 +5303,7 @@ class ToolExecutor:
                     results.append(item)
         results = self._filter_safe_video_results(query, results)
         results = self._filter_and_rank_results(query, results, query_type="video")
+
         _dl_attempts = 0
         for item in results:
             candidate = self._unwrap_redirect_url(normalize_text(item.url))
@@ -5089,6 +5353,7 @@ class ToolExecutor:
                 source_url=candidate, resolved=resolved, query=query, meta=meta,
                 extra_payload={"results": [{"title": r.title, "snippet": r.snippet, "url": r.url} for r in results]},
             )
+
         # 二次浏览器搜索：主动构造详情页定向查询，提升无直链请求成功率。
         targeted_results = await self._search_video_with_targeted_queries(query)
         targeted_results = self._filter_safe_video_results(query, targeted_results)
@@ -5136,6 +5401,7 @@ class ToolExecutor:
                     source_url=candidate, resolved=resolved, query=query, meta=meta,
                     extra_payload={"results": [{"title": r.title, "snippet": r.snippet, "url": r.url} for r in targeted_results]},
                 )
+
         if douyin_cookie_required:
             return ToolResult(
                 ok=False,
@@ -5145,6 +5411,7 @@ class ToolExecutor:
                 },
                 error="douyin_cookie_required",
             )
+
         video_url = ""
         for item in results:
             candidate = normalize_text(item.url)
@@ -5154,6 +5421,7 @@ class ToolExecutor:
             if self._is_direct_video_url(candidate):
                 video_url = candidate
                 break
+
         if video_url:
             evidence = [{"title": "视频来源", "point": "已找到可发视频链接。", "source": video_url}]
             return ToolResult(
@@ -5169,6 +5437,7 @@ class ToolExecutor:
                 },
                 evidence=evidence,
             )
+
         duration_filtered_text = self._build_video_duration_filtered_text(
             query=query,
             candidates=duration_filtered_candidates,
@@ -5180,6 +5449,7 @@ class ToolExecutor:
                 payload={"text": duration_filtered_text},
                 error="video_result_duration_filtered",
             )
+
         if platform_page_hint:
             hint_text = (
                 "我拿到的是平台搜索/频道页，不是具体视频详情链接，暂时没法直接转发。\n"
@@ -5197,6 +5467,7 @@ class ToolExecutor:
                     "results": [{"title": r.title, "snippet": r.snippet, "url": r.url} for r in results],
                 },
             )
+
         text = self._format_search_text(query, results, query_type="video")
         if duration_filtered_text:
             text = f"{duration_filtered_text}\n{text}" if text else duration_filtered_text
@@ -5215,6 +5486,7 @@ class ToolExecutor:
                 },
                 evidence=evidence,
             )
+
         return ToolResult(
             ok=False,
             tool_name="search_video",
@@ -5228,20 +5500,22 @@ class ToolExecutor:
             },
             error="video_result_unavailable",
         )
-    async def _search_video_with_targeted_queries(self, query: str) -> list[SearchResult]:
 
+    async def _search_video_with_targeted_queries(self, query: str) -> list[SearchResult]:
         target_queries = self._build_targeted_video_queries(query)
         if not target_queries:
             return []
+
         # 并行执行所有定向搜索，大幅减少等待时间
         async def _safe_search(q: str) -> list[SearchResult]:
-
             try:
                 rows = await self.search_engine.search(q)
                 return self._filter_and_rank_results(q, rows, query_type="video")
             except Exception:
                 return []
+
         all_results = await asyncio.gather(*[_safe_search(q) for q in target_queries])
+
         merged: list[SearchResult] = []
         seen_urls: set[str] = set()
         for rows in all_results:
@@ -5253,6 +5527,7 @@ class ToolExecutor:
                 merged.append(row)
                 if len(merged) >= 12:
                     return merged
+
         # DuckDuckGo site: 查询经常失败，用 Bing 视频搜索补充
         if len(merged) < 3:
             try:
@@ -5267,9 +5542,9 @@ class ToolExecutor:
                         return merged
             except Exception:
                 pass
+
         return merged
-    @staticmethod
-    @staticmethod
+
     @staticmethod
     def _build_targeted_video_queries(query: str) -> list[str]:
         content = normalize_text(query)
@@ -5277,14 +5552,18 @@ class ToolExecutor:
             return []
         lower = content.lower()
         out: list[str] = []
-        if "bilibili.com/" in lower or re.search(r"\b(?:platform|source)=bilibili\b", lower):
+
+        # 优先按用户提及平台
+        if ("b站" in content) or ("bilibili" in lower) or ("哔哩哔哩" in content):
             out.append(f"{content} site:bilibili.com/video")
-        if "douyin.com/" in lower or re.search(r"\b(?:platform|source)=douyin\b", lower):
+        if ("抖音" in content) or ("douyin" in lower):
             out.append(f"{content} site:douyin.com/video")
-        if "kuaishou.com/" in lower or re.search(r"\b(?:platform|source)=kuaishou\b", lower):
+        if ("快手" in content) or ("kuaishou" in lower):
             out.append(f"{content} site:kuaishou.com/short-video")
-        if "acfun.cn/" in lower or re.search(r"\b(?:platform|source)=acfun\b", lower):
+        if ("acfun" in lower) or ("a站" in content) or ("ac娘" in content):
             out.append(f"{content} site:acfun.cn/v/ac")
+
+        # 未指定平台时给一组通用详情页搜索
         if not out:
             out.extend(
                 [
@@ -5294,6 +5573,8 @@ class ToolExecutor:
                     f"{content} site:acfun.cn/v/ac",
                 ]
             )
+
+        # 去重保序
         uniq: list[str] = []
         seen: set[str] = set()
         for q in out:
@@ -5303,16 +5584,18 @@ class ToolExecutor:
             seen.add(key)
             uniq.append(key)
         return uniq
-    async def _generate_image(self, tool_args: dict[str, Any], message_text: str) -> ToolResult:
 
+    async def _generate_image(self, tool_args: dict[str, Any], message_text: str) -> ToolResult:
         prompt = normalize_text(str(tool_args.get("prompt", ""))) or normalize_text(message_text)
         size = normalize_text(str(tool_args.get("size", "")))
         if not prompt:
             return ToolResult(ok=False, tool_name="generate_image", error="empty_prompt")
+
         try:
             result = await self.image_engine.generate(prompt=prompt, size=size or None)
         except Exception as exc:
             return ToolResult(ok=False, tool_name="generate_image", error=f"image_failed:{exc}")
+
         if not result.ok:
             return ToolResult(
                 ok=False,
@@ -5320,6 +5603,7 @@ class ToolExecutor:
                 payload={"text": normalize_text(result.message)},
                 error="image_not_ready",
             )
+
         return ToolResult(
             ok=True,
             tool_name="generate_image",
@@ -5328,159 +5612,56 @@ class ToolExecutor:
                 "image_url": normalize_text(result.url),
             },
         )
+
     # ── 音乐搜索 & 播放 ──────────────────────────────────────────────
-    @staticmethod
-    def _music_artist_matches(song_artist: str, expected_artist: str) -> bool:
 
-        compact_expected = MusicEngine._compact_text(expected_artist)
-        if not compact_expected:
-            return True
-        compact_song_artist = MusicEngine._compact_text(song_artist)
-        if not compact_song_artist:
-            return False
-        return compact_expected in compact_song_artist or compact_song_artist in compact_expected
     async def _music_search(self, tool_args: dict[str, Any], message_text: str) -> ToolResult:
-
-        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
-        title = normalize_matching_text(str(tool_args.get("title", "")))
-        artist = normalize_matching_text(str(tool_args.get("artist", "")))
-        try:
-            limit = max(1, min(12, int(tool_args.get("limit", 5) or 5)))
-        except Exception:
-            limit = 5
+        keyword = normalize_text(str(tool_args.get("keyword", "")))
+        title = normalize_text(str(tool_args.get("title", "")))
+        artist = normalize_text(str(tool_args.get("artist", "")))
         if not keyword and title:
             keyword = f"{title} {artist}".strip()
         if not keyword:
-            keyword = normalize_matching_text(message_text)
+            keyword = normalize_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
-        query = build_music_keyword(keyword, title, artist)
-        results = await self._music_engine.search(keyword, limit=limit, title=title, artist=artist)
+        # 去掉常见前缀
+        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
+            if keyword.startswith(prefix):
+                keyword = keyword[len(prefix):].strip()
+        if not keyword:
+            return ToolResult(ok=False, tool_name="music_search", error="empty_keyword")
+
+        results = await self._music_engine.search(keyword, limit=5)
         if not results:
             return ToolResult(
                 ok=False, tool_name="music_search",
-                payload={"text": f"没找到「{query or keyword}」相关的歌曲。"},
+                payload={"text": f"没找到「{keyword}」相关的歌曲。"},
                 error="no_results",
             )
-        if title:
-            visible_results = [
-                song for song in results
-                if not MusicEngine._should_avoid_version(song.name, title or keyword)
-            ]
-            exact_title_results = [
-                song for song in visible_results
-                if MusicEngine._title_match_level(title, song.name) >= 2
-            ]
-            if not exact_title_results:
-                suggestions = MusicEngine._format_song_choices(visible_results, requested_text=title or keyword)
-                text = f"没找到和《{title}》明确匹配的歌曲。"
-                if suggestions:
-                    text += f"\n这些只是近似结果参考，不能直接当成同一首播：\n{suggestions}"
-                return ToolResult(
-                    ok=False,
-                    tool_name="music_search",
-                    payload={"text": text, "results": []},
-                    error="no_exact_match",
-                )
-            if artist:
-                exact_artist_results = [
-                    song for song in exact_title_results
-                    if self._music_artist_matches(song.artist, artist)
-                ]
-                if not exact_artist_results:
-                    suggestions = MusicEngine._format_song_choices(exact_title_results, requested_text=title)
-                    text = f"找到了《{title}》，但没有歌手为「{artist}」的精确结果。"
-                    if suggestions:
-                        text += f"\n可参考这些同名歌曲，但不能直接替你播：\n{suggestions}"
-                    return ToolResult(
-                        ok=False,
-                        tool_name="music_search",
-                        payload={"text": text, "results": []},
-                        error="artist_mismatch",
-                    )
-                results = exact_artist_results
-            else:
-                results = exact_title_results
-        lines = [f"🎵 搜索「{query or keyword}」找到 {len(results)} 首歌："]
+        lines = [f"🎵 搜索「{keyword}」找到 {len(results)} 首歌："]
         for i, s in enumerate(results, 1):
             dur = f" ({s.duration_ms // 1000 // 60}:{s.duration_ms // 1000 % 60:02d})" if s.duration_ms else ""
             lines.append(f"{i}. {s.name} - {s.artist}{dur}")
-        lines.append("\n仅这些精确结果才适合继续播放。")
+        lines.append("\n发送「点歌 歌名」可以直接播放。")
         return ToolResult(
             ok=True, tool_name="music_search",
             payload={"text": "\n".join(lines), "results": [
-                (
-                    {
-                        "id": s.song_id,
-                        "name": s.name,
-                        "artist": s.artist,
-                        **(
-                            {"source": getattr(s, "source", "")}
-                            if normalize_text(str(getattr(s, "source", ""))).lower() not in ("", "netease")
-                            else {}
-                        ),
-                        **(
-                            {"source_url": getattr(s, "source_url", "")}
-                            if normalize_text(str(getattr(s, "source_url", "")))
-                            else {}
-                        ),
-                    }
-                )
-                for s in results
+                {"id": s.song_id, "name": s.name, "artist": s.artist} for s in results
             ]},
         )
-    async def _music_play_by_id(
 
+    async def _music_play_by_id(
         self, tool_args: dict[str, Any],
         api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
     ) -> ToolResult:
         song_id = int(tool_args.get("song_id", 0) or 0)
         if song_id <= 0:
             return ToolResult(ok=False, tool_name="music_play_by_id", error="invalid_song_id")
+
         # 从 tool_args 获取歌曲信息
-        song_name = normalize_matching_text(str(tool_args.get("song_name", "")))
-        artist = normalize_matching_text(str(tool_args.get("artist", "")))
-        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
-        source = normalize_matching_text(str(tool_args.get("source", ""))) or "netease"
-        source_url = normalize_text(str(tool_args.get("source_url", "")))
-        duration_ms = 0
-        require_verified_original = MusicEngine._requires_verified_original(keyword)
-
-        # Agent 可能只传 song_id / song_name / artist，未把 music_search 命中的
-        # source/source_url 一起带回来。这里主动回查一次，避免把 SoundCloud
-        # 结果误当成网易云 ID，进而错误掉到 B 站兜底。
-        lookup_query = build_music_keyword(keyword, song_name, artist) or keyword or f"{song_name} {artist}".strip()
-        source_lower = normalize_text(source).lower()
-        needs_source_recovery = bool(lookup_query and (not source_url or source_lower in ("", "netease")))
-        if needs_source_recovery:
-            try:
-                search_rows = await self._music_engine.search(
-                    lookup_query,
-                    limit=8,
-                    title=song_name,
-                    artist=artist,
-                )
-            except Exception:
-                search_rows = []
-
-            matched_song = next((row for row in search_rows if int(getattr(row, "song_id", 0) or 0) == song_id), None)
-            if matched_song is None:
-                for row in search_rows:
-                    if song_name and MusicEngine._title_match_level(song_name, row.name) < 2:
-                        continue
-                    if artist and not self._music_artist_matches(row.artist, artist):
-                        continue
-                    matched_song = row
-                    break
-            if matched_song is not None:
-                song_name = normalize_matching_text(str(getattr(matched_song, "name", ""))) or song_name
-                artist = normalize_matching_text(str(getattr(matched_song, "artist", ""))) or artist
-                source = normalize_matching_text(str(getattr(matched_song, "source", ""))) or source
-                source_url = normalize_text(str(getattr(matched_song, "source_url", ""))) or source_url
-                try:
-                    duration_ms = int(getattr(matched_song, "duration_ms", 0) or 0)
-                except Exception:
-                    duration_ms = 0
+        song_name = normalize_text(str(tool_args.get("song_name", "")))
+        artist = normalize_text(str(tool_args.get("artist", "")))
 
         # 直接根据 ID 播放
         from core.music import MusicSearchResult
@@ -5489,22 +5670,20 @@ class ToolExecutor:
             name=song_name,
             artist=artist,
             album="",
-            duration_ms=duration_ms,
-            source=source,
-            source_url=source_url,
+            duration_ms=0,
+            source="netease",
         )
-        result = await self._music_engine._play_song(
-            song,
-            as_voice=True,
-            require_verified_original=require_verified_original,
-        )
+        result = await self._music_engine._play_song(song, as_voice=True)
+
         if not result.ok:
             return ToolResult(
                 ok=False, tool_name="music_play_by_id",
                 payload={"text": result.message or "播放失败。"},
                 error=result.error,
             )
+
         payload: dict[str, Any] = {"text": result.message}
+
         # 优先给完整音频文件
         if result.audio_path and api_call:
             payload["audio_file"] = result.audio_path
@@ -5514,142 +5693,38 @@ class ToolExecutor:
             payload["audio_file"] = result.silk_path
         elif result.silk_b64 and api_call:
             payload["record_b64"] = result.silk_b64
+
         return ToolResult(ok=True, tool_name="music_play_by_id", payload=payload)
-    @staticmethod
-    def _pick_music_search_candidate(
 
-        results: list[dict[str, Any]],
-        *,
-        keyword: str = "",
-        title: str = "",
-        artist: str = "",
-    ) -> dict[str, Any] | None:
-        if not results:
-            return None
-        compact_title = MusicEngine._compact_text(title)
-        compact_artist = MusicEngine._compact_text(artist)
-        compact_keyword = MusicEngine._compact_text(keyword)
-        artist_only_query = bool(compact_artist and not compact_title and compact_keyword == compact_artist)
-        def _title_hit(row: dict[str, Any]) -> bool:
-
-            if not compact_title:
-                return True
-            row_name_raw = str(row.get("name", ""))
-            row_name = MusicEngine._compact_text(row_name_raw)
-            if not row_name:
-                return False
-            if MusicEngine._should_avoid_version(row_name_raw, title or keyword):
-                return False
-            return MusicEngine._title_match_level(title, row_name_raw) >= 2
-        def _artist_hit(row: dict[str, Any]) -> bool:
-
-            if not compact_artist:
-                return True
-            row_artist = MusicEngine._compact_text(str(row.get("artist", "")))
-            if not row_artist:
-                return False
-            return compact_artist in row_artist or row_artist in compact_artist
-        if compact_title:
-            for row in results:
-                if _title_hit(row) and _artist_hit(row):
-                    return row
-            if compact_artist:
-                return None
-            for row in results:
-                if _title_hit(row):
-                    return row
-            return None
-        if artist_only_query:
-            return None
-        for row in results:
-            if _title_hit(row) and _artist_hit(row):
-                return row
-        for row in results:
-            if _title_hit(row):
-                return row
-        for row in results:
-            if _artist_hit(row):
-                return row
-        if compact_keyword:
-            for row in results:
-                row_full = MusicEngine._compact_text(f"{row.get('name', '')} {row.get('artist', '')}")
-                if row_full and compact_keyword in row_full:
-                    return row
-        return results[0]
     async def _music_play(
-
         self, tool_args: dict[str, Any], message_text: str,
         api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
     ) -> ToolResult:
-        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
-        title = normalize_matching_text(str(tool_args.get("title", "")))
-        artist = normalize_matching_text(str(tool_args.get("artist", "")))
+        keyword = normalize_text(str(tool_args.get("keyword", "")))
+        title = normalize_text(str(tool_args.get("title", "")))
+        artist = normalize_text(str(tool_args.get("artist", "")))
         if not keyword and title:
             keyword = f"{title} {artist}".strip()
         if not keyword:
-            keyword = normalize_matching_text(message_text)
+            keyword = normalize_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
-        query = build_music_keyword(keyword, title, artist) or keyword
-        result = await self._music_engine.play(keyword, as_voice=True, title=title, artist=artist)
-        retry_blocked_errors = {"no_exact_match", "ambiguous_keyword", "artist_mismatch"}
-        if not result.ok and query and result.error not in retry_blocked_errors:
-            search_result = await self._music_search(
-                {"keyword": query, "title": title, "artist": artist, "limit": 8},
-                query,
-            )
-            search_payload = search_result.payload if isinstance(getattr(search_result, "payload", None), dict) else {}
-            candidate = self._pick_music_search_candidate(
-                search_payload.get("results", []),
-                keyword=query,
-                title=title,
-                artist=artist,
-            )
-            if candidate:
-                _tool_log.info(
-                    "music_play_retry_by_id | song=%s | artist=%s | id=%s",
-                    candidate.get("name", ""),
-                    candidate.get("artist", ""),
-                    candidate.get("id", 0),
-                )
-                play_by_id_result = await self._music_play_by_id(
-                    {
-                        "song_id": candidate.get("id", 0),
-                        "song_name": candidate.get("name", ""),
-                        "artist": candidate.get("artist", ""),
-                        "source": candidate.get("source", ""),
-                        "source_url": candidate.get("source_url", ""),
-                        "keyword": keyword,
-                    },
-                    api_call,
-                    group_id,
-                )
-                if play_by_id_result.ok:
-                    return play_by_id_result
-                retry_payload = play_by_id_result.payload if isinstance(play_by_id_result.payload, dict) else {}
-                retry_text = normalize_text(str(retry_payload.get("text", "")))
-                if retry_text and not result.message:
-                    result.message = retry_text
-                if play_by_id_result.error:
-                    result.error = play_by_id_result.error
-        if not result.ok and query and result.error not in retry_blocked_errors:
-            _tool_log.info("music_play_fallback_bilibili | query=%s | error=%s", query, result.error or "?")
-            bili_result = await self._bilibili_audio_extract({"keyword": query}, query, api_call, group_id)
-            if bili_result.ok:
-                return bili_result
-            bili_payload = bili_result.payload if isinstance(getattr(bili_result, "payload", None), dict) else {}
-            bili_text = normalize_text(str(bili_payload.get("text", "")))
-            if bili_text and not result.message:
-                result.message = bili_text
-            if bili_result.error:
-                result.error = bili_result.error
+        for prefix in ("点歌", "听歌", "放歌", "搜歌", "播放", "来首", "来一首", "唱"):
+            if keyword.startswith(prefix):
+                keyword = keyword[len(prefix):].strip()
+        if not keyword:
+            return ToolResult(ok=False, tool_name="music_play", error="empty_keyword")
+
+        result = await self._music_engine.play(keyword, as_voice=True)
         if not result.ok:
             return ToolResult(
                 ok=False, tool_name="music_play",
                 payload={"text": result.message or "播放失败。"},
                 error=result.error,
             )
+
         payload: dict[str, Any] = {"text": result.message}
+
         # 优先给完整音频文件，发送层可按策略决定“整段发 / 分段发 / 回退 silk”。
         if result.audio_path and api_call:
             payload["audio_file"] = result.audio_path
@@ -5660,9 +5735,10 @@ class ToolExecutor:
         elif result.silk_b64 and api_call:
             # 仅在无本地文件时才用 base64
             payload["record_b64"] = result.silk_b64
-        return ToolResult(ok=True, tool_name="music_play", payload=payload)
-    async def _bilibili_audio_extract(
 
+        return ToolResult(ok=True, tool_name="music_play", payload=payload)
+
+    async def _bilibili_audio_extract(
         self, tool_args: dict[str, Any], message_text: str,
         api_call: Callable[..., Awaitable[Any]] | None, group_id: int,
     ) -> ToolResult:
@@ -5670,57 +5746,122 @@ class ToolExecutor:
         keyword = normalize_text(str(tool_args.get("keyword", ""))) or normalize_text(message_text)
         if not keyword:
             return ToolResult(ok=False, tool_name="bilibili_audio_extract", error="empty_keyword")
+
         # 在 B 站搜索视频
+        search_query = f"site:bilibili.com {keyword}"
         try:
             from core.search import SearchEngine
             search_cfg = self._raw_config.get("search", {})
             search_engine = SearchEngine(search_cfg)
-            results = await search_engine.search_bilibili_videos(keyword, limit=5)
+            results = await search_engine.search(search_query)
+
             if not results:
                 return ToolResult(
                     ok=False, tool_name="bilibili_audio_extract",
                     payload={"text": f"在 B 站未找到「{keyword}」相关视频。"},
                     error="no_bilibili_results",
                 )
-            audio_path = None
-            picked_title = ""
-            last_error = "download_failed"
-            candidate_results = results[:3]
-            for idx, row in enumerate(candidate_results, start=1):
-                first_url = normalize_text(getattr(row, "url", ""))
-                picked_title = normalize_text(getattr(row, "title", "")) or f"B站结果{idx}"
-                if not first_url:
-                    continue
-                _tool_log.info("bilibili_audio_extract | keyword=%s | idx=%d | url=%s", keyword, idx, first_url)
-                # 优先走 bilix 的 B站专用下载，失败再回退到 yt-dlp。
-                audio_path = await self._download_bilibili_audio_via_bilix(first_url)
-                if audio_path:
-                    break
+
+            # 尝试第一个结果
+            first_url = results[0].url
+            _tool_log.info("bilibili_audio_extract | keyword=%s | url=%s", keyword, first_url)
+
+            # 直接下载音频流（不需要 ffmpeg）
+            try:
+                from yt_dlp import YoutubeDL
+
+                digest = hashlib.sha1(first_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                audio_path = self._video_cache_dir / f"{digest}_audio.mp3"
+
+                ydl_opts = {
+                    "quiet": True,
+                    "no_warnings": True,
+                    "format": "bestaudio/best",
+                    "outtmpl": str(audio_path.with_suffix("")),
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }] if self._ffmpeg_available else [],
+                    "socket_timeout": self._video_download_timeout_seconds,
+                    "retries": 2,
+                    "logger": _SilentYTDLPLogger(),
+                }
+
+                if self._video_cookies_file:
+                    ydl_opts["cookiefile"] = self._video_cookies_file
+                if self._video_cookies_from_browser:
+                    ydl_opts["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
+                if self._ffmpeg_location:
+                    ydl_opts["ffmpeg_location"] = self._ffmpeg_location
+                _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, first_url)
                 try:
-                    audio_path = await asyncio.to_thread(self._download_bilibili_audio_via_ytdlp, first_url)
-                    if audio_path:
-                        break
-                except Exception as exc:
-                    last_error = normalize_text(str(exc)) or "download_error"
-                    _tool_log.warning("bilibili_audio_download_error | url=%s | %s", first_url, exc)
-                    continue
-            if not audio_path:
+                    while True:
+                        try:
+                            with YoutubeDL(ydl_opts) as ydl:
+                                ydl.download([first_url])
+                            break
+                        except Exception as exc:
+                            err_text = normalize_text(str(exc))
+                            lowered = err_text.lower()
+                            # 浏览器 cookie 数据库读取失败时，自动切到非 browser-cookie 重试一次。
+                            if (
+                                self._disable_cookie_browser_on_error(err_text)
+                                or "cookies database" in lowered
+                                or "cookiesfrombrowser" in lowered
+                            ) and "cookiesfrombrowser" in ydl_opts:
+                                _tool_log.warning(
+                                    "bilibili_audio_retry_without_cookie_browser | url=%s | reason=%s",
+                                    first_url,
+                                    clip_text(err_text, 140),
+                                )
+                                ydl_opts.pop("cookiesfrombrowser", None)
+                                continue
+                            raise
+                finally:
+                    if _tmp_cookie_file:
+                        try:
+                            os.unlink(_tmp_cookie_file)
+                        except OSError:
+                            pass
+
+                # 查找生成的音频文件
+                if not audio_path.exists():
+                    # 可能是 .mp3.mp3 或其他后缀
+                    for candidate in self._video_cache_dir.glob(f"{digest}_audio*"):
+                        if candidate.suffix in [".mp3", ".m4a", ".opus", ".webm"]:
+                            audio_path = candidate
+                            break
+
+                if not audio_path.exists():
+                    return ToolResult(
+                        ok=False, tool_name="bilibili_audio_extract",
+                        payload={"text": f"B 站音频下载失败。"},
+                        error="download_failed",
+                    )
+
+            except Exception as exc:
+                _tool_log.warning("bilibili_audio_download_error | url=%s | %s", first_url, exc)
                 return ToolResult(
                     ok=False, tool_name="bilibili_audio_extract",
-                    payload={"text": f"B 站音频下载失败：{last_error}"},
+                    payload={"text": f"B 站音频下载失败：{exc}"},
                     error="download_error",
                 )
+
             # 转换为 SILK
             silk_path = None
             if self._music_engine and self._music_engine._pilk_available:
                 silk_path = await self._music_engine._convert_to_silk(audio_path)
-            payload: dict[str, Any] = {"text": f"已从 B 站提取音频：{picked_title}"}
+
+            payload: dict[str, Any] = {"text": f"已从 B 站提取音频：{results[0].title}"}
             if silk_path and silk_path.exists():
                 payload["audio_file_silk"] = str(silk_path)
                 payload["audio_file"] = str(audio_path)
             elif audio_path.exists():
                 payload["audio_file"] = str(audio_path)
+
             return ToolResult(ok=True, tool_name="bilibili_audio_extract", payload=payload)
+
         except Exception as exc:
             _tool_log.warning("bilibili_audio_extract_error | keyword=%s | %s", keyword, exc)
             return ToolResult(
@@ -5728,129 +5869,15 @@ class ToolExecutor:
                 payload={"text": f"B 站音频提取失败: {exc}"},
                 error="extract_error",
             )
-    async def _download_bilibili_audio_via_bilix(self, source_url: str) -> Path | None:
 
-        """优先使用 bilix 下载 B站音频，规避 yt-dlp 常见 412。"""
-        try:
-            from bilix.sites.bilibili import DownloaderBilibili
-        except Exception:
-            return None
-        digest = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
-        output_dir = self._video_cache_dir / f"bilix_audio_{digest}"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            async with DownloaderBilibili(
-                sess_data=self._bilibili_sessdata or None,
-                video_concurrency=1,
-                part_concurrency=4,
-            ) as downloader:
-                await asyncio.wait_for(
-                    downloader.get_video(
-                        source_url,
-                        path=output_dir,
-                        quality=0,
-                        image=False,
-                        subtitle=False,
-                        dm=False,
-                        only_audio=True,
-                    ),
-                    timeout=max(20.0, min(float(self._video_download_timeout_seconds), 60.0)),
-                )
-            candidates = sorted(
-                [p for p in output_dir.rglob("*") if p.is_file() and p.suffix.lower() in {".aac", ".m4a", ".mp3", ".opus", ".ogg", ".flac", ".wav"}],
-                key=lambda p: p.stat().st_size if p.exists() else 0,
-                reverse=True,
-            )
-            if not candidates:
-                return None
-            src = candidates[0]
-            final_path = self._video_cache_dir / f"{digest}_audio{src.suffix.lower()}"
-            final_path.parent.mkdir(parents=True, exist_ok=True)
-            if final_path.exists():
-                final_path.unlink()
-            shutil.move(str(src), str(final_path))
-            _tool_log.info("bilibili_audio_bilix_ok | url=%s | path=%s", source_url, final_path.name)
-            return final_path
-        except Exception as exc:
-            _tool_log.warning("bilibili_audio_bilix_fail | url=%s | %s", source_url, exc)
-            return None
-        finally:
-            shutil.rmtree(output_dir, ignore_errors=True)
-    def _download_bilibili_audio_via_ytdlp(self, source_url: str) -> Path | None:
-
-        """yt-dlp 兜底下载 B站音频。"""
-        from yt_dlp import YoutubeDL
-        digest = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
-        audio_path = self._video_cache_dir / f"{digest}_audio.mp3"
-        ydl_opts = {
-            "quiet": True,
-            "no_warnings": True,
-            "format": "bestaudio/best",
-            "outtmpl": str(audio_path.with_suffix("")),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }] if self._ffmpeg_available else [],
-            "socket_timeout": self._video_download_timeout_seconds,
-            "retries": 2,
-            "logger": _SilentYTDLPLogger(),
-            "extractor_args": {"BiliBili": {"try_look": ["1"]}},
-            "http_headers": {
-                **self._http_headers,
-                "Referer": "https://www.bilibili.com/",
-                "Origin": "https://www.bilibili.com",
-            },
-        }
-        if self._video_cookies_file:
-            ydl_opts["cookiefile"] = self._video_cookies_file
-        if self._video_cookies_from_browser:
-            ydl_opts["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
-        if self._ffmpeg_location:
-            ydl_opts["ffmpeg_location"] = self._ffmpeg_location
-        _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, source_url)
-        try:
-            while True:
-                try:
-                    with YoutubeDL(ydl_opts) as ydl:
-                        ydl.download([source_url])
-                    break
-                except Exception as exc:
-                    err_text = normalize_text(str(exc))
-                    lowered = err_text.lower()
-                    if (
-                        self._disable_cookie_browser_on_error(err_text)
-                        or "cookies database" in lowered
-                        or "cookiesfrombrowser" in lowered
-                    ) and "cookiesfrombrowser" in ydl_opts:
-                        _tool_log.warning(
-                            "bilibili_audio_retry_without_cookie_browser | url=%s | reason=%s",
-                            source_url,
-                            clip_text(err_text, 140),
-                        )
-                        ydl_opts.pop("cookiesfrombrowser", None)
-                        continue
-                    raise
-        finally:
-            if _tmp_cookie_file:
-                try:
-                    os.unlink(_tmp_cookie_file)
-                except OSError:
-                    pass
-        if not audio_path.exists():
-            for candidate in self._video_cache_dir.glob(f"{digest}_audio*"):
-                if candidate.suffix.lower() in {".mp3", ".m4a", ".opus", ".webm", ".aac"}:
-                    audio_path = candidate
-                    break
-        return audio_path if audio_path.exists() else None
     async def _group_member_count(
-
         self,
         group_id: int,
         api_call: Callable[..., Awaitable[Any]] | None,
     ) -> ToolResult:
         if group_id <= 0 or api_call is None:
             return ToolResult(ok=False, tool_name="get_group_member_count", error="group_api_unavailable")
+
         try:
             info = await api_call("get_group_info", group_id=group_id, no_cache=True)
             if isinstance(info, dict):
@@ -5870,6 +5897,7 @@ class ToolExecutor:
                     )
         except Exception:
             pass
+
         try:
             members = await api_call("get_group_member_list", group_id=group_id)
             if isinstance(members, list):
@@ -5880,24 +5908,27 @@ class ToolExecutor:
                 )
         except Exception as exc:
             return ToolResult(ok=False, tool_name="get_group_member_count", error=f"group_count_failed:{exc}")
+
         return ToolResult(
             ok=False,
             tool_name="get_group_member_count",
             payload={},
             error="group_count_unavailable",
         )
-    async def _group_member_names(
 
+    async def _group_member_names(
         self,
         group_id: int,
         api_call: Callable[..., Awaitable[Any]] | None,
     ) -> ToolResult:
         if group_id <= 0 or api_call is None:
             return ToolResult(ok=False, tool_name="get_group_member_names", error="group_api_unavailable")
+
         try:
             members = await api_call("get_group_member_list", group_id=group_id)
         except Exception as exc:
             return ToolResult(ok=False, tool_name="get_group_member_names", error=f"group_names_failed:{exc}")
+
         if not isinstance(members, list) or not members:
             return ToolResult(
                 ok=False,
@@ -5905,6 +5936,7 @@ class ToolExecutor:
                 payload={"text": "这个群现在拿不到成员名单。"},
                 error="group_names_empty",
             )
+
         names: list[str] = []
         seen: set[str] = set()
         for item in members:
@@ -5915,6 +5947,7 @@ class ToolExecutor:
                 continue
             seen.add(display)
             names.append(display)
+
         if not names:
             return ToolResult(
                 ok=False,
@@ -5922,6 +5955,7 @@ class ToolExecutor:
                 payload={"text": "我拿到了成员列表，但昵称信息是空的。"},
                 error="group_names_no_display",
             )
+
         max_show = 20
         shown = names[:max_show]
         if len(names) > max_show:
@@ -5931,9 +5965,10 @@ class ToolExecutor:
             )
         else:
             text = f"这个群成员昵称大致有：{'、'.join(shown)}。"
-        return ToolResult(ok=True, tool_name="get_group_member_names", payload={"text": text})
-    async def _plugin_call(
 
+        return ToolResult(ok=True, tool_name="get_group_member_names", payload={"text": text})
+
+    async def _plugin_call(
         self,
         tool_name: str,
         tool_args: dict[str, Any],
@@ -5943,20 +5978,24 @@ class ToolExecutor:
         name = normalize_text(tool_name)
         if not name:
             return ToolResult(ok=False, tool_name="plugin_call", error="plugin_name_required")
+
         plugin_message = normalize_text(str(tool_args.get("message", ""))) or message_text
         extra_context = tool_args.get("context", {})
         if isinstance(extra_context, dict):
             context = {**context, **extra_context}
+
         try:
             output = await self.plugin_runner(name, plugin_message, context)
         except Exception as exc:
             return ToolResult(ok=False, tool_name="plugin_call", error=f"plugin_failed:{exc}")
+
         reply = normalize_text(output)
         if not reply:
             return ToolResult(ok=False, tool_name="plugin_call", error="plugin_empty_reply")
-        return ToolResult(ok=True, tool_name="plugin_call", payload={"text": reply})
-    async def _send_onebot_segment(
 
+        return ToolResult(ok=True, tool_name="plugin_call", payload={"text": reply})
+
+    async def _send_onebot_segment(
         self,
         tool_args: dict[str, Any],
         group_id: int,
@@ -5964,21 +6003,25 @@ class ToolExecutor:
         api_call: Callable[..., Awaitable[Any]] | None,
     ) -> ToolResult:
         """发送 OneBot 消息段。
+
         tool_args 格式:
-        segment_type: 消息段类型
-        data: dict — 消息段 data 字段
-        text: str — 可选，附带的文本消息（与消息段一起发送）
+          segment_type: 消息段类型
+          data: dict — 消息段 data 字段
+          text: str — 可选，附带的文本消息（与消息段一起发送）
+
         支持的 segment_type:
-        poke, dice, rps, face, mface,
-        image, record, video, file,
-        music, json, forward, at, reply
+          poke, dice, rps, face, mface,
+          image, record, video, file,
+          music, json, forward, at, reply
         """
         if not api_call:
             return ToolResult(ok=False, tool_name="send_segment", error="api_not_available")
+
         seg_type = normalize_text(str(tool_args.get("segment_type", ""))).lower()
         seg_data = tool_args.get("data", {})
         if not isinstance(seg_data, dict):
             seg_data = {}
+
         allowed_types = {
             "poke", "dice", "rps", "face", "mface",
             "image", "record", "video", "file",
@@ -5989,6 +6032,7 @@ class ToolExecutor:
                 ok=False, tool_name="send_segment",
                 error=f"unsupported_segment_type:{seg_type}, allowed: {','.join(sorted(allowed_types))}",
             )
+
         # 构建消息数组
         msg: list[dict[str, Any]] = []
         # 可选附带文本
@@ -5996,6 +6040,7 @@ class ToolExecutor:
         if extra_text:
             msg.append({"type": "text", "data": {"text": extra_text}})
         msg.append({"type": seg_type, "data": seg_data})
+
         try:
             if group_id:
                 await api_call("send_group_msg", group_id=int(group_id), message=msg)
@@ -6004,9 +6049,9 @@ class ToolExecutor:
             return ToolResult(ok=True, tool_name="send_segment", payload={"text": f"已发送 {seg_type} 消息段"})
         except Exception as exc:
             return ToolResult(ok=False, tool_name="send_segment", error=f"send_failed:{exc}")
+
     @staticmethod
     def _pick_int(payload: dict[str, Any], keys: tuple[str, ...]) -> int:
-
         for key in keys:
             value = payload.get(key)
             try:
@@ -6016,8 +6061,8 @@ class ToolExecutor:
             except (TypeError, ValueError):
                 continue
         return -1
-    def _format_search_text(
 
+    def _format_search_text(
         self,
         query: str,
         results: list[SearchResult],
@@ -6026,6 +6071,7 @@ class ToolExecutor:
     ) -> str:
         if not results:
             return f'我搜索了”{query}”，但没有找到相关的公开结果。你可以试试换个关键词，或者告诉我更具体的方向。'
+
         if self._summary_mode not in {"evidence_first", "evidence", "structured"}:
             lines = [f'我查了“{query}”，先给你 {min(3, len(results))} 条：']
             for idx, item in enumerate(results[:3], start=1):
@@ -6036,9 +6082,11 @@ class ToolExecutor:
                 else:
                     lines.append(f"{idx}. {title}")
             return "\n".join(lines)
+
         evidence_rows = [row for row in (evidence or []) if isinstance(row, dict)]
         if not evidence_rows:
             evidence_rows = self._build_evidence_from_results(results)
+
         lead = ""
         if evidence_rows:
             lead = normalize_text(str(evidence_rows[0].get("point", "")))
@@ -6046,6 +6094,7 @@ class ToolExecutor:
             lead = normalize_text(results[0].snippet) or normalize_text(results[0].title)
         if not lead:
             lead = "查到一些相关结果。"
+
         lines: list[str] = [f"我先给你 {min(3, len(evidence_rows) or len(results))} 个可核验来源："]
         lines.append(f"首条要点：{clip_text(lead, 128)}")
         if query_type == "person":
@@ -6062,8 +6111,8 @@ class ToolExecutor:
         if len(lines) <= 2:
             lines.append(f"1. {clip_text(normalize_text(results[0].title) or '来源1', 32)}")
         return "\n".join(lines)
-    def _filter_and_rank_results(
 
+    def _filter_and_rank_results(
         self,
         query: str,
         results: list[SearchResult],
@@ -6091,14 +6140,14 @@ class ToolExecutor:
             return salvage[:2] if salvage else results[:2]
         scored.sort(key=lambda x: x[0], reverse=True)
         return [item for _, item in scored]
-    def _is_risky_video_result(self, item: SearchResult) -> bool:
 
+    def _is_risky_video_result(self, item: SearchResult) -> bool:
         merged = normalize_text(f"{item.title}\n{item.snippet}\n{item.url}").lower()
         if not merged:
             return False
         return any(keyword in merged for keyword in self._risky_video_result_keywords)
-    def _filter_safe_video_results(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
 
+    def _filter_safe_video_results(self, query: str, results: list[SearchResult]) -> list[SearchResult]:
         if not results:
             return []
         # 如果用户明确是违规成人请求，前面会被拦截；这里主要过滤"中性查询被误回"
@@ -6110,9 +6159,9 @@ class ToolExecutor:
                 continue
             safe.append(item)
         return safe
+
     @staticmethod
     def _build_evidence_from_results(results: list[SearchResult], limit: int = 3) -> list[dict[str, str]]:
-
         evidence: list[dict[str, str]] = []
         for item in results[: max(1, limit)]:
             title = clip_text(normalize_text(item.title) or "来源", 64)
@@ -6120,9 +6169,9 @@ class ToolExecutor:
             source = normalize_text(item.url)
             evidence.append({"title": title, "point": point, "source": source})
         return evidence
+
     @staticmethod
     def _build_page_evidence(page: dict[str, Any]) -> list[dict[str, str]]:
-
         title = clip_text(normalize_text(str(page.get("title", ""))) or "网页来源", 64)
         summary = clip_text(normalize_text(str(page.get("summary", ""))), 160)
         source = normalize_text(str(page.get("final_url", "")))
@@ -6137,9 +6186,9 @@ class ToolExecutor:
                     continue
                 out.append({"title": title, "point": text, "source": source})
         return out[:3]
+
     @staticmethod
     def _build_video_evidence(source_url: str, meta: dict[str, Any]) -> list[dict[str, str]]:
-
         title = normalize_text(str(meta.get("title", ""))) or "视频元数据"
         uploader = normalize_text(str(meta.get("uploader", "")))
         duration = int(meta.get("duration", 0) or 0)
@@ -6157,43 +6206,99 @@ class ToolExecutor:
                 "source": normalize_text(str(meta.get("webpage_url", "")) or source_url),
             }
         ]
+
     @staticmethod
     def _detect_query_type(query: str) -> str:
-
         content = normalize_text(query).lower()
         if not content:
             return "general"
-        if ToolExecutor._has_control_token(query, "/video", "mode=video"):
+        if any(cue in content for cue in ("视频", "b站", "抖音", "快手", "acfun", "video", "clip")):
             return "video"
-        if ToolExecutor._has_control_token(query, "/image", "/img", "mode=image"):
+        if any(cue in content for cue in ("图片", "壁纸", "头像", "image", "photo", "illustration", "封面")):
             return "image"
-        if ToolExecutor._has_control_token(query, "/github", "platform=github", "source=github"):
+        if any(cue in content for cue in ("github", "代码", "api", "接口", "客户端", "技术", "部署", "报错")):
             return "tech"
-        if re.search(r"https?://[^\s]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s]*)?", content, flags=re.IGNORECASE):
-            return "video"
-        if re.search(r"https?://[^\s]+?\.(?:png|jpe?g|gif|webp|bmp)(?:\?[^\s]*)?", content, flags=re.IGNORECASE):
-            return "image"
-        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", content, flags=re.IGNORECASE):
-            return "video"
-        if "github.com/" in content or re.fullmatch(r"[a-z0-9_.-]+/[a-z0-9_.-]+", content):
-            return "tech"
+        if any(cue in content for cue in ("是谁", "来历", "什么人", "资料", "人物", "叫什", "哪里人")):
+            return "person"
+        if any(cue in content for cue in ("专辑", "歌曲", "歌手", "discography", "album")):
+            return "work"
         return "general"
+
     @staticmethod
     def _apply_query_type_hints(query: str, query_type: str) -> str:
+        content = normalize_text(query)
+        if not content:
+            return ""
+        if query_type == "person" and "人物" not in content and "百科" not in content:
+            return f"{content} 人物 资料"
+        if query_type == "work" and "专辑" not in content and "作品" not in content:
+            return f"{content} 专辑 作品"
+        if query_type == "tech" and "文档" not in content and "教程" not in content:
+            return f"{content} 文档 教程"
+        return content
 
-        _ = query_type
-        return normalize_text(query)
     @staticmethod
     def _build_query_variants(query: str, query_type: str) -> list[str]:
-
-        _ = query_type
         base = normalize_text(query)
         if not base:
             return []
-        return [base]
+
+        variants: list[str] = [base]
+        if query_type == "person":
+            variants.extend(
+                [
+                    f"{base} 是谁 来历",
+                    f"{base} 浜虹墿 璧勬枡",
+                    f"{base} site:zhihu.com",
+                    f"{base} site:baike.baidu.com",
+                ]
+            )
+        elif query_type == "work":
+            variants.extend(
+                [
+                    f"{base} 涓撹緫 鍒楄〃",
+                    f"{base} discography",
+                    f"{base} site:music.douban.com",
+                ]
+            )
+        elif query_type == "tech":
+            variants.extend(
+                [
+                    f"{base} 官方 文档",
+                    f"{base} github",
+                    f"{base} 教程",
+                ]
+            )
+        elif query_type == "video":
+            variants.extend(
+                [
+                    f"{base} site:bilibili.com/video",
+                    f"{base} site:douyin.com/video",
+                ]
+            )
+        elif query_type == "image":
+            variants.extend(
+                [
+                    f"{base} 楂樻竻 澹佺焊",
+                    f"{base} image",
+                ]
+            )
+
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for item in variants:
+            value = normalize_text(item)
+            if not value:
+                continue
+            key = value.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(value)
+        return uniq[:6]
+
     @staticmethod
     def _extract_entity_hint(query: str, keywords: list[str]) -> str:
-
         content = normalize_text(query)
         if not content:
             return ""
@@ -6207,53 +6312,58 @@ class ToolExecutor:
             return ""
         zh_tokens.sort(key=len, reverse=True)
         return normalize_text(zh_tokens[0]).lower()
+
     @staticmethod
     def _is_obvious_noise_result(item: SearchResult, query_type: str = "general") -> bool:
-
-        _ = query_type
-        title = normalize_text(item.title)
-        snippet = normalize_text(item.snippet)
-        url = normalize_text(item.url).lower()
-        if not normalize_text(f"{title} {snippet} {url}"):
+        corpus = normalize_text(f"{item.title} {item.snippet} {item.url}").lower()
+        if not corpus:
             return True
-        parsed = urlparse(url if re.match(r"https?://", url) else f"https://{url}")
-        host = normalize_text(parsed.netloc).lower()
-        path = normalize_text(parsed.path).lower()
-        if not host:
+        common_noise = ("广告", "推广", "下载app", "开户链接", "开户链接", "贷款", "开户", "户籍", "户口")
+        if any(cue in corpus for cue in common_noise):
             return True
-        if not title and not snippet and path in {"", "/"}:
-            return True
+        if query_type == "person":
+            person_noise = ("开户", "户籍所在地", "银行", "办卡", "订阅", "网易订阅")
+            if any(cue in corpus for cue in person_noise):
+                return True
         return False
+
     @staticmethod
     def _build_query_keywords(query: str) -> list[str]:
-
-        content = normalize_text(query)
+        content = normalize_text(query).lower()
         if not content:
             return []
-        candidates: list[str] = []
-        for pattern in (
-            r"`([^`]{2,80})`",
-            r"\*\*([^*]{2,80})\*\*",
-            r"[???\"]\s*([^???\"]{2,80})\s*[???\"]",
-        ):
-            for token in re.findall(pattern, content):
-                value = normalize_text(token).lower()
-                if value:
-                    candidates.append(value)
-        lowered = content.lower()
-        candidates.extend(re.findall(r"[\u4e00-\u9fff]{3,12}", lowered))
-        candidates.extend(re.findall(r"[a-z0-9][a-z0-9_\-]{1,24}", lowered))
+        # 中文词块
+        zh_tokens = re.findall(r"[\u4e00-\u9fff]{2,8}", content)
+        # 英文/数字词块
+        en_tokens = re.findall(r"[a-z0-9][a-z0-9_\-]{1,24}", content)
+        stopwords = {
+            "是谁",
+            "什么",
+            "怎么",
+            "哪里",
+            "去网上搜",
+            "上网搜",
+            "搜索",
+            "一下",
+            "给我",
+            "总结",
+            "分段",
+            "详细",
+            "深度",
+            "回答",
+        }
+        merged = [t for t in (zh_tokens + en_tokens) if t and t not in stopwords]
+        # 去重保序
         uniq: list[str] = []
         seen: set[str] = set()
-        for token in candidates:
-            key = normalize_text(token).lower()
-            if not key or key in seen:
+        for token in merged:
+            if token in seen:
                 continue
-            seen.add(key)
-            uniq.append(key)
+            seen.add(token)
+            uniq.append(token)
         return uniq[:8]
-    def _score_result_relevance(
 
+    def _score_result_relevance(
         self,
         item: SearchResult,
         keywords: list[str],
@@ -6267,15 +6377,33 @@ class ToolExecutor:
         if not corpus.strip():
             return 0
         compact_corpus = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", corpus)
+
+        # 明显无关词惩罚
+        noise_cues = (
+            "户口",
+            "开户",
+            "辽宁",
+            "吉林",
+            "贷款",
+            "银行",
+            "订阅",
+            "广告",
+        )
+        noise_penalty = sum(1 for cue in noise_cues if cue in corpus)
+
+        # 日文页面惩罚（除非关键词本身是日语）
         jp_penalty = 0
         if re.search(r"[\u3040-\u30ff]", corpus):
             if not any(re.search(r"[\u3040-\u30ff]", k) for k in keywords):
                 jp_penalty = 2
+
+        # 语言偏好：默认中文优先。
         lang_penalty = 0
         if self._language_preference.startswith("zh"):
             has_zh = bool(re.search(r"[\u4e00-\u9fff]", corpus))
             if not has_zh:
                 lang_penalty = 1
+
         score = 0
         if any(domain in url for domain in ("baike.baidu.com", "zh.wikipedia.org", "zhihu.com", "music.163.com", "douban.com")):
             score += 2
@@ -6285,8 +6413,12 @@ class ToolExecutor:
             domain in url for domain in ("bilibili.com", "douyin.com", "kuaishou.com", "acfun.cn", "pixabay.com")
         ):
             score += 2
+            # 视频详情页额外加分（/video/ /short-video/ /v/ac 等）
             if query_type == "video" and re.search(r"/(?:video|short-video|photo|note)/", url):
                 score += 3
+        if query_type == "person" and any(domain in url for domain in ("baike.baidu.com", "zh.wikipedia.org", "zhihu.com")):
+            score += 2
+
         if not keywords:
             score += 1
         else:
@@ -6294,6 +6426,7 @@ class ToolExecutor:
             for key in keywords:
                 if key in corpus:
                     hit_count += 1
+                    # 标题命中更重要
                     if key in title:
                         score += 3
                     elif key in snippet:
@@ -6305,31 +6438,35 @@ class ToolExecutor:
                 if compact_key and compact_key in compact_corpus:
                     hit_count += 1
                     score += 1
+            # 至少要命中一个关键词，否则视作低相关
             if hit_count == 0:
                 return 0
+
         if entity_hint and entity_hint in corpus:
             score += 3
         elif entity_hint:
             compact_entity = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", entity_hint.lower())
             if compact_entity and compact_entity in compact_corpus:
                 score += 2
+
+        score -= noise_penalty * 2
         score -= jp_penalty
         score -= lang_penalty
         return score
+
     @staticmethod
     def _extract_direct_video_url(text: str) -> str:
-
         match = re.search(r"https?://[^\s]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s]*)?", text, flags=re.IGNORECASE)
         if not match:
             return ""
         return match.group(0).strip()
+
     @staticmethod
     def _is_direct_video_url(url: str) -> bool:
-
         return bool(re.search(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)", url or "", flags=re.IGNORECASE))
+
     @staticmethod
     def _is_douyin_video_or_note_url(url: str) -> bool:
-
         target = normalize_text(url)
         if not target or not re.match(r"^https?://", target, flags=re.IGNORECASE):
             return False
@@ -6355,17 +6492,17 @@ class ToolExecutor:
             return True
         short_path = path.strip("/")
         return bool(short_path and len(short_path) >= 6)
+
     @staticmethod
     def _resolve_video_cache_dir(raw: str) -> Path:
-
         candidate = Path(str(raw or "").strip() or "storage/cache/videos")
         if candidate.is_absolute():
             return candidate
         project_root = Path(__file__).resolve().parents[1]
         return (project_root / candidate).resolve()
+
     @staticmethod
     def _browser_cookie_roots(browser: str) -> list[Path]:
-
         local = Path(os.environ.get("LOCALAPPDATA", ""))
         roaming = Path(os.environ.get("APPDATA", ""))
         name = normalize_text(browser).lower()
@@ -6384,15 +6521,15 @@ class ToolExecutor:
             if str(path):
                 out.append(path)
         return out
+
     @classmethod
     def _has_cookie_store_for_browser(cls, browser: str) -> bool:
-
         name = normalize_text(browser).lower()
         roots = cls._browser_cookie_roots(name)
         if not roots:
             return False
-        def _any_exists(paths: list[Path]) -> bool:
 
+        def _any_exists(paths: list[Path]) -> bool:
             for path in paths:
                 try:
                     if path.exists() and path.is_file():
@@ -6400,6 +6537,7 @@ class ToolExecutor:
                 except Exception:
                     continue
             return False
+
         for root in roots:
             if not root.exists():
                 continue
@@ -6431,16 +6569,16 @@ class ToolExecutor:
                 if _any_exists(candidates):
                     return True
         return False
+
     @classmethod
     def _pick_available_cookie_browser(cls) -> str:
-
         # Windows 常见可用顺序：Edge -> Chrome -> Brave -> Chromium -> Firefox -> Opera
         for browser in ("edge", "chrome", "brave", "chromium", "firefox", "opera"):
             if cls._has_cookie_store_for_browser(browser):
                 return browser
         return ""
-    def _resolve_video_cookies_from_browser(self, raw: str) -> str:
 
+    def _resolve_video_cookies_from_browser(self, raw: str) -> str:
         value = normalize_text(raw).lower()
         if value in {"", "auto", "default"}:
             chosen = self._pick_available_cookie_browser()
@@ -6449,9 +6587,11 @@ class ToolExecutor:
             return chosen
         if value in {"none", "off", "false", "disabled", "disable"}:
             return ""
+
         base = value.split(":", 1)[0]
         if self._has_cookie_store_for_browser(base):
             return value
+
         fallback = self._pick_available_cookie_browser()
         if fallback and fallback != base:
             _tool_log.warning(
@@ -6462,11 +6602,12 @@ class ToolExecutor:
             if ":" in value:
                 return value.replace(base, fallback, 1)
             return fallback
+
         _tool_log.warning("video_cookie_browser_unavailable | requested=%s | disabled=true", value)
         return ""
-    def _disable_cookie_browser_on_error(self, error_message: str) -> bool:
 
-        """????? cookie ??????????????? cookiesfrombrowser?"""
+    def _disable_cookie_browser_on_error(self, error_message: str) -> bool:
+        """检测到 cookie 错误时禁用浏览器自动提取 cookiesfrombrowser"""
         if not self._video_cookies_from_browser:
             return False
         lower = normalize_text(error_message).lower()
@@ -6485,9 +6626,95 @@ class ToolExecutor:
             self._video_cookies_from_browser = ""
             return True
         return False
+
+    def _resolve_local_roots(self, roots_raw: list[Any]) -> list[Path]:
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for item in roots_raw:
+            raw = normalize_text(str(item))
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (self._project_root / p).resolve()
+            else:
+                p = p.resolve()
+            if p == self._project_root.resolve() and not self._tool_interface_local_allow_project_root:
+                _tool_log.warning("local_root_skip_project_root | reason=local_allow_project_root_false")
+                continue
+            key = str(p).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(p)
+        if not roots:
+            roots = [
+                (self._project_root / "storage").resolve(),
+                (self._project_root / "config").resolve(),
+                (self._project_root / "docs").resolve(),
+                (self._project_root / "core").resolve(),
+                (self._project_root / "services").resolve(),
+                (self._project_root / "plugins").resolve(),
+            ]
+        return roots
+
+    def _resolve_local_path(self, raw_path: str) -> Path | None:
+        raw = normalize_text(str(raw_path))
+        if not raw:
+            return None
+        if raw.startswith("file://"):
+            parsed = urlparse(raw)
+            file_part = unquote(parsed.path or "")
+            if re.match(r"^/[A-Za-z]:/", file_part):
+                file_part = file_part[1:]
+            raw = file_part
+
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = (self._project_root / candidate).resolve()
+        else:
+            candidate = candidate.resolve()
+
+        for root in self._tool_interface_local_roots:
+            try:
+                candidate.relative_to(root)
+                return candidate
+            except Exception:
+                continue
+        return None
+
+    def _is_sensitive_local_path(self, path: Path) -> bool:
+        if self._tool_interface_local_allow_sensitive_files:
+            return False
+        normalized = str(path).replace("\\", "/").lower()
+        file_name = normalize_text(path.name).lower()
+        blocked_file_names = {
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.development",
+            "config.yml",
+            "config.yaml",
+            "auth.json",
+            ".secret_key",
+            "id_rsa",
+            "id_ed25519",
+        }
+        if file_name in blocked_file_names:
+            return True
+        if path.suffix.lower() in {".pem", ".key", ".p12", ".pfx"}:
+            return True
+        blocked_fragments = (
+            "/.git/",
+            "/storage/.secret_key",
+            "/storage/admin_state.json",
+            "/credentials/",
+            "/secrets/",
+        )
+        return any(fragment in normalized for fragment in blocked_fragments)
+
     @staticmethod
     def _is_public_ip_obj(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-
         return not (
             ip_obj.is_private
             or ip_obj.is_loopback
@@ -6496,8 +6723,8 @@ class ToolExecutor:
             or ip_obj.is_reserved
             or ip_obj.is_unspecified
         )
-    def _is_safe_public_http_url(self, url: str) -> bool:
 
+    def _is_safe_public_http_url(self, url: str) -> bool:
         target = normalize_text(url)
         if not target:
             return False
@@ -6522,9 +6749,11 @@ class ToolExecutor:
             ip_obj = None
         if ip_obj is not None:
             return self._is_public_ip_obj(ip_obj)
+
         cached = self._url_host_safety_cache.get(host)
         if cached is not None:
             return cached
+
         try:
             # socket.getaddrinfo 是阻塞调用，但此方法被大量同步代码调用
             # 使用缓存减少阻塞频率；首次查询仍会阻塞但结果会被缓存
@@ -6532,6 +6761,7 @@ class ToolExecutor:
         except Exception:
             self._url_host_safety_cache[host] = False
             return False
+
         saw_ip = False
         for info in infos:
             sockaddr = info[4] if len(info) >= 5 else None
@@ -6550,8 +6780,8 @@ class ToolExecutor:
                 return False
         self._url_host_safety_cache[host] = saw_ip
         return saw_ip
-    async def _is_safe_public_http_url_async(self, url: str) -> bool:
 
+    async def _is_safe_public_http_url_async(self, url: str) -> bool:
         """异步版本的 URL 安全检查，避免阻塞事件循环。"""
         target = normalize_text(url)
         if not target:
@@ -6577,9 +6807,11 @@ class ToolExecutor:
             ip_obj = None
         if ip_obj is not None:
             return self._is_public_ip_obj(ip_obj)
+
         cached = self._url_host_safety_cache.get(host)
         if cached is not None:
             return cached
+
         try:
             import asyncio as _aio
             loop = _aio.get_running_loop()
@@ -6587,6 +6819,7 @@ class ToolExecutor:
         except Exception:
             self._url_host_safety_cache[host] = False
             return False
+
         saw_ip = False
         for info in infos:
             sockaddr = info[4] if len(info) >= 5 else None
@@ -6605,9 +6838,9 @@ class ToolExecutor:
                 return False
         self._url_host_safety_cache[host] = saw_ip
         return saw_ip
+
     @staticmethod
     def _unwrap_redirect_url(url: str) -> str:
-
         raw = normalize_text(url)
         if not raw:
             return ""
@@ -6623,6 +6856,7 @@ class ToolExecutor:
             uddg = query_map.get("uddg", [])
             if uddg:
                 return normalize_text(unquote(str(uddg[0])))
+
         # 抖音精选页常见链接（jingxuan?modal_id=xxxx），转换成视频详情页提高解析成功率
         if "douyin.com" in host:
             query_map = parse_qs(parsed.query)
@@ -6660,8 +6894,8 @@ class ToolExecutor:
                     return f"{base}?{urlencode({k: v[0] for k, v in kept.items()})}"
                 return base
         return raw
-    def _build_bilibili_cookie(self) -> str:
 
+    def _build_bilibili_cookie(self) -> str:
         parts: list[str] = []
         if self._bilibili_sessdata:
             parts.append(f"SESSDATA={self._bilibili_sessdata}")
@@ -6671,8 +6905,8 @@ class ToolExecutor:
             # 常见默认参数，提升兼容性。
             parts.extend(["CURRENT_FNVAL=4048", "CURRENT_QUALITY=80"])
         return "; ".join(parts)
-    def _inject_platform_cookiefile(self, options: dict[str, Any], source_url: str) -> str:
 
+    def _inject_platform_cookiefile(self, options: dict[str, Any], source_url: str) -> str:
         """
         Inject platform-specific cookie file for yt-dlp request.
         Returns a temporary cookiefile path that caller must clean up.
@@ -6685,9 +6919,11 @@ class ToolExecutor:
             host = ""
         if not host:
             return ""
+
         is_bilibili = "bilibili.com" in host or host.endswith("b23.tv")
         is_douyin = "douyin.com" in host or "iesdouyin.com" in host
         is_kuaishou = "kuaishou.com" in host or "chenzhongtech.com" in host
+
         tmp_cookie_file = ""
         if is_bilibili and not options.get("cookiefile") and self._bilibili_cookie:
             tmp_cookie_file = _write_netscape_cookie_file(self._bilibili_cookie, "bilibili.com")
@@ -6711,8 +6947,8 @@ class ToolExecutor:
                 options["cookiefile"] = tmp_cookie_file
                 options.pop("cookiesfrombrowser", None)
         return tmp_cookie_file
-    def _is_supported_platform_video_url(self, url: str) -> bool:
 
+    def _is_supported_platform_video_url(self, url: str) -> bool:
         target = normalize_text(url)
         if not target:
             return False
@@ -6725,8 +6961,8 @@ class ToolExecutor:
         if not host:
             return False
         return any(host == domain or host.endswith(f".{domain}") for domain in self._platform_video_domains)
-    def _is_platform_video_detail_url(self, url: str) -> bool:
 
+    def _is_platform_video_detail_url(self, url: str) -> bool:
         target = normalize_text(url)
         if not target:
             return False
@@ -6739,14 +6975,17 @@ class ToolExecutor:
         host = normalize_text(parsed.netloc).lower()
         path = normalize_text(unquote(parsed.path or "")).lower()
         query = normalize_text(unquote(parsed.query or "")).lower()
+
         if host.endswith("b23.tv"):
             return path not in {"", "/"}
+
         if "bilibili.com" in host:
             if path.startswith("/video/") or path.startswith("/bangumi/play/"):
                 return True
             if re.match(r"^/(bv|av)[a-z0-9]+", path, flags=re.IGNORECASE):
                 return True
             return False
+
         if "douyin.com" in host or "iesdouyin.com" in host:
             blocked_cues = ("/search", "/hot", "/discover", "/challenge", "/topic")
             if any(cue in path for cue in blocked_cues):
@@ -6757,6 +6996,7 @@ class ToolExecutor:
             if short_path and len(short_path) >= 6:
                 return True
             return False
+
         if "kuaishou.com" in host or "chenzhongtech.com" in host:
             blocked_cues = ("/search", "/hot", "/channel", "/feed", "/new-reco", "/explore", "/live", "/profile")
             if any(cue in path for cue in blocked_cues):
@@ -6770,6 +7010,7 @@ class ToolExecutor:
             if short_path and len(short_path) >= 6:
                 return True
             return False
+
         if "acfun.cn" in host or "acfun.com" in host:
             blocked_cues = ("/search", "/rank", "/bangumi")
             if any(cue in path for cue in blocked_cues):
@@ -6780,6 +7021,7 @@ class ToolExecutor:
                 return True
             short_path = path.strip("/")
             return bool(short_path and len(short_path) >= 6)
+
         if "youku.com" in host:
             # 优酷视频详情页: /v_show/id_xxx.html
             if "/v_show/" in path:
@@ -6787,6 +7029,7 @@ class ToolExecutor:
             if re.search(r"/id_[a-zA-Z0-9]+", path):
                 return True
             return False
+
         if "v.qq.com" in host or ("qq.com" in host and "/x/" in path):
             # 腾讯视频详情页: /x/cover/xxx/xxx.html 或 /x/page/xxx.html
             if "/x/cover/" in path or "/x/page/" in path:
@@ -6794,15 +7037,16 @@ class ToolExecutor:
             if re.search(r"/[a-z]\d{10}", path):
                 return True
             return False
-        return False
-    def _is_blocked_video_text(self, text: str) -> bool:
 
+        return False
+
+    def _is_blocked_video_text(self, text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
         return any(keyword in content for keyword in self._blocked_video_text_keywords)
-    def _is_blocked_video_url(self, url: str) -> bool:
 
+    def _is_blocked_video_url(self, url: str) -> bool:
         target = normalize_text(url).lower()
         if not target:
             return False
@@ -6812,12 +7056,12 @@ class ToolExecutor:
         query = normalize_text(unquote(parsed.query or "")).lower()
         merged = f"{host} {path} {query}"
         return any(self._url_contains_keyword(merged, keyword) for keyword in self._blocked_video_domain_keywords)
-    async def _resolve_platform_video_safe(self, source_url: str) -> str:
 
+    async def _resolve_platform_video_safe(self, source_url: str) -> str:
         resolved, _ = await self._resolve_platform_video_safe_with_diagnostic(source_url)
         return resolved
-    async def _resolve_platform_video_safe_with_diagnostic(self, source_url: str) -> tuple[str, str]:
 
+    async def _resolve_platform_video_safe_with_diagnostic(self, source_url: str) -> tuple[str, str]:
         url = self._unwrap_redirect_url(source_url)
         try:
             resolved = await asyncio.wait_for(
@@ -6835,8 +7079,8 @@ class ToolExecutor:
         except Exception:
             self._last_video_resolve_diagnostic[url] = "resolve_exception"
             return "", "resolve_exception"
-    def _build_video_resolve_failed_text(self, diagnostic: str) -> str:
 
+    def _build_video_resolve_failed_text(self, diagnostic: str) -> str:
         code = normalize_text(diagnostic).lower()
         if "fresh cookies" in code:
             return (
@@ -6865,8 +7109,8 @@ class ToolExecutor:
                 "如果仍失败，你可以先执行 `/yuki cookie bilibili edge force` 刷新后再试。"
             )
         return "这条视频这次没解析出来。你换个链接我继续试。"
-    async def _resolve_platform_video(self, source_url: str) -> str:
 
+    async def _resolve_platform_video(self, source_url: str) -> str:
         url = self._unwrap_redirect_url(source_url)
         self._last_video_resolve_diagnostic.pop(url, None)
         if not self._video_resolver_enable:
@@ -6878,11 +7122,13 @@ class ToolExecutor:
         if not self._is_platform_video_detail_url(url):
             self._last_video_resolve_diagnostic[url] = "video_detail_url_required"
             return ""
+
         if self._video_parse_enable and self._video_parse_api_base:
             parsed_url = await self._resolve_platform_video_via_parse_api(url)
             if parsed_url:
                 return parsed_url
             self._last_video_resolve_diagnostic[url] = "parse_api_failed"
+
         # 抖音优先走分享页提取（不需要 cookie / 签名）
         host = normalize_text(urlparse(url).netloc).lower()
         is_douyin = "douyin.com" in host or "iesdouyin.com" in host
@@ -6896,12 +7142,15 @@ class ToolExecutor:
                 _ytdlp_log.warning("douyin_share_error: %s", str(exc)[:300])
             # 分享页失败不立即返回，继续尝试 yt-dlp
             _ytdlp_log.info("douyin_share fallback failed, trying yt-dlp")
+
         if YoutubeDL is not None:
             if self._video_prefer_direct_stream and self._allow_platform_direct_stream(url):
                 direct_url = await asyncio.to_thread(self._extract_platform_video_direct_url_sync, url)
                 if direct_url and self._is_direct_video_url(direct_url):
                     return direct_url
+
             self._cleanup_video_cache()
+
             # 使用混合解析器（bilix优先用于B站）
             if self._hybrid_resolver:
                 try:
@@ -6910,6 +7159,7 @@ class ToolExecutor:
                         return str(downloaded_path.resolve())
                 except Exception as e:
                     _ytdlp_log.warning("hybrid_resolver_error | error=%s", str(e)[:200])
+
             # fallback到原有的yt-dlp方法
             downloaded_path = await asyncio.to_thread(self._download_platform_video_sync, url)
             if downloaded_path:
@@ -6925,6 +7175,7 @@ class ToolExecutor:
                 self._last_video_resolve_diagnostic[url] = f"ytdlp:{clip_text(download_error, 120)}"
         else:
             self._last_video_resolve_diagnostic[url] = "ytdlp_missing"
+
         # 兜底：可选接入 parse-video 这类本地解析服务，拿直链再转发
         parsed_url = await self._resolve_platform_video_via_parse_api(url)
         if parsed_url:
@@ -6933,9 +7184,9 @@ class ToolExecutor:
             return ""
         self._last_video_resolve_diagnostic[url] = self._last_video_resolve_diagnostic.get(url, "resolve_failed")
         return ""
+
     @staticmethod
     def _allow_platform_direct_stream(url: str) -> bool:
-
         """
         平台详情页提取到的 CDN 直链通常依赖 Referer/Cookie。
         直接把这类直链丢给 QQ 客户端，容易拿到占位图或损坏片段。
@@ -6943,8 +7194,8 @@ class ToolExecutor:
         """
         _ = url
         return False
-    def _extract_platform_video_direct_url_sync(self, source_url: str) -> str:
 
+    def _extract_platform_video_direct_url_sync(self, source_url: str) -> str:
         if YoutubeDL is None:
             return ""
         options = {
@@ -6976,9 +7227,10 @@ class ToolExecutor:
                     pass
         if not isinstance(info, dict):
             return ""
-        candidates: list[str] = []
-        def add(value: Any) -> None:
 
+        candidates: list[str] = []
+
+        def add(value: Any) -> None:
             if not isinstance(value, str):
                 return
             url = self._unwrap_redirect_url(normalize_text(value))
@@ -6989,6 +7241,7 @@ class ToolExecutor:
             if ".m3u8" in url.lower():
                 return
             candidates.append(url)
+
         add(info.get("url"))
         for key in ("requested_formats", "formats"):
             rows = info.get(key)
@@ -6998,12 +7251,13 @@ class ToolExecutor:
                 if not isinstance(row, dict):
                     continue
                 add(row.get("url"))
+
         for item in candidates:
             if self._is_direct_video_url(item):
                 return item
         return candidates[0] if candidates else ""
-    async def _resolve_platform_video_via_parse_api(self, source_url: str) -> str:
 
+    async def _resolve_platform_video_via_parse_api(self, source_url: str) -> str:
         if not self._video_parse_enable or not self._video_parse_api_base:
             return ""
         endpoint = f"{self._video_parse_api_base}/video/share/url/parse"
@@ -7028,13 +7282,14 @@ class ToolExecutor:
             if code is not None and code not in (0, 200, "0", "200"):
                 return ""
         return self._extract_video_url_from_parse_payload(payload)
-    def _extract_video_url_from_parse_payload(self, payload: Any) -> str:
 
+    def _extract_video_url_from_parse_payload(self, payload: Any) -> str:
         if payload is None:
             return ""
-        candidates: list[str] = []
-        def add_candidate(value: Any) -> None:
 
+        candidates: list[str] = []
+
+        def add_candidate(value: Any) -> None:
             if isinstance(value, str):
                 url = self._unwrap_redirect_url(normalize_text(value))
                 if re.match(r"^https?://", url, flags=re.IGNORECASE) and not self._is_blocked_video_url(url):
@@ -7063,18 +7318,21 @@ class ToolExecutor:
                 for item in value.values():
                     if isinstance(item, (dict, list)):
                         add_candidate(item)
+
         add_candidate(payload)
         if not candidates:
             return ""
+
         # 优先带视频扩展名的直链，其次返回第一个 http 链接交由发送端判定
         for item in candidates:
             if self._is_direct_video_url(item):
                 return item
         return candidates[0]
-    def _download_platform_video_sync(self, source_url: str) -> Path | None:
 
+    def _download_platform_video_sync(self, source_url: str) -> Path | None:
         if YoutubeDL is None:
             return None
+
         digest = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
         output_template = str(self._video_cache_dir / f"{digest}_%(id)s.%(ext)s")
         host = normalize_text(urlparse(source_url).netloc).lower()
@@ -7111,6 +7369,7 @@ class ToolExecutor:
         if self._video_cookies_from_browser:
             common_options["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
         _tmp_cookie_file = self._inject_platform_cookiefile(common_options, source_url)
+
         if "bilibili.com" in host or host.endswith("b23.tv"):
             # B站经常是分段流；无 ffmpeg 时优先单文件中低清晰度，保证可发
             # 优先 h264(avc) 编码，避免 av1 导致 NapCat 缩略图生成失败。
@@ -7193,6 +7452,7 @@ class ToolExecutor:
                 f"best[ext=mp4][filesize<{self._video_download_max_mb}M]/best[ext=mp4]",
                 "best[ext=mp4]",
             ]
+
         _ytdlp_log.info(
             "video_download%s | ffmpeg=%s | formats=%d | url=%s",
             _tool_trace_tag(),
@@ -7285,6 +7545,7 @@ class ToolExecutor:
                         import time
                         time.sleep(2)
                     continue
+
             fallback = self._pick_downloaded_video_fallback(digest)
             if fallback is not None:
                 if require_audio and not self._video_has_audio_stream(fallback):
@@ -7322,8 +7583,8 @@ class ToolExecutor:
                     os.unlink(_tmp_cookie_file)
                 except OSError:
                     pass
-    def _pick_downloaded_video_fallback(self, digest: str) -> Path | None:
 
+    def _pick_downloaded_video_fallback(self, digest: str) -> Path | None:
         candidates = sorted(self._video_cache_dir.glob(f"{digest}_*"), key=lambda p: p.stat().st_mtime, reverse=True)
         for path in candidates:
             if not path.is_file():
@@ -7337,12 +7598,14 @@ class ToolExecutor:
                 return path
             self._safe_unlink(path)
         return None
+
     # ── 抖音视频下载（通过移动端分享页提取 video_id）──────────────
     _DOUYIN_MOBILE_UA = (
         "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
         "AppleWebKit/605.1.15 (KHTML, like Gecko) "
         "Version/16.0 Mobile/15E148 Safari/604.1"
     )
+
     # 多 CDN 主机回退列表（aweme.snssdk.com 失败时依次尝试）
     _DOUYIN_CDN_HOSTS = [
         "aweme.snssdk.com",
@@ -7352,8 +7615,8 @@ class ToolExecutor:
         "v5-web.douyinvod.com",
         "v11-web.douyinvod.com",
     ]
-    async def _download_douyin_via_share_page(self, source_url: str) -> Path | None:
 
+    async def _download_douyin_via_share_page(self, source_url: str) -> Path | None:
         """
         通过移动端分享页下载抖音视频（无需 cookie / 签名）。
         流程：短链接 → iesdouyin 分享页 → 提取 video_id → 多 CDN 回退下载
@@ -7367,9 +7630,11 @@ class ToolExecutor:
             _ytdlp_log.warning("douyin_share: no video_id from %s", source_url[:80])
             return None
         _ytdlp_log.info("douyin_share: video_id=%s aweme_id=%s", video_id, aweme_id or "?")
+
         digest = hashlib.sha1(source_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
         tag = aweme_id or video_id
         out_path = self._video_cache_dir / f"{digest}_{tag}.mp4"
+
         # 多 CDN 回退下载，增加重试
         host_timeout = max(8.0, min(float(self._video_download_timeout_seconds), 20.0))
         for host in self._DOUYIN_CDN_HOSTS:
@@ -7404,16 +7669,17 @@ class ToolExecutor:
                 except Exception as exc:
                     _ytdlp_log.warning("douyin_share: %s/%s download failed: %s", host, ratio, str(exc)[:200])
                     continue
-        return None
-    async def _extract_douyin_video_id(self, source_url: str) -> tuple[str, str]:
 
+        return None
+
+    async def _extract_douyin_video_id(self, source_url: str) -> tuple[str, str]:
         """
         从抖音 URL 提取 video_id（用于构造直链）和 aweme_id。
         返回 (video_id, aweme_id)。
         """
         def _extract_video_id_from_text(text: str, final_url: str, aweme_id_hint: str) -> tuple[str, str]:
-
             aweme_local = aweme_id_hint or self._extract_douyin_aweme_id(final_url)
+
             # 先从 URL query 中提取 video_id
             try:
                 qs = parse_qs(urlparse(final_url).query)
@@ -7423,6 +7689,7 @@ class ToolExecutor:
                         return candidate, aweme_local
             except Exception:
                 pass
+
             # 从 HTML 里提取 play_addr.uri / video_id
             patterns = (
                 r'"play_addr"\s*:\s*\{[^{}]*?"uri"\s*:\s*"([A-Za-z0-9_-]{8,80})"',
@@ -7436,8 +7703,10 @@ class ToolExecutor:
                     if self._is_valid_douyin_video_id(candidate):
                         return candidate, aweme_local
             return "", aweme_local
+
         # 1) 先尝试从 URL 提取 aweme_id
         aweme_id = self._extract_douyin_aweme_id(source_url)
+
         # 2) 用移动端 UA 访问，跟踪重定向到 iesdouyin 分享页
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(12.0, connect=5.0),
@@ -7457,16 +7726,20 @@ class ToolExecutor:
                         return vid, aweme_id
                 except Exception:
                     pass
+
             resp = await client.get(source_url)
             final_url = str(resp.url)
             html = resp.text
+
             # 从最终 URL 提取 aweme_id（如果之前没拿到）
             if not aweme_id:
                 aweme_id = self._extract_douyin_aweme_id(final_url)
+
             # 3) 从最终 URL + HTML 提取 video_id
             vid, aweme_id = _extract_video_id_from_text(html, final_url, aweme_id)
             if vid:
                 return vid, aweme_id
+
             # 4) 回退：通过 aweme 接口拿 play_addr.uri
             if aweme_id:
                 try:
@@ -7494,6 +7767,7 @@ class ToolExecutor:
                                         return candidate, aweme_id
                 except Exception:
                     pass
+
             # 5) 回退：用 PC UA 访问抖音页面提取 video_id
             if aweme_id:
                 try:
@@ -7513,10 +7787,11 @@ class ToolExecutor:
                             return vid, aweme_id
                 except Exception:
                     pass
+
         return "", aweme_id
+
     @staticmethod
     def _is_valid_douyin_video_id(value: str) -> bool:
-
         content = normalize_text(value).strip()
         if not content:
             return False
@@ -7529,9 +7804,9 @@ class ToolExecutor:
             return False
         # 抖音 video_id 常见是 v 开头或含数字。
         return bool(lower.startswith("v") or re.search(r"\d", content))
+
     @staticmethod
     def _extract_douyin_aweme_id(url: str) -> str:
-
         """从抖音 URL 中直接提取 aweme_id（纯数字）。"""
         m = re.search(r"/video/(\d+)", url)
         if m:
@@ -7549,8 +7824,8 @@ class ToolExecutor:
         except Exception:
             pass
         return ""
-    def _is_video_size_ok(self, path: Path) -> bool:
 
+    def _is_video_size_ok(self, path: Path) -> bool:
         try:
             size = path.stat().st_size
         except Exception:
@@ -7559,8 +7834,8 @@ class ToolExecutor:
         if not (0 < size <= max_bytes):
             return False
         return self._is_video_container_signature_ok(path)
-    def _video_has_audio_stream(self, path: Path) -> bool:
 
+    def _video_has_audio_stream(self, path: Path) -> bool:
         """检测视频是否包含音轨。优先 ffprobe，缺失时回退 ffmpeg -i 文本解析。"""
         target = str(path)
         ffprobe_bin = ""
@@ -7569,6 +7844,7 @@ class ToolExecutor:
             probe_path = Path(self._ffmpeg_probe_dir) / probe_name
             if probe_path.is_file():
                 ffprobe_bin = str(probe_path)
+
         if ffprobe_bin:
             try:
                 cmd = [
@@ -7593,6 +7869,7 @@ class ToolExecutor:
                         )
             except Exception:
                 pass
+
         if not self._ffmpeg_bin:
             return False
         try:
@@ -7602,9 +7879,9 @@ class ToolExecutor:
             return bool(re.search(r"\bAudio:\s*[A-Za-z0-9_]+", text, flags=re.IGNORECASE))
         except Exception:
             return False
+
     @staticmethod
     def _is_video_container_signature_ok(path: Path) -> bool:
-
         try:
             with path.open("rb") as fp:
                 head = fp.read(32)
@@ -7625,9 +7902,9 @@ class ToolExecutor:
         if len(head) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"AVI ":
             return True
         return False
+
     @staticmethod
     def _is_known_image_signature(head: bytes) -> bool:
-
         return (
             head.startswith(b"\x89PNG\r\n\x1a\n")
             or head.startswith(b"\xFF\xD8\xFF")
@@ -7636,23 +7913,23 @@ class ToolExecutor:
             or head.startswith(b"BM")
             or (head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP")
         )
+
     @staticmethod
     def _is_video_file_path(path: Path) -> bool:
-
         ext = path.suffix.lower()
         if ext in {".mp4", ".webm", ".mov", ".m4v", ".flv", ".mkv"}:
             return True
         mime = (mimetypes.guess_type(str(path))[0] or "").lower()
         return mime.startswith("video/")
+
     @staticmethod
     def _safe_unlink(path: Path) -> None:
-
         try:
             path.unlink(missing_ok=True)
         except Exception:
             return
-    def _cleanup_video_cache(self) -> None:
 
+    def _cleanup_video_cache(self) -> None:
         try:
             files = [p for p in self._video_cache_dir.glob("*") if p.is_file()]
         except Exception:
@@ -7662,9 +7939,9 @@ class ToolExecutor:
         files.sort(key=lambda p: p.stat().st_mtime)
         for item in files[: max(0, len(files) - self._video_cache_keep_files)]:
             self._safe_unlink(item)
+
     @staticmethod
     def _clean_markdown_text(text: str) -> str:
-
         content = str(text or "")
         if not content:
             return ""
@@ -7678,73 +7955,79 @@ class ToolExecutor:
         content = re.sub(r"<[^>]+>", " ", content)
         content = re.sub(r"\n{3,}", "\n\n", content)
         return normalize_text(content)
+
     def _looks_like_github_request(self, text: str) -> bool:
+        return _shared_github_request(text, config=self._raw_config)
 
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        if "github.com/" in content:
-            return True
-        if self._has_control_token(text, "/github", "platform=github", "source=github"):
-            return True
-        return bool(re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", content))
     def _looks_like_repo_readme_request(self, text: str) -> bool:
+        return _shared_repo_readme_request(text, config=self._raw_config)
 
-        content = normalize_text(text)
-        if not content:
-            return False
-        if re.search(r"README(?:\.md)?", content, flags=re.IGNORECASE):
-            return True
-        return self._has_control_token(text, "/readme", "type=readme", "target=readme")
     @staticmethod
     def _looks_like_download_request_text(text: str) -> bool:
-
         content = normalize_text(text).lower()
         if not content:
             return False
-        if ToolExecutor._has_control_token(text, "/download", "/sendfile", "mode=download", "mode=file", "output=file"):
-            return True
-        return bool(re.search(r"\.(?:zip|7z|rar|exe|apk|ipa|msi|dmg|pkg|deb|rpm|jar)", content, flags=re.IGNORECASE))
+        cues = (
+            "下载",
+            "发给我",
+            "发我",
+            "安装包",
+            "启动器",
+            "客户端",
+            "release",
+            "releases",
+            "installer",
+            "setup",
+        )
+        return any(cue in content for cue in cues)
+
     def _looks_like_software_download_request(self, text: str) -> bool:
-
         content = normalize_text(text).lower()
         if not content:
             return False
-        if not (
-            self._has_control_token(text, "/download", "/release", "mode=download", "source=release")
-            or self._looks_like_download_request_text(content)
-        ):
+        if not self._looks_like_download_request_text(content):
             return False
-        if "github.com/" in content:
-            return True
-        if re.search(r"[a-z0-9_.-]+/[a-z0-9_.-]+", content):
-            return True
-        return self._has_control_token(text, "/github", "platform=github", "source=github")
+        # 避免把“下载视频/图片”误判成软件安装包下载。
+        media_cues = ("视频", "图", "图片", "壁纸", "抖音", "快手", "b站", "bilibili")
+        if any(cue in content for cue in media_cues):
+            return False
+        software_cues = (
+            "hmcl",
+            "启动器",
+            "安装包",
+            "客户端",
+            ".exe",
+            ".msi",
+            ".apk",
+            ".jar",
+            ".zip",
+            "windows",
+            "win",
+            "安卓",
+            "android",
+            "官方",
+        )
+        return any(cue in content for cue in software_cues)
+
     @staticmethod
     def _guess_download_preferences(raw_query: str, message_text: str, repo_name: str = "") -> tuple[str, str]:
-
         merged = normalize_text(f"{raw_query}\n{message_text}\n{repo_name}").lower()
-        if re.search(r"\.(jar)\b", merged):
-            return ".jar", ""
-        if re.search(r"\.(apk)\b", merged):
+        if "hmcl" in merged:
+            return ".jar", "HMCL.jar"
+        if any(cue in merged for cue in ("android", "安卓")):
             return ".apk", ""
-        if re.search(r"\.(exe|msi)\b", merged):
+        if any(cue in merged for cue in ("windows", "win", "电脑", "pc")):
             return ".exe", ""
-        if re.search(r"\.(dmg|pkg)\b", merged):
-            return ".dmg", ""
-        if ToolExecutor._has_control_token(merged, "platform=android"):
-            return ".apk", ""
-        if ToolExecutor._has_control_token(merged, "platform=windows", "platform=win"):
-            return ".exe", ""
-        if ToolExecutor._has_control_token(merged, "platform=mac", "platform=macos"):
+        if any(cue in merged for cue in ("mac", "macos")):
             return ".dmg", ""
         return "", ""
+
     @staticmethod
     def _extract_github_repo_from_text(text: str) -> str:
-
         content = normalize_text(text)
         if not content:
             return ""
+
         url_match = re.search(
             r"https?://(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)",
             content,
@@ -7755,6 +8038,7 @@ class ToolExecutor:
             repo = url_match.group(2)
             repo = re.sub(r"\.git$", "", repo, flags=re.IGNORECASE)
             return f"{owner}/{repo}"
+
         token_match = re.search(r"\b([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\b", content)
         if token_match:
             owner = token_match.group(1)
@@ -7762,9 +8046,9 @@ class ToolExecutor:
             if owner.lower() not in {"http", "https"}:
                 return f"{owner}/{repo}"
         return ""
+
     @staticmethod
     def _extract_urls(text: str) -> list[str]:
-
         content = normalize_text(text)
         if not content:
             return []
@@ -7782,14 +8066,106 @@ class ToolExecutor:
             seen.add(url)
             uniq.append(url)
         return uniq
-    def _extract_message_media_urls(self, raw_segments: list[dict[str, Any]], media_type: str) -> list[str]:
 
+    @staticmethod
+    def _extract_local_path_candidates(text: str) -> list[str]:
+        content = normalize_text(text)
+        if not content:
+            return []
+        patterns = (
+            r"[A-Za-z]:\\[^\s\"'<>|?*]+",
+            r"(?:\./|\.\./|/)[^\s\"'<>|?*]+",
+            r"(?:[A-Za-z0-9_.-]+[\\/])+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10}",
+            r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+",
+        )
+        out: list[str] = []
+        seen: set[str] = set()
+        for pattern in patterns:
+            for raw in re.findall(pattern, content):
+                candidate = normalize_text(str(raw)).strip().rstrip("锛屻€傦紒锛??,.;:)]}")
+                if not candidate:
+                    continue
+                lower = candidate.lower()
+                if lower.startswith("http://") or lower.startswith("https://"):
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                out.append(candidate)
+        return out
+
+    @classmethod
+    def _pick_local_path_candidate(cls, text: str) -> str:
+        rows = cls._extract_local_path_candidates(text)
+        if not rows:
+            return ""
+        scored: list[tuple[int, str]] = []
+        for item in rows:
+            score = 0
+            if re.search(r"\.[A-Za-z0-9]{1,10}$", item):
+                score += 4
+            if any(
+                cue in item
+                for cue in ("core/", "core\\", "docs/", "docs\\", "config/", "config\\", "storage/", "storage\\")
+            ):
+                score += 2
+            if item.startswith(("./", "../", "/", "core/", "docs/", "config/", "storage/")):
+                score += 1
+            if re.match(r"^[A-Za-z]:\\", item):
+                score += 2
+            if item.startswith("/") and any(other != item and other.endswith(item) for other in rows):
+                score -= 3
+            scored.append((score, item))
+        scored.sort(key=lambda it: it[0], reverse=True)
+        return scored[0][1] if scored else ""
+
+    @staticmethod
+    def _looks_like_local_file_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        cues = (
+            "本地",
+            "文件",
+            "路径",
+            "读一下",
+            "读取",
+            "打开",
+            "看看这个文件",
+            "分析这个文件",
+            "学习这个文件",
+            "local",
+            "read",
+            "path",
+        )
+        return any(cue in content for cue in cues)
+
+    @staticmethod
+    def _looks_like_local_media_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        cues = [normalize_text(cue).lower() for cue in _pl.get_list("local_media_request_cues") if normalize_text(cue)]
+        if not cues:
+            return False
+        return any(cue in content for cue in cues)
+
+    @staticmethod
+    def _looks_like_media_file_path(path: str) -> bool:
+        value = normalize_text(path).lower()
+        if not value:
+            return False
+        return bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp|mp4|webm|mov|m4v)$", value))
+
+    def _extract_message_media_urls(self, raw_segments: list[dict[str, Any]], media_type: str) -> list[str]:
         wanted = normalize_text(media_type).lower()
         urls: list[str] = []
         seen: set[str] = set()
+
         image_types = {"image"}
         video_types = {"video"}
         audio_types = {"record", "audio"}
+
         for seg in raw_segments or []:
             if not isinstance(seg, dict):
                 continue
@@ -7801,20 +8177,23 @@ class ToolExecutor:
                 continue
             if wanted == "audio" and seg_type not in audio_types:
                 continue
+
             candidates: list[str] = []
             for key in ("url", "file", "path"):
                 value = normalize_text(str(data.get(key, "")))
                 if value:
                     candidates.append(value)
+
             for raw in candidates:
                 value = self._normalize_message_media_value(raw)
                 if not value or value in seen:
                     continue
                 seen.add(value)
                 urls.append(value)
-        return urls
-    def _remember_recent_media(self, conversation_id: str, raw_segments: list[dict[str, Any]]) -> None:
 
+        return urls
+
+    def _remember_recent_media(self, conversation_id: str, raw_segments: list[dict[str, Any]]) -> None:
         conv = normalize_text(conversation_id)
         if not conv:
             return
@@ -7823,6 +8202,7 @@ class ToolExecutor:
         if not images and not videos:
             self._cleanup_recent_media_cache()
             return
+
         state = self._recent_media_by_conversation.get(conv, {})
         if not isinstance(state, dict):
             state = {}
@@ -7840,8 +8220,8 @@ class ToolExecutor:
             state["video"] = (videos + video_old)[:6]
         self._recent_media_by_conversation[conv] = state
         self._cleanup_recent_media_cache()
-    def _get_recent_media(self, conversation_id: str, media_type: str) -> list[str]:
 
+    def _get_recent_media(self, conversation_id: str, media_type: str) -> list[str]:
         conv = normalize_text(conversation_id)
         if not conv:
             return []
@@ -7861,8 +8241,8 @@ class ToolExecutor:
             seen.add(value)
             out.append(value)
         return out
-    def _cleanup_recent_media_cache(self) -> None:
 
+    def _cleanup_recent_media_cache(self) -> None:
         if not self._recent_media_by_conversation:
             return
         now = datetime.now(timezone.utc)
@@ -7877,9 +8257,9 @@ class ToolExecutor:
                 stale.append(key)
         for key in stale:
             self._recent_media_by_conversation.pop(key, None)
+
     @staticmethod
     def _normalize_message_media_value(raw: str) -> str:
-
         value = normalize_text(str(raw or ""))
         if not value:
             return ""
@@ -7900,14 +8280,14 @@ class ToolExecutor:
             except Exception:
                 return str(path.resolve())
         return value
-    def _is_blocked_image_text(self, text: str) -> bool:
 
+    def _is_blocked_image_text(self, text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
         return any(keyword in content for keyword in self._blocked_image_text_keywords)
-    def _is_blocked_image_url(self, url: str) -> bool:
 
+    def _is_blocked_image_url(self, url: str) -> bool:
         target = normalize_text(url).lower()
         if not target:
             return False
@@ -7917,9 +8297,9 @@ class ToolExecutor:
         query = normalize_text(unquote(parsed.query or "")).lower()
         merged = f"{host} {path} {query}"
         return any(self._url_contains_keyword(merged, keyword) for keyword in self._blocked_image_domain_keywords)
+
     @staticmethod
     def _url_contains_keyword(target: str, keyword: str) -> bool:
-
         content = normalize_text(target).lower()
         token = normalize_text(keyword).lower()
         if not content or not token:
@@ -7927,98 +8307,120 @@ class ToolExecutor:
         if len(token) <= 3:
             return bool(re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", content, flags=re.IGNORECASE))
         return token in content
+
     @staticmethod
     def _is_generic_search_command(text: str) -> bool:
-
-        return ToolExecutor._has_control_token(text, "/search", "mode=search")
-    @staticmethod
-    def _has_control_token(text: str, *tokens: str) -> bool:
-
         content = normalize_text(text).lower()
         if not content:
             return False
-        for token in tokens:
-            token_norm = normalize_text(token).lower()
-            if not token_norm:
-                continue
-            if re.search(rf"(?<![a-z0-9_]){re.escape(token_norm)}(?![a-z0-9_])", content):
-                return True
-        return False
-    @staticmethod
-    def _has_question_punctuation(text: str) -> bool:
-
-        content = normalize_text(text)
-        return bool(content and ("?" in content or "？" in content))
-    @staticmethod
-    def _has_image_locator(text: str) -> bool:
-
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        if ToolExecutor._is_passive_multimodal_text(text):
-            return True
-        return bool(
-            re.search(r"https?://[^\s]+", content)
-            or re.search(r"\.(?:png|jpe?g|gif|webp|bmp)\b", content, flags=re.IGNORECASE)
+        generic = (
+            "你去搜",
+            "你去搜索",
+            "去搜",
+            "去搜索",
+            "上网搜",
+            "网上搜",
+            "帮我搜",
+            "查一下",
+            "查查",
+            "搜一下",
+            "搜索一下",
         )
-    @staticmethod
-    def _has_video_locator(text: str) -> bool:
+        if any(cue in content for cue in generic):
+            return True
+        return len(content) <= 8 and content in {"搜", "搜索", "查", "去搜", "去查"}
 
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        if re.search(r"https?://[^\s]+", content):
-            return True
-        if re.search(r"\b(?:bv[a-z0-9]{10}|av\d{4,})\b", content, flags=re.IGNORECASE):
-            return True
-        return bool(re.search(r"\.(?:mp4|webm|mov|m4v)\b", content, flags=re.IGNORECASE))
-    @staticmethod
-    def _has_audio_locator(text: str) -> bool:
-
-        content = normalize_text(text).lower()
-        if not content:
-            return False
-        if re.search(r"https?://[^\s]+", content):
-            return True
-        return bool(re.search(r"\.(?:mp3|wav|flac|ogg|m4a|aac)\b", content, flags=re.IGNORECASE))
     @staticmethod
     def _looks_like_media_request(text: str) -> bool:
-
-        return (
-            ToolExecutor._has_image_locator(text)
-            or ToolExecutor._has_video_locator(text)
-            or ToolExecutor._has_audio_locator(text)
-            or ToolExecutor._has_control_token(text, "/image", "/video", "/music", "/avatar", "mode=image", "mode=video", "mode=music")
-        )
-    @staticmethod
-    def _looks_like_deep_web_analysis_request(text: str) -> bool:
-
-        content = ToolExecutor._normalize_multimodal_query(text)
+        content = normalize_text(text).lower()
         if not content:
             return False
-        if ToolExecutor._looks_like_media_request(text):
+        media_cues = (
+            "图",
+            "图片",
+            "壁纸",
+            "头像",
+            "视频",
+            "发图",
+            "发视频",
+            "搜图",
+            "找图",
+            "pixiv",
+            "b站",
+            "bilibili",
+            "抖音",
+            "快手",
+            "image",
+            "video",
+        )
+        return any(cue in content for cue in media_cues)
+
+    @staticmethod
+    def _looks_like_deep_web_analysis_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
             return False
-        return ToolExecutor._has_question_punctuation(content) or ToolExecutor._has_control_token(text, "/lookup", "/search", "mode=web")
+        cues = (
+            "根据",
+            "总结",
+            "概括",
+            "分段",
+            "详细",
+            "来历",
+            "是谁",
+            "什么来历",
+            "这人是谁",
+            "文章说了什么",
+            "网页说了什么",
+            "原文",
+            "知乎",
+            "上网搜",
+            "去网上搜",
+            "搜一下",
+            "查一下",
+            "分析",
+        )
+        if any(cue in content for cue in cues):
+            return True
+        return bool(re.search(r"https?://[^\s]+", content))
+
     @staticmethod
     def _should_auto_web_analysis(query: str, query_type: str, intent_text: str) -> bool:
+        if query_type in {"video", "image"}:
+            return False
 
-        if normalize_text(query_type).lower() in {"image", "video"}:
+        content = normalize_text(f"{query}\n{intent_text}").lower()
+        if not content:
             return False
-        if ToolExecutor._looks_like_media_request(intent_text):
-            return False
-        content = normalize_text(f"{query}\n{intent_text}")
-        if not content or len(content) < 4:
-            return False
-        return ToolExecutor._looks_like_deep_web_analysis_request(content)
+
+        if query_type in {"person", "work", "tech"}:
+            return True
+
+        cues = (
+            "是谁",
+            "来历",
+            "什么人",
+            "叫什么",
+            "哪里人",
+            "总结",
+            "概括",
+            "分段",
+            "详细",
+            "深度",
+            "证据",
+            "根据",
+            "原文",
+            "来源",
+        )
+        return any(cue in content for cue in cues)
+
     @staticmethod
     def _normalize_multimodal_query(text: str) -> str:
-
         content = normalize_text(text)
         if not content:
             return ""
         content = re.sub(r"\bMULTIMODAL_EVENT(?:_AT)?\b", " ", content, flags=re.IGNORECASE)
-        content = content.replace("\u7528\u6237\u53d1\u9001\u4e86\u591a\u6a21\u6001\u6d88\u606f:", " ")
-        content = content.replace("\u7528\u6237@\u673a\u5668\u4eba\u5e76\u53d1\u9001\u591a\u6a21\u6001\u6d88\u606f:", " ")
+        content = content.replace("用户发送多模态消息：", " ").replace("用户@了你并发送多模态消息：", " ")
         content = content.replace("user sent multimodal message:", " ").replace(
             "user mentioned bot and sent multimodal message:",
             " ",
@@ -8035,34 +8437,95 @@ class ToolExecutor:
         while parts and not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", parts[0]):
             parts.pop(0)
         return " ".join(parts).strip()
+
     @staticmethod
     def _looks_like_vision_web_lookup_request(text: str) -> bool:
-
-        content = ToolExecutor._normalize_multimodal_query(text)
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
         if not content:
             return False
-        return ToolExecutor._has_question_punctuation(content) or ToolExecutor._has_control_token(text, "/lookup", "mode=lookup")
+
+        # 去掉纯指代词，避免把“这个/这张图”误当成联网查询词。
+        stripped = normalize_text(
+            re.sub(
+                r"(分析|识别|看看|看下|看一看|看一下|图片|照片|截图|这张图|这个图|这个|这玩意|这是什么)",
+                " ",
+                content,
+            )
+        )
+        stripped = normalize_text(re.sub(r"\s+", " ", stripped))
+        if len(stripped) < 4:
+            return False
+
+        strong_cues = (
+            "查一下",
+            "搜一下",
+            "联网",
+            "百度",
+            "维基",
+            "百科",
+            "官网",
+            "出处",
+            "原图",
+            "来源",
+            "是什么梗",
+            "这是谁",
+            "哪个动漫",
+            "哪部电影",
+            "哪部剧",
+            "什么品牌",
+            "什么型号",
+        )
+        if any(cue in content for cue in strong_cues):
+            return True
+
+        # 保守兜底：至少包含“身份/来源”类疑问词，且不是只剩一个代词。
+        return bool(re.search(r"(是谁|叫什么|来自哪里|哪来的|出自|来源|资料|背景)", content))
+
     @staticmethod
     def _looks_like_image_request(text: str) -> bool:
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_request_cues") if normalize_text(cue)]
+        if not cues:
+            return False
+        return any(cue in content for cue in cues)
 
-        return ToolExecutor._has_image_locator(text) or ToolExecutor._has_control_token(text, "/image", "/img", "mode=image")
     @staticmethod
     def _looks_like_image_send_request(text: str) -> bool:
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        send_cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_send_cues") if normalize_text(cue)]
+        if not send_cues:
+            return False
+        return ToolExecutor._looks_like_image_request(content) and any(cue in content for cue in send_cues)
 
-        return ToolExecutor._looks_like_image_request(text) and ToolExecutor._has_control_token(text, "/send", "mode=send", "output=image")
     def _looks_like_video_send_request(self, text: str) -> bool:
+        content = self._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        send_cues = [
+            normalize_text(cue).lower()
+            for cue in _pl.get_list("local_media_request_cues")
+            if normalize_text(cue)
+        ]
+        if not send_cues:
+            send_cues = ["发送", "发给我", "发视频", "把视频发我", "转发这个视频", "给我这个视频"]
+        return self._looks_like_video_request(content) and any(cue in content for cue in send_cues)
 
-        return self._looks_like_video_request(text) and self._has_control_token(text, "/send", "/resolve", "mode=send", "mode=resolve")
     @staticmethod
     def _looks_like_image_analysis_request(text: str) -> bool:
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
+        if not cues:
+            return False
+        return any(cue in content for cue in cues)
 
-        return ToolExecutor._looks_like_image_request(text) and (
-            ToolExecutor._has_question_punctuation(text)
-            or ToolExecutor._has_control_token(text, "/analyze", "mode=analyze", "ocr=true")
-        )
     @staticmethod
     def _is_passive_multimodal_text(text: str) -> bool:
-
         content = normalize_text(text)
         if not content:
             return False
@@ -8074,56 +8537,100 @@ class ToolExecutor:
             return True
         return (
             content.startswith("MULTIMODAL_EVENT")
-            or content.startswith("\u7528\u6237\u53d1\u9001\u4e86\u591a\u6a21\u6001\u6d88\u606f:")
-            or content.startswith("\u7528\u6237@\u673a\u5668\u4eba\u5e76\u53d1\u9001\u591a\u6a21\u6001\u6d88\u606f:")
+            or content.startswith("用户发送多模态消息：")
+            or content.startswith("用户@了你并发送多模态消息：")
             or content.lower().startswith("user sent multimodal message:")
             or content.lower().startswith("user mentioned bot and sent multimodal message:")
         )
+
     @staticmethod
     def _looks_like_music_request(text: str) -> bool:
-
-        return ToolExecutor._has_audio_locator(text) or ToolExecutor._has_control_token(text, "/music", "/song", "mode=music")
-    def _looks_like_video_request(self, text: str) -> bool:
-
-        return self._has_video_locator(text) or self._has_control_token(text, "/video", "mode=video")
-    def _looks_like_douyin_search_request(self, text: str) -> bool:
-
-        return self._has_control_token(text, "/douyin", "platform=douyin")
-    def _looks_like_video_analysis_request(self, text: str) -> bool:
-
-        return self._looks_like_video_request(text) and (
-            self._has_question_punctuation(text)
-            or self._has_control_token(text, "/analyze", "mode=analyze", "output=text", "mode=text")
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        cues = _prompt_cues(
+            "music_request_cues",
+            (
+                "点歌", "听歌", "放歌", "搜歌", "播放歌", "来首", "来一首",
+                "唱一首", "唱首", "音乐", "歌曲", "网易云", "qq音乐",
+            ),
         )
+        return any(cue in content for cue in cues)
+
+    def _looks_like_video_request(self, text: str) -> bool:
+        content = self._normalize_multimodal_query(text)
+        return _shared_video_request(content, config=self._raw_config)
+
+    def _looks_like_douyin_search_request(self, text: str) -> bool:
+        content = self._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        platform_hit = ("抖音" in content) or ("douyin" in content)
+        if not platform_hit:
+            return False
+        search_cues = _prompt_cues("douyin_search_cues", ("搜索", "搜", "找", "推荐", "来点", "给我来", "查"))
+        return any(cue in content for cue in search_cues) and self._looks_like_video_request(content)
+
+    @staticmethod
+    def _looks_like_video_analysis_request(text: str) -> bool:
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        cues = _prompt_cues(
+            "video_analysis_cues",
+            (
+                "解析",
+                "分析",
+                "评价",
+                "解读",
+                "讲讲",
+                "讲了什么",
+                "内容是什么",
+                "总结一下",
+                "怎么看",
+            ),
+        )
+        return any(cue in content for cue in cues)
+
     @staticmethod
     def _looks_like_qq_avatar_request(text: str) -> bool:
-
-        content = normalize_text(text)
-        if not content or not ToolExecutor._has_control_token(text, "/avatar", "/qqavatar", "type=avatar"):
+        content = normalize_text(text).lower()
+        if not content:
             return False
-        return bool(ToolExecutor._extract_qq_number(content) or ToolExecutor._contains_self_avatar_cue(content))
+        avatar_cues = _prompt_cues("qq_avatar_request_cues", ("头像", "avatar", "profile"))
+        qq_cues = _prompt_cues("qq_identity_cues", ("qq", "q号", "企鹅号", "uin"))
+        self_avatar_cues = _prompt_cues("self_avatar_cues", ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"))
+        other_avatar_cues = _prompt_cues("other_avatar_cues", ("他的头像", "她的头像"))
+        return any(cue in content for cue in avatar_cues) and (
+            any(cue in content for cue in qq_cues)
+            or any(cue in content for cue in self_avatar_cues)
+            or any(cue in content for cue in other_avatar_cues)
+            or bool(re.search(r"[\u4e00-\u9fffa-z0-9_.-]{2,20}的头像", content))
+        )
+
     @staticmethod
     def _contains_self_avatar_cue(text: str) -> bool:
+        content = normalize_text(text)
+        cues = _prompt_cues("self_avatar_cues", ("我的头像", "我头像", "my avatar", "我的qq头像", "我qq头像"), lowercase=False)
+        return any(cue in content for cue in cues)
 
-        return ToolExecutor._has_control_token(text, "target=self", "/me")
     @staticmethod
     def _extract_qq_number(text: str) -> str:
-
         content = normalize_text(text)
         match = re.search(r"(?<!\d)([1-9]\d{4,11})(?!\d)", content)
         if not match:
             return ""
         return str(match.group(1))
+
     @staticmethod
     def _normalize_qq_id(value: str) -> str:
-
         raw = str(value or "").strip()
         if re.fullmatch(r"[1-9]\d{4,11}", raw):
             return raw
         return ""
+
     @staticmethod
     def _extract_qq_from_at_segments(raw_segments: list[dict[str, Any]], bot_id: str) -> str:
-
         bid = str(bot_id or "").strip()
         for seg in raw_segments or []:
             if not isinstance(seg, dict):
@@ -8139,8 +8646,8 @@ class ToolExecutor:
             if re.fullmatch(r"[1-9]\d{4,11}", qq):
                 return qq
         return ""
-    async def _resolve_avatar_target_from_group(
 
+    async def _resolve_avatar_target_from_group(
         self,
         merged: str,
         fallback_user_name: str,
@@ -8149,15 +8656,18 @@ class ToolExecutor:
     ) -> str:
         if group_id <= 0 or api_call is None:
             return ""
+
         candidates = self._extract_avatar_name_candidates(merged)
         if not candidates:
             return ""
+
         try:
             members = await api_call("get_group_member_list", group_id=group_id)
         except Exception:
             return ""
         if not isinstance(members, list):
             return ""
+
         # 先精确匹配，再包含匹配；命中多个时用第一条稳定返回
         exact_hits: list[str] = []
         fuzzy_hits: list[str] = []
@@ -8184,6 +8694,7 @@ class ToolExecutor:
             keys = [k for k in keys if k]
             if not keys:
                 continue
+
             for cand in candidates:
                 ck = self._normalize_name_key(cand)
                 if not ck:
@@ -8194,59 +8705,62 @@ class ToolExecutor:
                 if any(ck in key or key in ck for key in keys):
                     fuzzy_hits.append(uid)
                     break
+
         if exact_hits:
             return exact_hits[0]
         if fuzzy_hits:
             return fuzzy_hits[0]
         return ""
+
     @staticmethod
     def _extract_avatar_name_candidates(text: str) -> list[str]:
-
         content = normalize_text(text)
         if not content:
             return []
-        if not ToolExecutor._has_control_token(text, "/avatar", "/qqavatar", "type=avatar"):
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        strip_chars = "`\"'[](){}<>.,;:!?\uFF0C\u3002\uFF1F\uFF01\uFF1A"
-        def add_candidate(raw: str) -> None:
 
-            cand = normalize_text(str(raw)).strip(strip_chars)
-            if not cand:
-                return
+        raw_hits: list[str] = []
+        patterns = (
+            r"([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})的头像",
+            r"头像\s*[:：]?\s*([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})",
+            r"发([\u4e00-\u9fffA-Za-z0-9_.-]{2,20})头像",
+        )
+        for pat in patterns:
+            raw_hits.extend(re.findall(pat, content, flags=re.IGNORECASE))
+
+        stopwords = {
+            "他的",
+            "她的",
+            "ta的",
+            "这个",
+            "那个",
+            "群里",
+            "群里的",
+            "qq群里",
+            "qq群里的",
+            "头像",
+            "我的",
+            "我",
+        }
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for item in raw_hits:
+            cand = normalize_text(str(item)).strip("\"'[]()锛堬級")
+            if not cand or cand in stopwords:
+                continue
             key = cand.lower()
             if key in seen:
-                return
-            if key.startswith("/") or "=" in key:
-                return
-            if key in {"me", "self"}:
-                return
-            if re.fullmatch(r"[1-9]\d{4,11}", cand):
-                return
-            compact = re.sub(r"[^a-z0-9\u4e00-\u9fff_.-]+", "", key)
-            if len(compact) < 2:
-                return
+                continue
             seen.add(key)
-            out.append(cand)
-        explicit_patterns = (
-            r"target\s*=\s*[\"']?([^\"'\s][^\"']{0,31})[\"']?",
-            r"/(?:avatar|qqavatar)\s+[\"']([^\"']{2,32})[\"']",
-        )
-        for pattern in explicit_patterns:
-            for raw in re.findall(pattern, content, flags=re.IGNORECASE):
-                add_candidate(raw)
-                if len(out) >= 3:
-                    return out[:3]
-        for token in re.split(r"\s+", content):
-            add_candidate(token)
-            if len(out) >= 3:
-                break
-        return out[:3]
+            uniq.append(cand)
+        return uniq[:3]
+
     @staticmethod
     def _normalize_name_key(name: str) -> str:
-
         raw = normalize_text(name).lower()
         if not raw:
             return ""
         return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", raw)
+
+
+
+

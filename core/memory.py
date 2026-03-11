@@ -137,6 +137,8 @@ class MemoryEngine:
                 self._user_display_names[user_id] = name
         self.thread_state_path = self.user_dir / "thread_state.json"
         self._thread_state: dict[str, dict[str, Any]] = self._load_thread_state()
+        self._user_profiles_dirty = False
+        self._thread_state_dirty = False
 
         self.db_path = self.vector_dir / "memory.db"
         self._vector_buffer: list[tuple[str, str, str, str, str, str]] = []
@@ -1152,6 +1154,12 @@ class MemoryEngine:
         return None
 
     def get_recent_messages(self, conversation_id: str, limit: int | None = None) -> list[MemoryMessage]:
+        """获取会话历史消息。
+
+        注意：此方法仅按 conversation_id 检索，不过滤 user_id。
+        在群聊场景下，conversation_id 通常为 group_id，返回所有成员消息。
+        在私聊场景下，conversation_id 通常为 user_id，自然隔离。
+        """
         records = list(self._history.get(conversation_id, []))
         if limit is None:
             return records

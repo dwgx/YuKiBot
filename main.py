@@ -1,7 +1,6 @@
 ﻿from __future__ import annotations
 
 import io
-import logging
 import os
 import sys
 
@@ -28,38 +27,6 @@ def _load_env_files() -> None:
 
 
 _load_env_files()
-
-
-def _tune_runtime_logging() -> None:
-    # Keep startup/runtime diagnostics, suppress noisy per-request HTTP access logs.
-    def _silence_logger(name: str) -> None:
-        logger = logging.getLogger(name)
-        logger.handlers.clear()
-        logger.filters.clear()
-        logger.disabled = True
-        logger.propagate = False
-        logger.setLevel(logging.CRITICAL + 1)
-
-    for name in ("uvicorn.access", "uvicorn.asgi", "uvicorn.protocols.http.h11_impl"):
-        _silence_logger(name)
-
-    try:
-        import uvicorn.config
-
-        loggers = uvicorn.config.LOGGING_CONFIG.get("loggers", {})
-        for name in ("uvicorn.access", "uvicorn.asgi"):
-            if name in loggers:
-                loggers[name]["handlers"] = []
-                loggers[name]["propagate"] = False
-                loggers[name]["level"] = "CRITICAL"
-    except Exception:
-        pass
-
-    logging.getLogger("websockets.server").setLevel(logging.WARNING)
-    logging.getLogger("websockets.client").setLevel(logging.WARNING)
-
-
-_tune_runtime_logging()
 
 # 首次运行向导：
 #   config.yml 不存在 → 启动 WebUI 配置页面
@@ -115,12 +82,7 @@ if _webui_assets.is_dir():
 
 def _webui_missing_response() -> Response:
     return Response(
-        (
-            "WebUI 静态页面未构建。请先执行前端构建后重启服务：\n"
-            "Windows: build-webui.bat\n"
-            "Linux/macOS: bash build-webui.sh\n"
-            "或手动执行: cd webui && npm install && npm run build"
-        ),
+        "WebUI 静态页面未构建。请先执行：cd webui && npm install && npm run build，然后重启服务再访问 /webui/login",
         status_code=503,
         media_type="text/plain; charset=utf-8",
     )
@@ -162,6 +124,4 @@ async def _root_redirect():
 
 
 if __name__ == "__main__":
-    # NoneBot FastAPI driver rebuilds its own uvicorn logging config, so
-    # access_log must be disabled at the run() call site to silence GET noise.
-    nonebot.run(access_log=False)
+    nonebot.run()
