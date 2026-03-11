@@ -83,6 +83,7 @@ Commands:
   help                              Show this help
   install [install.sh options]      Run interactive/non-interactive installer
   run [main.py args]                Run app in foreground (same as start.sh)
+  update [options]                  Pull latest code and refresh runtime deps
   start [--service-name NAME]       systemctl start service
   stop [--service-name NAME]        systemctl stop service
   restart [--service-name NAME]     systemctl restart service
@@ -105,12 +106,157 @@ Uninstall options:
 Examples:
   yukiko --help
   yukiko install --host 0.0.0.0 --port 18081
+  yukiko update --check-only
+  yukiko update --restart
   yukiko register --service-name yukiko --user \$USER
   yukiko start
   yukiko logs --lines 200
   yukiko set-port --port 8088 --host 0.0.0.0
   yukiko uninstall --purge-runtime --purge-env --yes
 EOF
+}
+
+cmd_update() {
+  local service_name="$DEFAULT_SERVICE_NAME"
+  local check_only=0
+  local restart_service=0
+  local install_python=1
+  local build_webui=1
+  local allow_dirty=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --service-name)
+        service_name="${2:-}"
+        shift 2
+        ;;
+      --check-only)
+        check_only=1
+        shift
+        ;;
+      --restart)
+        restart_service=1
+        shift
+        ;;
+      --no-python)
+        install_python=0
+        shift
+        ;;
+      --no-webui)
+        build_webui=0
+        shift
+        ;;
+      --allow-dirty)
+        allow_dirty=1
+        shift
+        ;;
+      *)
+        error "Unknown option for update: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  if ! command_exists git; then
+    error "git not found. Cannot run update."
+    exit 1
+  fi
+
+  if [[ ! -d "$ROOT_DIR/.git" ]]; then
+    error "Current directory is not a git repository: $ROOT_DIR"
+    exit 1
+  fi
+
+  info "Fetching remote changes..."
+  git -C "$ROOT_DIR" fetch --prune --tags origin
+
+  local branch upstream remote_head local_head status_line
+  branch="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref HEAD)"
+  upstream="$(git -C "$ROOT_DIR" rev-parse --abbrev-ref --symbolic-full-name "@{upstream}" 2>/dev/null || true)"
+  if [[ -z "$upstream" ]]; then
+    upstream="origin/$branch"
+  fi
+
+  if ! git -C "$ROOT_DIR" rev-parse --verify "$upstream" >/dev/null 2>&1; then
+    warn "Upstream ref not found: $upstream"
+    status_line="branch=$branch upstream=$upstream status=unknown"
+    echo "$status_line"
+    if [[ "$check_only" -eq 1 ]]; then
+      return 0
+    fi
+  fi
+
+  local ahead=0 behind=0 dirty=0
+  if git -C "$ROOT_DIR" rev-parse --verify "$upstream" >/dev/null 2>&1; then
+    read -r ahead behind < <(git -C "$ROOT_DIR" rev-list --left-right --count "$upstream...HEAD")
+  fi
+  if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
+    dirty=1
+  fi
+
+  local_head="$(git -C "$ROOT_DIR" rev-parse --short HEAD)"
+  remote_head="$(git -C "$ROOT_DIR" rev-parse --short "$upstream" 2>/dev/null || echo "unknown")"
+  status_line="branch=$branch upstream=$upstream local=$local_head remote=$remote_head ahead=$ahead behind=$behind dirty=$dirty"
+  echo "$status_line"
+
+  if [[ "$check_only" -eq 1 ]]; then
+    return 0
+  fi
+
+  if [[ "$dirty" -eq 1 && "$allow_dirty" -ne 1 ]]; then
+    error "Working tree has local changes. Commit/stash first, or retry with --allow-dirty."
+    exit 1
+  fi
+
+  if [[ "$behind" -gt 0 ]]; then
+    info "Pulling latest commits (ff-only)..."
+    git -C "$ROOT_DIR" pull --ff-only
+  else
+    info "Already up to date with $upstream."
+  fi
+
+  if [[ "$install_python" -eq 1 ]]; then
+    local py_cmd=""
+    if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+      py_cmd="$ROOT_DIR/.venv/bin/python"
+    elif command_exists python3; then
+      py_cmd="python3"
+    elif command_exists python; then
+      py_cmd="python"
+    fi
+    if [[ -n "$py_cmd" ]]; then
+      info "Installing Python dependencies..."
+      "$py_cmd" -m pip install -r "$ROOT_DIR/requirements.txt"
+    else
+      warn "No python executable found, skipped Python dependency sync."
+    fi
+  fi
+
+  if [[ "$build_webui" -eq 1 ]]; then
+    if [[ -f "$ROOT_DIR/webui/package.json" ]]; then
+      if command_exists npm; then
+        info "Building WebUI..."
+        (
+          cd "$ROOT_DIR/webui"
+          npm install --no-audit --no-fund
+          npm run build
+        )
+      else
+        warn "npm not found, skipped WebUI build."
+      fi
+    fi
+  fi
+
+  if [[ "$restart_service" -eq 1 ]]; then
+    if [[ -z "$service_name" ]]; then
+      error "Service name cannot be empty."
+      exit 1
+    fi
+    info "Restarting service: $service_name"
+    run_root systemctl restart "$service_name"
+  fi
+
+  info "Update flow completed."
 }
 
 register_service() {
@@ -444,6 +590,9 @@ main() {
       ;;
     run)
       cmd_run "$@"
+      ;;
+    update)
+      cmd_update "$@"
       ;;
     start|stop|restart)
       cmd_service_action "$cmd" "$@"

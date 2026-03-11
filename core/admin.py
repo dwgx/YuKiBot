@@ -40,6 +40,7 @@ _FUZZY_COMMAND_MAP: dict[str, str] = {
     "debug": "debug", "调试": "debug",
     "定海神针": "clear_screen", "刷屏": "clear_screen", "清屏": "clear_screen",
     "学习表情包": "learn_sticker", "表情包": "sticker_status", "扫描表情包": "scan_sticker",
+    "更新": "update", "升级": "update", "update": "update", "upgrade": "update", "远程更新": "update",
 }
 
 
@@ -75,6 +76,11 @@ class AdminEngine:
         "whitelist": "white",
         "群信息": "group_info",
         "debug": "debug",
+        "update": "update",
+        "升级": "update",
+        "更新": "update",
+        "upgrade": "update",
+        "远程更新": "update",
         "cookie": "cookie",
         "cookies": "cookie",
         "尺度": "scale",
@@ -111,6 +117,7 @@ class AdminEngine:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self._started = time.time()
         self._count = 0
+        self._update_lock = asyncio.Lock()
 
         admin_cfg = self.config.get("admin", {}) if isinstance(self.config, dict) else {}
         if not isinstance(admin_cfg, dict):
@@ -251,7 +258,7 @@ class AdminEngine:
         return (
             "YuKiKo 管理面板\n"
             "---------------------\n"
-            "reload / ping / status\n"
+            "reload / ping / status / update\n"
             "加白 / 拉黑 / 白名单\n"
             "尺度 / 敏感词 / 行为\n"
             "戳 / 骰子 / 猜拳\n"
@@ -269,6 +276,7 @@ class AdminEngine:
             "  /yuki reload\n"
             "  /yuki ping\n"
             "  /yuki status\n"
+            "  /yuki update [check|run|restart]\n"
             "  /yuki plugins\n"
             "  /yuki debug <QQ>\n"
             "  /yuki cookie [platform] [browser] [force]\n"
@@ -312,6 +320,14 @@ class AdminEngine:
             "  /yuki 表情包          sticker system status\n"
             "  /yuki 扫描表情包      rescan QQ emoji cache\n"
             "  /yuki 学习表情包 [n]  learn n stickers via LLM (default 5)\n"
+            "---------------------\n"
+            "Update (Remote)\n"
+            "  /yuki update check            check local/remote version\n"
+            "  /yuki update run              pull latest + sync deps + build webui\n"
+            "  /yuki update restart          run update and restart service\n"
+            "  /yuki update run --no-webui   skip webui build\n"
+            "  /yuki update run --no-python  skip pip install\n"
+            "  /yuki update run --allow-dirty\n"
             "---------------------\n"
             "Fuzzy match enabled - typos are auto-corrected"
         )
@@ -456,6 +472,118 @@ class AdminEngine:
             return "引擎未就绪"
         ok, msg = engine.reload_config()
         return f"重载{'成功' if ok else '失败'}: {msg}"
+
+    async def _act_update(self, **kwargs: Any) -> str:
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        tokens = [x for x in arg.split() if x]
+        if not tokens:
+            return (
+                "用法:\n"
+                "/yuki update check\n"
+                "/yuki update run\n"
+                "/yuki update restart\n"
+                "/yuki update run --no-webui --no-python --allow-dirty\n"
+            )
+
+        first = normalize_text(tokens[0]).lower()
+        check_alias = {"check", "status", "查看", "检查"}
+        run_alias = {"run", "pull", "升级", "更新", "执行", "update", "upgrade"}
+        restart_alias = {"restart", "重启"}
+        force_alias = {"force", "强制"}
+
+        cmd_args = ["update"]
+        passthrough: list[str] = []
+        check_only = False
+        restart_mode = False
+        allow_dirty = False
+
+        for raw in tokens:
+            t = normalize_text(raw).lower()
+            if t in check_alias:
+                check_only = True
+                continue
+            if t in run_alias:
+                continue
+            if t in restart_alias:
+                restart_mode = True
+                continue
+            if t in force_alias:
+                allow_dirty = True
+                continue
+            passthrough.append(raw)
+
+        if first in check_alias:
+            check_only = True
+        elif first in restart_alias:
+            restart_mode = True
+        elif first not in run_alias and first.startswith("--"):
+            # 允许直接传 flags：/yuki update --check-only ...
+            pass
+
+        if check_only:
+            cmd_args.append("--check-only")
+        if restart_mode:
+            cmd_args.append("--restart")
+        if allow_dirty:
+            cmd_args.append("--allow-dirty")
+        cmd_args.extend(passthrough)
+
+        if self._update_lock.locked():
+            return "已有远程更新任务在执行中，请稍后再试。"
+
+        async with self._update_lock:
+            timeout_sec = 120 if check_only else 1800
+            ok, output = await self._run_manager_command(cmd_args, timeout_sec=timeout_sec)
+            output = self._clip_command_output(output)
+            title = "远程更新检查完成" if check_only else ("远程更新成功" if ok else "远程更新失败")
+            if not output:
+                return title
+            return f"{title}\n{output}"
+
+    async def _run_manager_command(self, args: list[str], timeout_sec: int = 600) -> tuple[bool, str]:
+        root_dir = Path(__file__).resolve().parents[1]
+        script = root_dir / "scripts" / "yukiko_manager.sh"
+        if not script.exists():
+            return False, f"管理脚本不存在: {script}"
+
+        cmd = ["bash", "scripts/yukiko_manager.sh", *args]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(root_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as exc:
+            return False, f"启动更新进程失败: {str(exc)[:160]}"
+
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_sec)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return False, f"更新命令超时（>{timeout_sec}s）"
+
+        text = ""
+        if stdout:
+            text = stdout.decode("utf-8", errors="ignore").replace("\r\n", "\n").replace("\r", "\n").strip()
+        return proc.returncode == 0, text
+
+    @staticmethod
+    def _clip_command_output(text: str, *, max_lines: int = 80, max_chars: int = 3800) -> str:
+        raw = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+        if not raw.strip():
+            return ""
+        rows = [line.rstrip() for line in raw.splitlines()]
+        if len(rows) > max_lines:
+            rows = rows[:max_lines] + ["...(output truncated)"]
+        out = "\n".join(rows)
+        if len(out) > max_chars:
+            out = out[:max_chars] + "\n...(output truncated)"
+        return out
 
     async def _act_white(self, **kwargs: Any) -> str:
         sub = normalize_text(str(kwargs.get("arg", ""))).lower()

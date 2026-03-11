@@ -33,6 +33,8 @@ After install, use the unified manager command:
 
 ```bash
 yukiko --help
+yukiko update --check-only
+yukiko update --restart
 yukiko status
 yukiko logs --lines 200
 yukiko stop

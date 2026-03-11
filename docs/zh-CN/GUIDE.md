@@ -71,6 +71,8 @@ bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yuk
 
 ```bash
 yukiko --help
+yukiko update --check-only
+yukiko update --restart
 yukiko status
 yukiko logs --lines 200
 yukiko stop
