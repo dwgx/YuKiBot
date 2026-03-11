@@ -4234,6 +4234,9 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
                 "properties": {
                     "url": {"type": "string", "description": "图片URL（可选，不传则从消息中自动提取）"},
                     "question": {"type": "string", "description": "针对图片的具体问题（可选，如'图里的文字是什么'）"},
+                    "analyze_all": {"type": "boolean", "description": "是否批量识别可见范围内的所有图片（可选）"},
+                    "max_images": {"type": "integer", "description": "批量识别时最多识别多少张（可选，默认 8）"},
+                    "target_message_id": {"type": "string", "description": "强制指定要分析的消息ID（可选）"},
                 },
                 "required": [],
             },
@@ -4628,7 +4631,55 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
     query = question or message_text or "请描述这张图片的内容"
     query_norm = normalize_text(query).lower()
 
+    def _to_flag(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        text = normalize_text(str(value)).lower()
+        if not text:
+            return default
+        if text in {"1", "true", "yes", "on", "y"}:
+            return True
+        if text in {"0", "false", "no", "off", "n"}:
+            return False
+        return default
+
+    def _to_positive_int(value: Any, default: int = 0) -> int:
+        text = normalize_text(str(value))
+        if not text:
+            return default
+        try:
+            parsed = int(text)
+        except ValueError:
+            return default
+        if parsed <= 0:
+            return default
+        return parsed
+
+    all_scope_cues = (
+        "所有图片",
+        "全部图片",
+        "所有图",
+        "全部图",
+        "群里图片",
+        "群里的图片",
+        "群里所有图",
+        "每张图",
+        "每个图",
+        "逐张",
+        "一张张",
+        "批量",
+        "all images",
+        "every image",
+    )
+    all_action_cues = ("识别", "分析", "看看", "描述", "提取", "总结", "识图", "analyze", "describe", "ocr", "read")
+    inferred_analyze_all = any(cue in query_norm for cue in all_scope_cues) and any(cue in query_norm for cue in all_action_cues)
+    analyze_all = _to_flag(args.get("analyze_all", False), False) or inferred_analyze_all
+    max_images = _to_positive_int(args.get("max_images"), 8 if analyze_all else 0)
+
     method_args: dict[str, Any] = {}
+    if analyze_all:
+        method_args["analyze_all"] = True
+        method_args["max_images"] = max_images
     selected_source = "none"
     selected_segments: list[dict[str, Any]] = []
     if url:
@@ -4676,7 +4727,10 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
                     display="你指定的目标消息里没有图片，请直接回复那张图再问我。",
                 )
         elif current_image_count > 0 and reply_image_count > 0:
-            if explicit_reply_ref:
+            if analyze_all:
+                selected_source = "current_and_reply"
+                selected_segments = current_segments + reply_segments
+            elif explicit_reply_ref:
                 selected_source = "reply_message"
                 selected_segments = reply_segments
                 if reply_to_message_id:
@@ -4708,21 +4762,23 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
             # - 用户显式说“这张/刚刚那张”时同样走该路径。
             selected_source = "recent_cache_fallback"
             method_args["allow_recent_fallback"] = True
-            method_args["recent_only_when_unique"] = True
+            method_args["recent_only_when_unique"] = not analyze_all
             selected_segments = current_segments + reply_segments
 
         method_args.setdefault("allow_recent_fallback", False)
-        method_args.setdefault("recent_only_when_unique", True)
+        method_args.setdefault("recent_only_when_unique", not analyze_all)
         if selected_source:
             method_args["target_source"] = selected_source
 
         _log.info(
-            "analyze_image_target | source=%s | current_images=%d | reply_images=%d | message_id=%s | reply_to=%s",
+            "analyze_image_target | source=%s | current_images=%d | reply_images=%d | message_id=%s | reply_to=%s | analyze_all=%s | max_images=%s",
             selected_source,
             current_image_count,
             reply_image_count,
             message_id or "-",
             reply_to_message_id or "-",
+            analyze_all,
+            max_images if analyze_all else "-",
         )
 
     try:
@@ -4745,9 +4801,21 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
 
     if result.ok and (text or analysis):
         display = clip_text(analysis or text, 600)
+        data: dict[str, Any] = {
+            "analysis": analysis,
+            "source": str(payload.get("source", "")),
+        }
+        analyses = payload.get("analyses")
+        if isinstance(analyses, list) and analyses:
+            data["analyses"] = analyses
+            count_val = payload.get("count")
+            if isinstance(count_val, int) and count_val > 0:
+                data["count"] = count_val
+            else:
+                data["count"] = len(analyses)
         return ToolCallResult(
             ok=True,
-            data={"analysis": analysis, "source": str(payload.get("source", ""))},
+            data=data,
             display=display,
         )
 

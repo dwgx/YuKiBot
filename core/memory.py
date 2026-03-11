@@ -71,6 +71,13 @@ class MemoryEngine:
         self.vector_dim = max(16, int(config.get("vector_dim", 64)))
         self.retrieve_top_k = max(1, int(config.get("retrieve_top_k", 5)))
         self.privacy_filter = bool(config.get("privacy_filter", False))
+        self.enable_media_memory = bool(config.get("media_memory_enable", True))
+        self.media_memory_max_data_uri_chars = max(
+            1024,
+            int(config.get("media_memory_max_data_uri_chars", 2_000_000)),
+        )
+        self.media_memory_store_non_image = bool(config.get("media_memory_store_non_image", False))
+        self.media_memory_max_rows = max(200, min(50_000, int(config.get("media_memory_max_rows", 4_000))))
         if self.heuristic_rules_enable:
             self.preferred_name_patterns = self._compile_regex_list(config.get("preferred_name_patterns", []))
             self.preferred_name_invalid_parts = tuple(self._normalize_text_list(config.get("preferred_name_invalid_parts", [])))
@@ -143,7 +150,7 @@ class MemoryEngine:
         self.db_path = self.vector_dir / "memory.db"
         self._vector_buffer: list[tuple[str, str, str, str, str, str]] = []
         self._vector_buffer_limit = 10  # 攒 10 条再批量写入
-        if self.enable_vector_memory:
+        if self.enable_vector_memory or self.enable_media_memory:
             self._init_vector_db()
 
     @staticmethod
@@ -341,6 +348,31 @@ class MemoryEngine:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_audit_created_at ON memory_audit_log(created_at);"
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS media_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    media_type TEXT NOT NULL,
+                    data_uri TEXT,
+                    url TEXT,
+                    file_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_memory_message_id ON media_memory(message_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_memory_conversation_id ON media_memory(conversation_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_memory_created_at ON media_memory(created_at);"
+            )
 
     def _embed(self, text: str) -> list[float]:
         vec = [0.0] * self.vector_dim
@@ -447,6 +479,119 @@ class MemoryEngine:
         self._message_counter += 1
         if self.enable_daily_log and self._message_counter % self.summary_every_n_messages == 0:
             self.write_daily_snapshot(day_key)
+
+    def add_media_artifacts(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        user_id: str,
+        source: str,
+        media_items: list[dict[str, Any]],
+        timestamp: datetime | None = None,
+    ) -> None:
+        if not self.enable_media_memory:
+            return
+        conv = normalize_text(conversation_id)
+        mid = normalize_text(message_id)
+        uid = normalize_text(user_id)
+        if not conv or not mid:
+            return
+        if not isinstance(media_items, list) or not media_items:
+            return
+        source_text = normalize_text(source) or "message"
+        ts = (timestamp or datetime.now(timezone.utc)).isoformat()
+        rows: list[tuple[str, str, str, str, str, str, str, str, str]] = []
+        for item in media_items:
+            if not isinstance(item, dict):
+                continue
+            media_type = normalize_text(str(item.get("type", ""))).lower()
+            if not media_type:
+                continue
+            if media_type != "image" and not self.media_memory_store_non_image:
+                continue
+            data_uri = normalize_text(str(item.get("data_uri", "")))
+            if data_uri and len(data_uri) > self.media_memory_max_data_uri_chars:
+                data_uri = ""
+            url = normalize_text(str(item.get("url", "")))
+            file_id = normalize_text(str(item.get("file_id", "")))
+            if not data_uri and not url and not file_id:
+                continue
+            rows.append((conv, mid, uid, source_text, media_type, data_uri, url, file_id, ts))
+        if not rows:
+            return
+        try:
+            with self._connect() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO media_memory (
+                        conversation_id, message_id, user_id, source, media_type,
+                        data_uri, url, file_id, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    rows,
+                )
+                conn.execute(
+                    """
+                    DELETE FROM media_memory
+                    WHERE id NOT IN (
+                        SELECT id FROM media_memory ORDER BY id DESC LIMIT ?
+                    );
+                    """,
+                    (self.media_memory_max_rows,),
+                )
+        except Exception:
+            return
+
+    def get_message_media_artifacts(
+        self,
+        *,
+        message_id: str,
+        conversation_id: str = "",
+        media_type: str = "image",
+        limit: int = 6,
+    ) -> list[dict[str, str]]:
+        if not self.enable_media_memory:
+            return []
+        mid = normalize_text(message_id)
+        if not mid:
+            return []
+        conv = normalize_text(conversation_id)
+        media_type_norm = normalize_text(media_type).lower()
+        row_limit = max(1, min(20, int(limit)))
+        sql = (
+            "SELECT message_id, media_type, data_uri, url, file_id, source, created_at "
+            "FROM media_memory WHERE message_id = ?"
+        )
+        params: list[Any] = [mid]
+        if conv:
+            sql += " AND conversation_id = ?"
+            params.append(conv)
+        if media_type_norm:
+            sql += " AND media_type = ?"
+            params.append(media_type_norm)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(row_limit)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(sql, tuple(params)).fetchall()
+        except Exception:
+            return []
+        out: list[dict[str, str]] = []
+        for row in reversed(rows or []):
+            out.append(
+                {
+                    "message_id": normalize_text(str(row[0] or "")),
+                    "media_type": normalize_text(str(row[1] or "")),
+                    "data_uri": normalize_text(str(row[2] or "")),
+                    "url": normalize_text(str(row[3] or "")),
+                    "file_id": normalize_text(str(row[4] or "")),
+                    "source": normalize_text(str(row[5] or "")),
+                    "created_at": normalize_text(str(row[6] or "")),
+                }
+            )
+        return out
 
     @staticmethod
     def _redact_sensitive_content(text: str) -> str:
@@ -2150,4 +2295,3 @@ class MemoryEngine:
                     )
             except Exception:
                 pass
-

@@ -71,8 +71,15 @@ type PendingThinkingLog = {
 };
 
 type ThinkingIslandSize = "sm" | "md" | "lg";
+type ThinkingStage = "idle" | "routing" | "planning" | "executing" | "replying" | "done" | "cancelled" | "error";
 
 const THINKING_ISLAND_SIZE_ORDER: ThinkingIslandSize[] = ["sm", "md", "lg"];
+const THINKING_STAGE_STEPS: Array<{ key: "routing" | "planning" | "executing" | "replying"; label: string }> = [
+  { key: "routing", label: "理解" },
+  { key: "planning", label: "规划" },
+  { key: "executing", label: "执行" },
+  { key: "replying", label: "回复" },
+];
 
 const THINKING_ISLAND_SIZE_WIDTH: Record<ThinkingIslandSize, string> = {
   sm: "min(520px,100%)",
@@ -85,6 +92,47 @@ const THINKING_ISLAND_PREVIEW_HEIGHT_CLASS: Record<ThinkingIslandSize, string> =
   md: "max-h-36",
   lg: "max-h-44",
 };
+
+function stateBelongsToConversation(stateConversationId: string, selectedConversationId: string): boolean {
+  const stateId = String(stateConversationId || "").trim();
+  const selectedId = String(selectedConversationId || "").trim();
+  if (!stateId || !selectedId) return false;
+  if (stateId === selectedId) return true;
+  return stateId.startsWith(`${selectedId}:user:`);
+}
+
+function toTimestamp(value: string | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(String(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function mergeAgentStates(states: ChatAgentStateItem[], selectedConversationId: string): ChatAgentStateItem | null {
+  const matched = states.filter((item) =>
+    stateBelongsToConversation(String(item?.conversation_id || ""), selectedConversationId),
+  );
+  if (matched.length === 0) return null;
+  if (matched.length === 1) return matched[0] ?? null;
+
+  const sorted = [...matched].sort((a, b) => {
+    const delta = toTimestamp(String(b?.last_update || "")) - toTimestamp(String(a?.last_update || ""));
+    if (delta !== 0) return delta;
+    return Number(String(b?.latest_trace_id || "").length) - Number(String(a?.latest_trace_id || "").length);
+  });
+  const latest = sorted[0] ?? matched[0];
+  return {
+    conversation_id: selectedConversationId,
+    pending_count: matched.reduce((sum, item) => sum + Number(item?.pending_count || 0), 0),
+    running_count: matched.reduce((sum, item) => sum + Number(item?.running_count || 0), 0),
+    queued_count: matched.reduce((sum, item) => sum + Number(item?.queued_count || 0), 0),
+    interruptible_count: matched.reduce((sum, item) => sum + Number(item?.interruptible_count || 0), 0),
+    latest_trace_id: String(latest?.latest_trace_id || ""),
+    last_trace_id: String(latest?.last_trace_id || latest?.latest_trace_id || ""),
+    last_user_id: String(latest?.last_user_id || ""),
+    last_text_preview: String(latest?.last_text_preview || ""),
+    last_update: String(latest?.last_update || ""),
+  };
+}
 
 function clampThinkingIslandOffset(offset: ThinkingIslandOffset): ThinkingIslandOffset {
   if (typeof window === "undefined") return offset;
@@ -121,6 +169,34 @@ function loadThinkingIslandSize(): ThinkingIslandSize {
 function parseThinkingLine(rawLine: string): string {
   const line = String(rawLine || "").trim();
   if (!line) return "";
+  if (line.includes("qq_recv")) return "收到新消息，正在开始处理";
+  if (line.includes("router_llm")) return "AI 正在理解问题并做路由判断";
+  if (line.includes("router_decision")) {
+    const action = line.match(/\|\s*action=([a-zA-Z0-9_.-]+)/)?.[1] || "";
+    return action ? `已决策动作: ${action}` : "路由决策完成";
+  }
+  if (line.includes("effective_threshold_trace")) return "通过触发阈值，准备执行";
+  if (line.includes("tool_dispatch")) {
+    const action = line.match(/\|\s*action=([a-zA-Z0-9_.-]+)/)?.[1] || "";
+    const tool = line.match(/\|\s*tool=([a-zA-Z0-9_.-]+)/)?.[1] || "";
+    const name = action || tool;
+    return name ? `开始执行: ${name}` : "开始执行工具";
+  }
+  if (line.includes("tool_result")) {
+    const tool = line.match(/\|\s*tool=([a-zA-Z0-9_.-]+)/)?.[1] || "";
+    const ok = line.match(/\|\s*ok=(true|false)/)?.[1] || "";
+    const err = line.match(/\|\s*error=([^|]+)/)?.[1] || "";
+    if (ok === "false") return `执行失败${tool ? `: ${tool}` : ""}${err ? ` (${clip(err, 72)})` : ""}`;
+    if (tool) return `执行完成: ${tool}`;
+    return "执行完成";
+  }
+  if (line.includes("send_final")) return "正在发送回复";
+  if (line.includes("queue_final")) {
+    const status = line.match(/\|\s*status=([a-zA-Z0-9_.-]+)/)?.[1] || "";
+    if (status === "finished") return "任务已完成";
+    if (status === "cancelled") return "任务已取消";
+    return status ? `队列状态: ${status}` : "队列处理完成";
+  }
   if (line.includes("agent_done")) return "任务完成";
   if (line.includes("cancelled_by_webui_interrupt")) return "已收到中断请求";
   if (line.includes("agent_direct_reply")) return "准备直接回复";
@@ -165,7 +241,7 @@ function parseThinkingLine(rawLine: string): string {
 function compactThinkingRawLine(rawLine: string): string {
   const line = String(rawLine || "").trim();
   if (!line) return "";
-  if (!/(agent_|queue_|tool_call|tool_result|interrupt|trace=|step=)/.test(line)) return "";
+  if (!/(agent_|queue_|router_|tool_dispatch|tool_call|tool_result|send_final|effective_threshold_trace|interrupt|trace=|step=)/.test(line)) return "";
   const compact = line
     .replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*\|\s*[A-Z]+\s*\|\s*[^|]*\|\s*/, "")
     .replace(/^\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s*\[[A-Z]+\]\s*[^|]*\|\s*/, "")
@@ -183,6 +259,49 @@ function thinkingStreamLabel(state: "connecting" | "open" | "closed"): string {
   if (state === "open") return "任务流已连接";
   if (state === "connecting") return "连接任务流中";
   return "任务流已断开";
+}
+
+function inferThinkingStage(line: string, active: boolean): ThinkingStage {
+  const normalized = String(line || "").toLowerCase();
+  if (!normalized) return active ? "planning" : "idle";
+  if (/取消|中断|interrupt|cancel/.test(normalized)) return "cancelled";
+  if (/失败|超时|error|failed|timeout/.test(normalized)) return "error";
+  if (/任务已完成|处理完成|agent_done|queue_final/.test(normalized)) return "done";
+  if (/发送回复|最终回复|send_final|final/.test(normalized)) return "replying";
+  if (/执行|工具|dispatch|tool/.test(normalized)) return "executing";
+  if (/规划|思考|计划|agent_/.test(normalized)) return "planning";
+  if (/路由|理解问题|router|qq_recv/.test(normalized)) return "routing";
+  return active ? "planning" : "idle";
+}
+
+function thinkingStageLabel(stage: ThinkingStage): string {
+  if (stage === "routing") return "理解问题";
+  if (stage === "planning") return "规划策略";
+  if (stage === "executing") return "执行动作";
+  if (stage === "replying") return "整理回复";
+  if (stage === "done") return "任务完成";
+  if (stage === "cancelled") return "已中断";
+  if (stage === "error") return "异常兜底";
+  return "等待任务";
+}
+
+function thinkingStageColor(stage: ThinkingStage): "default" | "primary" | "success" | "warning" | "danger" {
+  if (stage === "done") return "success";
+  if (stage === "cancelled") return "warning";
+  if (stage === "error") return "danger";
+  if (stage === "idle") return "default";
+  return "primary";
+}
+
+function thinkingStageProgress(stage: ThinkingStage): number {
+  if (stage === "idle") return 6;
+  if (stage === "routing") return 22;
+  if (stage === "planning") return 46;
+  if (stage === "executing") return 72;
+  if (stage === "replying") return 88;
+  if (stage === "done") return 100;
+  if (stage === "cancelled") return 100;
+  return 100;
 }
 
 function isOneBotUnavailableError(error: unknown): boolean {
@@ -286,6 +405,7 @@ export default function ChatPage() {
   const pendingThinkingLogsRef = useRef<PendingThinkingLog[]>([]);
   const autoStickToBottomRef = useRef(true);
   const traceRef = useRef("");
+  const traceCandidatesRef = useRef<string[]>([]);
   const conversationRef = useRef("");
   const thinkingDragControls = useDragControls();
   const scrollMessagesToBottom = useCallback(() => {
@@ -298,10 +418,31 @@ export default function ChatPage() {
     () => conversations.find((item) => item.conversation_id === selectedId) ?? null,
     [conversations, selectedId],
   );
-  const selectedState = useMemo(
-    () => agentStates.find((item) => item.conversation_id === selectedId) ?? null,
+  const selectedStateMatches = useMemo(
+    () =>
+      agentStates.filter((item) =>
+        stateBelongsToConversation(String(item?.conversation_id || ""), selectedId),
+      ),
     [agentStates, selectedId],
   );
+  const selectedState = useMemo(
+    () => mergeAgentStates(selectedStateMatches, selectedId),
+    [selectedStateMatches, selectedId],
+  );
+  const selectedTraceCandidates = useMemo(() => {
+    const traces = new Set<string>();
+    const addTrace = (value: unknown) => {
+      const normalized = String(value ?? "").trim();
+      if (normalized) traces.add(normalized);
+    };
+    for (const row of selectedStateMatches) {
+      addTrace(row?.last_trace_id);
+      addTrace(row?.latest_trace_id);
+    }
+    addTrace(selectedState?.last_trace_id);
+    addTrace(selectedState?.latest_trace_id);
+    return Array.from(traces).slice(0, 8);
+  }, [selectedState, selectedStateMatches]);
   const filteredConversations = useMemo(() => {
     const q = conversationKeyword.trim().toLowerCase();
     if (!q) return conversations;
@@ -329,6 +470,13 @@ export default function ChatPage() {
     () => thinkingLines[thinkingLines.length - 1] || (thinkingActive ? "正在建立计划..." : "刚刚处理完成"),
     [thinkingActive, thinkingLines],
   );
+  const thinkingStage = useMemo(
+    () => inferThinkingStage(latestThinkingLine, thinkingActive),
+    [latestThinkingLine, thinkingActive],
+  );
+  const thinkingStageLabelText = useMemo(() => thinkingStageLabel(thinkingStage), [thinkingStage]);
+  const thinkingStageColorValue = useMemo(() => thinkingStageColor(thinkingStage), [thinkingStage]);
+  const thinkingProgressValue = useMemo(() => thinkingStageProgress(thinkingStage), [thinkingStage]);
   const thinkingPreviewLines = useMemo(() => thinkingLines.slice(-6), [thinkingLines]);
   const lastStreamPacketLabel = useMemo(
     () => (thinkingStreamLastPacketAt > 0 ? new Date(thinkingStreamLastPacketAt).toLocaleTimeString() : "-"),
@@ -363,6 +511,9 @@ export default function ChatPage() {
     }
   }, []);
   const beginThinkingIslandDrag = useCallback((evt: ReactPointerEvent<HTMLDivElement>) => {
+    if (evt.button !== 0) return;
+    evt.preventDefault();
+    evt.stopPropagation();
     thinkingIslandDragOriginRef.current = thinkingIslandOffset;
     thinkingDragControls.start(evt, { snapToCursor: false });
   }, [thinkingDragControls, thinkingIslandOffset]);
@@ -553,9 +704,10 @@ export default function ChatPage() {
   }, [contextMenu.open, closeContextMenu]);
 
   useEffect(() => {
-    traceRef.current = String(selectedState?.last_trace_id || selectedState?.latest_trace_id || "");
+    traceCandidatesRef.current = selectedTraceCandidates;
+    traceRef.current = String(selectedTraceCandidates[0] || selectedState?.last_trace_id || selectedState?.latest_trace_id || "");
     conversationRef.current = String(selected?.conversation_id || "");
-  }, [selectedState, selected]);
+  }, [selected, selectedState, selectedTraceCandidates]);
 
   useEffect(() => {
     thinkingActiveRef.current = thinkingActive;
@@ -634,10 +786,12 @@ export default function ChatPage() {
           const line = String(raw || "").trim();
           if (!line) continue;
           const trace = traceRef.current;
+          const traceCandidates = traceCandidatesRef.current;
           const conversationId = conversationRef.current;
-          const matchesTrace = !!trace && line.includes(trace);
-          const matchesConversation = !trace && !!conversationId && line.includes(conversationId);
-          const looksAgentLine = /(agent_|queue_|tool_call|tool_result|interrupt)/.test(line);
+          const matchesTrace = (trace ? line.includes(trace) : false)
+            || traceCandidates.some((candidate) => !!candidate && line.includes(candidate));
+          const matchesConversation = !!conversationId && line.includes(conversationId);
+          const looksAgentLine = /(agent_|queue_|router_|tool_dispatch|tool_call|tool_result|send_final|effective_threshold_trace|interrupt)/.test(line);
           const display = parseThinkingLine(line) || compactThinkingRawLine(line);
 
           if ((matchesTrace || matchesConversation) && display) {
@@ -646,7 +800,7 @@ export default function ChatPage() {
             continue;
           }
 
-          if (!trace && conversationId && thinkingActiveRef.current && looksAgentLine) {
+          if (conversationId && thinkingActiveRef.current && looksAgentLine) {
             pendingThinkingLogsRef.current = [
               ...pendingThinkingLogsRef.current.slice(-119),
               { raw: line, at: Date.now() },
@@ -694,12 +848,16 @@ export default function ChatPage() {
 
   useEffect(() => {
     const trace = traceRef.current;
+    const traceCandidates = traceCandidatesRef.current;
     const conversationId = conversationRef.current;
-    if (!trace || !conversationId || pendingThinkingLogsRef.current.length === 0) return;
+    if (!conversationId || pendingThinkingLogsRef.current.length === 0) return;
     const keep: PendingThinkingLog[] = [];
     for (const item of pendingThinkingLogsRef.current) {
       if (Date.now() - item.at > 25000) continue;
-      if (!item.raw.includes(trace)) {
+      const matchesTrace = (trace ? item.raw.includes(trace) : false)
+        || traceCandidates.some((candidate) => !!candidate && item.raw.includes(candidate));
+      const matchesConversation = item.raw.includes(conversationId);
+      if (!matchesTrace && !matchesConversation) {
         keep.push(item);
         continue;
       }
@@ -709,7 +867,7 @@ export default function ChatPage() {
       pushThinkingLine(parsed);
     }
     pendingThinkingLogsRef.current = keep.slice(-120);
-  }, [pushThinkingLine, selectedState?.last_trace_id, selectedState?.latest_trace_id, touchThinkingPresence]);
+  }, [pushThinkingLine, selectedId, selectedTraceCandidates, touchThinkingPresence]);
 
   useEffect(() => {
     if (!thinkingScrollRef.current) return;
@@ -1334,9 +1492,9 @@ export default function ChatPage() {
                   exit={{ opacity: 0, y: -16, scale: 0.94 }}
                   transition={{
                     type: "spring",
-                    stiffness: 380,
-                    damping: 30,
-                    mass: 0.8
+                    stiffness: 240,
+                    damping: 24,
+                    mass: 0.75
                   }}
                   className="pointer-events-none fixed inset-x-0 top-3 z-[90] flex justify-center px-3"
                 >
@@ -1351,6 +1509,7 @@ export default function ChatPage() {
                       x: thinkingIslandOffset.x,
                       y: thinkingIslandOffset.y,
                       width: THINKING_ISLAND_SIZE_WIDTH[thinkingIslandSize],
+                      touchAction: "none",
                     }}
                     whileDrag={{ scale: 1.02, boxShadow: "0 20px 40px rgba(0,0,0,0.15)" }}
                     whileHover={{ scale: 1.005 }}
@@ -1363,16 +1522,35 @@ export default function ChatPage() {
                         y: thinkingIslandDragOriginRef.current.y + info.offset.y,
                       }));
                     }}
-                    className="pointer-events-auto overflow-hidden rounded-2xl border border-primary/20 bg-content1/95 shadow-lg backdrop-blur-xl"
+                    className={`pointer-events-auto select-none overflow-hidden rounded-2xl border border-primary/20 bg-content1/95 shadow-lg backdrop-blur-xl ${thinkingActive ? "thinking-island-live" : ""}`}
+                    onWheel={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (e.deltaY < 0) {
+                        setThinkingIslandSize((prev) => {
+                          const idx = THINKING_ISLAND_SIZE_ORDER.indexOf(prev);
+                          return idx < THINKING_ISLAND_SIZE_ORDER.length - 1 ? THINKING_ISLAND_SIZE_ORDER[idx + 1] : prev;
+                        });
+                      } else if (e.deltaY > 0) {
+                        setThinkingIslandSize((prev) => {
+                          const idx = THINKING_ISLAND_SIZE_ORDER.indexOf(prev);
+                          return idx > 0 ? THINKING_ISLAND_SIZE_ORDER[idx - 1] : prev;
+                        });
+                      }
+                    }}
                   >
-                    <div className="flex items-start gap-2 px-3 py-2">
+                    <div
+                      className="flex select-none items-start gap-2 px-3 py-2"
+                      onPointerDown={beginThinkingIslandDrag}
+                      onDoubleClick={() => setThinkingIslandExpanded((prev) => !prev)}
+                    >
                       <div
                         className="flex h-9 w-9 shrink-0 cursor-grab items-center justify-center rounded-full bg-primary/10 ring-1 ring-primary/20 select-none touch-none active:cursor-grabbing"
                         onPointerDown={beginThinkingIslandDrag}
                         onDoubleClick={() => setThinkingIslandOffset({ x: 0, y: 0 })}
                         title="拖动移动，双击回中"
                       >
-                        <BrainCircuit size={16} className={`${thinkingActive ? "text-primary" : "text-success"}`} />
+                        <BrainCircuit size={16} className={`${thinkingActive ? "text-primary animate-pulse" : "text-success"}`} />
                       </div>
                       <div className="min-w-0 flex-1">
                         <div className="flex flex-wrap items-center gap-2">
@@ -1380,31 +1558,48 @@ export default function ChatPage() {
                           <Chip size="sm" variant="flat" color={thinkingActive ? "primary" : "success"}>
                             {thinkingStatusLabel(thinkingActive)}
                           </Chip>
+                          <Chip size="sm" variant="flat" color={thinkingStageColorValue}>
+                            {thinkingStageLabelText}
+                          </Chip>
                           <Chip size="sm" variant="flat">
                             {thinkingLines.length} 条
                           </Chip>
-                          <Chip size="sm" variant="flat" color={thinkingStreamState === "open" ? "success" : thinkingStreamState === "connecting" ? "warning" : "default"}>
-                            {thinkingStreamLabel(thinkingStreamState)}
-                          </Chip>
-                          <Chip size="sm" variant="flat">
-                            流包 {thinkingStreamPacketCount}
-                          </Chip>
-                          <Chip size="sm" variant="flat">
-                            尺寸 {thinkingIslandSize.toUpperCase()}
-                          </Chip>
                         </div>
-                        <div className="mt-1 flex items-center gap-1.5 text-[11px] text-default-600">
-                          <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />
+                        <div className="mt-1.5 flex items-center gap-2 text-[11px] text-default-600">
+                          <span className={`h-2 w-2 rounded-full ${thinkingActive ? "bg-primary animate-pulse" : "bg-success"}`} />
                           <span className="truncate">{latestThinkingLine}</span>
                         </div>
-                        <div className="mt-0.5 text-[10px] text-default-500 select-text">
-                          当前 trace: {selectedState?.last_trace_id || selectedState?.latest_trace_id || "等待分配"}
+                        <div className="mt-2">
+                          <div className="relative h-1.5 overflow-hidden rounded-full bg-default-200/80">
+                            <motion.div
+                              initial={false}
+                              animate={{ width: `${thinkingProgressValue}%` }}
+                              transition={{ type: "spring", stiffness: 220, damping: 26, mass: 0.8 }}
+                              className={`h-full ${thinkingStage === "error" ? "bg-red-500" : thinkingStage === "cancelled" ? "bg-amber-500" : thinkingStage === "done" ? "bg-emerald-500" : "bg-primary"} ${thinkingActive ? "thinking-progress-flow" : ""}`}
+                            />
+                            {thinkingActive && (
+                              <>
+                                <span className="thinking-progress-sweep absolute inset-y-0 w-10 bg-white/35 blur-[1px]" />
+                                <span className="thinking-progress-sweep thinking-progress-sweep-delay absolute inset-y-0 w-8 bg-white/25 blur-[1px]" />
+                              </>
+                            )}
+                          </div>
+                          <div className="mt-1 flex items-center justify-between text-[10px] text-default-500">
+                            <span>{thinkingStreamLabel(thinkingStreamState)}</span>
+                            <span>{thinkingStreamState === "open" ? `流包 ${thinkingStreamPacketCount}` : `最近流包 ${lastStreamPacketLabel}`}</span>
+                          </div>
                         </div>
-                        <div className="mt-0.5 text-[10px] text-default-500">
-                          最近流包时间: {lastStreamPacketLabel}
-                        </div>
-                        <div className="text-[10px] text-default-400">
-                          log stream mode (not token-by-token)
+                        <div className="mt-1.5 grid grid-cols-4 gap-1 text-[10px] text-default-500">
+                          {THINKING_STAGE_STEPS.map((step) => {
+                            const current = THINKING_STAGE_STEPS.findIndex((item) => item.key === thinkingStage);
+                            const stepIndex = THINKING_STAGE_STEPS.findIndex((item) => item.key === step.key);
+                            const done = thinkingStage === "done" || stepIndex <= current;
+                            return (
+                              <div key={step.key} className={`rounded-full px-1.5 py-0.5 text-center ${done ? "bg-primary/10 text-primary-700" : "bg-default-100 text-default-500"}`}>
+                                {step.label}
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                       <div className="flex items-center gap-1" onPointerDown={(evt) => evt.stopPropagation()}>
@@ -1462,14 +1657,20 @@ export default function ChatPage() {
                           animate={{ height: "auto", opacity: 1 }}
                           exit={{ height: 0, opacity: 0 }}
                           transition={{
-                            height: { type: "spring", stiffness: 400, damping: 32 },
-                            opacity: { duration: 0.2 }
+                            height: { type: "spring", stiffness: 320, damping: 30, mass: 0.6 },
+                            opacity: { duration: 0.15 }
                           }}
                           className="overflow-hidden border-t border-default-200"
                         >
+                          <div className="grid grid-cols-2 gap-2 px-3 pt-2 text-[10px] text-default-500">
+                            <div className="truncate">trace: {selectedState?.last_trace_id || selectedState?.latest_trace_id || "等待分配"}</div>
+                            <div className="text-right">尺寸: {thinkingIslandSize.toUpperCase()}</div>
+                            <div>最近流包: {lastStreamPacketLabel}</div>
+                            <div className="text-right">累计流包: {thinkingStreamPacketCount}</div>
+                          </div>
                           <div
                             ref={thinkingScrollRef}
-                            className={`${THINKING_ISLAND_PREVIEW_HEIGHT_CLASS[thinkingIslandSize]} space-y-1.5 overflow-auto px-3 py-2`}
+                            className={`${THINKING_ISLAND_PREVIEW_HEIGHT_CLASS[thinkingIslandSize]} mt-1 space-y-1.5 overflow-auto px-3 py-2`}
                           >
                             {thinkingPreviewLines.length === 0 && (
                               <p className="text-xs text-default-500">已接入会话，等待更具体的思考流。</p>
@@ -1482,9 +1683,10 @@ export default function ChatPage() {
                                 exit={{ opacity: 0, scale: 0.96 }}
                                 transition={{
                                   type: "spring",
-                                  stiffness: 500,
-                                  damping: 35,
-                                  delay: idx * 0.02
+                                  stiffness: 400,
+                                  damping: 30,
+                                  mass: 0.5,
+                                  delay: idx * 0.015
                                 }}
                                 className="rounded-2xl border border-default-200 bg-content2/80 px-3 py-2 text-xs text-default-700 backdrop-blur-sm"
                               >

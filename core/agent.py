@@ -54,6 +54,8 @@ class AgentContext:
     tool_executor: Any = None  # ToolExecutor instance (for video parsing etc.)
     crawler_hub: Any = None  # CrawlerHub instance
     knowledge_base: Any = None  # KnowledgeBase instance
+    memory_engine: Any = None  # MemoryEngine instance（兼容 engine 注入）
+    stream_callback: Any = None  # WebUI 思考流回调
     trace_id: str = ""
     memory_context: list[str] = field(default_factory=list)
     related_memories: list[str] = field(default_factory=list)
@@ -1557,6 +1559,17 @@ class AgentLoop:
             )
             if normalize_text(reply_media_line):
                 parts.append(reply_media_line)
+            if reply_image_count:
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_reply_images_always",
+                        "[提示: 引用消息里有图片；若用户在问这条引用内容，请优先 analyze_image 并以引用图为目标]",
+                    ),
+                    {"reply_image_count": reply_image_count},
+                )
+                if normalize_text(line):
+                    parts.append(line)
             if reply_image_count and self._looks_like_image_question(ctx.message_text):
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
@@ -1586,6 +1599,7 @@ class AgentLoop:
         fixed = dict(args or {})
         text = normalize_text(ctx.message_text)
         contextual_query = self._rebuild_query_with_context(text, ctx)
+        full_text = normalize_text(f"{ctx.message_text}\n{ctx.reply_to_text}")
         first_url = self._extract_first_url(text)
         reply_url = self._extract_first_url(normalize_text(ctx.reply_to_text))
         candidate_url = first_url or reply_url
@@ -1648,6 +1662,13 @@ class AgentLoop:
         elif tool_name == "search_web_media":
             _set_if_empty("query", contextual_query or text)
             _set_if_empty("media_type", self._infer_media_type(contextual_query or text))
+        elif tool_name == "analyze_image":
+            _set_if_empty("question", text)
+            _set_if_empty("allow_recent_fallback", True)
+            if self._looks_like_all_images_request(full_text):
+                fixed["analyze_all"] = True
+                _set_if_empty("max_images", 8)
+                fixed["recent_only_when_unique"] = False
         elif tool_name == "search_download_resources":
             _set_if_empty("query", contextual_query or text)
             _set_if_empty("file_type", self._infer_resource_file_type(contextual_query or text))
@@ -2082,7 +2103,14 @@ class AgentLoop:
             "scrape_extract",
             "extract_structured",
             "extract_links_and_content",
+            "music_play",
+            "music_play_by_id",
+            "bilibili_audio_extract",
         }
+        if tool_name in {"bilibili_audio_extract", "music_play_by_id"}:
+            return float(max(float(self.tool_timeout_seconds_media), 70.0))
+        if tool_name == "music_play":
+            return float(max(float(self.tool_timeout_seconds_media), 55.0))
         if has_media or tool_name in heavy_tools:
             return float(self.tool_timeout_seconds_media)
         return float(self.tool_timeout_seconds)
@@ -2264,6 +2292,42 @@ class AgentLoop:
         if not cues:
             return False
         return any(c in t for c in cues)
+
+    @staticmethod
+    def _looks_like_all_images_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        scope_cues = (
+            "所有图片",
+            "全部图片",
+            "所有图",
+            "全部图",
+            "群里图片",
+            "群里的图片",
+            "群里所有图",
+            "每张图",
+            "每个图",
+            "逐张",
+            "一张张",
+            "批量",
+            "all images",
+            "every image",
+        )
+        action_cues = (
+            "识别",
+            "分析",
+            "看看",
+            "描述",
+            "提取",
+            "总结",
+            "识图",
+            "read",
+            "analyze",
+            "describe",
+            "ocr",
+        )
+        return any(cue in content for cue in scope_cues) and any(cue in content for cue in action_cues)
 
     def _parse_llm_output(self, text: str) -> dict[str, Any] | None:
         """解析 LLM 输出为 tool_call dict，失败返回 None。"""
@@ -2858,7 +2922,7 @@ class AgentLoop:
             data = seg.get("data", {}) or {}
             if not isinstance(data, dict):
                 continue
-            for key in ("url", "file", "path"):
+            for key in ("memory_data_uri", "url", "file", "path"):
                 value = normalize_text(str(data.get(key, "")))
                 if value:
                     refs.append(value)

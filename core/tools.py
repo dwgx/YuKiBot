@@ -96,6 +96,10 @@ class _SilentYTDLPLogger:
         trace_id = normalize_text(_tool_trace_id_ctx.get(""))
         message = normalize_text(str(msg))[:220]
         lower_message = message.lower()
+        # B 站部分 AV 链接会触发 bvid 解析异常，由上层候选重试处理，这里降级为 debug。
+        if "keyerror('bvid')" in lower_message or 'keyerror("bvid")' in lower_message:
+            _ytdlp_log.debug("ytdlp_bvid_fallback%s: %s", _tool_trace_tag(), message[:220])
+            return
         canonical = message
         if "could not find" in lower_message and "cookies database" in lower_message:
             canonical = "missing_browser_cookies_database"
@@ -103,6 +107,8 @@ class _SilentYTDLPLogger:
             canonical = "missing_browser_cookies_database"
         elif "cookiesfrombrowser" in lower_message:
             canonical = "cookiesfrombrowser_error"
+        elif "did not get any data blocks" in lower_message:
+            canonical = "did_not_get_any_data_blocks"
         key = (trace_id or "-", canonical)
         if key in _ytdlp_error_dedupe:
             return
@@ -227,6 +233,7 @@ class ToolExecutor:
         self._recent_image_sources: dict[str, list[str]] = {}
         self._last_search_query: dict[str, str] = {}
         self._recent_media_cache_ttl_seconds = max(10, int(search_cfg.get("recent_media_cache_ttl_seconds", 300)))
+        self._recent_media_cache_limit = max(4, min(24, int(search_cfg.get("recent_media_cache_limit", 12))))
         self._recent_media_by_conversation: dict[str, dict[str, Any]] = {}
         self._video_resolver_enable = bool(video_cfg.get("enable", True))
         self._video_download_max_mb = max(8, int(video_cfg.get("download_max_mb", 64)))
@@ -3319,9 +3326,30 @@ class ToolExecutor:
                 error="vision_config_incomplete",
             )
 
+        def _to_flag(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+            text = normalize_text(str(value)).lower()
+            if not text:
+                return default
+            if text in {"1", "true", "yes", "on", "y"}:
+                return True
+            if text in {"0", "false", "no", "off", "n"}:
+                return False
+            return default
+
         explicit_url = normalize_text(str(method_args.get("url", "")))
-        allow_recent_fallback = bool(method_args.get("allow_recent_fallback", False))
-        recent_only_when_unique = bool(method_args.get("recent_only_when_unique", False))
+        allow_recent_fallback = _to_flag(method_args.get("allow_recent_fallback", False), False)
+        recent_only_when_unique = _to_flag(method_args.get("recent_only_when_unique", False), False)
+        analyze_all = _to_flag(method_args.get("analyze_all", False), False)
+        max_images_raw = normalize_text(str(method_args.get("max_images", "")))
+        try:
+            max_images = int(max_images_raw) if max_images_raw else 0
+        except ValueError:
+            max_images = 0
+        if max_images <= 0:
+            max_images = 8 if analyze_all else 6
+        max_images = max(1, min(24, max_images))
         target_source = normalize_text(str(method_args.get("target_source", ""))) or "unspecified"
         target_message_id = normalize_text(str(method_args.get("target_message_id", "")))
         candidates: list[str] = []
@@ -3387,6 +3415,8 @@ class ToolExecutor:
                 continue
             seen.add(value)
             uniq.append(value)
+        if len(uniq) > max_images:
+            uniq = uniq[:max_images]
         if not uniq:
             return ToolResult(
                 ok=False,
@@ -3420,13 +3450,15 @@ class ToolExecutor:
 
         prompt = self._build_vision_prompt(query=query, message_text=message_text)
         _tool_log.info(
-            "vision_analyze_start%s | method=%s | candidates=%d | explicit=%s | target_source=%s | target_mid=%s",
+            "vision_analyze_start%s | method=%s | candidates=%d | explicit=%s | target_source=%s | target_mid=%s | analyze_all=%s | max_images=%d",
             _tool_trace_tag(),
             method_name,
             len(uniq),
             bool(explicit_url),
             target_source,
             target_message_id or "-",
+            analyze_all,
+            max_images,
         )
         if candidate_meta:
             preview = " | ".join(
@@ -3435,21 +3467,35 @@ class ToolExecutor:
             )
             _tool_log.info("vision_analyze_candidates%s | method=%s | %s", _tool_trace_tag(), method_name, preview)
         low_confidence_seen = False
+        successful_items: list[dict[str, Any]] = []
+        collected_evidence: list[dict[str, str]] = []
         for url in uniq:
             if self._is_blocked_image_url(url):
                 continue
             if re.match(r"^https?://", url, flags=re.IGNORECASE) and not self._is_safe_public_http_url(url):
                 continue
+            file_token = url_file_map.get(normalize_text(url))
             image_ref = await self._prepare_vision_image_ref(url)
+            if not image_ref and file_token and api_call is not None:
+                onebot_data_uri = await self._data_uri_from_onebot_image_file(
+                    image_file=file_token,
+                    api_call=api_call,
+                )
+                if onebot_data_uri:
+                    image_ref = onebot_data_uri
+                    _tool_log.info(
+                        "vision_image_ref%s | source=onebot_get_image | converted=data_uri",
+                        _tool_trace_tag(),
+                    )
             if (
                 image_ref
                 and re.match(r"^https?://", image_ref, flags=re.IGNORECASE)
                 and api_call is not None
             ):
-                file_token = url_file_map.get(normalize_text(url)) or url_file_map.get(normalize_text(image_ref))
-                if file_token:
+                remote_file_token = file_token or url_file_map.get(normalize_text(image_ref))
+                if remote_file_token:
                     onebot_data_uri = await self._data_uri_from_onebot_image_file(
-                        image_file=file_token,
+                        image_file=remote_file_token,
                         api_call=api_call,
                     )
                     if onebot_data_uri:
@@ -3492,16 +3538,53 @@ class ToolExecutor:
                 method_name,
                 clip_text(source, 120),
             )
+            if not analyze_all:
+                return ToolResult(
+                    ok=True,
+                    tool_name=method_name,
+                    payload={
+                        "text": answer,
+                        "analysis": answer,
+                        "source": source,
+                        "evidence": evidence,
+                    },
+                    evidence=evidence,
+                )
+            successful_items.append(
+                {
+                    "index": len(successful_items) + 1,
+                    "analysis": answer,
+                    "source": source,
+                }
+            )
+            collected_evidence.extend(evidence)
+
+        if analyze_all and successful_items:
+            lines = [f"已识别 {len(successful_items)} 张图（候选 {len(uniq)} 张）："]
+            for idx, item in enumerate(successful_items, start=1):
+                one_line = clip_text(item.get("analysis", ""), 220)
+                one_source = clip_text(item.get("source", ""), 80)
+                if one_source:
+                    lines.append(f"{idx}. {one_line}（来源: {one_source}）")
+                else:
+                    lines.append(f"{idx}. {one_line}")
+            merged = "\n".join(lines)
+            sources = [normalize_text(item.get("source", "")) for item in successful_items if normalize_text(item.get("source", ""))]
+            first_source = sources[0] if sources else ""
             return ToolResult(
                 ok=True,
                 tool_name=method_name,
                 payload={
-                    "text": answer,
-                    "analysis": answer,
-                    "source": source,
-                    "evidence": evidence,
+                    "text": merged,
+                    "analysis": merged,
+                    "source": first_source,
+                    "sources": sources,
+                    "analyses": successful_items,
+                    "count": len(successful_items),
+                    "requested": len(uniq),
+                    "evidence": collected_evidence,
                 },
-                evidence=evidence,
+                evidence=collected_evidence,
             )
 
         if low_confidence_seen:
@@ -3511,7 +3594,14 @@ class ToolExecutor:
             return ToolResult(
                 ok=False,
                 tool_name=method_name,
-                payload={"text": "这张图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"},
+                payload={
+                    "text": (
+                        "这些图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定。你可以发更清晰截图，"
+                        "或告诉我要重点看哪一块。"
+                        if analyze_all
+                        else "这张图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"
+                    )
+                },
                 error="vision_low_confidence",
             )
 
@@ -3521,7 +3611,13 @@ class ToolExecutor:
         return ToolResult(
             ok=False,
             tool_name=method_name,
-            payload={"text": "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"},
+            payload={
+                "text": (
+                    "这些图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
+                    if analyze_all
+                    else "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
+                )
+            },
             error="vision_analyze_failed",
         )
 
@@ -3736,69 +3832,24 @@ class ToolExecutor:
         if not candidates:
             return None
 
-        if self._vision_route_text_model_to_local and not self._can_use_remote_vision_model():
-            return await self._analyze_image_local_fallback(
-                method_name="vision_analyze_image",
-                query=query,
-                message_text=message_text,
-                raw_segments=raw_segments,
-                api_call=api_call,
-            )
+        analyze_all = self._looks_like_analyze_all_images_request(f"{query}\n{message_text}")
+        method_args: dict[str, Any] = {
+            "allow_recent_fallback": bool(conversation_id),
+            "recent_only_when_unique": False,
+            "target_source": "search_shortcut",
+        }
+        if analyze_all:
+            method_args["analyze_all"] = True
+            method_args["max_images"] = 8
 
-        prompt = self._build_vision_prompt(query=query, message_text=message_text)
-        low_confidence_seen = False
-        for url in candidates:
-            if self._is_blocked_image_url(url):
-                continue
-            image_ref = await self._prepare_vision_image_ref(url)
-            if not image_ref:
-                continue
-            raw_answer = await self._vision_describe(image_ref=image_ref, prompt=prompt)
-            answer = await self._normalize_vision_answer_with_retry(
-                image_ref=image_ref,
-                answer=raw_answer,
-                prompt=prompt,
-                query=query,
-                message_text=message_text,
-            )
-            if answer:
-                if self._looks_like_weak_vision_answer(answer):
-                    low_confidence_seen = True
-                    continue
-                source = self._unwrap_redirect_url(url)
-                evidence = [
-                    {
-                        "title": "图像识别",
-                        "point": clip_text(answer, 180),
-                        "source": source,
-                    }
-                ]
-                return ToolResult(
-                    ok=True,
-                    tool_name="vision_analyze_image",
-                    payload={"text": answer, "source": source, "evidence": evidence},
-                    evidence=evidence,
-                )
-
-        if low_confidence_seen:
-            web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
-            if web_fallback is not None:
-                return web_fallback
-            return ToolResult(
-                ok=False,
-                tool_name="vision_analyze_image",
-                payload={"text": "这张图已尝试识别，但结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"},
-                error="vision_low_confidence",
-            )
-
-        web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
-        if web_fallback is not None:
-            return web_fallback
-        return ToolResult(
-            ok=False,
-            tool_name="vision_analyze_image",
-            payload={"text": "这张图这次没识别出来，请发更清晰的图片，或直接告诉我要识别哪部分。"},
-            error="vision_analyze_failed",
+        return await self._method_media_analyze_image(
+            method_name="vision_analyze_image",
+            method_args=method_args,
+            query=query,
+            message_text=message_text,
+            raw_segments=raw_segments,
+            conversation_id=conversation_id,
+            api_call=api_call,
         )
 
     def _can_use_remote_vision_model(self) -> bool:
@@ -3978,6 +4029,8 @@ class ToolExecutor:
                 resolved = ToolExecutor._unwrap_redirect_url(url)
                 if resolved:
                     mapping[resolved] = file_token
+            if file_token:
+                mapping[file_token] = file_token
         return mapping
 
     @staticmethod
@@ -5747,13 +5800,13 @@ class ToolExecutor:
         if not keyword:
             return ToolResult(ok=False, tool_name="bilibili_audio_extract", error="empty_keyword")
 
-        # 在 B 站搜索视频
-        search_query = f"site:bilibili.com {keyword}"
         try:
-            from core.search import SearchEngine
             search_cfg = self._raw_config.get("search", {})
             search_engine = SearchEngine(search_cfg)
-            results = await search_engine.search(search_query)
+            search_query = f"site:bilibili.com {keyword}"
+            preferred_results = await search_engine.search_bilibili_videos(keyword, limit=5)
+            fallback_results = await search_engine.search(search_query)
+            results = [*(preferred_results or []), *(fallback_results or [])]
 
             if not results:
                 return ToolResult(
@@ -5762,15 +5815,62 @@ class ToolExecutor:
                     error="no_bilibili_results",
                 )
 
-            # 尝试第一个结果
-            first_url = results[0].url
-            _tool_log.info("bilibili_audio_extract | keyword=%s | url=%s", keyword, first_url)
+            # 去重并保留前若干候选，避免单一结果偶发失败导致全局失败。
+            dedup_results: list[SearchResult] = []
+            seen_url: set[str] = set()
+            for row in results:
+                row_url = normalize_text(getattr(row, "url", ""))
+                if not row_url:
+                    continue
+                if row_url in seen_url:
+                    continue
+                seen_url.add(row_url)
+                dedup_results.append(row)
+                if len(dedup_results) >= 8:
+                    break
 
-            # 直接下载音频流（不需要 ffmpeg）
-            try:
+            if not dedup_results:
+                return ToolResult(
+                    ok=False,
+                    tool_name="bilibili_audio_extract",
+                    payload={"text": f"在 B 站未找到「{keyword}」可用结果。"},
+                    error="no_bilibili_results",
+                )
+
+            def _candidate_urls(raw_url: str) -> list[str]:
+                out: list[str] = []
+                for url in (normalize_text(raw_url), self._unwrap_redirect_url(raw_url)):
+                    if not url or url in out:
+                        continue
+                    out.append(url)
+                target = out[0] if out else ""
+                try:
+                    parsed = urlparse(target)
+                except Exception:
+                    return out
+                host = normalize_text(parsed.netloc).lower()
+                if "bilibili.com" not in host:
+                    return out
+                path = normalize_text(unquote(parsed.path or ""))
+                match_av = re.search(r"/(av\d+)", path, flags=re.IGNORECASE)
+                if not match_av:
+                    return out
+                q = parse_qs(parsed.query)
+                kept: dict[str, str] = {}
+                for key in ("p", "t"):
+                    vals = q.get(key, [])
+                    if vals:
+                        kept[key] = str(vals[0])
+                suffix = f"?{urlencode(kept)}" if kept else ""
+                normalized_av = f"https://www.bilibili.com/video/{match_av.group(1)}{suffix}"
+                if normalized_av not in out:
+                    out.append(normalized_av)
+                return out
+
+            async def _download_audio_once(target_url: str) -> tuple[Path | None, str]:
                 from yt_dlp import YoutubeDL
 
-                digest = hashlib.sha1(first_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+                digest = hashlib.sha1(target_url.encode("utf-8", errors="ignore")).hexdigest()[:12]
                 audio_path = self._video_cache_dir / f"{digest}_audio.mp3"
 
                 ydl_opts = {
@@ -5794,12 +5894,12 @@ class ToolExecutor:
                     ydl_opts["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
                 if self._ffmpeg_location:
                     ydl_opts["ffmpeg_location"] = self._ffmpeg_location
-                _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, first_url)
+                _tmp_cookie_file = self._inject_platform_cookiefile(ydl_opts, target_url)
                 try:
                     while True:
                         try:
                             with YoutubeDL(ydl_opts) as ydl:
-                                ydl.download([first_url])
+                                ydl.download([target_url])
                             break
                         except Exception as exc:
                             err_text = normalize_text(str(exc))
@@ -5812,12 +5912,16 @@ class ToolExecutor:
                             ) and "cookiesfrombrowser" in ydl_opts:
                                 _tool_log.warning(
                                     "bilibili_audio_retry_without_cookie_browser | url=%s | reason=%s",
-                                    first_url,
+                                    target_url,
                                     clip_text(err_text, 140),
                                 )
                                 ydl_opts.pop("cookiesfrombrowser", None)
                                 continue
-                            raise
+                            if "did not get any data blocks" in lowered:
+                                return None, "did_not_get_any_data_blocks"
+                            if "keyerror('bvid')" in lowered or 'keyerror("bvid")' in lowered:
+                                return None, "bilibili_bvid_keyerror"
+                            return None, err_text or "download_error"
                 finally:
                     if _tmp_cookie_file:
                         try:
@@ -5834,31 +5938,63 @@ class ToolExecutor:
                             break
 
                 if not audio_path.exists():
-                    return ToolResult(
-                        ok=False, tool_name="bilibili_audio_extract",
-                        payload={"text": f"B 站音频下载失败。"},
-                        error="download_failed",
-                    )
+                    return None, "download_failed"
+                return audio_path, ""
 
-            except Exception as exc:
-                _tool_log.warning("bilibili_audio_download_error | url=%s | %s", first_url, exc)
+            selected_audio_path: Path | None = None
+            selected_title = keyword
+            selected_url = ""
+            last_error = ""
+
+            for row in dedup_results:
+                row_title = normalize_text(getattr(row, "title", "")) or keyword
+                row_url = normalize_text(getattr(row, "url", ""))
+                if not row_url:
+                    continue
+                for candidate_url in _candidate_urls(row_url):
+                    _tool_log.info("bilibili_audio_extract | keyword=%s | url=%s", keyword, candidate_url)
+                    try:
+                        audio_path, err = await _download_audio_once(candidate_url)
+                    except Exception as exc:
+                        audio_path, err = None, normalize_text(str(exc)) or "download_error"
+                    if audio_path and audio_path.exists():
+                        selected_audio_path = audio_path
+                        selected_title = row_title
+                        selected_url = candidate_url
+                        break
+                    if err:
+                        last_error = err
+                if selected_audio_path is not None:
+                    break
+
+            if selected_audio_path is None:
+                _tool_log.warning(
+                    "bilibili_audio_download_error | keyword=%s | last_error=%s",
+                    keyword,
+                    clip_text(last_error or "download_failed", 220),
+                )
+                detail = f"：{clip_text(last_error, 120)}" if last_error else ""
                 return ToolResult(
-                    ok=False, tool_name="bilibili_audio_extract",
-                    payload={"text": f"B 站音频下载失败：{exc}"},
+                    ok=False,
+                    tool_name="bilibili_audio_extract",
+                    payload={"text": f"B 站音频下载失败{detail}"},
                     error="download_error",
                 )
 
             # 转换为 SILK
             silk_path = None
-            if self._music_engine and self._music_engine._pilk_available:
-                silk_path = await self._music_engine._convert_to_silk(audio_path)
+            if self._music_engine and self._music_engine._pilk_available and selected_audio_path:
+                silk_path = await self._music_engine._convert_to_silk(selected_audio_path)
 
-            payload: dict[str, Any] = {"text": f"已从 B 站提取音频：{results[0].title}"}
+            payload: dict[str, Any] = {
+                "text": f"已从 B 站提取音频：{selected_title}",
+                "source_url": selected_url,
+            }
             if silk_path and silk_path.exists():
                 payload["audio_file_silk"] = str(silk_path)
-                payload["audio_file"] = str(audio_path)
-            elif audio_path.exists():
-                payload["audio_file"] = str(audio_path)
+                payload["audio_file"] = str(selected_audio_path)
+            elif selected_audio_path and selected_audio_path.exists():
+                payload["audio_file"] = str(selected_audio_path)
 
             return ToolResult(ok=True, tool_name="bilibili_audio_extract", payload=payload)
 
@@ -8179,7 +8315,7 @@ class ToolExecutor:
                 continue
 
             candidates: list[str] = []
-            for key in ("url", "file", "path"):
+            for key in ("memory_data_uri", "url", "file", "path"):
                 value = normalize_text(str(data.get(key, "")))
                 if value:
                     candidates.append(value)
@@ -8193,9 +8329,32 @@ class ToolExecutor:
 
         return urls
 
-    def _remember_recent_media(self, conversation_id: str, raw_segments: list[dict[str, Any]]) -> None:
+    @staticmethod
+    def _group_conversation_id_from_any(conversation_id: str) -> str:
         conv = normalize_text(conversation_id)
         if not conv:
+            return ""
+        match = re.match(r"^group:([^:]+)", conv, flags=re.IGNORECASE)
+        if not match:
+            return ""
+        group_id = normalize_text(match.group(1))
+        if not group_id:
+            return ""
+        return f"group:{group_id}"
+
+    def _recent_media_scope_keys(self, conversation_id: str) -> list[str]:
+        conv = normalize_text(conversation_id)
+        if not conv:
+            return []
+        keys = [conv]
+        group_conv = self._group_conversation_id_from_any(conv)
+        if group_conv and group_conv not in keys:
+            keys.append(group_conv)
+        return keys
+
+    def _remember_recent_media(self, conversation_id: str, raw_segments: list[dict[str, Any]]) -> None:
+        target_keys = self._recent_media_scope_keys(conversation_id)
+        if not target_keys:
             return
         images = self._extract_message_media_urls(raw_segments, media_type="image")
         videos = self._extract_message_media_urls(raw_segments, media_type="video")
@@ -8203,43 +8362,48 @@ class ToolExecutor:
             self._cleanup_recent_media_cache()
             return
 
-        state = self._recent_media_by_conversation.get(conv, {})
-        if not isinstance(state, dict):
-            state = {}
         now = datetime.now(timezone.utc)
-        state["updated_at"] = now
-        image_old = state.get("image", [])
-        video_old = state.get("video", [])
-        if not isinstance(image_old, list):
-            image_old = []
-        if not isinstance(video_old, list):
-            video_old = []
-        if images:
-            state["image"] = (images + image_old)[:6]
-        if videos:
-            state["video"] = (videos + video_old)[:6]
-        self._recent_media_by_conversation[conv] = state
+        for key in target_keys:
+            state = self._recent_media_by_conversation.get(key, {})
+            if not isinstance(state, dict):
+                state = {}
+            state["updated_at"] = now
+            image_old = state.get("image", [])
+            video_old = state.get("video", [])
+            if not isinstance(image_old, list):
+                image_old = []
+            if not isinstance(video_old, list):
+                video_old = []
+            if images:
+                state["image"] = (images + image_old)[: self._recent_media_cache_limit]
+            if videos:
+                state["video"] = (videos + video_old)[: self._recent_media_cache_limit]
+            self._recent_media_by_conversation[key] = state
         self._cleanup_recent_media_cache()
 
     def _get_recent_media(self, conversation_id: str, media_type: str) -> list[str]:
-        conv = normalize_text(conversation_id)
-        if not conv:
+        keys = self._recent_media_scope_keys(conversation_id)
+        if not keys:
             return []
         self._cleanup_recent_media_cache()
-        state = self._recent_media_by_conversation.get(conv, {})
-        if not isinstance(state, dict):
-            return []
-        rows = state.get(normalize_text(media_type).lower(), [])
-        if not isinstance(rows, list):
-            return []
+        field = normalize_text(media_type).lower()
         out: list[str] = []
         seen: set[str] = set()
-        for item in rows:
-            value = normalize_text(str(item))
-            if not value or value in seen:
+        for key in keys:
+            state = self._recent_media_by_conversation.get(key, {})
+            if not isinstance(state, dict):
                 continue
-            seen.add(value)
-            out.append(value)
+            rows = state.get(field, [])
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                value = normalize_text(str(item))
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                out.append(value)
+                if len(out) >= self._recent_media_cache_limit:
+                    return out
         return out
 
     def _cleanup_recent_media_cache(self) -> None:
@@ -8525,6 +8689,42 @@ class ToolExecutor:
         return any(cue in content for cue in cues)
 
     @staticmethod
+    def _looks_like_analyze_all_images_request(text: str) -> bool:
+        content = ToolExecutor._normalize_multimodal_query(text).lower()
+        if not content:
+            return False
+        scope_cues = (
+            "所有图片",
+            "全部图片",
+            "所有图",
+            "全部图",
+            "群里图片",
+            "群里的图片",
+            "群里所有图",
+            "每张图",
+            "每个图",
+            "逐张",
+            "一张张",
+            "批量",
+            "all images",
+            "every image",
+        )
+        action_cues = (
+            "识别",
+            "分析",
+            "看看",
+            "描述",
+            "提取",
+            "总结",
+            "识图",
+            "analyze",
+            "describe",
+            "ocr",
+            "read",
+        )
+        return any(cue in content for cue in scope_cues) and any(cue in content for cue in action_cues)
+
+    @staticmethod
     def _is_passive_multimodal_text(text: str) -> bool:
         content = normalize_text(text)
         if not content:
@@ -8760,7 +8960,3 @@ class ToolExecutor:
         if not raw:
             return ""
         return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", raw)
-
-
-
-

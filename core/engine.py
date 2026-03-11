@@ -1651,13 +1651,27 @@ class YukikoEngine:
         self._agent_conversation_locks: dict[str, asyncio.Lock] = {}
 
 
-        # 媒体 artifact 索引: message_id -> [{"type": "image"|"video"|"audio", "url": str}]
+        # 媒体 artifact 索引: message_id -> [{"type": "...", "url": str, "file_id": str, "data_uri": str}]
 
 
         self._media_artifact_index: OrderedDict[str, list[dict[str, str]]] = OrderedDict()
 
 
         self._media_artifact_index_max = 500
+        memory_cfg = self.config.get("memory", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(memory_cfg, dict):
+            memory_cfg = {}
+        self._memory_media_capture_enable = bool(memory_cfg.get("media_memory_enable", True))
+        try:
+            max_images_per_message = int(memory_cfg.get("media_memory_max_images_per_message", 4))
+        except (TypeError, ValueError):
+            max_images_per_message = 4
+        self._memory_media_max_images_per_message = max(1, min(8, max_images_per_message))
+        try:
+            capture_timeout = float(memory_cfg.get("media_memory_capture_timeout_seconds", 6.0))
+        except (TypeError, ValueError):
+            capture_timeout = 6.0
+        self._memory_media_capture_timeout_seconds = max(1.0, min(15.0, capture_timeout))
 
 
         self._async_init_done = False
@@ -3609,6 +3623,7 @@ class YukikoEngine:
 
 
         if allow_memory and (message.mentioned or message.is_private or bool(trigger.followup_candidate)):
+            await self._remember_message_media_memory(message)
 
 
             self.memory.add_message(
@@ -3693,6 +3708,18 @@ class YukikoEngine:
 
 
                     memory_context = (memory_context + [f"[引用对象近期]{item}" for item in reply_target_recent])[-16:]
+
+            if message.reply_to_message_id and hasattr(self.memory, "get_message_media_artifacts"):
+                reply_media_items = self.memory.get_message_media_artifacts(
+                    message_id=message.reply_to_message_id,
+                    conversation_id=message.conversation_id,
+                    media_type="image",
+                    limit=3,
+                )
+                if reply_media_items:
+                    reply_media_lines = self._build_reply_media_memory_lines(reply_media_items, limit=2)
+                    if reply_media_lines:
+                        memory_context = (memory_context + reply_media_lines)[-22:]
 
 
             if not memory_context:
@@ -11118,9 +11145,13 @@ class YukikoEngine:
 
 
                 url = normalize_text(str(data.get("url", "")))
+                data_uri = normalize_text(str(data.get("memory_data_uri", "")))
 
 
-                items.append(f"image:{clip_text(url or 'no_url', 80)}")
+                if data_uri.startswith("data:image"):
+                    items.append(f"image:base64:{clip_text(data_uri, 80)}")
+                else:
+                    items.append(f"image:{clip_text(url or 'no_url', 80)}")
 
 
             elif seg_type == "video":
@@ -11289,12 +11320,13 @@ class YukikoEngine:
 
 
             url = normalize_text(str(data.get("url", "")))
+            data_uri = normalize_text(str(data.get("memory_data_uri", "")))
 
 
             file_id = normalize_text(str(data.get("file", "") or data.get("file_id", "")))
 
 
-            refs.append({"type": seg_type, "url": url, "file_id": file_id})
+            refs.append({"type": seg_type, "url": url, "file_id": file_id, "data_uri": data_uri})
 
 
         if refs:
@@ -11322,6 +11354,161 @@ class YukikoEngine:
 
 
         return self._media_artifact_index.get(message_id, [])
+
+    async def _resolve_memory_image_data_uri(
+        self,
+        seg_data: dict[str, Any],
+        api_call: Callable[..., Awaitable[Any]] | None,
+    ) -> str:
+        existing = normalize_text(str(seg_data.get("memory_data_uri", "")))
+        if existing.startswith("data:image"):
+            return existing
+        tools = getattr(self, "tools", None)
+        if tools is None:
+            return ""
+
+        file_id = normalize_text(str(seg_data.get("file", "") or seg_data.get("file_id", "")))
+        if file_id and api_call and hasattr(tools, "_data_uri_from_onebot_image_file"):
+            try:
+                data_uri = await asyncio.wait_for(
+                    tools._data_uri_from_onebot_image_file(image_file=file_id, api_call=api_call),
+                    timeout=self._memory_media_capture_timeout_seconds,
+                )
+            except Exception:
+                data_uri = ""
+            if normalize_text(data_uri).startswith("data:image"):
+                return normalize_text(data_uri)
+
+        url = normalize_text(str(seg_data.get("url", "")))
+        if url and hasattr(tools, "_prepare_vision_image_ref"):
+            try:
+                prepared = await asyncio.wait_for(
+                    tools._prepare_vision_image_ref(url),
+                    timeout=self._memory_media_capture_timeout_seconds,
+                )
+            except Exception:
+                prepared = ""
+            prepared_norm = normalize_text(str(prepared))
+            if prepared_norm.startswith("data:image"):
+                return prepared_norm
+        return ""
+
+    async def _capture_media_memory_for_segments(
+        self,
+        *,
+        conversation_id: str,
+        message_id: str,
+        user_id: str,
+        source: str,
+        segments: list[dict[str, Any]],
+        api_call: Callable[..., Awaitable[Any]] | None,
+        timestamp: datetime,
+    ) -> int:
+        if not self._memory_media_capture_enable:
+            return 0
+        if not segments:
+            return 0
+        media_rows: list[dict[str, Any]] = []
+        image_count = 0
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            if seg_type not in {"image", "video", "record", "audio"}:
+                continue
+            data = seg.get("data", {}) or {}
+            if not isinstance(data, dict):
+                continue
+            url = normalize_text(str(data.get("url", "")))
+            file_id = normalize_text(str(data.get("file", "") or data.get("file_id", "")))
+            data_uri = normalize_text(str(data.get("memory_data_uri", "")))
+            if seg_type == "image":
+                if image_count >= self._memory_media_max_images_per_message:
+                    continue
+                image_count += 1
+                if not data_uri:
+                    data_uri = await self._resolve_memory_image_data_uri(seg_data=data, api_call=api_call)
+                    if data_uri:
+                        data["memory_data_uri"] = data_uri
+                        seg["data"] = data
+            if not data_uri and not url and not file_id:
+                continue
+            media_rows.append(
+                {
+                    "type": seg_type,
+                    "data_uri": data_uri,
+                    "url": url,
+                    "file_id": file_id,
+                }
+            )
+        if not media_rows:
+            return 0
+        if hasattr(self.memory, "add_media_artifacts"):
+            self.memory.add_media_artifacts(
+                conversation_id=conversation_id,
+                message_id=message_id,
+                user_id=user_id,
+                source=source,
+                media_items=media_rows,
+                timestamp=timestamp,
+            )
+        return len(media_rows)
+
+    async def _remember_message_media_memory(self, message: EngineMessage) -> None:
+        if not self._memory_media_capture_enable:
+            return
+        if not hasattr(self.memory, "add_media_artifacts"):
+            return
+        captured = 0
+        if message.message_id and message.raw_segments:
+            added = await self._capture_media_memory_for_segments(
+                conversation_id=message.conversation_id,
+                message_id=message.message_id,
+                user_id=message.user_id,
+                source="message",
+                segments=message.raw_segments,
+                api_call=message.api_call,
+                timestamp=message.timestamp,
+            )
+            captured += added
+            if added > 0:
+                self._index_message_media(message.message_id, message.raw_segments)
+        if message.reply_to_message_id and message.reply_media_segments:
+            added = await self._capture_media_memory_for_segments(
+                conversation_id=message.conversation_id,
+                message_id=message.reply_to_message_id,
+                user_id=message.reply_to_user_id or message.user_id,
+                source="reply",
+                segments=message.reply_media_segments,
+                api_call=message.api_call,
+                timestamp=message.timestamp,
+            )
+            captured += added
+            if added > 0:
+                self._index_message_media(message.reply_to_message_id, message.reply_media_segments)
+        if captured > 0:
+            self.logger.info(
+                "memory_media_captured | conversation=%s | message=%s | reply=%s | records=%d",
+                message.conversation_id,
+                message.message_id or "-",
+                message.reply_to_message_id or "-",
+                captured,
+            )
+
+    @staticmethod
+    def _build_reply_media_memory_lines(media_items: list[dict[str, str]], limit: int = 2) -> list[str]:
+        rows = media_items[-max(1, limit) :]
+        if not rows:
+            return []
+        lines: list[str] = [f"[引用图片记忆] 已缓存 {len(media_items)} 张图片(base64)"]
+        for idx, item in enumerate(rows, start=1):
+            data_uri = normalize_text(str(item.get("data_uri", "")))
+            url = normalize_text(str(item.get("url", "")))
+            if data_uri.startswith("data:image"):
+                lines.append(f"[引用图片base64#{idx}] {clip_text(data_uri, 96)}")
+            elif url:
+                lines.append(f"[引用图片URL#{idx}] {clip_text(url, 96)}")
+        return lines
 
 
 
@@ -15245,7 +15432,13 @@ class YukikoEngine:
                 for row in mem_rows
 
 
-                if row.startswith("[当前用户近期]") or row.startswith("[引用对象近期]")
+                if (
+                    row.startswith("[当前用户近期]")
+                    or row.startswith("[引用对象近期]")
+                    or row.startswith("[引用图片记忆]")
+                    or row.startswith("[引用图片base64")
+                    or row.startswith("[引用图片URL")
+                )
 
 
             ]
