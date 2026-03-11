@@ -6,6 +6,7 @@
 如果你准备发布上线，建议直接配合这份超详细手册一起使用：
 
 - `docs/zh-CN/RELEASE_PLAYBOOK.md`（发布/升级/回滚/排障/Checklist，一次性覆盖）
+- `docs/zh-CN/PROJECT_DEEP_SUMMARY.md`（项目架构深度总结 + Prompt 维护 + 代码维护策略，700+ 行）
 
 ## 1. 部署前准备
 
@@ -40,6 +41,42 @@ Copy-Item .env.example .env
 - `ONEBOT_ACCESS_TOKEN`：必须和 OneBot 服务保持一致
 - `WEBUI_TOKEN`：WebUI API 访问 token，务必改成随机字符串
 - `HOST` / `PORT`：按你本机和反向代理规划设置
+
+### 1.4 NapCat WS（反向 WebSocket）怎么配
+
+这部分 Linux / Windows 配置完全一致，只有 IP 地址可能不同。
+
+在 NapCat 的 OneBot V11 页面按下面填：
+
+1. 连接模式：`反向 WebSocket (Reverse WS)`
+2. WS 上报地址：`ws://<YuKiKo主机>:<PORT>/onebot/v11/ws`
+3. Access Token：`与 .env 的 ONEBOT_ACCESS_TOKEN 完全一致`
+4. 保存并启用
+
+示例（同机部署）：
+
+```text
+ws://127.0.0.1:8081/onebot/v11/ws
+```
+
+示例（跨机器）：
+
+```text
+ws://192.168.1.50:8081/onebot/v11/ws
+```
+
+`.env` 最小示例：
+
+```env
+HOST=0.0.0.0
+PORT=8081
+ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
+```
+
+注意：
+
+1. 如果 YuKiKo 在 Docker/云服务器，请放通 `PORT` 并确认路由可达。
+2. YuKiKo 的 WS 接入路径是 `/onebot/v11/ws`（也兼容 `/onebot/v11/`，推荐 `/onebot/v11/ws`）。
 
 ## 2. 快速部署启动（推荐）
 
@@ -317,3 +354,4 @@ build-webui.bat
 
 - 架构与数据流：`docs/zh-CN/ARCHITECTURE.md`
 - 里面包含 Agent、Router、自检、队列、插件配置模板的协作关系
+- 深度总结与维护手册：`docs/zh-CN/PROJECT_DEEP_SUMMARY.md`

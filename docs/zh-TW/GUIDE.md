@@ -37,6 +37,42 @@ Copy-Item .env.example .env
 - `WEBUI_TOKEN`：WebUI API 保護 token，請改成隨機值
 - `HOST` / `PORT`：依實際部署環境設定
 
+### 1.4 NapCat WS（反向 WebSocket）設定
+
+這部分 Linux / Windows 參數一致，只有主機位址可能不同。
+
+在 NapCat 的 OneBot V11 設定頁請填：
+
+1. 連線模式：`反向 WebSocket (Reverse WS)`
+2. WS 上報位址：`ws://<YuKiKo主機>:<PORT>/onebot/v11/ws`
+3. Access Token：必須和 `.env` 的 `ONEBOT_ACCESS_TOKEN` 完全一致
+4. 儲存並啟用
+
+同機範例：
+
+```text
+ws://127.0.0.1:8081/onebot/v11/ws
+```
+
+跨機範例：
+
+```text
+ws://192.168.1.50:8081/onebot/v11/ws
+```
+
+`.env` 最小範例：
+
+```env
+HOST=0.0.0.0
+PORT=8081
+ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
+```
+
+注意：
+
+1. 若 YuKiKo 跑在 Docker 或雲主機，請先放通 `PORT` 並確認路由可達。
+2. YuKiKo WS 入口為 `/onebot/v11/ws`（也相容 `/onebot/v11/`，建議使用 `/onebot/v11/ws`）。
+
 ## 2. 快速部署啟動（建議）
 
 ### 2.1 Linux 一鍵部署（1Panel 風格）

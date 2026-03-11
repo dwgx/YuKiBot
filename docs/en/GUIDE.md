@@ -38,6 +38,42 @@ Minimum values to set first:
 - `WEBUI_TOKEN` (set a strong random token)
 - `HOST` and `PORT`
 
+### 1.1 NapCat WS (Reverse WebSocket) Setup
+
+This part is the same on Linux and Windows. Only the host/IP may differ.
+
+In NapCat OneBot V11 settings, fill:
+
+1. Connection mode: `Reverse WebSocket`
+2. WS target URL: `ws://<YuKiKo-host>:<PORT>/onebot/v11/ws`
+3. Access Token: exactly the same as `.env` `ONEBOT_ACCESS_TOKEN`
+4. Save and enable
+
+Same-machine example:
+
+```text
+ws://127.0.0.1:8081/onebot/v11/ws
+```
+
+Cross-machine example:
+
+```text
+ws://192.168.1.50:8081/onebot/v11/ws
+```
+
+Minimal `.env` example:
+
+```env
+HOST=0.0.0.0
+PORT=8081
+ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
+```
+
+Notes:
+
+1. If YuKiKo runs in Docker or cloud VM, make sure `PORT` is reachable from NapCat host.
+2. YuKiKo WS endpoint is `/onebot/v11/ws` (it also accepts `/onebot/v11/`, but `/onebot/v11/ws` is recommended).
+
 ## 2. Quick Deploy and Start
 
 ### 2.1 Linux one-click deploy (1Panel-like)

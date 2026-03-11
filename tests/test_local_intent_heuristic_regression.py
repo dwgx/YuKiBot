@@ -60,7 +60,7 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertEqual(AgentLoop._infer_media_type("\u52a8\u56fe\u8868\u60c5"), "")
         self.assertEqual(AgentLoop._infer_media_type("type=gif"), "gif")
 
-        self.assertEqual(AgentLoop._infer_resource_file_type("\u5b89\u5353\u5b89\u88c5\u5305"), "")
+        self.assertEqual(AgentLoop._infer_resource_file_type("\u5b89\u5353\u5b89\u88c5\u5305"), "apk")
         self.assertEqual(AgentLoop._infer_resource_file_type("prefer_ext=apk"), "apk")
         self.assertEqual(AgentLoop._infer_resource_file_type("demo.exe"), "exe")
 
@@ -81,6 +81,16 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             "download_untrusted_source",
         )
         self.assertEqual(fallback, ("web_search", {"query": "demo app", "mode": "text"}))
+
+        mismatch_fallback = AgentLoop._fallback_tool_on_failure(
+            "smart_download",
+            {"query": "demo app 安卓安装包", "prefer_ext": "apk"},
+            "download_signature_mismatch",
+        )
+        self.assertEqual(
+            mismatch_fallback,
+            ("search_download_resources", {"query": "demo app 安卓安装包", "limit": 8, "file_type": "apk"}),
+        )
 
     def test_trigger_and_router_drop_local_keyword_defaults(self) -> None:
         trigger = TriggerEngine({}, {"name": "YuKiKo", "nicknames": []})

@@ -6,12 +6,15 @@ ENV_FILE="$ROOT_DIR/.env"
 ENV_EXAMPLE="$ROOT_DIR/.env.example"
 SERVICE_TEMPLATE="$ROOT_DIR/deploy/systemd/yukiko.service.template"
 MANAGER_SCRIPT="$ROOT_DIR/scripts/yukiko_manager.sh"
+NAPCAT_INSTALLER_URL="https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh"
+NAPCAT_GUIDE_URL="https://napneko.github.io/guide/boot/Shell"
 
 NON_INTERACTIVE=0
 AUTO_INSTALL_SERVICE=1
 AUTO_OPEN_FIREWALL=0
 SKIP_WEBUI_BUILD=0
 SKIP_CLI_INSTALL=0
+SKIP_NAPCAT=0
 
 HOST_INPUT=""
 PORT_INPUT=""
@@ -21,6 +24,10 @@ SERVICE_NAME_INPUT="yukiko"
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 error() { printf '[ERROR] %s\n' "$*" >&2; }
+
+is_tty_session() {
+  [[ -t 0 && -t 1 ]]
+}
 
 usage() {
   cat <<'EOF'
@@ -37,6 +44,7 @@ Options:
   --no-firewall             Do not touch firewall (default)
   --skip-webui-build        Skip npm build step
   --skip-cli-install        Skip installing /usr/local/bin/yukiko
+  --skip-napcat             Skip NapCat detection and install
   --non-interactive         Use defaults and CLI arguments, no prompts
   -h, --help                Show this help
 
@@ -346,6 +354,112 @@ EOF
   info "CLI installed: yukiko -> $MANAGER_SCRIPT"
 }
 
+print_napcat_manual_hint() {
+  warn "See: $NAPCAT_GUIDE_URL"
+  warn "Manual install:"
+  warn "  curl -o napcat.sh $NAPCAT_INSTALLER_URL && bash napcat.sh"
+}
+
+detect_napcat() {
+  # Check common NapCat install locations
+  if command_exists napcat; then
+    echo "binary"
+    return
+  fi
+  if [[ -f /opt/QQ/resources/app/app_launcher/napcat/napcat.mjs ]]; then
+    echo "shell"
+    return
+  fi
+  if command_exists systemctl; then
+    if systemctl is-active --quiet napcat 2>/dev/null || systemctl is-enabled --quiet napcat 2>/dev/null; then
+      echo "systemd"
+      return
+    fi
+  fi
+  if command_exists docker && docker ps -a 2>/dev/null | grep -qi napcat; then
+    echo "docker"
+    return
+  fi
+  if command_exists pgrep && pgrep -fa napcat >/dev/null 2>&1; then
+    echo "process"
+    return
+  fi
+  echo ""
+}
+
+install_napcat() {
+  if [[ "$SKIP_NAPCAT" -eq 1 ]]; then
+    warn "Skipping NapCat install (--skip-napcat)."
+    return
+  fi
+
+  local napcat_status
+  napcat_status="$(detect_napcat)"
+
+  if [[ -n "$napcat_status" ]]; then
+    info "NapCat already detected (method: $napcat_status). Skipping install."
+    return
+  fi
+
+  local do_install=0
+  if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+    info "NapCat not detected. Installing in non-interactive mode..."
+    do_install=1
+  elif ! is_tty_session; then
+    info "NapCat not detected and no TTY available. Falling back to non-interactive install..."
+    do_install=1
+  else
+    if ask_yes_no "NapCat (QQ adapter) not detected. Install NapCat now?" "yes"; then
+      do_install=1
+    fi
+  fi
+
+  if [[ "$do_install" -eq 0 ]]; then
+    warn "Skipping NapCat install. You will need to set it up manually."
+    print_napcat_manual_hint
+    return
+  fi
+
+  if ! command_exists curl; then
+    warn "curl is missing, cannot download NapCat installer."
+    print_napcat_manual_hint
+    return
+  fi
+
+  info "Downloading NapCat installer..."
+  local napcat_script
+  napcat_script="$(mktemp)"
+  if ! curl -fsSL --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 120 -o "$napcat_script" "$NAPCAT_INSTALLER_URL"; then
+    warn "Failed to download NapCat installer. Please install manually:"
+    print_napcat_manual_hint
+    rm -f "$napcat_script"
+    return
+  fi
+
+  info "Running NapCat installer..."
+  if [[ "$NON_INTERACTIVE" -eq 1 ]] || ! is_tty_session; then
+    bash "$napcat_script" --docker n --cli n --proxy 0 --force || {
+      warn "NapCat auto-install failed. Please install manually after deployment."
+      print_napcat_manual_hint
+    }
+  else
+    bash "$napcat_script" --tui || {
+      warn "NapCat install exited. You can retry later with:"
+      print_napcat_manual_hint
+    }
+  fi
+  rm -f "$napcat_script"
+
+  local napcat_after
+  napcat_after="$(detect_napcat)"
+  if [[ -n "$napcat_after" ]]; then
+    info "NapCat install check: detected ($napcat_after)."
+  else
+    warn "NapCat install check: still not detected."
+    print_napcat_manual_hint
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -387,6 +501,10 @@ parse_args() {
         ;;
       --skip-cli-install)
         SKIP_CLI_INSTALL=1
+        shift
+        ;;
+      --skip-napcat)
+        SKIP_NAPCAT=1
         shift
         ;;
       --non-interactive)
@@ -489,6 +607,7 @@ main() {
   ensure_node_18_plus "$pm"
   bootstrap_python
   build_webui
+  install_napcat
 
   if [[ "$SKIP_CLI_INSTALL" -eq 0 ]]; then
     install_cli_command "$service_name"
@@ -518,6 +637,13 @@ main() {
   echo "Port: $port"
   echo "WebUI: http://${host}:${port}/webui/login"
   echo "CLI: yukiko --help"
+  local napcat_final
+  napcat_final="$(detect_napcat)"
+  if [[ -n "$napcat_final" ]]; then
+    echo "NapCat: installed ($napcat_final)"
+  else
+    echo "NapCat: not installed (set up manually: $NAPCAT_GUIDE_URL)"
+  fi
   if [[ "$install_service" -eq 1 ]]; then
     echo "Service: $service_name"
     echo "Status:  sudo systemctl status $service_name"

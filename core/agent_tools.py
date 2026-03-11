@@ -3438,14 +3438,96 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
         )
 
     if expected_ext and not _matches_expected_signature(expected_ext, head):
-        return ToolCallResult(
-            ok=False,
-            error="download_signature_mismatch",
-            display=(
-                f"下载文件头与期望扩展名不匹配 (expected={expected_ext})，已拦截。"
-                f" 当前URL: {candidate_url}"
-            ),
-        )
+        mismatch_retry_urls: list[str] = []
+        mismatch_seen: set[str] = set()
+
+        def _push_mismatch_retry(url: str) -> None:
+            clean = normalize_text(url)
+            if not clean:
+                return
+            if re.match(r"^https?://", clean, flags=re.IGNORECASE):
+                clean = _normalize_download_http_url(clean)
+            key = clean.lower()
+            if key in mismatch_seen or key == normalize_text(candidate_url).lower():
+                return
+            mismatch_seen.add(key)
+            mismatch_retry_urls.append(clean)
+
+        for retry_url in download_attempts:
+            _push_mismatch_retry(retry_url)
+        for retry_url in _extract_download_candidates_from_html_file(candidate_url, raw_path, prefer_ext=expected_ext):
+            _push_mismatch_retry(retry_url)
+
+        mismatch_fixed = False
+        for retry_url in mismatch_retry_urls[:8]:
+            retry_parsed = urlparse(retry_url)
+            retry_host = normalize_text(retry_parsed.netloc).lower()
+            retry_path_lower = normalize_text(retry_parsed.path).lower()
+            if "/download/" in retry_path_lower or retry_host.startswith("get."):
+                try:
+                    retry_resolved = await asyncio.wait_for(
+                        _resolve_redirect_download_url(retry_url, referer=candidate_url),
+                        timeout=8.0,
+                    )
+                except asyncio.TimeoutError:
+                    retry_resolved = retry_url
+                retry_resolved = normalize_text(retry_resolved)
+                if retry_resolved and retry_resolved != retry_url:
+                    retry_url = _normalize_download_http_url(retry_resolved)
+                    retry_parsed = urlparse(retry_url)
+                    retry_host = normalize_text(retry_parsed.netloc).lower()
+
+            is_cross_retry_host = bool(
+                source_host and retry_host and not _same_distribution_family(source_host, retry_host)
+            )
+            if expected_ext in install_exts and is_cross_retry_host and not allow_third_party:
+                return ToolCallResult(
+                    ok=False,
+                    error=f"download_requires_user_consent:third_party:{retry_host or '-'}",
+                    display=(
+                        "检测到将切换到第三方下载源，已暂停执行。"
+                        f" 当前源: {retry_host or retry_url}\n"
+                        "请先征求用户确认是否允许第三方下载；用户明确同意后，重试 smart_download 并传 allow_third_party=true。"
+                    ),
+                )
+
+            dl_retry = await _napcat_api_call(
+                context,
+                "download_file",
+                "文件下载成功",
+                url=retry_url,
+                thread_count=thread_count,
+            )
+            retry_path = normalize_text(str((dl_retry.data or {}).get("file", ""))) if dl_retry.ok else ""
+            if not retry_path:
+                retry_path = await _download_file_via_http_fallback(retry_url, file_name=file_name)
+                if retry_path:
+                    resolve_note = "via_http_fallback" if not resolve_note else f"{resolve_note}|via_http_fallback"
+            if not retry_path:
+                continue
+
+            retry_head = _read_file_head(retry_path)
+            if _looks_like_html_payload(retry_head):
+                continue
+            if not _matches_expected_signature(expected_ext, retry_head):
+                continue
+
+            candidate_url = retry_url
+            raw_path = retry_path
+            head = retry_head
+            mismatch_fixed = True
+            resolve_note = "via_signature_retry" if not resolve_note else f"{resolve_note}|via_signature_retry"
+            break
+
+        if not mismatch_fixed:
+            return ToolCallResult(
+                ok=False,
+                error="download_signature_mismatch",
+                display=(
+                    f"下载文件头与期望扩展名不匹配 (expected={expected_ext})，已拦截。"
+                    f" 当前URL: {candidate_url}"
+                ),
+            )
 
     staged_path = _stage_download_file(raw_path, candidate_url, file_name=file_name)
     if not staged_path:

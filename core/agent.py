@@ -16,11 +16,10 @@ import re
 import secrets
 import time
 from dataclasses import dataclass, field
-from types import SimpleNamespace
 from typing import Any
 from urllib.parse import urlsplit
 
-from core.agent_tools import AgentToolRegistry
+from core.agent_tools import AgentToolRegistry, ToolCallResult
 from core import prompt_loader as _pl
 from core.prompt_policy import PromptPolicy
 from services.model_client import ModelClient
@@ -1132,7 +1131,7 @@ class AgentLoop:
                     timeout=tool_timeout,
                 )
             except asyncio.TimeoutError:
-                result = SimpleNamespace(
+                result = ToolCallResult(
                     ok=False,
                     display=f"{tool_name} 执行超时（>{int(tool_timeout)}s）",
                     error=f"tool_timeout:{tool_name}",
@@ -1168,7 +1167,7 @@ class AgentLoop:
                             timeout=fb_timeout,
                         )
                     except asyncio.TimeoutError:
-                        fb_result = SimpleNamespace(
+                        fb_result = ToolCallResult(
                             ok=False,
                             display=f"{fb_tool_name} 执行超时（>{int(fb_timeout)}s）",
                             error=f"tool_timeout:{fb_tool_name}",
@@ -1273,6 +1272,7 @@ class AgentLoop:
         rules_text = template.get("rules", "")
         reply_style_text = template.get("reply_style", "")
         tool_usage_text = template.get("tool_usage", "")
+        tool_priority_text = template.get("tool_priority", "")
         context_rules_text = template.get("context_rules", "")
         network_flow_text = template.get("network_flow", "")
 
@@ -1285,6 +1285,16 @@ class AgentLoop:
         total_tools = self.tool_registry.tool_count
         if len(selected_tools) < total_tools:
             tool_docs += f"\n\n(已根据意图筛选 {len(selected_tools)}/{total_tools} 个工具，如需其他工具请说明)"
+        tool_hints_map = _pl.get_dict("tool_hints")
+        selected_tool_hints: list[str] = []
+        if tool_hints_map and selected_tools:
+            for tool_name in selected_tools:
+                hint_text = normalize_text(tool_hints_map.get(tool_name, ""))
+                if not hint_text:
+                    continue
+                selected_tool_hints.append(f"- {tool_name}: {hint_text}")
+                if len(selected_tool_hints) >= 12:
+                    break
         sticker_hint = ""
         if hasattr(ctx, "sticker_manager") and ctx.sticker_manager:
             sticker_hint = self._build_sticker_hint(ctx)
@@ -1324,8 +1334,18 @@ class AgentLoop:
             prompt += f"## 联网任务流程（必须遵守）\n{network_flow_text}\n"
         prompt += (
             f"## 回复风格（极其重要）\n{reply_style_text}\n\n"
-            f"## 工具使用\n{tool_usage_text}{sticker_hint}"
-            f"## 上下文关联（极其重要）\n{context_rules_text}"
+            f"## 工具使用\n{tool_usage_text}{sticker_hint}\n\n"
+        )
+        if normalize_text(tool_priority_text):
+            prompt += f"## 工具优先级（必须遵守）\n{tool_priority_text}\n\n"
+        if selected_tool_hints:
+            prompt += "## 工具细粒度提示（按本轮可用工具）\n" + "\n".join(selected_tool_hints) + "\n\n"
+        prompt += (
+            "## 执行预算（硬约束）\n"
+            f"- 本轮最多 {self.max_steps} 步，优先选择成功率最高的路径，不要重复同类搜索。\n"
+            "- 下载类任务若工具返回扩展名/签名不匹配，必须立即换源或改用资源检索，不得继续复述失败结果。\n\n"
+            "## 上下文关联（极其重要）\n"
+            f"{context_rules_text}"
         )
         # 插件注入的规则
         plugin_rules = self.tool_registry.get_prompt_hints_text("rules")
@@ -1911,6 +1931,12 @@ class AgentLoop:
         for cue, ft in mapping:
             if cue in plain:
                 return ft
+        if any(cue in t for cue in ("安卓", "android", "手机端", "手机版", "移动端", "arm64-v8a", "armeabi")):
+            return "apk"
+        if any(cue in t for cue in ("windows", "win", "pc", "电脑", "桌面端", "x64", "x86", "amd64")):
+            return "exe"
+        if any(cue in t for cue in ("mac", "macos", "darwin")):
+            return "dmg"
         return ""
 
     @staticmethod
@@ -2095,6 +2121,24 @@ class AgentLoop:
             url = normalize_text(str(args.get("url", "")))
             if url:
                 return "web_search", {"query": url, "mode": "text"}
+            return None
+        if tool_name in {"smart_download", "download_file"} and err in {
+            "download_payload_is_html",
+            "download_signature_mismatch",
+            "download_path_missing",
+            "download_failed",
+        }:
+            file_type = normalize_text(str(args.get("prefer_ext", ""))).lower().strip(".")
+            if not file_type and query:
+                file_type = Agent._infer_resource_file_type(query)
+            fallback_query = query
+            if not fallback_query:
+                fallback_query = normalize_text(str(args.get("url", "")))
+            if fallback_query:
+                payload: dict[str, Any] = {"query": fallback_query, "limit": 8}
+                if file_type:
+                    payload["file_type"] = file_type
+                return "search_download_resources", payload
             return None
         if not query:
             return None

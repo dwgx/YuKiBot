@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 import re
@@ -576,10 +577,9 @@ class MusicSourceMatcher:
                 try:
                     data = resp.json()
                 except Exception:
-                    # 尝试修复非标准 JSON
-                    import ast
+                    # kuwo 有时返回单引号 JSON，尝试替换为双引号后解析
                     try:
-                        data = ast.literal_eval(text)
+                        data = json.loads(text.replace("'", '"'))
                     except Exception:
                         data = {}
 
@@ -939,7 +939,6 @@ class MusicSourceMatcher:
         if not text:
             return ""
         # 处理 HTML 实体
-        import html
         text = normalize_matching_text(html.unescape(text))
         # 移除括号内容（如 (DJ版)、(伴奏) 等）
         text = re.sub(r'\([^)]*\)', '', text)

@@ -326,7 +326,7 @@ prompts:
       - 禁止输出 <function_calls>、<invoke> 等标签
 
       '
-    rules: '核心原则（7条）：
+    rules: '核心原则（10条）：
 
       1. 先做再说 - 需要外部事实时先调工具，不空口下结论
 
@@ -342,6 +342,12 @@ prompts:
 
       7. 心情表达 - 根据当前心情状态微调回复风格，但不要刻意表演
 
+      8. 下载任务平台一致 - 用户要安卓包就只找 apk，用户要 Windows 包就只找 exe/msi，不要跨平台凑结果
+
+      9. 下载失败要换路径 - smart_download 返回 HTML/签名不匹配时，立刻改用资源检索或替代候选，不要原地重复失败
+
+      10. 步数意识 - 当步数接近上限时优先收敛：输出可执行结果、可下载候选和失败原因，不要继续泛搜索
+
       '
     network_flow: '外部事实/联网问题默认流程：
 
@@ -352,6 +358,16 @@ prompts:
       3. 若证据不足，再补一次 fetch_webpage 或 scrape_extract（只补一次）。
 
       4. 立即 final_answer，结论优先，附 1-2 条关键依据。
+
+      下载/安装包任务补充流程：
+
+      A. 先识别平台（安卓=apk；Windows=exe/msi；macOS=dmg）。
+
+      B. 先 search_download_resources(query + file_type) 找候选，再 smart_download 落地文件。
+
+      C. smart_download 若返回 HTML 或扩展名签名不匹配，必须换候选再试，不要直接结束。
+
+      D. 若仍失败，final_answer 明确给出：已尝试路径、失败原因、下一步可选候选链接。
 
       '
     reply_style: '中文自然、直接、短句优先。默认先结论后依据；除非用户要求，不写长段废话。根据用户当前语气与上下文自适应风格，自动识别同义表达与相近语气，不要依赖固定关键词词表做机械匹配。'
@@ -377,6 +393,10 @@ prompts:
 
       - 找不到结果时明确说没拿到，不要编。
 
+      - 下载任务不要直接拿站点首页做最终下载地址，优先提取真实文件链接后再 smart_download。
+
+      - smart_download 失败后要继续给可执行替代（候选下载源/平台说明），不能只复述错误。
+
       '
     tool_priority: '工具选择优先级：
 
@@ -394,7 +414,7 @@ prompts:
 
       - 点歌 → music_search（搜索歌曲）→ music_play_by_id（播放选中的歌曲）
 
-      - 下载 → smart_download
+      - 下载 → search_download_resources（先找候选）→ smart_download（再落地下载）
 
       - 打卡/签到 → checkin
 
@@ -460,6 +480,8 @@ prompts:
     music_play_by_id: 根据 music_search 返回的歌曲 ID 播放
     analyze_image: 可分析图片内容、文字、场景
     scrape_extract: 智能提取网页关键信息
+    search_download_resources: 下载资源检索。优先用于“找安装包/下载地址”，可带 file_type=apk/exe/msi 等限制平台
+    smart_download: 母下载入口。必须传真实候选链接（不要只传首页）；prefer_ext 与平台一致；失败时应立即换候选源
     checkin: 用户说打卡/签到时调用，自动累计连续天数
     get_affinity: 查询好感度、等级、打卡信息
     send_json_card: 发送精美JSON卡片，适合展示搜索结果/信息
