@@ -89,13 +89,13 @@ bash install.sh
 GitHub 远程脚本直装（不用先手动 clone）：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
 非交互直装示例：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
 ```
 
 你会按步骤填写：
@@ -355,3 +355,4 @@ build-webui.bat
 - 架构与数据流：`docs/zh-CN/ARCHITECTURE.md`
 - 里面包含 Agent、Router、自检、队列、插件配置模板的协作关系
 - 深度总结与维护手册：`docs/zh-CN/PROJECT_DEEP_SUMMARY.md`
+

@@ -25,8 +25,8 @@ Release and operations deep dive (CN, 1000+ lines checklist + SOP):
 1. 克隆项目并进入目录：
 
 ```bash
-git clone https://github.com/dwgx/YuKiBot.git
-cd YuKiBot
+git clone https://github.com/dwgx/YuKiKo.git
+cd YuKiKo
 ```
 
 2. 一键交互式部署（推荐）：
@@ -61,13 +61,13 @@ bash install.sh
 Remote bootstrap directly from GitHub:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
 Pass installer args (for non-interactive deploy):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
 ```
 
 Non-interactive example:
@@ -142,3 +142,4 @@ ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
 1. Linux 和 Windows 参数完全一样，只是 `<YuKiKo主机>` 不同。
 2. 同一台机器可用 `127.0.0.1`；跨机器请填 YuKiKo 所在机器的局域网 IP。
 3. YuKiKo 监听的 WS 路径是 `/onebot/v11/ws`（也兼容 `/onebot/v11/`，推荐前者）。
+

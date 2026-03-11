@@ -85,13 +85,13 @@ bash install.sh
 Direct remote bootstrap from GitHub (no manual clone required):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
 Non-interactive remote install example:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
 ```
 
 The installer asks for:
@@ -345,3 +345,4 @@ build-webui.bat
 ## 8. Principles and Internals
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for message flow, self-check logic, and template strategy.
+

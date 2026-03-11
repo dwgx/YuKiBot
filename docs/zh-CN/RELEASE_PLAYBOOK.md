@@ -127,19 +127,19 @@ bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yuk
 ### 4.1 一条命令启动
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
 ### 4.2 透传安装参数
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
 ```
 
 ### 4.3 指定仓库、分支、目录
 
 ```bash
-bash bootstrap.sh --repo-url https://github.com/dwgx/YuKiBot.git --branch main --install-dir /opt/yukiko-bot -- --non-interactive --port 18081
+bash bootstrap.sh --repo-url https://github.com/dwgx/YuKiKo.git --branch main --install-dir /opt/yukiko-bot -- --non-interactive --port 18081
 ```
 
 ### 4.4 bootstrap 行为说明
@@ -1158,3 +1158,4 @@ bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yuk
 - 发布不是“保证永不出错”，而是“即使出错也能快速恢复”。
 - 你可以把这份文档当成发布演练脚本，用事实代替感觉。
 - 只要每次发布都按清单执行，稳定性会持续提升。
+

@@ -3,10 +3,10 @@ set -euo pipefail
 
 # GitHub remote bootstrap installer for YuKiKo.
 # Usage examples:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh)
-#   bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiBot/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081
+#   bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081
 
-REPO_URL_DEFAULT="https://github.com/dwgx/YuKiBot.git"
+REPO_URL_DEFAULT="https://github.com/dwgx/YuKiKo.git"
 BRANCH_DEFAULT="main"
 INSTALL_DIR_DEFAULT=""
 KEEP_EXISTING=0
@@ -20,7 +20,7 @@ usage() {
 Usage: bash bootstrap.sh [bootstrap-options] [-- install-options]
 
 Bootstrap options:
-  --repo-url <url>         Git repository URL (default: https://github.com/dwgx/YuKiBot.git)
+  --repo-url <url>         Git repository URL (default: https://github.com/dwgx/YuKiKo.git)
   --branch <name>          Git branch/tag to checkout (default: main)
   --install-dir <path>     Target directory for repo (default: /opt/yukiko-bot if root, else $HOME/yukiko-bot)
   --keep-existing          If install dir exists and is not empty, do not delete it
