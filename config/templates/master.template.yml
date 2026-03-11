@@ -253,9 +253,10 @@ config:
     timeout_seconds: 15
     cache_keep_files: 50
     local_source_enable: true
-    unblock_enable: false
+    unblock_enable: true
     unblock_api_base: ''
-    unblock_sources: qq,kuwo,migu
+    unblock_sources: qq,kuwo,kugou,migu
+    alternative_sources: qq,kuwo,kugou,migu
   affinity:
     enable: true
     storage_dir: storage/affinity

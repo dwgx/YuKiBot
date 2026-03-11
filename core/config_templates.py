@@ -269,6 +269,11 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "trial_max_duration_ms": 35000,
             "artist_guard_enable": True,
             "artist_guard_allow_mismatch_fallback": False,
+            "local_source_enable": True,
+            "unblock_enable": True,
+            "unblock_api_base": "",
+            "unblock_sources": "qq,kuwo,kugou,migu",
+            "alternative_sources": "qq,kuwo,kugou,migu",
         },
     }
 

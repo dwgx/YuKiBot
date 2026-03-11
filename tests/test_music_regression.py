@@ -193,6 +193,51 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.error, "no_exact_match")
         self.assertEqual(seen_calls, [("原声", "热水澡", "蛋堡", True)])
 
+    async def test_music_play_by_id_recovers_cross_source_metadata_from_search(self) -> None:
+        executor = _DummyExecutor()
+        captured: dict[str, object] = {}
+
+        async def fake_search(keyword: str, limit: int = 5, title: str = "", artist: str = ""):
+            return [
+                MusicSearchResult(
+                    song_id=335732052,
+                    name="黑-in3",
+                    artist="IN3",
+                    duration_ms=225000,
+                    source="qq",
+                    source_url="https://y.qq.com/n/ryqq/songDetail/00123456789",
+                )
+            ]
+
+        async def fake_play_song(song, as_voice: bool = True, require_verified_original: bool = False):
+            captured["song_id"] = song.song_id
+            captured["name"] = song.name
+            captured["artist"] = song.artist
+            captured["source"] = song.source
+            captured["source_url"] = song.source_url
+            captured["duration_ms"] = song.duration_ms
+            return MusicPlayResult(ok=True, song=song, message="黑-in3 - IN3 QWQ")
+
+        executor._music_engine.search = fake_search
+        executor._music_engine._play_song = fake_play_song
+
+        result = await executor._music_play_by_id(
+            {"song_id": 335732052, "song_name": "黑", "artist": "IN3", "keyword": "IN3 黑"},
+            None,
+            0,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured["song_id"], 335732052)
+        self.assertEqual(
+            normalize_matching_text(str(captured["name"])),
+            normalize_matching_text("黑-in3"),
+        )
+        self.assertEqual(captured["artist"], "IN3")
+        self.assertEqual(captured["source"], "qq")
+        self.assertEqual(captured["source_url"], "https://y.qq.com/n/ryqq/songDetail/00123456789")
+        self.assertEqual(captured["duration_ms"], 225000)
+
     async def test_search_bilibili_videos_filters_multi_token_mismatch(self) -> None:
         import sys
 
@@ -324,7 +369,15 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source_calls["count"], 0)
 
     async def test_get_play_url_with_alternative_respects_configured_source_order(self) -> None:
-        engine = MusicEngine({"music": {"enable": True, "local_source_enable": True, "unblock_sources": "soundcloud"}})
+        engine = MusicEngine(
+            {
+                "music": {
+                    "enable": True,
+                    "local_source_enable": True,
+                    "alternative_sources": " QQ , invalid , kugou , kuwo , qq ",
+                },
+            }
+        )
         song = MusicSearchResult(song_id=76897, name="热水澡", artist="蛋堡", duration_ms=180000)
         seen_sources: list[list[str] | None] = []
 
@@ -343,7 +396,21 @@ class MusicRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         await engine._get_play_url_with_alternative(song)
 
-        self.assertEqual(seen_sources, [["soundcloud"]])
+        self.assertEqual(seen_sources, [["qq", "kugou", "kuwo"]])
+
+    def test_music_source_csv_keeps_only_supported_sources(self) -> None:
+        engine = MusicEngine(
+            {
+                "music": {
+                    "enable": True,
+                    "unblock_sources": " QQ , soundcloud , migu, invalid , kuwo , qq ",
+                    "alternative_sources": " kugou , invalid , Migu ",
+                },
+            }
+        )
+
+        self.assertEqual(engine._unblock_sources, "qq,migu,kuwo")
+        self.assertEqual(engine._alternative_source_list, ["kugou", "migu"])
 
     async def test_music_play_with_exact_title_does_not_drift_to_other_song_after_preview_only(self) -> None:
         engine = MusicEngine({"music": {"enable": True, "local_source_enable": False}})

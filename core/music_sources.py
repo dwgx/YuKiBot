@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
+from utils.text import normalize_matching_text
 
 _log = logging.getLogger("yukiko.music_sources")
 
@@ -66,7 +67,7 @@ class MusicSourceMatcher:
             sources: 音源优先级列表，如 ["qq", "kuwo", "kugou", "migu"]
         """
         if not sources:
-            sources = ["kuwo", "kugou", "migu", "qq"]  # Kuwo 搜索最稳定，优先尝试
+            sources = ["qq", "kuwo", "kugou", "migu"]
 
         # 清理歌曲名和歌手名
         song_name = self._normalize_text(song_name)
@@ -741,10 +742,7 @@ class MusicSourceMatcher:
         # 移除括号内容（如 (DJ版)、(伴奏) 等）
         text = re.sub(r'\([^)]*\)', '', text)
         text = re.sub(r'（[^）]*）', '', text)
-        # 移除特殊字符
-        text = re.sub(r'[^\w\s]', '', text)
-        # 移除空格并转小写
-        return text.strip().lower().replace(" ", "")
+        return normalize_matching_text(text).strip().lower().replace(" ", "")
 
     @staticmethod
     def _similarity(a: str, b: str) -> float:

@@ -36,6 +36,7 @@ class MusicSearchResult:
     album: str = ""
     duration_ms: int = 0
     source: str = "netease"
+    source_url: str = ""
 
 
 @dataclass(slots=True)
@@ -84,6 +85,7 @@ class MusicEngine:
     _DEFAULT_MAX_VOICE_DURATION_S = 0  # 0 means no truncation
     _DEFAULT_TRIAL_MAX_DURATION_MS = 35_000
     _BREAK_LIMIT_MIN_FULL_MS = 90_000
+    _SUPPORTED_SOURCE_ORDER = ("qq", "kuwo", "kugou", "migu")
 
     def __init__(self, cfg: dict[str, Any] | None = None):
         cfg = cfg or {}
@@ -118,12 +120,18 @@ class MusicEngine:
         )
 
         # UnblockNeteaseMusic 配置
-        self._unblock_enable = bool(music_cfg.get("unblock_enable", False))
+        self._unblock_enable = bool(music_cfg.get("unblock_enable", True))
         self._unblock_api_base = str(music_cfg.get("unblock_api_base", "")).rstrip("/")
-        self._unblock_sources = str(music_cfg.get("unblock_sources", "qq,kuwo,migu")).strip()
+        self._unblock_source_list = self._parse_source_csv(
+            music_cfg.get("unblock_sources", "qq,kuwo,kugou,migu")
+        )
+        self._unblock_sources = ",".join(self._unblock_source_list)
 
         # 本地音源匹配器
         self._local_source_enable = bool(music_cfg.get("local_source_enable", True))
+        self._alternative_source_list = self._parse_source_csv(
+            music_cfg.get("alternative_sources", music_cfg.get("unblock_sources", "qq,kuwo,kugou,migu"))
+        )
         self._source_matcher = None
         if self._local_source_enable:
             try:
@@ -163,6 +171,22 @@ class MusicEngine:
         except Exception:
             return False
 
+    @classmethod
+    def _parse_source_csv(cls, raw_value: Any) -> list[str]:
+        raw = normalize_text(str(raw_value or ""))
+        if not raw:
+            return list(cls._SUPPORTED_SOURCE_ORDER)
+
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in raw.split(","):
+            source = normalize_text(item).lower()
+            if not source or source not in cls._SUPPORTED_SOURCE_ORDER or source in seen:
+                continue
+            seen.add(source)
+            out.append(source)
+        return out or list(cls._SUPPORTED_SOURCE_ORDER)
+
     async def aclose(self) -> None:
         """Compatibility hook."""
         return None
@@ -175,64 +199,136 @@ class MusicEngine:
         title: str = "",
         artist: str = "",
     ) -> list[MusicSearchResult]:
-        """Search songs with minimal local preference logic."""
-        query = build_music_keyword(
-            normalize_matching_text(keyword),
-            normalize_matching_text(title),
-            normalize_matching_text(artist),
-        )
-        if not self._enable or not query.strip():
+        """Search songs with exact-title preference and Alger-first query variants."""
+        keyword = normalize_matching_text(keyword)
+        title = normalize_matching_text(title)
+        artist = normalize_matching_text(artist)
+        query = build_music_keyword(keyword, title, artist)
+        if not self._enable or not (query or keyword or title or artist):
             return []
+        intent = self._build_keyword_intent(keyword=keyword, title=title, artist=artist)
+        query_variants = self._build_search_queries(keyword=keyword, title=title, artist=artist, intent=intent)
+        fetch_limit = max(limit * 3, 20)
+        merge_limit = fetch_limit * 10
 
-        kw = query.strip()
-        intent = self._parse_keyword_intent(kw)
-        fetch_limit = max(limit * 3, 20)  # 获取更多结果用于过滤
+        results: list[MusicSearchResult] = []
+        found_precise = False
 
-        # Always search with original keyword first
-        primary = await self._search_alger(kw, fetch_limit)
-        fallback: list[MusicSearchResult] = []
-        title_only_fallback: list[MusicSearchResult] = []
-        if not primary:
-            title_hint = intent.title_hint
-            if title_hint and title_hint != kw.lower():
-                primary = await self._search_alger(title_hint, fetch_limit)
+        for query_variant in query_variants:
+            rows = await self._search_alger(query_variant, fetch_limit)
+            results = self._merge_unique_results(results, rows, merge_limit)
+            if self._contains_precise_match(rows, intent=intent):
+                found_precise = True
+                break
 
-        if not primary:
-            fallback = await self._search_netease(kw, fetch_limit)
-            if not fallback:
-                title_hint = intent.title_hint
-                if title_hint and title_hint != kw.lower():
-                    title_only_fallback = await self._search_netease(title_hint, fetch_limit)
+        if not results or not found_precise:
+            for query_variant in query_variants:
+                rows = await self._search_netease(query_variant, fetch_limit)
+                results = self._merge_unique_results(results, rows, merge_limit)
+                if self._contains_precise_match(rows, intent=intent):
+                    break
 
-        results = self._merge_unique_results(primary, fallback, fetch_limit * 2)
-        if title_only_fallback:
-            results = self._merge_unique_results(results, title_only_fallback, fetch_limit * 2)
-
-        # 结构化排序：按歌名/歌手提示与关键词命中排序（不使用本地词典特判）。
-        results = self._rank_search_results(results, kw, intent=intent)
-
+        results = self._rank_search_results(results, query or keyword or title or artist, intent=intent)
         return results[:limit]
 
     @staticmethod
-    def _parse_keyword_intent(keyword: str) -> MusicKeywordIntent:
-        raw = normalize_matching_text(keyword)
-        lower = raw.lower()
-        parts = [x for x in re.split(r"[\s,，;；/|]+", lower) if x]
-        artist_tokens: tuple[str, ...] = ()
+    def _split_artist_song(keyword: str) -> tuple[str, str]:
+        kw = normalize_matching_text(keyword)
+        if not kw:
+            return "", ""
+        if "的" in kw:
+            left, right = kw.split("的", 1)
+            left = normalize_matching_text(left)
+            right = normalize_matching_text(right)
+            if len(left) >= 2 and right:
+                return left, right
+        parts = [part for part in re.split(r"\s+", kw) if part]
         if len(parts) >= 2:
-            title_hint = parts[0]
-            artist_hint = " ".join(parts[1:])
-            artist_tokens = tuple(dict.fromkeys(x for x in parts[1:] if x))
-            return MusicKeywordIntent(
-                title_hint=normalize_matching_text(title_hint),
-                artist_hint=normalize_matching_text(artist_hint),
-                artist_tokens=artist_tokens,
-            )
-        return MusicKeywordIntent(
-            title_hint=normalize_matching_text(lower),
-            artist_hint="",
-            artist_tokens=(),
+            left = parts[0]
+            right = " ".join(parts[1:])
+            if len(left) >= 2 and right:
+                return left, right
+        return "", kw
+
+    @classmethod
+    def _build_keyword_intent(
+        cls,
+        *,
+        keyword: str,
+        title: str = "",
+        artist: str = "",
+    ) -> MusicKeywordIntent:
+        title_hint = normalize_matching_text(title)
+        artist_hint = normalize_matching_text(artist)
+        if not title_hint:
+            parsed_artist, parsed_title = cls._split_artist_song(keyword)
+            if parsed_title:
+                title_hint = parsed_title
+            if parsed_artist and not artist_hint:
+                artist_hint = parsed_artist
+        artist_tokens = tuple(
+            dict.fromkeys(token for token in re.split(r"[\s,/|]+", artist_hint.lower()) if token)
         )
+        return MusicKeywordIntent(
+            title_hint=title_hint,
+            artist_hint=artist_hint,
+            artist_tokens=artist_tokens,
+        )
+
+    @classmethod
+    def _build_search_queries(
+        cls,
+        *,
+        keyword: str,
+        title: str,
+        artist: str,
+        intent: MusicKeywordIntent,
+    ) -> list[str]:
+        queries: list[str] = []
+
+        def _add(value: str) -> None:
+            normalized = normalize_matching_text(value)
+            if normalized and normalized not in queries:
+                queries.append(normalized)
+
+        if title and artist:
+            _add(f"{title} {artist}")
+            _add(f"{artist} {title}")
+            _add(title)
+        elif title:
+            _add(title)
+        elif intent.artist_hint and intent.title_hint:
+            _add(f"{intent.artist_hint} {intent.title_hint}")
+            _add(f"{intent.title_hint} {intent.artist_hint}")
+            _add(intent.title_hint)
+        elif keyword:
+            _add(keyword)
+
+        expanded = build_music_keyword(keyword, title, artist)
+        _add(expanded)
+        _add(keyword)
+        if title and not artist:
+            _add(title)
+        if intent.title_hint and intent.title_hint != title:
+            _add(intent.title_hint)
+        return queries
+
+    @classmethod
+    def _contains_precise_match(cls, rows: list[MusicSearchResult], *, intent: MusicKeywordIntent) -> bool:
+        if not rows:
+            return False
+        if not intent.title_hint and not intent.artist_hint:
+            return True
+        for row in rows[:8]:
+            if intent.title_hint:
+                if cls._title_match_level(intent.title_hint, row.name) < 2:
+                    continue
+                if cls._should_avoid_version(row.name, intent.title_hint):
+                    continue
+            if intent.artist_hint and not cls._artist_matches_intent(row.artist, intent):
+                continue
+            return True
+        return False
 
     @staticmethod
     def _compact_text(text: str) -> str:
@@ -240,12 +336,17 @@ class MusicEngine:
 
     @classmethod
     def _title_match_level(cls, expected_title: str, actual_title: str) -> int:
-        expected = cls._compact_text(expected_title)
-        actual = cls._compact_text(actual_title)
+        expected_raw = normalize_matching_text(expected_title).lower()
+        actual_raw = normalize_matching_text(actual_title).lower()
+        expected = cls._compact_text(expected_raw)
+        actual = cls._compact_text(actual_raw)
         if not expected or not actual:
             return 0
         if expected == actual:
             return 3
+        if len(expected) < 2 or len(actual) < 2:
+            boundary = re.compile(rf"^{re.escape(expected_raw)}(?:\s|$)")
+            return 2 if expected_raw and boundary.search(actual_raw) else 0
         if expected in actual or actual in expected:
             return 2
         return 0
@@ -291,7 +392,7 @@ class MusicEngine:
         intent: MusicKeywordIntent | None = None,
     ) -> list[MusicSearchResult]:
         """对搜索结果进行智能排序，优先关键词命中且非改编版本。"""
-        keyword_lower = normalize_text(keyword).lower()
+        keyword_lower = normalize_matching_text(keyword).lower()
         raw_tokens = [x for x in re.split(r"[\s,，;；/|]+", keyword_lower) if x]
         if not raw_tokens and keyword_lower:
             raw_tokens = [keyword_lower]
@@ -300,21 +401,21 @@ class MusicEngine:
         intent_obj = intent or MusicKeywordIntent(title_hint=keyword_lower, artist_hint="", artist_tokens=())
 
         compact_keyword = re.sub(r"\s+", "", keyword_lower)
-        compact_title_hint = re.sub(r"\s+", "", normalize_text(intent_obj.title_hint).lower())
-        artist_hint = normalize_text(intent_obj.artist_hint).lower()
+        compact_title_hint = re.sub(r"\s+", "", normalize_matching_text(intent_obj.title_hint).lower())
 
-        def score_result(item: MusicSearchResult) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int]:
+        def score_result(item: MusicSearchResult) -> tuple[int, int, int, int, int, int, int, int, int, int, int, int, int]:
             """关键词命中优先，其次标题/歌手约束，再其次时长。"""
-            name_lower = item.name.lower()
-            artist_lower = item.artist.lower()
+            name_lower = normalize_matching_text(item.name).lower()
+            artist_lower = normalize_matching_text(item.artist).lower()
             compact_name = re.sub(r"\s+", "", name_lower)
 
             exact_name_match = 1 if keyword_lower and keyword_lower in name_lower else 0
             exact_compact_match = 1 if compact_keyword and compact_name == compact_keyword else 0
             starts_with_keyword = 1 if compact_keyword and compact_name.startswith(compact_keyword) else 0
-            title_exact_match = 1 if compact_title_hint and compact_name == compact_title_hint else 0
-            title_contains = 1 if compact_title_hint and compact_title_hint in compact_name else 0
+            title_match_level = MusicEngine._title_match_level(intent_obj.title_hint, item.name) if intent_obj.title_hint else 0
             artist_hint_match = 1 if MusicEngine._artist_matches_intent(artist_lower, intent_obj) else 0
+            strict_match = 1 if title_match_level >= 2 and artist_hint_match else 0
+            version_ok = 0 if (intent_obj.title_hint and MusicEngine._should_avoid_version(item.name, intent_obj.title_hint)) else 1
             keyword_pos_score = 0
             if compact_keyword:
                 pos = compact_name.find(compact_keyword)
@@ -338,9 +439,10 @@ class MusicEngine:
             duration_score = int(item.duration_ms or 0)
 
             return (
-                title_exact_match,
-                title_contains,
+                strict_match,
+                title_match_level,
                 artist_hint_match,
+                version_ok,
                 exact_compact_match,
                 exact_name_match,
                 starts_with_keyword,
@@ -586,6 +688,7 @@ class MusicEngine:
                     album=album,
                     duration_ms=duration_ms,
                     source="netease",
+                    source_url="",
                 )
             )
 
@@ -715,7 +818,7 @@ class MusicEngine:
                 "trying_alternative_source | id=%d | song=%s | artist=%s",
                 song.song_id, song.name, song.artist,
             )
-            sources = self._unblock_sources.split(",") if self._unblock_sources else None
+            sources = list(self._alternative_source_list) or None
             alternative = await self._source_matcher.find_alternative(
                 song.name,
                 song.artist,
@@ -732,7 +835,6 @@ class MusicEngine:
                 )
 
         return netease_url
-
     async def _get_alger_url(self, song_id: int) -> MusicPlayUrl:
         best = MusicPlayUrl()
         tried: set[str] = set()
@@ -828,7 +930,7 @@ class MusicEngine:
     def _order_play_candidates(results: list[MusicSearchResult], *, intent: MusicKeywordIntent) -> list[MusicSearchResult]:
         if not results:
             return []
-        title_hint = normalize_text(intent.title_hint).lower()
+        title_hint = normalize_matching_text(intent.title_hint)
 
         strict_title: list[MusicSearchResult] = []
         title_only: list[MusicSearchResult] = []
@@ -836,8 +938,11 @@ class MusicEngine:
         rest: list[MusicSearchResult] = []
 
         for row in results:
-            name_l = normalize_text(row.name).lower()
-            title_hit = bool(title_hint and title_hint in name_l)
+            title_hit = bool(
+                title_hint
+                and MusicEngine._title_match_level(title_hint, row.name) >= 2
+                and not MusicEngine._should_avoid_version(row.name, title_hint)
+            )
             artist_hit = bool(intent.artist_hint and MusicEngine._artist_matches_intent(row.artist, intent))
             if title_hit and artist_hit:
                 strict_title.append(row)
@@ -857,6 +962,15 @@ class MusicEngine:
             seen_ids.add(row.song_id)
             out.append(row)
         return out
+
+    @staticmethod
+    def _format_song_choices(results: list[MusicSearchResult], requested_text: str = "") -> str:
+        visible: list[str] = []
+        for idx, row in enumerate(results[:5], start=1):
+            if requested_text and MusicEngine._should_avoid_version(row.name, requested_text):
+                continue
+            visible.append(f"{idx}. {row.name} - {row.artist} (ID: {row.song_id})")
+        return "\n".join(visible)
 
     async def get_lyrics(self, song_id: int) -> str:
         url = f"{self._api_base}/lyric"
@@ -880,17 +994,37 @@ class MusicEngine:
         title: str = "",
         artist: str = "",
     ) -> MusicPlayResult:
-        query = build_music_keyword(
-            normalize_matching_text(keyword),
-            normalize_matching_text(title),
-            normalize_matching_text(artist),
-        )
+        keyword = normalize_matching_text(keyword)
+        title = normalize_matching_text(title)
+        artist = normalize_matching_text(artist)
+        query = build_music_keyword(keyword, title, artist)
+        intent = self._build_keyword_intent(keyword=keyword, title=title, artist=artist)
         results = await self.search(query, limit=12, title=title, artist=artist)
         if not results:
             return MusicPlayResult(ok=False, message="没找到相关歌曲", error="no_results")
 
-        intent = self._parse_keyword_intent(query)
         ordered = self._order_play_candidates(results, intent=intent)
+        requested_title = title or intent.title_hint
+        if requested_title:
+            exact_title_results = [
+                row
+                for row in ordered
+                if self._title_match_level(requested_title, row.name) >= 2
+                and not self._should_avoid_version(row.name, requested_title)
+            ]
+            if not exact_title_results:
+                suggestions = self._format_song_choices(results, requested_text=requested_title)
+                text = f"没找到和《{requested_title}》明确匹配的可播歌曲。"
+                if suggestions:
+                    text += f"\n可参考这些近似结果，但我不能直接替你播：\n{suggestions}"
+                return MusicPlayResult(
+                    ok=False,
+                    song=results[0],
+                    message=text,
+                    error="no_exact_match",
+                )
+            ordered = exact_title_results
+
         has_artist_hint = bool(intent.artist_hint)
         artist_matched: list[MusicSearchResult] = []
         artist_mismatched: list[MusicSearchResult] = []
@@ -1031,13 +1165,8 @@ class MusicEngine:
                 pass
 
         if not mp3_path.exists():
-            try:
-                async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-                    resp = await client.get(play_url.url)
-                    resp.raise_for_status()
-                    mp3_path.write_bytes(resp.content)
-            except Exception as exc:
-                _log.warning("music_download_fail | id=%d | %s", song.song_id, exc)
+            if not await self._download_audio_to_cache(play_url.url, mp3_path):
+                _log.warning("music_download_fail | id=%d | url=%s", song.song_id, play_url.url[:160])
                 return MusicPlayResult(ok=False, song=song, error="download_failed")
 
         result = MusicPlayResult(
@@ -1062,6 +1191,80 @@ class MusicEngine:
 
         self._evict_cache()
         return result
+
+    async def _download_audio_to_cache(self, source_url: str, target_path: Path) -> bool:
+        url = normalize_text(source_url)
+        if not url:
+            return False
+        try:
+            target_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        lower_url = url.lower()
+        if self._should_transcode_remote_audio(lower_url, "") and self._ffmpeg:
+            return await self._transcode_remote_audio_to_mp3(url, target_path)
+
+        try:
+            async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+                resp = await client.get(url)
+                resp.raise_for_status()
+                content_type = normalize_text(resp.headers.get("content-type", "")).lower()
+                if self._should_transcode_remote_audio(lower_url, content_type):
+                    if self._ffmpeg:
+                        return await self._transcode_remote_audio_to_mp3(url, target_path)
+                    return False
+                target_path.write_bytes(resp.content)
+        except Exception as exc:
+            _log.warning("music_download_http_fail | url=%s | %s", url[:160], exc)
+            if self._ffmpeg:
+                return await self._transcode_remote_audio_to_mp3(url, target_path)
+            return False
+
+        try:
+            return target_path.exists() and target_path.stat().st_size > 1024
+        except Exception:
+            return False
+
+    @staticmethod
+    def _should_transcode_remote_audio(url: str, content_type: str) -> bool:
+        lowered_content_type = normalize_text(content_type).lower()
+        if ".m3u8" in url or "mpegurl" in lowered_content_type:
+            return True
+        if any(url.endswith(ext) for ext in (".m4a", ".aac", ".ogg", ".opus", ".webm")):
+            return True
+        return lowered_content_type.startswith("audio/") and "mpeg" not in lowered_content_type
+
+    async def _transcode_remote_audio_to_mp3(self, source_url: str, target_path: Path) -> bool:
+        if not self._ffmpeg:
+            return False
+        cmd = [
+            self._ffmpeg,
+            "-y",
+            "-i",
+            str(source_url),
+            "-vn",
+            "-acodec",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            str(target_path),
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=max(60, min(self._silk_encode_timeout_s, 240)))
+            if proc.returncode != 0:
+                target_path.unlink(missing_ok=True)
+                return False
+            return target_path.exists() and target_path.stat().st_size > 1024
+        except Exception as exc:
+            _log.warning("music_transcode_remote_fail | url=%s | %s", source_url[:160], exc)
+            target_path.unlink(missing_ok=True)
+            return False
 
     @staticmethod
     def _encode_silk_with_fallback(
@@ -1298,13 +1501,37 @@ def build_music_keyword(keyword: str, title: str = "", artist: str = "") -> str:
     Returns:
         组合后的搜索关键词
     """
-    parts = []
-    if title:
-        parts.append(title)
-    if artist:
-        parts.append(artist)
+    keyword = normalize_matching_text(keyword)
+    title = normalize_matching_text(title)
+    artist = normalize_matching_text(artist)
 
-    if parts:
-        return " ".join(parts)
-    return keyword
+    def _compact(text: str) -> str:
+        return re.sub(r"\s+", "", text)
 
+    def _token_is_covered(token: str, target: str) -> bool:
+        compact_token = _compact(token)
+        compact_target = _compact(target)
+        return bool(compact_token and compact_target and compact_token in compact_target)
+
+    extra_tokens = [
+        token
+        for token in re.split(r"\s+", keyword)
+        if token and not _token_is_covered(token, title) and not _token_is_covered(token, artist)
+    ]
+
+    parts: list[str] = []
+    keyword_contains_title = bool(title and _compact(title) and _compact(title) in _compact(keyword))
+    if title or artist:
+        if keyword_contains_title and artist:
+            parts.extend([artist, title])
+        else:
+            parts.extend([title, artist])
+    elif keyword:
+        parts.append(keyword)
+
+    for token in extra_tokens:
+        if token and token not in parts:
+            parts.append(token)
+
+    cleaned = [part for part in parts if part]
+    return " ".join(cleaned)
