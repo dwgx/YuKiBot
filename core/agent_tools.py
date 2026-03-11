@@ -2563,6 +2563,23 @@ def _pick_download_candidates(page_url: str, html_text: str, prefer_ext: str = "
         raw = normalize_text(m.group(1))
         if raw:
             raw_links.append(raw)
+    # 3) 兜底: 脚本变量/JSON 里直接给了文件地址（如 Address:"https://.../setup.exe"）
+    for m in re.finditer(
+        r"""["'](https?://[^"'\s]+\.(?:apk|exe|msi|zip|7z|rar|mp4|mp3|m4a|wav)(?:\?[^"']*)?)["']""",
+        html_text,
+        flags=re.IGNORECASE,
+    ):
+        raw = normalize_text(m.group(1))
+        if raw:
+            raw_links.append(raw)
+    for m in re.finditer(
+        r"""["'](//[^"'\s]+\.(?:apk|exe|msi|zip|7z|rar|mp4|mp3|m4a|wav)(?:\?[^"']*)?)["']""",
+        html_text,
+        flags=re.IGNORECASE,
+    ):
+        raw = normalize_text(m.group(1))
+        if raw:
+            raw_links.append(raw)
 
     candidates: list[tuple[int, str]] = []
     for raw_link in raw_links:
@@ -2708,33 +2725,35 @@ async def _extract_runtime_download_candidates_from_page(
     if not page_host:
         return []
 
+    inline_patterns = (
+        r"https?://[^\s\"']*download\?[^\s\"']*",
+        r"https?://[^\s\"']+/download/[^\s\"']+",
+        r"https?://[^\s\"']+\.(?:exe|msi|apk|zip|7z|rar|dmg|pkg)(?:\?[^\s\"']*)?",
+        r"//[^\s\"']+/download/[^\s\"']+",
+        r"//[^\s\"']+\.(?:exe|msi|apk|zip|7z|rar|dmg|pkg)(?:\?[^\s\"']*)?",
+    )
+    out: list[str] = []
+    seen: set[str] = set()
+    for pattern in inline_patterns:
+        for raw in re.findall(pattern, html_text, flags=re.IGNORECASE):
+            endpoint = normalize_text(raw)
+            if not endpoint:
+                continue
+            if endpoint.startswith("//"):
+                endpoint = f"{page_parsed.scheme or 'https'}:{endpoint}"
+            parsed = urlparse(endpoint)
+            if parsed.scheme not in {"http", "https"}:
+                continue
+            key = endpoint.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(endpoint)
+            if len(out) >= 10:
+                return out
+
     script_srcs = re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html_text, flags=re.IGNORECASE)
     if not script_srcs:
-        inline_patterns = (
-            r"https?://[^\s\"']*download\?[^\s\"']*",
-            r"https?://[^\s\"']+/download/[^\s\"']+",
-            r"https?://[^\s\"']+\.(?:exe|msi|apk|zip|7z|rar|dmg|pkg)(?:\?[^\s\"']*)?",
-            r"//[^\s\"']+/download/[^\s\"']+",
-        )
-        out: list[str] = []
-        seen: set[str] = set()
-        for pattern in inline_patterns:
-            for raw in re.findall(pattern, html_text, flags=re.IGNORECASE):
-                endpoint = normalize_text(raw)
-                if not endpoint:
-                    continue
-                if endpoint.startswith("//"):
-                    endpoint = f"{page_parsed.scheme or 'https'}:{endpoint}"
-                parsed = urlparse(endpoint)
-                if parsed.scheme not in {"http", "https"}:
-                    continue
-                key = endpoint.lower()
-                if key in seen:
-                    continue
-                seen.add(key)
-                out.append(endpoint)
-                if len(out) >= 10:
-                    return out
         return out
 
     scored_scripts: list[tuple[int, str]] = []
@@ -2757,7 +2776,7 @@ async def _extract_runtime_download_candidates_from_page(
             score += 1
         scored_scripts.append((score, script_url))
     if not scored_scripts:
-        return []
+        return out
     scored_scripts.sort(key=lambda item: item[0], reverse=True)
 
     os_hint = _guess_download_os_hint(prefer_ext=prefer_ext, file_name=file_name)
@@ -2781,13 +2800,11 @@ async def _extract_runtime_download_candidates_from_page(
                 for pattern in patterns:
                     endpoint_raw.extend(re.findall(pattern, js_text, flags=re.IGNORECASE))
     except Exception:
-        return []
+        return out
 
     if not endpoint_raw:
-        return []
+        return out
 
-    out: list[str] = []
-    seen: set[str] = set()
     for raw in endpoint_raw:
         endpoint = normalize_text(raw)
         if not endpoint:
@@ -3289,14 +3306,90 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
             return ToolCallResult(ok=False, error=last_download_error, display=last_download_display or "下载失败")
         return ToolCallResult(ok=False, error="download_path_missing", display="下载成功但没有返回本地路径")
 
-    # 3.5) 安全防线：拦截“HTML 伪装成安装包/可执行文件”，并尝试一次自动纠正。
+    # 3.5) 安全防线：拦截“HTML 伪装成安装包/可执行文件”，并做多候选自动纠正。
     head = _read_file_head(raw_path)
     is_html_payload = _looks_like_html_payload(head)
     if is_html_payload:
-        retry_links = _extract_download_candidates_from_html_file(candidate_url, raw_path, prefer_ext=prefer_ext)
-        retry_links = [u for u in retry_links if normalize_text(u) and normalize_text(u) != candidate_url]
-        if retry_links:
-            retry_url = retry_links[0]
+        retry_queue: list[str] = []
+        retry_seen: set[str] = set()
+
+        def _push_retry_link(url: str) -> None:
+            clean = normalize_text(url)
+            if not clean:
+                return
+            if re.match(r"^https?://", clean, flags=re.IGNORECASE):
+                clean = _normalize_download_http_url(clean)
+            key = clean.lower()
+            if key in retry_seen or key == normalize_text(candidate_url).lower():
+                return
+            retry_seen.add(key)
+            retry_queue.append(clean)
+
+        def _read_html_text(path: str) -> str:
+            try:
+                return Path(path).read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                return ""
+
+        def _collect_retry_links_from_html(source_url: str, html_path: str, html_text: str) -> None:
+            for retry_link in _extract_download_candidates_from_html_file(
+                source_url,
+                html_path,
+                prefer_ext=prefer_ext,
+            ):
+                _push_retry_link(retry_link)
+            if html_text:
+                for retry_link in _pick_download_candidates(source_url, html_text, prefer_ext=prefer_ext):
+                    _push_retry_link(retry_link)
+
+        seed_html_text = _read_html_text(raw_path)
+        _collect_retry_links_from_html(candidate_url, raw_path, seed_html_text)
+        runtime_retry_links = await _extract_runtime_download_candidates_from_page(
+            candidate_url,
+            seed_html_text,
+            prefer_ext=prefer_ext,
+            file_name=file_name,
+        )
+        for retry_link in runtime_retry_links:
+            _push_retry_link(retry_link)
+
+        retries = 0
+        while retry_queue and is_html_payload and retries < 8:
+            retries += 1
+            retry_url = retry_queue.pop(0)
+
+            retry_parsed = urlparse(retry_url)
+            retry_host = normalize_text(retry_parsed.netloc).lower()
+            retry_path_lower = normalize_text(retry_parsed.path).lower()
+            if "/download/" in retry_path_lower or retry_host.startswith("get."):
+                try:
+                    retry_resolved = await asyncio.wait_for(
+                        _resolve_redirect_download_url(retry_url, referer=candidate_url),
+                        timeout=8.0,
+                    )
+                except asyncio.TimeoutError:
+                    retry_resolved = retry_url
+                retry_resolved = normalize_text(retry_resolved)
+                if retry_resolved and retry_resolved != retry_url:
+                    retry_url = _normalize_download_http_url(retry_resolved)
+                    _push_retry_link(retry_url)
+                    retry_parsed = urlparse(retry_url)
+                    retry_host = normalize_text(retry_parsed.netloc).lower()
+
+            is_cross_retry_host = bool(
+                source_host and retry_host and not _same_distribution_family(source_host, retry_host)
+            )
+            if expected_ext in install_exts and is_cross_retry_host and not allow_third_party:
+                return ToolCallResult(
+                    ok=False,
+                    error=f"download_requires_user_consent:third_party:{retry_host or '-'}",
+                    display=(
+                        "检测到将切换到第三方下载源，已暂停执行。"
+                        f" 当前源: {retry_host or retry_url}\n"
+                        "请先征求用户确认是否允许第三方下载；用户明确同意后，重试 smart_download 并传 allow_third_party=true。"
+                    ),
+                )
+
             dl_retry = await _napcat_api_call(
                 context,
                 "download_file",
@@ -3304,14 +3397,35 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
                 url=retry_url,
                 thread_count=thread_count,
             )
-            if dl_retry.ok:
-                retry_path = normalize_text(str((dl_retry.data or {}).get("file", "")))
-                if retry_path:
-                    candidate_url = retry_url
-                    raw_path = retry_path
-                    head = _read_file_head(raw_path)
-                    is_html_payload = _looks_like_html_payload(head)
-                    resolve_note = "via_downloaded_html_retry"
+            retry_path = normalize_text(str((dl_retry.data or {}).get("file", ""))) if dl_retry.ok else ""
+            if not retry_path:
+                http_retry_path = await _download_file_via_http_fallback(retry_url, file_name=file_name)
+                if http_retry_path:
+                    retry_path = http_retry_path
+                    resolve_note = "via_http_fallback" if not resolve_note else f"{resolve_note}|via_http_fallback"
+            if not retry_path:
+                continue
+
+            retry_head = _read_file_head(retry_path)
+            if _looks_like_html_payload(retry_head):
+                nested_html_text = _read_html_text(retry_path)
+                _collect_retry_links_from_html(retry_url, retry_path, nested_html_text)
+                nested_runtime_links = await _extract_runtime_download_candidates_from_page(
+                    retry_url,
+                    nested_html_text,
+                    prefer_ext=prefer_ext,
+                    file_name=file_name,
+                )
+                for retry_link in nested_runtime_links:
+                    _push_retry_link(retry_link)
+                continue
+
+            candidate_url = retry_url
+            raw_path = retry_path
+            head = retry_head
+            is_html_payload = False
+            resolve_note = "via_downloaded_html_retry" if not resolve_note else f"{resolve_note}|via_downloaded_html_retry"
+            break
 
     if is_html_payload:
         return ToolCallResult(

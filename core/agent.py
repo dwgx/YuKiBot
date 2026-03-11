@@ -1877,7 +1877,7 @@ class AgentLoop:
             return "apk"
         if any(c in t for c in ("ipa", "ios", "iphone", "ipad")):
             return "ipa"
-        if any(c in t for c in (".exe", "windows", "win32", "win64", "电脑版", "pc端")):
+        if any(c in t for c in (".exe", "windows", "win32", "win64", "电脑版", "电脑板", "pc端", "pc版", "电脑端", "桌面版")):
             return "exe"
 
         mapping = (
