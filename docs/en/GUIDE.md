@@ -16,8 +16,8 @@ This guide is intentionally ordered for real usage:
 Clone:
 
 ```bash
-git clone <your-repo-url> yukiko-bot
-cd yukiko-bot
+git clone <your-repo-url> YuKiKo
+cd YuKiKo
 ```
 
 Copy env file:

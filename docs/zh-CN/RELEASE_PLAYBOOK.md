@@ -139,7 +139,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.s
 ### 4.3 指定仓库、分支、目录
 
 ```bash
-bash bootstrap.sh --repo-url https://github.com/dwgx/YuKiKo.git --branch main --install-dir /opt/yukiko-bot -- --non-interactive --port 18081
+bash bootstrap.sh --repo-url https://github.com/dwgx/YuKiKo.git --branch main --install-dir /opt/YuKiKo -- --non-interactive --port 18081
 ```
 
 ### 4.4 bootstrap 行为说明
@@ -283,7 +283,7 @@ yukiko uninstall --service-name yukiko --purge-runtime --purge-env --yes
 ### 9.2 回滚步骤
 
 ```bash
-cd /path/to/yukiko-bot
+cd /path/to/YuKiKo
 git fetch --all --tags
 git checkout <last_stable_tag_or_commit>
 python scripts/deploy.py

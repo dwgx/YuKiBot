@@ -20,8 +20,8 @@
 ### 1.2 克隆与进入目录
 
 ```bash
-git clone <your-repo-url> yukiko-bot
-cd yukiko-bot
+git clone <your-repo-url> YuKiKo
+cd YuKiKo
 ```
 
 ### 1.3 准备环境变量

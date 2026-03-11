@@ -22,7 +22,7 @@ Usage: bash bootstrap.sh [bootstrap-options] [-- install-options]
 Bootstrap options:
   --repo-url <url>         Git repository URL (default: https://github.com/dwgx/YuKiKo.git)
   --branch <name>          Git branch/tag to checkout (default: main)
-  --install-dir <path>     Target directory for repo (default: /opt/yukiko-bot if root, else $HOME/yukiko-bot)
+  --install-dir <path>     Target directory for repo (default: /opt/YuKiKo if root, else $HOME/YuKiKo)
   --keep-existing          If install dir exists and is not empty, do not delete it
   -h, --help               Show this help
 
@@ -31,7 +31,7 @@ All arguments after `--` are forwarded to install.sh.
 Examples:
   bash bootstrap.sh
   bash bootstrap.sh -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko
-  bash bootstrap.sh --install-dir /opt/yukiko-bot --branch main -- --open-firewall
+  bash bootstrap.sh --install-dir /opt/YuKiKo --branch main -- --open-firewall
 EOF
 }
 
@@ -41,9 +41,9 @@ command_exists() {
 
 resolve_default_install_dir() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-    printf '/opt/yukiko-bot'
+    printf '/opt/YuKiKo'
   else
-    printf '%s/yukiko-bot' "${HOME:-$PWD}"
+    printf '%s/YuKiKo' "${HOME:-$PWD}"
   fi
 }
 

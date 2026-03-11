@@ -3,7 +3,7 @@
 ## Tree (core folders)
 
 ```text
-yukiko-bot/
+YuKiKo/
 ├─ main.py
 ├─ app.py
 ├─ core/                  # engine, queue, router, tools, config loader

@@ -15,8 +15,8 @@
 ### 1.2 下載與進入專案
 
 ```bash
-git clone <your-repo-url> yukiko-bot
-cd yukiko-bot
+git clone <your-repo-url> YuKiKo
+cd YuKiKo
 ```
 
 ### 1.3 建立環境變數檔
