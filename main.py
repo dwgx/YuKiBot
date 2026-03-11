@@ -47,14 +47,11 @@ def _tune_runtime_logging() -> None:
         import uvicorn.config
 
         loggers = uvicorn.config.LOGGING_CONFIG.get("loggers", {})
-        handlers = uvicorn.config.LOGGING_CONFIG.get("handlers", {})
         for name in ("uvicorn.access", "uvicorn.asgi"):
             if name in loggers:
                 loggers[name]["handlers"] = []
                 loggers[name]["propagate"] = False
                 loggers[name]["level"] = "CRITICAL"
-        if "access" in handlers:
-            handlers["access"]["class"] = "logging.NullHandler"
     except Exception:
         pass
 

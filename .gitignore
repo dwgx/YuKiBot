@@ -19,6 +19,7 @@ plugins/config/*.local.yml
 
 # 运行日志与本地状态目录
 logs/
+storage/
 storage/logs/
 storage/cache/
 storage/tmp/
