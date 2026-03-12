@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import re
+import unicodedata
 from functools import lru_cache
 from typing import Iterable
 
@@ -32,6 +33,22 @@ _BRACKET_KAOMOJI_PATTERN = re.compile(r"\((?=[^)]*[^\w\s])[^\n()]{1,20}\)")
 
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def strip_invisible_format_chars(text: str, *, keep_newlines: bool = False) -> str:
+    content = str(text or "")
+    if not content:
+        return ""
+    out: list[str] = []
+    for ch in content:
+        if keep_newlines and ch in "\r\n\t":
+            out.append(ch)
+            continue
+        category = unicodedata.category(ch)
+        if category in {"Cf", "Cc", "Cs"}:
+            continue
+        out.append(ch)
+    return "".join(out)
 
 
 @lru_cache(maxsize=1)

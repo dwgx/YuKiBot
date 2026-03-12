@@ -210,8 +210,8 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "non_whitelist_mode": "silent",
         },
         "trigger": {
-            "ai_listen_enable": False,
-            "delegate_undirected_to_ai": False,
+            "ai_listen_enable": True,
+            "delegate_undirected_to_ai": True,
             "ai_listen_min_messages": 2,
             "ai_listen_min_score": 1.2,
             "followup_reply_window_seconds": 30,

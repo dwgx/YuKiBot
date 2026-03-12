@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +14,7 @@ from typing import Any
 
 
 
+from utils.learning_guard import assess_preferred_name_learning
 from utils.text import normalize_text
 
 
@@ -35,6 +36,12 @@ class TriggerInput:
     is_private: bool
 
     timestamp: datetime
+
+    at_other_user_ids: list[str] = field(default_factory=list)
+
+    reply_to_user_id: str = ""
+
+    bot_id: str = ""
 
 
 
@@ -450,7 +457,7 @@ class TriggerEngine:
 
 
 
-        if self._looks_like_explicit_memory_declare(payload.text):
+        if self._looks_like_explicit_memory_declare(payload):
 
             return TriggerResult(
 
@@ -946,11 +953,9 @@ class TriggerEngine:
 
 
 
-    @staticmethod
+    def _looks_like_explicit_memory_declare(self, payload: TriggerInput) -> bool:
 
-    def _looks_like_explicit_memory_declare(text: str) -> bool:
-
-        content = normalize_text(text).lower()
+        content = normalize_text(payload.text).lower()
 
         if not content:
 
@@ -960,6 +965,29 @@ class TriggerEngine:
 
         if any(q in content for q in ("我叫什么", "我叫啥", "你记得我叫什么", "记得我叫什么")):
 
+            return False
+
+        preferred_name_decision = assess_preferred_name_learning(
+            payload.text,
+            is_private=payload.is_private,
+            mentioned=payload.mentioned,
+            bot_aliases=self.bot_aliases,
+            at_other_user_ids=payload.at_other_user_ids,
+            reply_to_user_id=payload.reply_to_user_id,
+            bot_id=payload.bot_id,
+        )
+        if preferred_name_decision.allow:
+            return True
+        if preferred_name_decision.reason in {
+            "non_serious_context",
+            "group_not_directed",
+            "group_at_other_users",
+            "group_reply_to_other",
+            "group_roleplay_name",
+        }:
+            return False
+
+        if not payload.is_private and not (payload.mentioned or self._contains_alias(payload.text)):
             return False
 
         cues = (
@@ -1281,4 +1309,3 @@ class TriggerEngine:
             if not queue:
 
                 self._recent_group_messages.pop(cid, None)
-

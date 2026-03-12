@@ -4060,7 +4060,7 @@ class ToolExecutor:
         raw_segments: list[dict[str, Any]] | None = None,
     ) -> bool:
         merged = normalize_text(f"{query}\n{message_text}").lower()
-        animated_cues = ("动画表情", "动图", "gif", "动态图", "表情包", "贴纸")
+        animated_cues = ("动画表情", "动图", "gif", "动态图", "表情包", "贴纸", "动表情", "动态贴纸")
         if any(cue in merged for cue in animated_cues):
             return True
         for seg in raw_segments or []:
@@ -4071,12 +4071,15 @@ class ToolExecutor:
             data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
             summary = normalize_text(str(data.get("summary", ""))).lower()
             file_name = normalize_text(str(data.get("file", ""))).lower()
+            url = normalize_text(str(data.get("url", ""))).lower()
             sub_type = normalize_text(str(data.get("sub_type", ""))).lower()
             if sub_type == "1":
                 return True
             if any(cue in summary for cue in animated_cues):
                 return True
             if file_name.endswith(".gif"):
+                return True
+            if ".gif" in url:
                 return True
         return False
 
@@ -4788,6 +4791,8 @@ class ToolExecutor:
         content = normalize_text(answer)
         if not content:
             return ""
+        if content.strip().lower() in {"-", "--", "n/a", "na", "null", "none"}:
+            return ""
         content = re.sub(r"\s+", " ", content).strip()
         if self._looks_like_english_refusal(content):
             return "这张图我这次没法稳定识别完整内容。请发更清晰的图片，或告诉我要识别哪一部分。"
@@ -4810,9 +4815,8 @@ class ToolExecutor:
         animated_hint: bool = False,
     ) -> str:
         normalized = await self._normalize_vision_answer(answer, prompt=prompt)
-        if not normalized:
-            return ""
-        if not self._vision_second_pass_enable or not self._looks_like_weak_vision_answer(normalized):
+        need_retry = not normalized or self._looks_like_weak_vision_answer(normalized)
+        if not self._vision_second_pass_enable or not need_retry:
             return normalized
 
         retry_prompt = self._build_vision_retry_prompt(
@@ -4824,7 +4828,9 @@ class ToolExecutor:
         retry_norm = await self._normalize_vision_answer(retry_raw, prompt=retry_prompt)
         if retry_norm and not self._looks_like_weak_vision_answer(retry_norm):
             return retry_norm
-        return normalized
+        if retry_norm and not normalized:
+            return retry_norm
+        return normalized or retry_norm
 
     async def _translate_to_chinese(self, content: str, prompt: str) -> str:
         model_client = getattr(self.image_engine, "model_client", None)
@@ -4896,6 +4902,19 @@ class ToolExecutor:
             "识别失败???",
         )
         if any(marker in plain for marker in explicit_markers):
+            return True
+        vague_cues = (
+            "看不清",
+            "看不出来",
+            "无法判断",
+            "无法确定",
+            "不太清楚",
+            "信息不足",
+            "结果不稳定",
+            "可能是动图",
+            "画面比较复杂",
+        )
+        if len(content) <= 40 and any(cue in content for cue in vague_cues):
             return True
         return False
 

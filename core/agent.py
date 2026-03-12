@@ -39,6 +39,8 @@ class AgentContext:
     is_private: bool
     mentioned: bool
     message_text: str
+    original_message_text: str = ""
+    explicit_bot_addressed: bool = False
     message_id: str = ""
     reply_to_message_id: str = ""
     raw_segments: list[dict[str, Any]] = field(default_factory=list)
@@ -1150,14 +1152,18 @@ class AgentLoop:
                 "tool_executor": ctx.tool_executor,
                 "crawler_hub": ctx.crawler_hub,
                 "knowledge_base": ctx.knowledge_base,
+                "memory_engine": ctx.memory_engine,
                 "conversation_id": ctx.conversation_id,
                 "user_id": ctx.user_id,
                 "user_name": ctx.user_name,
                 "group_id": ctx.group_id,
                 "bot_id": ctx.bot_id,
                 "is_private": ctx.is_private,
+                "mentioned": ctx.mentioned,
+                "explicit_bot_addressed": ctx.explicit_bot_addressed,
                 "trace_id": ctx.trace_id,
                 "message_text": ctx.message_text,
+                "original_message_text": ctx.original_message_text or ctx.message_text,
                 "message_id": ctx.message_id,
                 "raw_segments": ctx.raw_segments,
                 "reply_media_segments": ctx.reply_media_segments,
@@ -1165,6 +1171,8 @@ class AgentLoop:
                 "reply_to_user_id": ctx.reply_to_user_id,
                 "reply_to_user_name": ctx.reply_to_user_name,
                 "reply_to_text": ctx.reply_to_text,
+                "at_other_user_ids": ctx.at_other_user_ids,
+                "recent_speakers": ctx.recent_speakers,
                 "event_payload": ctx.event_payload,
                 "user_policies": ctx.user_policies,
                 "user_directives": ctx.user_directives,

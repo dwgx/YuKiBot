@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from utils.learning_guard import assess_preferred_name_learning, is_safe_user_profile_learning_context
 from utils.text import clip_text, normalize_text
 
 
@@ -206,9 +207,11 @@ class KnowledgeUpdater:
         user_text: str,
         user_id: str,
         conversation_id: str,
+        metadata: dict[str, Any] | None = None,
     ) -> list[KnowledgeCandidate]:
         text = normalize_text(user_text)
         uid = normalize_text(user_id)
+        message_meta = metadata if isinstance(metadata, dict) else {}
         if not text or not uid:
             return []
         if not self._can_use_llm_extractor():
@@ -278,10 +281,21 @@ class KnowledgeUpdater:
                 preferred = clip_text(content, 24)
                 if self._is_blocked_name_preference(preferred):
                     continue
+                decision = assess_preferred_name_learning(
+                    text,
+                    is_private=bool(message_meta.get("is_private", False)),
+                    mentioned=bool(message_meta.get("mentioned", False)),
+                    explicit_bot_addressed=bool(message_meta.get("explicit_bot_addressed", False)),
+                    at_other_user_ids=message_meta.get("at_other_user_ids", []) or [],
+                    reply_to_user_id=normalize_text(str(message_meta.get("reply_to_user_id", ""))),
+                    bot_id=normalize_text(str(message_meta.get("bot_id", ""))),
+                )
+                if not decision.allow:
+                    continue
                 out.append(
                     KnowledgeCandidate(
                         title=f"user:{uid}:preferred_name",
-                        content=preferred,
+                        content=decision.candidate or preferred,
                         confidence=max(confidence, 0.86),
                         is_correction=False,
                     )
@@ -289,6 +303,16 @@ class KnowledgeUpdater:
                 continue
 
             if kind in {"preference", "music_preference"}:
+                if not is_safe_user_profile_learning_context(
+                    text,
+                    is_private=bool(message_meta.get("is_private", False)),
+                    mentioned=bool(message_meta.get("mentioned", False)),
+                    explicit_bot_addressed=bool(message_meta.get("explicit_bot_addressed", False)),
+                    at_other_user_ids=message_meta.get("at_other_user_ids", []) or [],
+                    reply_to_user_id=normalize_text(str(message_meta.get("reply_to_user_id", ""))),
+                    bot_id=normalize_text(str(message_meta.get("bot_id", ""))),
+                ):
+                    continue
                 pref_title = (
                     f"user:{uid}:music_preference"
                     if kind == "music_preference"
@@ -389,6 +413,7 @@ class KnowledgeUpdater:
         user_text: str,
         bot_reply: str = "",
         timestamp: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         if not self.enable or self.knowledge_base is None:
             return {"candidates": 0, "saved": 0, "updated": 0}
@@ -397,6 +422,7 @@ class KnowledgeUpdater:
             user_text=user_text,
             user_id=user_id,
             conversation_id=conversation_id,
+            metadata=metadata,
         )
         candidates = llm_candidates
 
@@ -422,6 +448,7 @@ class KnowledgeUpdater:
         user_text: str,
         bot_reply: str = "",
         timestamp: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> dict[str, int]:
         """同步兼容入口：内部转发到 LLM 异步提取。"""
         try:
@@ -440,5 +467,6 @@ class KnowledgeUpdater:
                 user_text=user_text,
                 bot_reply=bot_reply,
                 timestamp=timestamp,
+                metadata=metadata,
             )
         )

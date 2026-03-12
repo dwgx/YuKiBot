@@ -142,6 +142,9 @@ from utils.text import (
     replace_emoji_with_kaomoji,
 
 
+    strip_invisible_format_chars,
+
+
     tokenize,
 
 
@@ -3537,6 +3540,12 @@ class YukikoEngine:
 
                 is_private=message.is_private,
 
+                at_other_user_ids=message.at_other_user_ids or [],
+
+                reply_to_user_id=message.reply_to_user_id,
+
+                bot_id=message.bot_id,
+
 
                 timestamp=message.timestamp,
 
@@ -3613,6 +3622,7 @@ class YukikoEngine:
 
 
 
+        explicit_bot_addressed = bool(message.is_private or message.mentioned or self._looks_like_bot_call(message.text))
         alias_call_hint = ""
 
 
@@ -3637,7 +3647,7 @@ class YukikoEngine:
         # 仅在明确对 bot 说话或 followup 窗口内写入用户消息，避免群聊旁路噪声污染记忆。
 
 
-        if allow_memory and (message.mentioned or message.is_private or bool(trigger.followup_candidate)):
+        if allow_memory and (explicit_bot_addressed or bool(trigger.followup_candidate)):
             await self._remember_message_media_memory(message)
 
 
@@ -3660,6 +3670,14 @@ class YukikoEngine:
 
 
                 timestamp=message.timestamp,
+                metadata={
+                    "is_private": message.is_private,
+                    "mentioned": message.mentioned,
+                    "explicit_bot_addressed": explicit_bot_addressed,
+                    "at_other_user_ids": message.at_other_user_ids or [],
+                    "reply_to_user_id": message.reply_to_user_id,
+                    "bot_id": message.bot_id,
+                },
 
 
             )
@@ -6021,6 +6039,10 @@ class YukikoEngine:
 
 
                 message_text=text,
+
+                original_message_text=message.text,
+
+                explicit_bot_addressed=explicit_bot_addressed,
 
 
                 message_id=message.message_id,
@@ -11177,12 +11199,16 @@ class YukikoEngine:
 
                 url = normalize_text(str(data.get("url", "")))
                 data_uri = normalize_text(str(data.get("memory_data_uri", "")))
+                summary = normalize_text(str(data.get("summary", ""))).lower()
+                file_name = normalize_text(str(data.get("file", ""))).lower()
+                sub_type = normalize_text(str(data.get("sub_type", ""))).lower()
+                image_prefix = "image:animated" if (sub_type == "1" or file_name.endswith(".gif") or "gif" in summary or "动画表情" in summary) else "image"
 
 
                 if data_uri.startswith("data:image"):
-                    items.append(f"image:base64:{clip_text(data_uri, 80)}")
+                    items.append(f"{image_prefix}:base64:{clip_text(data_uri, 80)}")
                 else:
-                    items.append(f"image:{clip_text(url or 'no_url', 80)}")
+                    items.append(f"{image_prefix}:{clip_text(url or 'no_url', 80)}")
 
 
             elif seg_type == "video":
@@ -12304,7 +12330,7 @@ class YukikoEngine:
             return reply_text
 
 
-        name = normalize_text(user_name)
+        name = normalize_text(strip_invisible_format_chars(user_name))
 
 
         if not name or len(name) > 24:
@@ -12969,6 +12995,15 @@ class YukikoEngine:
 
                                 message.timestamp,
 
+                                {
+                                    "is_private": message.is_private,
+                                    "mentioned": message.mentioned,
+                                    "explicit_bot_addressed": explicit_bot_addressed,
+                                    "at_other_user_ids": message.at_other_user_ids or [],
+                                    "reply_to_user_id": message.reply_to_user_id,
+                                    "bot_id": message.bot_id,
+                                },
+
 
                             )
 
@@ -13004,6 +13039,15 @@ class YukikoEngine:
 
 
                         message.timestamp,
+
+                        {
+                            "is_private": message.is_private,
+                            "mentioned": message.mentioned,
+                            "explicit_bot_addressed": explicit_bot_addressed,
+                            "at_other_user_ids": message.at_other_user_ids or [],
+                            "reply_to_user_id": message.reply_to_user_id,
+                            "bot_id": message.bot_id,
+                        },
 
 
                     )

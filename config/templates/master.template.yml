@@ -193,8 +193,8 @@ config:
     whitelist_groups: []
     non_whitelist_mode: silent
   trigger:
-    ai_listen_enable: false
-    delegate_undirected_to_ai: false
+    ai_listen_enable: true
+    delegate_undirected_to_ai: true
     ai_listen_min_messages: 2
     ai_listen_min_score: 1.2
     followup_reply_window_seconds: 30

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from utils.filter import STOP_WORDS
+from utils.learning_guard import assess_preferred_name_learning
 from utils.text import normalize_text, tokenize
 
 SYSTEM_NOISE_KEYWORDS = frozenset(
@@ -438,6 +439,7 @@ class MemoryEngine:
         content: str,
         timestamp: datetime | None = None,
         user_name: str = "",
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         text = normalize_text(content)
         if not text:
@@ -474,6 +476,7 @@ class MemoryEngine:
                 text=text,
                 ts=ts,
                 conversation_id=conversation_id,
+                metadata=metadata or {},
             )
 
         self._message_counter += 1
@@ -745,8 +748,10 @@ class MemoryEngine:
         text: str,
         ts: datetime,
         conversation_id: str,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         profile = self._user_profiles.get(user_id, {})
+        message_meta = metadata if isinstance(metadata, dict) else {}
         profile_text = self._normalize_profile_text(text)
         message_count = int(profile.get("message_count", 0)) + 1
         total_chars = int(profile.get("total_chars", 0)) + len(profile_text)
@@ -805,7 +810,21 @@ class MemoryEngine:
 
         preferred_name = normalize_text(str(profile.get("preferred_name", "")))
         preferred_name_updated_at = normalize_text(str(profile.get("preferred_name_updated_at", "")))
-        detected_preferred_name = self._extract_preferred_name(text) if self.heuristic_rules_enable else ""
+        detected_preferred_name = ""
+        if self.heuristic_rules_enable:
+            raw_preferred_name = self._extract_preferred_name(text)
+            if raw_preferred_name:
+                decision = assess_preferred_name_learning(
+                    text,
+                    is_private=bool(message_meta.get("is_private", False)),
+                    mentioned=bool(message_meta.get("mentioned", False)),
+                    explicit_bot_addressed=bool(message_meta.get("explicit_bot_addressed", False)),
+                    at_other_user_ids=message_meta.get("at_other_user_ids", []) or [],
+                    reply_to_user_id=normalize_text(str(message_meta.get("reply_to_user_id", ""))),
+                    bot_id=normalize_text(str(message_meta.get("bot_id", ""))),
+                )
+                if decision.allow:
+                    detected_preferred_name = raw_preferred_name
         if detected_preferred_name:
             preferred_name = detected_preferred_name
             preferred_name_updated_at = ts.isoformat()

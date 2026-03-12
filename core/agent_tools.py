@@ -28,6 +28,7 @@ from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     record_recalled_message as _record_recalled_message,
 )
+from utils.learning_guard import assess_preferred_name_learning, looks_like_preferred_name_knowledge
 from utils.text import clip_text, normalize_matching_text, normalize_text, tokenize
 
 _log = logging.getLogger("yukiko.agent_tools")
@@ -5862,7 +5863,7 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
                 },
                 "required": ["song_id"],
             },
-            category="admin",
+            category="utility",
         ),
         _handle_music_play_by_id,
     )
@@ -7676,6 +7677,48 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
         return ToolCallResult(ok=False, error="missing title")
     if not content:
         return ToolCallResult(ok=False, error="missing content")
+    if looks_like_preferred_name_knowledge(title, content, tags):
+        cfg = context.get("config", {})
+        bot_cfg = cfg.get("bot", {}) if isinstance(cfg, dict) and isinstance(cfg.get("bot"), dict) else {}
+        bot_aliases = [bot_cfg.get("name", ""), *(bot_cfg.get("nicknames", []) or []), "yuki", "yukiko", "雪"]
+        source_text = normalize_text(str(context.get("message_text", ""))) or normalize_text(
+            str(context.get("original_message_text", ""))
+        )
+        decision = assess_preferred_name_learning(
+            source_text or content,
+            is_private=bool(context.get("is_private", False)),
+            mentioned=bool(context.get("mentioned", False)),
+            explicit_bot_addressed=bool(context.get("explicit_bot_addressed", False)),
+            bot_aliases=bot_aliases,
+            at_other_user_ids=context.get("at_other_user_ids", []) or [],
+            reply_to_user_id=normalize_text(str(context.get("reply_to_user_id", ""))),
+            bot_id=normalize_text(str(context.get("bot_id", ""))),
+        )
+        if not decision.allow:
+            return ToolCallResult(
+                ok=False,
+                error=f"preferred_name_guard:{decision.reason}",
+                display="群聊称呼学习需要明确点名我、明确声明，并且不能在起哄语境里。",
+            )
+        memory = context.get("memory_engine")
+        if memory is None or not hasattr(memory, "set_preferred_name"):
+            return ToolCallResult(ok=False, error="memory_engine_unavailable", display="称呼记忆模块未初始化")
+        ok, message, payload = memory.set_preferred_name(
+            target_user_id=normalize_text(str(context.get("user_id", ""))),
+            preferred_name=decision.candidate,
+            actor="agent.learn_knowledge",
+            conversation_id=normalize_text(str(context.get("conversation_id", ""))),
+            note="Agent 显式学习用户偏好称呼",
+            reason="agent_learn_preferred_name",
+        )
+        if not ok:
+            return ToolCallResult(ok=False, error="preferred_name_update_failed", data=payload or {}, display=message)
+        preferred_name = normalize_text(str(payload.get("preferred_name", decision.candidate)))
+        return ToolCallResult(
+            ok=True,
+            data=payload or {},
+            display=f"已更新用户偏好称呼: {preferred_name or decision.candidate}",
+        )
     merged_text = normalize_text(f"{title} {content}")
     if _looks_like_harmful_knowledge_payload(merged_text):
         return ToolCallResult(ok=False, error="unsafe_knowledge_content")
