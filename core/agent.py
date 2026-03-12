@@ -2835,13 +2835,14 @@ class AgentLoop:
         fixed = fixed.replace("\u2018", "'").replace("\u2019", "'")
         try:
             data = json.loads(fixed)
-            if isinstance(data, dict) and "tool" in data:
-                return data
+            norm = self._normalize_tool_call(data)
+            if norm:
+                return norm
         except (json.JSONDecodeError, ValueError):
             pass
 
-        # 2. 对 final_answer 用正则提取 text 内容
-        m = re.search(r'"tool"\s*:\s*"final_answer"', text)
+        # 2. 对 final_answer 用正则提取 text 内容，兼容 {"tool":...} / {"name":...}
+        m = re.search(r'"(?:tool|name)"\s*:\s*"final_answer"', text)
         if m:
             # 找到 "text" : " 之后的所有内容，去掉尾部的 "}} 等
             tm = re.search(r'"text"\s*:\s*"', text)
@@ -2860,8 +2861,9 @@ class AgentLoop:
                 candidate += "}" * open_count
                 try:
                     data = json.loads(candidate)
-                    if isinstance(data, dict) and "tool" in data:
-                        return data
+                    norm = self._normalize_tool_call(data)
+                    if norm:
+                        return norm
                 except (json.JSONDecodeError, ValueError):
                     pass
 
