@@ -8541,16 +8541,16 @@ class YukikoEngine:
 
 
 
-        ai_router_undirected_gate = normalize_text(str(getattr(trigger, "reason", ""))).lower() in {
-            "ai_router_candidate",
-            "ai_router_gate",
-        }
+
+
+
+
 
         # 群聊非指向消息在多人场景默认更保守：
 
 
         # 未@、非私聊、非followup 且没有“明确叫bot”时，必须先通过 listen_probe 才可继续。
-        # 但 ai_router_candidate/ai_router_gate 已进入 AI 旁听判定链路，不应在这里提前拦死。
+
 
 
         if (
@@ -8583,7 +8583,7 @@ class YukikoEngine:
             and not bool(getattr(trigger, "listen_probe", False))
 
 
-            and not ai_router_undirected_gate
+
 
 
         ):
@@ -8661,7 +8661,7 @@ class YukikoEngine:
         ):
 
 
-            listen_probe = bool(getattr(trigger, "listen_probe", False)) or ai_router_undirected_gate
+            listen_probe = bool(getattr(trigger, "listen_probe", False))
 
 
             # 阈值=0 表示关闭非指向自动接话（仅对白名单指向消息放行）。

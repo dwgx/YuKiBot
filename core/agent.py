@@ -282,18 +282,7 @@ class AgentLoop:
 
     def _is_explicit_bot_addressed(self, ctx: "AgentContext") -> bool:
         """是否明确在和机器人说话（用于高风险管理工具额外护栏）。"""
-        if ctx.is_private or ctx.mentioned:
-            return True
-        content = normalize_text(ctx.message_text).lower()
-        if not content:
-            return False
-        bot_cfg = self.config.get("bot", {}) if isinstance(self.config, dict) else {}
-        aliases = {normalize_text(str(bot_cfg.get("name", ""))).lower()}
-        for item in bot_cfg.get("nicknames", []) or []:
-            aliases.add(normalize_text(str(item)).lower())
-        aliases.update({"yuki", "yukiko", "雪"})
-        aliases.discard("")
-        return any(alias and alias in content for alias in aliases)
+        return bool(ctx.is_private or ctx.mentioned)
 
     @staticmethod
     def _compile_regex_patterns(values: Any) -> tuple[re.Pattern[str], ...]:
@@ -398,6 +387,56 @@ class AgentLoop:
             return json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
         except Exception:
             return str(args or {})
+
+    def _build_tool_context(self, ctx: AgentContext, permission_level: str) -> dict[str, Any]:
+        return {
+            "api_call": ctx.api_call,
+            "admin_handler": ctx.admin_handler,
+            "config_patch_handler": ctx.config_patch_handler,
+            "sticker_manager": ctx.sticker_manager,
+            "tool_executor": ctx.tool_executor,
+            "crawler_hub": ctx.crawler_hub,
+            "knowledge_base": ctx.knowledge_base,
+            "memory_engine": ctx.memory_engine,
+            "conversation_id": ctx.conversation_id,
+            "user_id": ctx.user_id,
+            "user_name": ctx.user_name,
+            "group_id": ctx.group_id,
+            "bot_id": ctx.bot_id,
+            "is_private": ctx.is_private,
+            "mentioned": ctx.mentioned,
+            "explicit_bot_addressed": ctx.explicit_bot_addressed,
+            "trace_id": ctx.trace_id,
+            "message_text": ctx.message_text,
+            "original_message_text": ctx.original_message_text or ctx.message_text,
+            "message_id": ctx.message_id,
+            "raw_segments": ctx.raw_segments,
+            "reply_media_segments": ctx.reply_media_segments,
+            "reply_to_message_id": ctx.reply_to_message_id,
+            "reply_to_user_id": ctx.reply_to_user_id,
+            "reply_to_user_name": ctx.reply_to_user_name,
+            "reply_to_text": ctx.reply_to_text,
+            "at_other_user_ids": ctx.at_other_user_ids,
+            "recent_speakers": ctx.recent_speakers,
+            "event_payload": ctx.event_payload,
+            "user_policies": ctx.user_policies,
+            "user_directives": ctx.user_directives,
+            "is_admin_user": permission_level in ("super_admin", "group_admin"),
+            "permission_level": permission_level,
+            "config": self.config,
+        }
+
+    @staticmethod
+    def _tool_result_reply_text(tool_name: str, result: ToolCallResult) -> str:
+        display = normalize_text(result.display)
+        if display:
+            return display
+        if result.ok:
+            return f"{tool_name} 已执行。"
+        error = normalize_text(result.error)
+        if error:
+            return f"{tool_name} 执行失败：{error}"
+        return f"{tool_name} 执行失败。"
 
     def _is_confirmation_text(self, text: str, pending: dict[str, Any] | None = None) -> bool:
         content = normalize_text(text).lower()
@@ -2283,7 +2322,7 @@ class AgentLoop:
         }:
             file_type = normalize_text(str(args.get("prefer_ext", ""))).lower().strip(".")
             if not file_type and query:
-                file_type = Agent._infer_resource_file_type(query)
+                file_type = AgentLoop._infer_resource_file_type(query)
             fallback_query = query
             if not fallback_query:
                 fallback_query = normalize_text(str(args.get("url", "")))

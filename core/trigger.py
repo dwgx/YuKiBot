@@ -1047,8 +1047,6 @@ class TriggerEngine:
 
 
     @classmethod
-
-    @classmethod
     def _explicit_request_signal_from_cues(cls, text: str, cues: tuple[str, ...]) -> float:
         _ = cues
         if not text:
@@ -1057,7 +1055,7 @@ class TriggerEngine:
 
         if re.search(r"^[!/][a-z0-9_.:-]+", text, flags=re.IGNORECASE):
             score += 1.3
-        if "?" in text or "?" in text:
+        if "?" in text or "\uff1f" in text:
             score += 0.6
         if re.search(r"https?://", text, flags=re.IGNORECASE):
             score += 0.7
@@ -1091,7 +1089,7 @@ class TriggerEngine:
         user_ratio = busy_users / max(1, self.ai_listen_min_unique_users)
         score = msg_ratio * 0.9 + user_ratio * 0.9 + float(keyword_hits) * 1.1
 
-        if ("?" in text or "?" in text) or re.search(r"^[!/][a-z0-9_.:-]+", text, flags=re.IGNORECASE):
+        if ("?" in text or "\uff1f" in text) or re.search(r"^[!/][a-z0-9_.:-]+", text, flags=re.IGNORECASE):
             score += 0.5
         score += min(1.6, explicit_signal * 0.9)
         return score

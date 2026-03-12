@@ -222,7 +222,7 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             confidence=0.93,
         )
 
-        self.assertEqual(engine._self_check_decision(message, trigger, decision), "")
+        self.assertEqual(engine._self_check_decision(message, trigger, decision), "self_check:undirected_requires_listen_probe")
 
     def test_choice_followups_accept_only_structural_number_forms(self) -> None:
         self.assertEqual(YukikoEngine._extract_choice_index("1"), 1)
