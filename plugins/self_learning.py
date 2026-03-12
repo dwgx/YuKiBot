@@ -659,6 +659,9 @@ class Plugin:
                     "PYTHONDONTWRITEBYTECODE": "1",
                 }
 
+            # 某些调用路径下 setup 尚未执行，确保沙盒目录存在（Windows 下否则会触发 WinError 267）
+            _SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
+
             # 运行代码
             proc = await asyncio.create_subprocess_exec(
                 sys.executable,
