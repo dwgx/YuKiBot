@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button, Card, CardBody, Chip, Spinner, Switch } from "@heroui/react";
 import { motion } from "framer-motion";
 import clsx from "clsx";
@@ -19,7 +19,7 @@ import {
   Users,
   Wrench,
 } from "lucide-react";
-import { api, StatusData, SystemUpdateStatus } from "../api/client";
+import { api, StatusData, SystemUpdateStatus, SystemUpdateTask } from "../api/client";
 import { NotificationContainer } from "../components/notification";
 import { useNotifications } from "../hooks/useNotifications";
 
@@ -30,6 +30,24 @@ function formatUptime(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
+}
+
+const UPDATE_STAGE_LABEL: Record<string, string> = {
+  queued: "已排队",
+  checking: "检查仓库状态",
+  pulling: "拉取 GitHub 代码",
+  pip_install: "同步 Python 依赖",
+  npm_install: "安装前端依赖",
+  npm_build: "构建前端资源",
+  finalize: "刷新更新状态",
+  completed: "更新完成",
+  failed: "更新失败",
+};
+
+function formatUpdateStage(stage: string): string {
+  const safe = (stage || "").trim().toLowerCase();
+  if (!safe) return "等待开始";
+  return UPDATE_STAGE_LABEL[safe] || safe;
 }
 
 const cardClass = clsx(
@@ -67,15 +85,19 @@ function StatCard({ icon, label, value, delay = 0 }: StatCardProps) {
 }
 
 export default function DashboardPage() {
-  const { notifications, success, danger } = useNotifications();
+  const { notifications, info, success, danger } = useNotifications();
   const [data, setData] = useState<StatusData | null>(null);
   const [statusError, setStatusError] = useState("");
   const [updateInfo, setUpdateInfo] = useState<SystemUpdateStatus | null>(null);
   const [updateError, setUpdateError] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [runningUpdate, setRunningUpdate] = useState(false);
+  const [updateTaskId, setUpdateTaskId] = useState("");
+  const [updateTask, setUpdateTask] = useState<SystemUpdateTask | null>(null);
   const [updateLogs, setUpdateLogs] = useState<string[]>([]);
   const [allowDirty, setAllowDirty] = useState(false);
+  const stageNoticeRef = useRef("");
+  const finalNoticeRef = useRef("");
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -101,37 +123,104 @@ export default function DashboardPage() {
     }
   }, []);
 
+  const pollUpdateTask = useCallback(async (taskId: string) => {
+    const safeTaskId = taskId.trim();
+    if (!safeTaskId) return;
+
+    try {
+      const res = await api.getSystemUpdateTask(safeTaskId);
+      const task = res.task;
+      setUpdateTask(task);
+      setUpdateLogs(task.logs || []);
+      if (task.result?.status) {
+        setUpdateInfo(task.result.status);
+      }
+
+      const stage = (task.stage || "").trim().toLowerCase();
+      if (task.status === "running") {
+        if (stage && stage !== stageNoticeRef.current) {
+          stageNoticeRef.current = stage;
+          info("更新进度", `${formatUpdateStage(stage)} (${task.progress || 0}%)`, 2200);
+        }
+        return;
+      }
+
+      if (finalNoticeRef.current === safeTaskId) {
+        return;
+      }
+      finalNoticeRef.current = safeTaskId;
+      setRunningUpdate(false);
+
+      if (task.status === "done") {
+        setUpdateError("");
+        success("更新完成", task.result?.restart_hint || "更新流程已完成", 8000);
+      } else {
+        const message = task.error || task.result?.message || "执行更新失败";
+        setUpdateError(message);
+        danger("更新失败", message, 8000);
+      }
+      void fetchUpdateStatus();
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : "获取更新进度失败";
+      setUpdateError(message);
+      setRunningUpdate(false);
+      danger("更新中断", message, 6500);
+      void fetchUpdateStatus();
+    }
+  }, [danger, fetchUpdateStatus, info, success]);
+
   useEffect(() => {
     void fetchStatus();
-    void fetchUpdateStatus();
+    if (!runningUpdate) {
+      void fetchUpdateStatus();
+    }
     const timer = setInterval(() => {
       void fetchStatus();
-      void fetchUpdateStatus();
+      if (!runningUpdate) {
+        void fetchUpdateStatus();
+      }
     }, 15000);
     return () => clearInterval(timer);
-  }, [fetchStatus, fetchUpdateStatus]);
+  }, [fetchStatus, fetchUpdateStatus, runningUpdate]);
+
+  useEffect(() => {
+    if (!runningUpdate || !updateTaskId) return;
+    const timer = window.setInterval(() => {
+      void pollUpdateTask(updateTaskId);
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [pollUpdateTask, runningUpdate, updateTaskId]);
 
   const runLatestUpdate = useCallback(async () => {
     setRunningUpdate(true);
+    setUpdateError("");
+    setUpdateLogs([]);
+    setUpdateTask(null);
+    stageNoticeRef.current = "";
+    finalNoticeRef.current = "";
     try {
-      const res = await api.runSystemUpdate({
+      const res = await api.startSystemUpdate({
         syncPython: true,
         buildWebui: true,
         allowDirty,
       });
-      setUpdateInfo(res.status);
-      setUpdateLogs(res.logs || []);
-      setUpdateError("");
-      success("更新完成", res.restart_hint, 6500);
+      setUpdateTaskId(res.task_id);
+      setUpdateTask(res.task);
+      setUpdateLogs(res.task.logs || []);
+      info(
+        "更新已启动",
+        res.reused ? "检测到已有更新任务，已切换到该任务的实时进度。" : "正在执行更新，会实时显示阶段和日志。",
+        4000,
+      );
+      await pollUpdateTask(res.task_id);
     } catch (e: unknown) {
-      const message = e instanceof Error ? e.message : "执行更新失败";
+      const message = e instanceof Error ? e.message : "启动更新失败";
       setUpdateError(message);
-      danger("更新失败", message, 6500);
-    } finally {
       setRunningUpdate(false);
+      danger("更新失败", message, 6500);
       void fetchUpdateStatus();
     }
-  }, [allowDirty, danger, fetchUpdateStatus, success]);
+  }, [allowDirty, danger, fetchUpdateStatus, info, pollUpdateTask]);
 
   if (statusError && !data) {
     return <p className="text-danger">{statusError}</p>;
@@ -141,6 +230,12 @@ export default function DashboardPage() {
   }
 
   const scaleNames: Record<number, string> = { 1: "宽松", 2: "标准", 3: "严格", 4: "最严" };
+  const updateStageLabel = useMemo(() => formatUpdateStage(updateTask?.stage || ""), [updateTask?.stage]);
+  const updateProgress = useMemo(() => {
+    const value = Number(updateTask?.progress || 0);
+    if (!Number.isFinite(value)) return 0;
+    return Math.max(0, Math.min(100, Math.round(value)));
+  }, [updateTask?.progress]);
 
   return (
     <>
@@ -251,7 +346,27 @@ export default function DashboardPage() {
                       <Chip size="sm" variant="flat" color={updateInfo?.dirty ? "danger" : "success"}>
                         {updateInfo?.dirty ? "工作区有改动" : "工作区干净"}
                       </Chip>
+                      {updateTask && (
+                        <Chip
+                          size="sm"
+                          variant="flat"
+                          color={
+                            runningUpdate
+                              ? "primary"
+                              : updateTask.status === "failed"
+                                ? "danger"
+                                : "success"
+                          }
+                        >
+                          {runningUpdate ? `任务进行中 ${updateProgress}%` : updateTask.status === "failed" ? "任务失败" : "任务完成"}
+                        </Chip>
+                      )}
                     </div>
+                    {updateTask && (
+                      <p className="mt-3 text-xs text-default-500">
+                        阶段：{updateStageLabel} · 任务ID：{updateTask.task_id.slice(0, 8)}
+                      </p>
+                    )}
                     <p className="mt-3 text-xs text-default-500">
                       {updateError || updateInfo?.message || "等待检查"}
                     </p>
@@ -267,7 +382,7 @@ export default function DashboardPage() {
 
                 {updateLogs.length > 0 && (
                   <div className="rounded-2xl border border-default-200/60 bg-content2/50 p-4">
-                    <p className="text-sm font-semibold">最近一次更新输出</p>
+                    <p className="text-sm font-semibold">{runningUpdate ? "实时更新输出" : "最近一次更新输出"}</p>
                     <pre className="mt-3 max-h-56 overflow-auto whitespace-pre-wrap break-words text-xs text-default-600">
                       {updateLogs.join("\n\n")}
                     </pre>

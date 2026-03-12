@@ -73,6 +73,21 @@ _ROOT_DIR = Path(__file__).resolve().parents[1]
 _PROMPTS_FILE = _ROOT_DIR / "config" / "prompts.yml"
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_UPDATE_TASKS: dict[str, dict[str, Any]] = {}
+_UPDATE_TASKS_LOCK = asyncio.Lock()
+_UPDATE_TASK_MAX_LOG_ENTRIES = 400
+_UPDATE_TASK_RETENTION_SECONDS = 24 * 3600
+_UPDATE_STAGE_PROGRESS: dict[str, int] = {
+    "queued": 0,
+    "checking": 8,
+    "pulling": 28,
+    "pip_install": 52,
+    "npm_install": 72,
+    "npm_build": 88,
+    "finalize": 96,
+    "completed": 100,
+    "failed": 100,
+}
 
 
 def _default_prompts() -> dict:
@@ -452,6 +467,241 @@ async def _run_command(
     )
 
 
+def _utc_iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_update_task_logs(logs: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    for item in logs:
+        text = _clip_command_output(normalize_text(str(item)))
+        if text:
+            cleaned.append(text)
+    if len(cleaned) > _UPDATE_TASK_MAX_LOG_ENTRIES:
+        return cleaned[-_UPDATE_TASK_MAX_LOG_ENTRIES:]
+    return cleaned
+
+
+def _task_progress_for_stage(stage: str, fallback: int = 0) -> int:
+    stage_key = normalize_text(stage).strip().lower()
+    if stage_key in _UPDATE_STAGE_PROGRESS:
+        return _UPDATE_STAGE_PROGRESS[stage_key]
+    return max(0, min(100, int(fallback)))
+
+
+def _snapshot_update_task(task: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "task_id": str(task.get("task_id", "")),
+        "status": str(task.get("status", "unknown")),
+        "stage": str(task.get("stage", "")),
+        "progress": int(task.get("progress", 0) or 0),
+        "logs": list(task.get("logs", [])),
+        "error": str(task.get("error", "")),
+        "started_at": str(task.get("started_at", "")),
+        "updated_at": str(task.get("updated_at", "")),
+        "ended_at": str(task.get("ended_at", "")),
+        "options": dict(task.get("options", {})),
+        "result": task.get("result"),
+    }
+
+
+def _cleanup_update_tasks_locked(now_ts: float) -> None:
+    stale_ids: list[str] = []
+    for task_id, task in _UPDATE_TASKS.items():
+        ended_ts = float(task.get("ended_ts", 0.0) or 0.0)
+        if ended_ts <= 0:
+            continue
+        if now_ts - ended_ts > _UPDATE_TASK_RETENTION_SECONDS:
+            stale_ids.append(task_id)
+    for task_id in stale_ids:
+        _UPDATE_TASKS.pop(task_id, None)
+
+    if len(_UPDATE_TASKS) <= 100:
+        return
+
+    ended_tasks = sorted(
+        (
+            (tid, float(info.get("ended_ts", 0.0) or 0.0))
+            for tid, info in _UPDATE_TASKS.items()
+            if str(info.get("status", "")) != "running"
+        ),
+        key=lambda row: row[1],
+    )
+    for task_id, _ in ended_tasks:
+        if len(_UPDATE_TASKS) <= 60:
+            break
+        _UPDATE_TASKS.pop(task_id, None)
+
+
+async def _create_update_task(*, allow_dirty: bool, sync_python: bool, build_webui: bool) -> dict[str, Any]:
+    now_ts = time.time()
+    now_iso = _utc_iso_now()
+    task_id = uuid.uuid4().hex
+    task = {
+        "task_id": task_id,
+        "status": "running",
+        "stage": "queued",
+        "progress": 0,
+        "logs": [],
+        "error": "",
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "ended_at": "",
+        "started_ts": now_ts,
+        "updated_ts": now_ts,
+        "ended_ts": 0.0,
+        "result": None,
+        "options": {
+            "allow_dirty": bool(allow_dirty),
+            "sync_python": bool(sync_python),
+            "build_webui": bool(build_webui),
+        },
+    }
+    async with _UPDATE_TASKS_LOCK:
+        _cleanup_update_tasks_locked(now_ts)
+        _UPDATE_TASKS[task_id] = task
+        return _snapshot_update_task(task)
+
+
+async def _find_running_update_task() -> dict[str, Any] | None:
+    async with _UPDATE_TASKS_LOCK:
+        for task in _UPDATE_TASKS.values():
+            if str(task.get("status", "")) == "running":
+                return _snapshot_update_task(task)
+    return None
+
+
+async def _get_update_task(task_id: str) -> dict[str, Any] | None:
+    safe_task_id = normalize_text(task_id).strip()
+    if not safe_task_id:
+        return None
+    async with _UPDATE_TASKS_LOCK:
+        task = _UPDATE_TASKS.get(safe_task_id)
+        return _snapshot_update_task(task) if isinstance(task, dict) else None
+
+
+async def _update_update_task(
+    task_id: str,
+    *,
+    status: str | None = None,
+    stage: str | None = None,
+    progress: int | None = None,
+    log: str | None = None,
+    error: str | None = None,
+    result: dict[str, Any] | None = None,
+    logs: list[str] | None = None,
+) -> dict[str, Any] | None:
+    safe_task_id = normalize_text(task_id).strip()
+    if not safe_task_id:
+        return None
+
+    now_ts = time.time()
+    now_iso = _utc_iso_now()
+    async with _UPDATE_TASKS_LOCK:
+        task = _UPDATE_TASKS.get(safe_task_id)
+        if not isinstance(task, dict):
+            return None
+
+        if status:
+            task["status"] = normalize_text(status).strip() or task.get("status", "running")
+        if stage:
+            task["stage"] = normalize_text(stage).strip() or task.get("stage", "")
+        if progress is not None:
+            task["progress"] = max(0, min(100, int(progress)))
+        if logs is not None:
+            task["logs"] = _normalize_update_task_logs(logs)
+        if log:
+            text = _clip_command_output(normalize_text(log))
+            if text:
+                task_logs = list(task.get("logs", []))
+                task_logs.append(text)
+                task["logs"] = _normalize_update_task_logs(task_logs)
+        if error is not None:
+            task["error"] = normalize_text(str(error))
+        if result is not None:
+            task["result"] = result
+
+        if str(task.get("status", "")) in {"done", "failed"}:
+            if not str(task.get("ended_at", "")):
+                task["ended_at"] = now_iso
+            task["ended_ts"] = now_ts
+            if not task.get("progress"):
+                task["progress"] = 100
+
+        task["updated_at"] = now_iso
+        task["updated_ts"] = now_ts
+        _cleanup_update_tasks_locked(now_ts)
+        return _snapshot_update_task(task)
+
+
+async def _run_update_task(
+    task_id: str,
+    *,
+    allow_dirty: bool,
+    sync_python: bool,
+    build_webui: bool,
+) -> None:
+    async def _progress_hook(event: dict[str, Any]) -> None:
+        if not isinstance(event, dict):
+            return
+        stage = normalize_text(str(event.get("stage", ""))).strip().lower()
+        progress_raw = event.get("progress", None)
+        progress_value: int | None = None
+        if progress_raw is not None:
+            try:
+                progress_value = int(progress_raw)
+            except (TypeError, ValueError):
+                progress_value = None
+        if progress_value is None and stage:
+            progress_value = _task_progress_for_stage(stage)
+        log_text = event.get("log", None)
+        payload_log = normalize_text(str(log_text)) if log_text is not None else None
+        await _update_update_task(
+            task_id,
+            stage=stage or None,
+            progress=progress_value,
+            log=payload_log,
+        )
+
+    await _update_update_task(
+        task_id,
+        stage="checking",
+        progress=_task_progress_for_stage("checking"),
+        log="更新任务已开始，正在检查远程状态",
+    )
+    try:
+        result = await _execute_update(
+            allow_dirty=allow_dirty,
+            sync_python=sync_python,
+            build_webui=build_webui,
+            progress_hook=_progress_hook,
+        )
+        ok = bool(result.get("ok", False))
+        final_status = "done" if ok else "failed"
+        final_stage = "completed" if ok else "failed"
+        final_error = "" if ok else str(result.get("message", "更新失败"))
+        final_logs = list(result.get("logs", []))
+        await _update_update_task(
+            task_id,
+            status=final_status,
+            stage=final_stage,
+            progress=_task_progress_for_stage(final_stage),
+            error=final_error,
+            result=result,
+            logs=final_logs,
+        )
+    except Exception as exc:
+        _log.exception("webui async update task crashed: %s", exc)
+        await _update_update_task(
+            task_id,
+            status="failed",
+            stage="failed",
+            progress=_task_progress_for_stage("failed"),
+            error=str(exc),
+            log=f"更新任务异常中断: {exc}",
+        )
+
+
 async def _collect_update_status(fetch_remote: bool = True) -> dict[str, Any]:
     git_cmd = _resolve_command(["git.exe", "git"])
     platform_name = "windows" if os.name == "nt" else "linux"
@@ -533,8 +783,8 @@ async def _collect_update_status(fetch_remote: bool = True) -> dict[str, Any]:
         parts = [p for p in counts_out.split() if p]
         if len(parts) >= 2:
             try:
-                ahead = int(parts[0] or 0)
-                behind = int(parts[1] or 0)
+                behind = int(parts[0] or 0)
+                ahead = int(parts[1] or 0)
             except ValueError:
                 ahead = 0
                 behind = 0
@@ -579,12 +829,32 @@ async def _execute_update(
     allow_dirty: bool = False,
     sync_python: bool = True,
     build_webui: bool = True,
+    progress_hook: Any = None,
 ) -> dict[str, Any]:
+    async def _emit(stage: str, *, progress: int | None = None, log: str = "") -> None:
+        if not callable(progress_hook):
+            return
+        payload: dict[str, Any] = {"stage": normalize_text(stage).strip().lower()}
+        if progress is not None:
+            payload["progress"] = max(0, min(100, int(progress)))
+        text = _clip_command_output(normalize_text(log))
+        if text:
+            payload["log"] = text
+        try:
+            result = progress_hook(payload)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            pass
+
+    await _emit("checking", progress=_task_progress_for_stage("checking"), log="开始检查远程更新状态")
     status = await _collect_update_status(fetch_remote=True)
     if not bool(status.get("ok")):
+        fail_message = str(status.get("message", "无法检查更新"))
+        await _emit("failed", progress=_task_progress_for_stage("failed"), log=fail_message)
         return {
             "ok": False,
-            "message": str(status.get("message", "无法检查更新")),
+            "message": fail_message,
             "logs": list(status.get("logs", [])),
             "status": status,
             "restart_required": False,
@@ -603,11 +873,14 @@ async def _execute_update(
             dirty=int(bool(status.get("dirty", False))),
         )
     )
+    await _emit("checking", progress=_task_progress_for_stage("checking"), log=logs[-1])
 
     if bool(status.get("dirty")) and not allow_dirty:
+        fail_message = "工作区存在未提交改动，已阻止自动更新。需要的话可在 WebUI 强制允许 dirty 更新。"
+        await _emit("failed", progress=_task_progress_for_stage("failed"), log=fail_message)
         return {
             "ok": False,
-            "message": "工作区存在未提交改动，已阻止自动更新。需要的话可在 WebUI 强制允许 dirty 更新。",
+            "message": fail_message,
             "logs": logs,
             "status": status,
             "restart_required": False,
@@ -618,16 +891,24 @@ async def _execute_update(
     assert git_cmd
     pulled = False
     if int(status.get("behind", 0) or 0) > 0:
+        await _emit(
+            "pulling",
+            progress=_task_progress_for_stage("pulling"),
+            log=f"检测到本地落后 {int(status.get('behind', 0) or 0)} 个提交，开始拉取远程更新",
+        )
         rc, out = await _run_command(
             [git_cmd, "-C", str(_ROOT_DIR), "pull", "--ff-only"],
             timeout_seconds=600,
         )
         if out:
             logs.append(out)
+            await _emit("pulling", progress=_task_progress_for_stage("pulling"), log=out)
         if rc != 0:
+            fail_message = out or "git pull 失败"
+            await _emit("failed", progress=_task_progress_for_stage("failed"), log=fail_message)
             return {
                 "ok": False,
-                "message": out or "git pull 失败",
+                "message": fail_message,
                 "logs": logs,
                 "status": status,
                 "restart_required": False,
@@ -635,12 +916,17 @@ async def _execute_update(
             }
         pulled = True
     else:
-        logs.append(f"Already up to date with {status.get('upstream') or 'origin'}")
+        up_to_date = f"Already up to date with {status.get('upstream') or 'origin'}"
+        logs.append(up_to_date)
+        await _emit("pulling", progress=_task_progress_for_stage("pulling"), log=up_to_date)
 
     if sync_python:
+        await _emit("pip_install", progress=_task_progress_for_stage("pip_install"), log="开始同步 Python 依赖")
         python_cmd = _resolve_python_command()
         if not python_cmd:
-            logs.append("跳过 Python 依赖同步：未找到 python")
+            skip_message = "跳过 Python 依赖同步：未找到 python"
+            logs.append(skip_message)
+            await _emit("pip_install", progress=_task_progress_for_stage("pip_install"), log=skip_message)
         else:
             rc, out = await _run_command(
                 [python_cmd, "-m", "pip", "install", "-r", str(_ROOT_DIR / "requirements.txt")],
@@ -648,10 +934,13 @@ async def _execute_update(
             )
             if out:
                 logs.append(out)
+                await _emit("pip_install", progress=_task_progress_for_stage("pip_install"), log=out)
             if rc != 0:
+                fail_message = out or "pip install 失败"
+                await _emit("failed", progress=_task_progress_for_stage("failed"), log=fail_message)
                 return {
                     "ok": False,
-                    "message": out or "pip install 失败",
+                    "message": fail_message,
                     "logs": logs,
                     "status": status,
                     "restart_required": pulled,
@@ -661,8 +950,11 @@ async def _execute_update(
     if build_webui and (_ROOT_DIR / "webui" / "package.json").is_file():
         npm_cmd = _resolve_npm_command()
         if not npm_cmd:
-            logs.append("跳过 WebUI 构建：未找到 npm")
+            skip_message = "跳过 WebUI 构建：未找到 npm"
+            logs.append(skip_message)
+            await _emit("npm_install", progress=_task_progress_for_stage("npm_install"), log=skip_message)
         else:
+            await _emit("npm_install", progress=_task_progress_for_stage("npm_install"), log="开始安装 WebUI 依赖")
             rc, out = await _run_command(
                 [npm_cmd, "install", "--no-audit", "--no-fund"],
                 cwd=_ROOT_DIR / "webui",
@@ -670,16 +962,20 @@ async def _execute_update(
             )
             if out:
                 logs.append(out)
+                await _emit("npm_install", progress=_task_progress_for_stage("npm_install"), log=out)
             if rc != 0:
+                fail_message = out or "npm install 失败"
+                await _emit("failed", progress=_task_progress_for_stage("failed"), log=fail_message)
                 return {
                     "ok": False,
-                    "message": out or "npm install 失败",
+                    "message": fail_message,
                     "logs": logs,
                     "status": status,
                     "restart_required": pulled,
                     "restart_hint": "代码可能已更新，但前端构建失败，请处理后再重启。",
                 }
 
+            await _emit("npm_build", progress=_task_progress_for_stage("npm_build"), log="开始构建 WebUI 产物")
             rc, out = await _run_command(
                 [npm_cmd, "run", "build"],
                 cwd=_ROOT_DIR / "webui",
@@ -687,16 +983,20 @@ async def _execute_update(
             )
             if out:
                 logs.append(out)
+                await _emit("npm_build", progress=_task_progress_for_stage("npm_build"), log=out)
             if rc != 0:
+                fail_message = out or "npm run build 失败"
+                await _emit("failed", progress=_task_progress_for_stage("failed"), log=fail_message)
                 return {
                     "ok": False,
-                    "message": out or "npm run build 失败",
+                    "message": fail_message,
                     "logs": logs,
                     "status": status,
                     "restart_required": pulled,
                     "restart_hint": "代码可能已更新，但前端构建失败，请处理后再重启。",
                 }
 
+    await _emit("finalize", progress=_task_progress_for_stage("finalize"), log="更新步骤完成，正在刷新仓库状态")
     updated_status = await _collect_update_status(fetch_remote=False)
     restart_required = pulled
     restart_hint = (
@@ -704,6 +1004,7 @@ async def _execute_update(
         if restart_required
         else "当前已经是最新版本，没有新的代码需要重启生效。"
     )
+    await _emit("completed", progress=_task_progress_for_stage("completed"), log=restart_hint)
     return {
         "ok": True,
         "message": "更新流程完成",
@@ -1365,6 +1666,59 @@ async def status():
 async def system_update_status():
     status = await _collect_update_status(fetch_remote=True)
     return {"status": status}
+
+
+@router.post("/system/update/start", dependencies=[Depends(_check_auth)])
+async def system_update_start(request: Request):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    running = await _find_running_update_task()
+    if running:
+        return {
+            "ok": True,
+            "task_id": running.get("task_id", ""),
+            "task": running,
+            "reused": True,
+        }
+
+    allow_dirty = bool(body.get("allow_dirty", False))
+    sync_python = bool(body.get("sync_python", True))
+    build_webui = bool(body.get("build_webui", True))
+    created = await _create_update_task(
+        allow_dirty=allow_dirty,
+        sync_python=sync_python,
+        build_webui=build_webui,
+    )
+    task_id = str(created.get("task_id", "")).strip()
+    asyncio.create_task(
+        _run_update_task(
+            task_id,
+            allow_dirty=allow_dirty,
+            sync_python=sync_python,
+            build_webui=build_webui,
+        )
+    )
+    return {
+        "ok": True,
+        "task_id": task_id,
+        "task": created,
+        "reused": False,
+    }
+
+
+@router.get("/system/update/task", dependencies=[Depends(_check_auth)])
+async def system_update_task(task_id: str = Query("", description="更新任务ID")):
+    safe_task_id = normalize_text(task_id).strip()
+    if not safe_task_id:
+        raise HTTPException(400, "task_id 不能为空")
+    task = await _get_update_task(safe_task_id)
+    if not task:
+        raise HTTPException(404, "更新任务不存在或已过期")
+    return {"task": task}
 
 
 @router.post("/system/update/run", dependencies=[Depends(_check_auth)])

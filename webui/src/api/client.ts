@@ -68,6 +68,26 @@ class ApiClient {
     return this.request<{ status: SystemUpdateStatus }>("/system/update/status");
   }
 
+  startSystemUpdate(payload?: {
+    allowDirty?: boolean;
+    syncPython?: boolean;
+    buildWebui?: boolean;
+  }) {
+    return this.request<SystemUpdateStartResponse>("/system/update/start", {
+      method: "POST",
+      body: JSON.stringify({
+        allow_dirty: Boolean(payload?.allowDirty),
+        sync_python: payload?.syncPython ?? true,
+        build_webui: payload?.buildWebui ?? true,
+      }),
+    });
+  }
+
+  getSystemUpdateTask(taskId: string) {
+    const q = new URLSearchParams({ task_id: taskId });
+    return this.request<SystemUpdateTaskResponse>(`/system/update/task?${q.toString()}`);
+  }
+
   runSystemUpdate(payload?: {
     allowDirty?: boolean;
     syncPython?: boolean;
@@ -431,6 +451,35 @@ export interface SystemUpdateRunResponse {
   status: SystemUpdateStatus;
   restart_required: boolean;
   restart_hint: string;
+}
+
+export interface SystemUpdateTask {
+  task_id: string;
+  status: "running" | "done" | "failed";
+  stage: string;
+  progress: number;
+  logs: string[];
+  error: string;
+  started_at: string;
+  updated_at: string;
+  ended_at: string;
+  options: {
+    allow_dirty: boolean;
+    sync_python: boolean;
+    build_webui: boolean;
+  };
+  result?: SystemUpdateRunResponse | null;
+}
+
+export interface SystemUpdateStartResponse {
+  ok: boolean;
+  task_id: string;
+  task: SystemUpdateTask;
+  reused?: boolean;
+}
+
+export interface SystemUpdateTaskResponse {
+  task: SystemUpdateTask;
 }
 
 export interface DbOverviewItem {
