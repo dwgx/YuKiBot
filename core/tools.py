@@ -4291,6 +4291,14 @@ class ToolExecutor:
                 file_part = file_part[1:]
             value = file_part
 
+        # 防止 data URI 被当作文件路径处理（会导致 "File name too long" 错误）
+        if value.startswith("data:"):
+            _tool_log.warning(
+                "vision_image_ref%s | source=data_uri | unhandled_format | skipping_file_path_check",
+                _tool_trace_tag(),
+            )
+            return ""
+
         path = Path(value)
         if not path.is_absolute():
             path = (self._project_root / path).resolve()
