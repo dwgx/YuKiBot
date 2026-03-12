@@ -3531,6 +3531,11 @@ class ToolExecutor:
                 message_text=message_text,
             )
             if not answer:
+                raw_fallback = normalize_text(str(raw_answer or ""))
+                if raw_fallback:
+                    answer = clip_text(raw_fallback, 1200)
+                    _tool_log.info("vision_answer_fallback_to_raw%s", _tool_trace_tag())
+            if not answer:
                 _tool_log.warning("vision_answer_empty_after_normalize%s", _tool_trace_tag())
                 continue
             if self._looks_like_weak_vision_answer(answer):

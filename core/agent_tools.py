@@ -4524,6 +4524,8 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
                     "analyze_all": {"type": "boolean", "description": "是否批量识别可见范围内的所有图片（可选）"},
                     "max_images": {"type": "integer", "description": "批量识别时最多识别多少张（可选，默认 8）"},
                     "target_message_id": {"type": "string", "description": "强制指定要分析的消息ID（可选）"},
+                    "allow_recent_fallback": {"type": "boolean", "description": "无图片时是否允许回退到最近一张图片（可选）"},
+                    "recent_only_when_unique": {"type": "boolean", "description": "回退时仅在最近图片唯一时才自动命中（可选）"},
                 },
                 "required": [],
             },
