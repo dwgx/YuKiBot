@@ -3648,6 +3648,16 @@ class ToolExecutor:
         web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
         if web_fallback is not None:
             return web_fallback
+        if api_call is not None:
+            local_fallback = await self._analyze_image_local_fallback(
+                method_name=method_name,
+                query=query,
+                message_text=message_text,
+                raw_segments=raw_segments,
+                api_call=api_call,
+            )
+            if local_fallback.ok:
+                return local_fallback
         return ToolResult(
             ok=False,
             tool_name=method_name,
@@ -4532,6 +4542,25 @@ class ToolExecutor:
                 text = normalize_text("".join(parts))
                 if text:
                     return text
+
+        # 某些 OpenAI 兼容网关（如部分 skiapi/newapi）在 claude 模型下会返回空 content，
+        # 这里自动补一次 Anthropic /messages 兼容路径，避免图片识别整体失效。
+        if image_ref.startswith("data:image") and "claude" in model_name.lower():
+            anthro_text = await self._vision_describe_via_anthropic(
+                image_ref=image_ref,
+                prompt=prompt,
+                api_key=api_key,
+                base_url=base_url,
+                model_name=model_name,
+                timeout_seconds=timeout_seconds,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                prefer_v1=prefer_v1,
+                anthropic_version=normalize_text(str(getattr(client, "anthropic_version", "2023-06-01"))),
+            )
+            if anthro_text:
+                _tool_log.info("vision_request_fallback%s | route=anthropic_messages_proxy", _tool_trace_tag())
+                return anthro_text
         return ""
 
     async def _vision_describe_via_anthropic(
