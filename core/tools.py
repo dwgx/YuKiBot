@@ -4274,7 +4274,7 @@ class ToolExecutor:
                 )
                 return downloaded
             provider_hint = normalize_text(self._vision_provider).lower()
-            if provider_hint in {"anthropic", "gemini"}:
+            if provider_hint in {"anthropic", "gemini", "skiapi"}:
                 _tool_log.warning(
                     "vision_image_ref_empty%s | source=http_url | reason=download_failed_for_provider_%s",
                     _tool_trace_tag(),
@@ -4303,12 +4303,12 @@ class ToolExecutor:
         if not data:
             return ""
         if len(data) < self._vision_min_image_bytes:
-            _tool_log.info(
-                "vision_image_ref%s | source=local_file | rejected=too_small | bytes=%d",
+            _tool_log.warning(
+                "vision_image_ref%s | source=local_file | small_image_warning | bytes=%d | will_try_anyway",
                 _tool_trace_tag(),
                 len(data),
             )
-            return ""
+            # 不要拒绝小图片，继续处理
         if len(data) > self._vision_max_image_bytes:
             return ""
         mime = mimetypes.guess_type(str(path))[0] or "image/png"
@@ -4335,12 +4335,12 @@ class ToolExecutor:
             if not data:
                 return ""
             if len(data) < self._vision_min_image_bytes:
-                _tool_log.info(
-                    "vision_image_ref%s | source=http_url | rejected=too_small | bytes=%d",
+                _tool_log.warning(
+                    "vision_image_ref%s | source=http_url | small_image_warning | bytes=%d | will_try_anyway",
                     _tool_trace_tag(),
                     len(data),
                 )
-                return ""
+                # 不要拒绝小图片，继续处理
             if len(data) > self._vision_max_image_bytes:
                 return ""
             content_type = str(resp.headers.get("content-type", "")).lower()
