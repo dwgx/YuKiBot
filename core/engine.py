@@ -8519,10 +8519,16 @@ class YukikoEngine:
 
 
 
+        ai_router_undirected_gate = normalize_text(str(getattr(trigger, "reason", ""))).lower() in {
+            "ai_router_candidate",
+            "ai_router_gate",
+        }
+
         # 群聊非指向消息在多人场景默认更保守：
 
 
         # 未@、非私聊、非followup 且没有“明确叫bot”时，必须先通过 listen_probe 才可继续。
+        # 但 ai_router_candidate/ai_router_gate 已进入 AI 旁听判定链路，不应在这里提前拦死。
 
 
         if (
@@ -8553,6 +8559,9 @@ class YukikoEngine:
 
 
             and not bool(getattr(trigger, "listen_probe", False))
+
+
+            and not ai_router_undirected_gate
 
 
         ):
@@ -8630,7 +8639,7 @@ class YukikoEngine:
         ):
 
 
-            listen_probe = bool(getattr(trigger, "listen_probe", False))
+            listen_probe = bool(getattr(trigger, "listen_probe", False)) or ai_router_undirected_gate
 
 
             # 阈值=0 表示关闭非指向自动接话（仅对白名单指向消息放行）。
@@ -11782,22 +11791,25 @@ class YukikoEngine:
 
 
 
-            # 剥离内嵌 tool call JSON（兼容 "name"/"tool" 两种字段）
+            tool_payload_name_pattern = r"[a-zA-Z0-9_.-]+"
+            tool_payload_args_pattern = r"\"(?:args|arguments|tool_arguments)\"\s*:"
+
+            # 剥离内嵌 tool call JSON（兼容任意工具名，而不只是一小部分白名单）
             content = re.sub(
-                r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\")(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*?```",
+                rf"```(?:json)?\s*\{{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"{tool_payload_name_pattern}\")(?=[\s\S]*?{tool_payload_args_pattern})[\s\S]*?```",
                 "",
                 content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
             content = re.sub(
-                r"\{\s*\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\"(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*?\}",
+                rf"\{{\s*\"(?:name|tool)\"\s*:\s*\"{tool_payload_name_pattern}\"(?=[\s\S]*?{tool_payload_args_pattern})[\s\S]*?\}}",
                 "",
                 content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
             # 兜底：剥离未闭合的 ```json tool call 片段。
             content = re.sub(
-                r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\")(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*$",
+                rf"```(?:json)?\s*\{{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"{tool_payload_name_pattern}\")(?=[\s\S]*?{tool_payload_args_pattern})[\s\S]*$",
                 "",
                 content,
                 flags=re.DOTALL | re.IGNORECASE,
@@ -11817,6 +11829,10 @@ class YukikoEngine:
 
 
             content = content.strip()
+            if re.fullmatch(r"```(?:json)?", content, flags=re.IGNORECASE):
+                _log_sanitize = logging.getLogger("yukiko.sanitize")
+                _log_sanitize.warning("sanitize_leaked_tool_call_fence_only")
+                return ""
 
 
 
@@ -11934,7 +11950,7 @@ class YukikoEngine:
 
 
             if re.search(
-                r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\")",
+                rf"```(?:json)?\s*\{{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"{tool_payload_name_pattern}\")(?=[\s\S]*?{tool_payload_args_pattern})",
                 content,
                 flags=re.DOTALL | re.IGNORECASE,
             ):

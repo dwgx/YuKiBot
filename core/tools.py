@@ -44,9 +44,10 @@ except Exception:  # pragma: no cover - optional runtime dependency
     YoutubeDL = None
 
 try:  # pragma: no cover - optional runtime dependency
-    from PIL import Image
+    from PIL import Image, ImageDraw
 except Exception:  # pragma: no cover - optional runtime dependency
     Image = None
+    ImageDraw = None
 
 
 import logging as _logging
@@ -3483,7 +3484,16 @@ class ToolExecutor:
                 error="vision_local_unavailable",
             )
 
-        prompt = self._build_vision_prompt(query=query, message_text=message_text)
+        animated_hint = self._has_animated_image_hint(
+            query=query,
+            message_text=message_text,
+            raw_segments=raw_segments,
+        )
+        prompt = self._build_vision_prompt(
+            query=query,
+            message_text=message_text,
+            animated_hint=animated_hint,
+        )
         _tool_log.info(
             "vision_analyze_start%s | method=%s | candidates=%d | explicit=%s | target_source=%s | target_mid=%s | analyze_all=%s | max_images=%d",
             _tool_trace_tag(),
@@ -3551,6 +3561,7 @@ class ToolExecutor:
                 prompt=prompt,
                 query=query,
                 message_text=message_text,
+                animated_hint=animated_hint,
             )
             if not answer:
                 raw_fallback = normalize_text(str(raw_answer or ""))
@@ -3631,6 +3642,12 @@ class ToolExecutor:
             web_fallback = await self._vision_uncertain_web_fallback(query=query, message_text=message_text)
             if web_fallback is not None:
                 return web_fallback
+            single_low_confidence_text = (
+                "这张动画表情/动图我已经按多帧尝试识别了，但结果还不够稳定。你可以发更清晰的静态截图，"
+                "或者直接问我它大概想表达什么。"
+                if animated_hint
+                else "这张图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"
+            )
             return ToolResult(
                 ok=False,
                 tool_name=method_name,
@@ -3639,7 +3656,7 @@ class ToolExecutor:
                         "这些图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定。你可以发更清晰截图，"
                         "或告诉我要重点看哪一块。"
                         if analyze_all
-                        else "这张图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"
+                        else single_low_confidence_text
                     )
                 },
                 error="vision_low_confidence",
@@ -3665,7 +3682,12 @@ class ToolExecutor:
                 "text": (
                     "这些图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
                     if analyze_all
-                    else "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
+                    else (
+                        "这张动画表情/动图这次还是没稳定识别出来。你可以发一张关键帧截图，"
+                        "或者直接问我它像是在表达什么情绪/态度。"
+                        if animated_hint
+                        else "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
+                    )
                 )
             },
             error="vision_analyze_failed",
@@ -4031,17 +4053,51 @@ class ToolExecutor:
                 rows.append(txt)
         return normalize_text("\n".join(rows))
 
-    def _build_vision_prompt(self, query: str, message_text: str) -> str:
+    @staticmethod
+    def _has_animated_image_hint(
+        query: str,
+        message_text: str,
+        raw_segments: list[dict[str, Any]] | None = None,
+    ) -> bool:
+        merged = normalize_text(f"{query}\n{message_text}").lower()
+        animated_cues = ("动画表情", "动图", "gif", "动态图", "表情包", "贴纸")
+        if any(cue in merged for cue in animated_cues):
+            return True
+        for seg in raw_segments or []:
+            if not isinstance(seg, dict):
+                continue
+            if normalize_text(str(seg.get("type", ""))).lower() != "image":
+                continue
+            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            summary = normalize_text(str(data.get("summary", ""))).lower()
+            file_name = normalize_text(str(data.get("file", ""))).lower()
+            sub_type = normalize_text(str(data.get("sub_type", ""))).lower()
+            if sub_type == "1":
+                return True
+            if any(cue in summary for cue in animated_cues):
+                return True
+            if file_name.endswith(".gif"):
+                return True
+        return False
+
+    def _build_vision_prompt(self, query: str, message_text: str, *, animated_hint: bool = False) -> str:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             merged = "请描述这张图的主要内容，并提取可见文字。"
-        extra = ""
+        extra_parts: list[str] = []
         merged_lower = merged.lower()
         if any(cue in merged_lower for cue in ("软件", "应用", "程序", "开着哪些", "任务栏", "图标", "窗口")):
-            extra = (
+            extra_parts.append(
                 "\n如果是桌面/任务栏截图："
                 "按从左到右列出可识别的软件或窗口名称；不确定的项标注“疑似”。"
             )
+        if animated_hint:
+            extra_parts.append(
+                "\n如果这是动画表情、GIF 或多帧拼图："
+                "请综合所有帧，先判断主体是谁、在做什么、情绪/语气是什么、可能想表达什么梗或态度；"
+                "即使不能百分百确定，也要给出最可能的解释，不要只说“看不清”或“可能是动图”。"
+            )
+        extra = "".join(extra_parts)
         base = SystemPromptRelay.vision_main_prompt(user_query=merged, extra=extra)
         return self._prompt_policy.compose_prompt(
             channel="vision",
@@ -4049,10 +4105,15 @@ class ToolExecutor:
             tool_name="media.analyze_image",
         )
 
-    def _build_vision_retry_prompt(self, query: str, message_text: str) -> str:
+    def _build_vision_retry_prompt(self, query: str, message_text: str, *, animated_hint: bool = False) -> str:
         merged = self._normalize_multimodal_query(f"{query}\n{message_text}")
         if not merged:
             merged = "请识别这张图。"
+        if animated_hint:
+            merged = (
+                f"{merged}\n补充要求：如果这是动画表情/GIF/多帧图，请综合各帧动作与情绪，"
+                "优先回答“这张图想表达什么”。"
+            )
         base = SystemPromptRelay.vision_retry_prompt(user_query=merged)
         return self._prompt_policy.compose_prompt(
             channel="vision",
@@ -4144,7 +4205,9 @@ class ToolExecutor:
     def _pick_gif_keyframe_indexes(frame_count: int) -> list[int]:
         if frame_count <= 1:
             return [0]
-        picks = [0, frame_count // 2, frame_count - 1]
+        target_frames = min(4, frame_count)
+        last = frame_count - 1
+        picks = [int(round(last * idx / max(1, target_frames - 1))) for idx in range(target_frames)]
         out: list[int] = []
         seen: set[int] = set()
         for idx in picks:
@@ -4175,20 +4238,38 @@ class ToolExecutor:
         if not frames:
             return ""
 
-        target_h = max(120, min(640, max(frame.height for frame in frames)))
+        target_h = max(120, min(520, max(frame.height for frame in frames)))
         resized = []
         for frame in frames:
             src_h = max(1, int(frame.height))
             width = max(1, int(round(float(frame.width) * float(target_h) / float(src_h))))
             resized.append(frame.resize((width, target_h)))
 
-        gap = 8
-        total_w = sum(frame.width for frame in resized) + gap * max(0, len(resized) - 1)
-        canvas = Image.new("RGB", (total_w, target_h), (12, 12, 12))
-        offset = 0
-        for frame in resized:
-            canvas.paste(frame, (offset, 0))
-            offset += frame.width + gap
+        gap = 10
+        cols = 2 if len(resized) > 1 else 1
+        rows = max(1, (len(resized) + cols - 1) // cols)
+        cell_w = max(frame.width for frame in resized)
+        cell_h = max(frame.height for frame in resized)
+        canvas = Image.new(
+            "RGB",
+            (
+                cell_w * cols + gap * max(0, cols - 1),
+                cell_h * rows + gap * max(0, rows - 1),
+            ),
+            (12, 12, 12),
+        )
+        draw = ImageDraw.Draw(canvas) if ImageDraw is not None else None
+        for idx, frame in enumerate(resized):
+            row = idx // cols
+            col = idx % cols
+            x = col * (cell_w + gap)
+            y = row * (cell_h + gap)
+            paste_x = x + max(0, (cell_w - frame.width) // 2)
+            paste_y = y + max(0, (cell_h - frame.height) // 2)
+            canvas.paste(frame, (paste_x, paste_y))
+            if draw is not None:
+                draw.rectangle((x + 4, y + 4, x + 34, y + 22), fill=(0, 0, 0))
+                draw.text((x + 9, y + 7), f"F{idx + 1}", fill=(255, 255, 255))
 
         buf = io.BytesIO()
         try:
@@ -4726,6 +4807,7 @@ class ToolExecutor:
         prompt: str,
         query: str,
         message_text: str,
+        animated_hint: bool = False,
     ) -> str:
         normalized = await self._normalize_vision_answer(answer, prompt=prompt)
         if not normalized:
@@ -4733,7 +4815,11 @@ class ToolExecutor:
         if not self._vision_second_pass_enable or not self._looks_like_weak_vision_answer(normalized):
             return normalized
 
-        retry_prompt = self._build_vision_retry_prompt(query=query, message_text=message_text)
+        retry_prompt = self._build_vision_retry_prompt(
+            query=query,
+            message_text=message_text,
+            animated_hint=animated_hint,
+        )
         retry_raw = await self._vision_describe(image_ref=image_ref, prompt=retry_prompt)
         retry_norm = await self._normalize_vision_answer(retry_raw, prompt=retry_prompt)
         if retry_norm and not self._looks_like_weak_vision_answer(retry_norm):

@@ -32,11 +32,20 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         payloads = (
             '```json\n{"tool":"final_answer","args":{"text":"hello"',
             '```json\n{"name":"final_answer","arguments":{"text":"hello"',
+            '```json\n{"tool":"learn_knowledge","args":{"title":"用户称呼偏好","content":"以后叫我"妈妈""}',
         )
 
         for payload in payloads:
             with self.subTest(payload=payload):
                 self.assertEqual(engine._sanitize_reply_output(payload, action="reply"), "")
+
+    def test_agent_marks_generic_fenced_tool_payload_as_leak(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        payload = (
+            '```json { "tool": "learn_knowledge", "args": { "title": "用户称呼偏好", '
+            '"content": "以后叫我"妈妈"" } } ```'
+        )
+        self.assertTrue(loop._looks_like_embedded_tool_payload_text(payload))
 
 
 if __name__ == "__main__":

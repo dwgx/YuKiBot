@@ -904,6 +904,16 @@ class AgentLoop:
                             "tool_payload_leaked",
                             "检测到模型输出了工具调用格式，我已自动重试处理。",
                         )
+                elif self._looks_like_embedded_tool_payload_text(text):
+                    _log.warning(
+                        "agent_final_answer_embedded_tool_payload_blocked | trace=%s | step=%d",
+                        ctx.trace_id,
+                        step_idx,
+                    )
+                    text = _pl.get_message(
+                        "tool_payload_leaked",
+                        "检测到模型输出了工具调用格式，我已自动拦截。",
+                    )
                 if tool_name == "final_answer" and not text and not image_url and not video_url and not audio_file:
                     # bot 用 think 推理后决定不回复 → 保持空文本（intentional silence）
                     # 其他情况（没 think 过就空 final_answer）→ AI 生成兜底
@@ -2941,6 +2951,20 @@ class AgentLoop:
                 if recovered:
                     return recovered
         return None
+
+    @staticmethod
+    def _looks_like_embedded_tool_payload_text(text: str) -> bool:
+        """识别明显的工具调用泄漏片段，即使内容已截断或 JSON 不合法。"""
+        content = normalize_text(text)
+        if not content:
+            return False
+        if re.search(r"</?\s*(function_calls?|invoke|parameter)\b", content, flags=re.IGNORECASE):
+            return True
+        patterns = (
+            r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"[a-zA-Z0-9_.-]+\")(?:[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*?(?:```|$)",
+            r"^\{\s*\"(?:name|tool)\"\s*:\s*\"[a-zA-Z0-9_.-]+\"(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*$",
+        )
+        return any(re.search(pattern, content, flags=re.DOTALL | re.IGNORECASE) for pattern in patterns)
 
     @staticmethod
     def _normalize_embedded_tool_name(name: str) -> str:

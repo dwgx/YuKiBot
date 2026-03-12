@@ -216,7 +216,7 @@ class Plugin:
 
     async def setup(self, config: dict[str, Any], context: Any) -> None:
         if not _IS_WINDOWS:
-            _log.warning("connect_cli 仅支持 Windows 平台，当前: %s", platform.system())
+            _log.info("connect_cli skipped on unsupported platform: %s", platform.system())
             return
         if not config.get("enabled", True):
             _log.info("connect_cli disabled")
