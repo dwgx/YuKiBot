@@ -266,7 +266,15 @@ const SECTIONS: SectionDef[] = [
   ]},
 ];
 
-const INPUT_CLASSES = { label: "text-default-500 text-xs", input: "text-sm", inputWrapper: "bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:bg-content2/70 data-[focus=true]:bg-content2/80 data-[focus=true]:border-primary/65 data-[focus=true]:shadow-[0_0_0_2px_rgba(120,120,130,0.24)]" };
+const INPUT_CLASSES = {
+  label: "text-default-500 text-xs",
+  base: "bg-transparent",
+  mainWrapper: "bg-transparent",
+  innerWrapper: "bg-transparent",
+  input: "text-sm !bg-transparent",
+  inputWrapper:
+    "!bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:!bg-content2/70 data-[focus=true]:!bg-content2/80 data-[focus=true]:border-primary/65 data-[focus=true]:shadow-[0_0_0_2px_rgba(120,120,130,0.24)] before:!bg-transparent after:!bg-transparent",
+};
 const SELECT_CLASSES = { label: "text-default-500 text-xs", trigger: "bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:bg-content2/70 data-[focus=true]:bg-content2/80 data-[focus=true]:border-primary/65 data-[focus=true]:shadow-[0_0_0_2px_rgba(120,120,130,0.24)]" };
 const SHELL = "rounded-2xl border border-default-400/35 bg-content1/55 p-3 shadow-sm transition-all duration-200 hover:border-default-400/55 hover:bg-content1/75";
 const IMAGE_GEN_PROMPT_PRESETS: Array<{ label: string; prompt: string }> = [
@@ -474,6 +482,7 @@ export default function ConfigPage() {
   const [config, setConfig] = useState<Cfg>({});
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, string>>({});
   const [numberDrafts, setNumberDrafts] = useState<Record<string, string>>({});
+  const [listDrafts, setListDrafts] = useState<Record<string, string>>({});
   const [rawConfigText, setRawConfigText] = useState("");
   const [rawConfigError, setRawConfigError] = useState("");
   const [rawConfigDirty, setRawConfigDirty] = useState(false);
@@ -521,6 +530,7 @@ export default function ConfigPage() {
       setConfig(merged);
       setFieldDrafts({});
       setNumberDrafts({});
+      setListDrafts({});
       setRawConfigText(JSON.stringify(merged, null, 2));
       setRawConfigError("");
       setRawConfigDirty(false);
@@ -568,6 +578,12 @@ export default function ConfigPage() {
       delete copied[path];
       return copied;
     });
+    setListDrafts((drafts) => {
+      if (!(path in drafts)) return drafts;
+      const copied = { ...drafts };
+      delete copied[path];
+      return copied;
+    });
     setRawConfigText(JSON.stringify(next, null, 2));
     setRawConfigError("");
     setRawConfigDirty(false);
@@ -609,8 +625,13 @@ export default function ConfigPage() {
       const current = getPath(next, path);
       next = setPath(next, path, parseNumberInput(raw, current, field));
     }
+    for (const [path, raw] of Object.entries(listDrafts)) {
+      const field = fieldMap.get(path);
+      if (!field || field.type !== "list") continue;
+      next = setPath(next, path, parseListValue(raw));
+    }
     return next;
-  }, [fieldDrafts, numberDrafts]);
+  }, [fieldDrafts, listDrafts, numberDrafts]);
 
   const resolveConfigForAction = useCallback((): Cfg => {
     let payload = applyPendingDrafts(config);
@@ -811,7 +832,24 @@ export default function ConfigPage() {
       }
       if (field.type === "list") {
         const list = Array.isArray(val) ? val.map((x) => String(x)) : [];
-        return <Input label={field.label} labelPlacement="outside" value={list.join(", ")} onValueChange={(v) => updateField(field.path, parseListValue(v))} classNames={INPUT_CLASSES} />;
+        const draft = listDrafts[field.path];
+        const inputValue = draft === undefined ? list.join(", ") : draft;
+        return (
+          <Input
+            label={field.label}
+            labelPlacement="outside"
+            value={inputValue}
+            description="支持中英文逗号或换行分割；按 Enter 或失焦后应用"
+            onValueChange={(v) => setListDrafts((prev) => ({ ...prev, [field.path]: v }))}
+            onBlur={() => updateField(field.path, parseListValue(inputValue))}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                updateField(field.path, parseListValue(inputValue));
+              }
+            }}
+            classNames={INPUT_CLASSES}
+          />
+        );
       }
       if (field.type === "group_verbosity_map" || field.type === "group_text_map") {
         const formatted = field.type === "group_verbosity_map" ? formatGroupVerbosityMap(val) : formatGroupTextMap(val);
