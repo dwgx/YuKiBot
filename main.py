@@ -120,6 +120,13 @@ def _webui_missing_response() -> Response:
     )
 
 
+def _with_no_cache(resp: Response) -> Response:
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
+
+
 @app.get("/webui/{path:path}")
 async def _webui_spa(path: str):
     if ".." in path:
@@ -130,16 +137,19 @@ async def _webui_spa(path: str):
         return _webui_missing_response()
     fp = _webui_dist / path
     if fp.is_file():
-        return FileResponse(fp)
+        resp = FileResponse(fp)
+        if fp.name.lower() == "index.html":
+            return _with_no_cache(resp)
+        return resp
     if _webui_index.exists():
-        return FileResponse(_webui_index)
+        return _with_no_cache(FileResponse(_webui_index))
     return _webui_missing_response()
 
 
 @app.get("/webui")
 async def _webui_root():
     if _webui_index.exists():
-        return FileResponse(_webui_index)
+        return _with_no_cache(FileResponse(_webui_index))
     return _webui_missing_response()
 
 
