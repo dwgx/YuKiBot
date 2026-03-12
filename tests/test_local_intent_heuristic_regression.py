@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from core.agent import AgentLoop
+from core.config_templates import _built_in_config_defaults
 from core.engine import YukikoEngine
 from core.router import RouterEngine
 from core.tools import ToolExecutor
@@ -181,6 +182,24 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertTrue(executor._looks_like_repo_readme_request("/readme foo/bar"))
         self.assertFalse(executor._looks_like_download_request_text("download demo"))
         self.assertTrue(executor._looks_like_download_request_text("/download demo"))
+
+    def test_data_uri_media_value_never_treated_as_local_path(self) -> None:
+        executor = _DummyExecutor()
+        huge_data_uri = "data:image/png;base64," + ("a" * 12000)
+        normalized = executor._normalize_message_media_value(huge_data_uri)
+        self.assertTrue(normalized.startswith("data:image/png;base64,"))
+
+    def test_built_in_defaults_disable_short_ping_heuristics_and_enable_risk_confirm(self) -> None:
+        defaults = _built_in_config_defaults()
+        bot_cfg = defaults.get("bot", {})
+        agent_cfg = defaults.get("agent", {})
+        hr_cfg = agent_cfg.get("high_risk_control", {})
+
+        self.assertEqual(bot_cfg.get("short_ping_phrases"), [])
+        self.assertTrue(bot_cfg.get("short_ping_require_directed", False))
+        self.assertTrue(hr_cfg.get("default_require_confirmation", False))
+        self.assertTrue(bool(hr_cfg.get("tool_name_patterns")))
+        self.assertTrue(bool(hr_cfg.get("description_patterns")))
 
 
 if __name__ == "__main__":
