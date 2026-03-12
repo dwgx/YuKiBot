@@ -2176,6 +2176,15 @@ class YukikoEngine:
         )
 
 
+        self.smart_interrupt_same_user_enable = bool(
+
+
+            queue_cfg.get("smart_interrupt_same_user_enable", False)
+
+
+        )
+
+
         self.smart_interrupt_require_directed = bool(
 
 
@@ -9568,6 +9577,12 @@ class YukikoEngine:
 
 
         if same_user:
+
+
+            if not self.smart_interrupt_same_user_enable:
+
+
+                return False, "same_user_interrupt_disabled"
 
 
             if low_info and not directed:
@@ -17122,5 +17137,4 @@ class YukikoEngine:
 
 
         return bool(re.fullmatch(r"[?？!！~～…,.，]{1,8}", content))
-
 

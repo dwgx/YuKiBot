@@ -2377,6 +2377,37 @@ async def _download_file_via_http_fallback(
     return str(out_path)
 
 
+def _is_readable_regular_file(path: str) -> bool:
+    raw = normalize_text(path)
+    if not raw:
+        return False
+    try:
+        candidate = Path(raw).expanduser()
+        if not candidate.exists() or not candidate.is_file():
+            return False
+        with open(candidate, "rb") as f:
+            f.read(1)
+        return True
+    except Exception:
+        return False
+
+
+async def _ensure_download_path_readable(
+    raw_path: str,
+    source_url: str,
+    *,
+    file_name: str = "",
+) -> tuple[str, bool]:
+    """确保下载产物对当前进程可读；Linux/NapCat 临时目录无权限时回退 HTTP 下载。"""
+    clean = normalize_text(raw_path)
+    if _is_readable_regular_file(clean):
+        return clean, False
+    http_path = await _download_file_via_http_fallback(source_url, file_name=file_name)
+    if _is_readable_regular_file(http_path):
+        return http_path, True
+    return clean, False
+
+
 def _friendly_download_failure_display(error_text: str, url: str) -> str:
     err = normalize_text(error_text)
     lower = err.lower()
@@ -3000,8 +3031,15 @@ async def _resolve_github_release_direct_url(
 
 
 def _stage_download_file(raw_path: str, source_url: str, file_name: str = "") -> str:
-    src = Path(raw_path).expanduser().resolve()
-    if not src.is_file():
+    raw = normalize_text(raw_path)
+    if not raw:
+        return ""
+    try:
+        src = Path(raw).expanduser()
+        if not src.exists() or not src.is_file():
+            return ""
+    except Exception as exc:
+        _log.warning("stage_download_file_inaccessible | path=%s | err=%s", clip_text(raw, 180), exc)
         return ""
     project_root = Path(__file__).resolve().parents[1]
     target_dir = (project_root / "storage" / "tmp" / "downloads").resolve()
@@ -3015,7 +3053,16 @@ def _stage_download_file(raw_path: str, source_url: str, file_name: str = "") ->
     dst = target_dir / f"{stem}{suffix}"
     if dst.exists():
         dst = target_dir / f"{stem}_{int(random.randint(1000, 9999))}{suffix}"
-    shutil.copy2(src, dst)
+    try:
+        shutil.copy2(src, dst)
+    except Exception as exc:
+        _log.warning(
+            "stage_download_file_copy_failed | src=%s | dst=%s | err=%s",
+            clip_text(str(src), 180),
+            clip_text(str(dst), 180),
+            exc,
+        )
+        return ""
     return str(dst)
 
 
@@ -3298,6 +3345,24 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
                 display=last_download_display,
             )
 
+        ensured_path, used_http_permission_fallback = await _ensure_download_path_readable(
+            raw_path,
+            attempt_url,
+            file_name=file_name,
+        )
+        if used_http_permission_fallback:
+            raw_path = ensured_path
+            candidate_url = attempt_url
+            resolve_note = "via_http_permission_fallback" if not resolve_note else f"{resolve_note}|via_http_permission_fallback"
+        elif ensured_path:
+            raw_path = ensured_path
+        if not _is_readable_regular_file(raw_path):
+            last_download_error = "download_path_permission_denied"
+            last_download_display = f"下载完成但当前进程无法读取文件：{clip_text(raw_path, 140)}"
+            if idx + 1 < len(download_attempts):
+                continue
+            return ToolCallResult(ok=False, error=last_download_error, display=last_download_display)
+
         candidate_url = attempt_url
         break
 
@@ -3406,6 +3471,19 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
             if not retry_path:
                 continue
 
+            ensured_retry_path, used_retry_permission_fallback = await _ensure_download_path_readable(
+                retry_path,
+                retry_url,
+                file_name=file_name,
+            )
+            if used_retry_permission_fallback:
+                retry_path = ensured_retry_path
+                resolve_note = "via_http_permission_fallback" if not resolve_note else f"{resolve_note}|via_http_permission_fallback"
+            elif ensured_retry_path:
+                retry_path = ensured_retry_path
+            if not _is_readable_regular_file(retry_path):
+                continue
+
             retry_head = _read_file_head(retry_path)
             if _looks_like_html_payload(retry_head):
                 nested_html_text = _read_html_text(retry_path)
@@ -3504,6 +3582,19 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
                 if retry_path:
                     resolve_note = "via_http_fallback" if not resolve_note else f"{resolve_note}|via_http_fallback"
             if not retry_path:
+                continue
+
+            ensured_retry_path, used_retry_permission_fallback = await _ensure_download_path_readable(
+                retry_path,
+                retry_url,
+                file_name=file_name,
+            )
+            if used_retry_permission_fallback:
+                retry_path = ensured_retry_path
+                resolve_note = "via_http_permission_fallback" if not resolve_note else f"{resolve_note}|via_http_permission_fallback"
+            elif ensured_retry_path:
+                retry_path = ensured_retry_path
+            if not _is_readable_regular_file(retry_path):
                 continue
 
             retry_head = _read_file_head(retry_path)

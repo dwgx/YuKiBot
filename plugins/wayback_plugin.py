@@ -865,6 +865,39 @@ class Plugin:
         rows = rows[:limit]
 
         if not rows:
+            fallback_snapshot: _Snapshot | None = None
+            fallback_mode = ""
+            try:
+                fallback_snapshot, fallback_mode = await self._resolve_snapshot(
+                    url=url,
+                    year=year or None,
+                    timestamp=from_ts or to_ts,
+                )
+            except Exception as exc:
+                errors.append(f"resolve_snapshot:{exc}")
+
+            if fallback_snapshot is not None:
+                display_lines = [
+                    f"Wayback closest snapshot for {url}:",
+                    f"1. {_pretty_ts(fallback_snapshot.timestamp)} | status={fallback_snapshot.statuscode or '-'} | {clip_text(fallback_snapshot.ui_url(), 120)}",
+                    f"mode: {fallback_mode}",
+                ]
+                return ToolCallResult(
+                    ok=True,
+                    data={
+                        "url": url,
+                        "year": year or None,
+                        "from_ts": from_ts,
+                        "to_ts": to_ts,
+                        "count": 1,
+                        "approximate": True,
+                        "source_variant": fallback_mode,
+                        "snapshots": [_snapshot_dict(fallback_snapshot)],
+                        "recommended": _snapshot_dict(fallback_snapshot),
+                    },
+                    display="\n".join(display_lines),
+                )
+
             msg = f"no snapshots found for {url}"
             if year:
                 msg += f" in {year}"

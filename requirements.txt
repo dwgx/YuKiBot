@@ -1,6 +1,7 @@
 nonebot2[fastapi]
 nonebot-adapter-onebot
 httpx>=0.27.0
+python-multipart>=0.0.9
 PyYAML>=6.0.1,<7
 python-dotenv>=1.0.1
 cryptography>=44.0.0,<47

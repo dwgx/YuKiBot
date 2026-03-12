@@ -29,6 +29,7 @@ from urllib.parse import urlencode, urljoin
 import httpx
 
 from plugins.newapi_client import NewAPIClient
+from utils.text import normalize_text
 
 _log = logging.getLogger("yukiko.plugin.newapi")
 
@@ -1200,6 +1201,43 @@ def _normalize_pay_method(raw_method: str) -> str:
     return aliases.get(method, method)
 
 
+def _parse_payment_amount(raw_amount: str) -> int | None:
+    text = normalize_text(str(raw_amount or "")).strip().lower().replace(",", "")
+    if not text:
+        return None
+    text = re.sub(r"^[¥￥$]\s*", "", text)
+    text = re.sub(r"\s*(?:rmb|cny|usd|元|块钱|块)\s*$", "", text)
+    matched = re.fullmatch(r"(\d+(?:\.\d+)?)([kmbw万]?)", text)
+    if not matched:
+        return None
+    number = float(matched.group(1))
+    suffix = matched.group(2)
+    multiplier = {
+        "": 1,
+        "k": 1_000,
+        "w": 10_000,
+        "万": 10_000,
+        "m": 1_000_000,
+        "b": 1_000_000_000,
+    }.get(suffix, 1)
+    amount = int(round(number * multiplier))
+    return amount if amount > 0 else None
+
+
+def _looks_like_online_payment_args(raw_args: str) -> bool:
+    text = normalize_text(str(raw_args or "")).strip()
+    if not text:
+        return False
+    parts = [part for part in text.split() if part]
+    if not parts:
+        return False
+    if _parse_payment_amount(parts[0]) is None:
+        return False
+    if len(parts) == 1:
+        return True
+    return any(_normalize_pay_method(part) in {"auto", "wxpay", "alipay", "qqpay", "stripe", "creem"} for part in parts[1:])
+
+
 def _remember_pending_payment(
     *,
     context: dict[str, Any],
@@ -1680,6 +1718,8 @@ async def _cmd_topup(args: str, context: dict) -> str:
     try:
         code = args.strip()
         if code:
+            if _looks_like_online_payment_args(code):
+                return await _cmd_pay(code, context)
             r = await client.redeem_topup(code)
             if not _resp_success(r):
                 return f"❌ {_resp_error_text(r, '充值失败')}"
@@ -1803,9 +1843,12 @@ async def _cmd_pay(args: str, context: dict) -> str:
             return f"💳 Creem 支付\n产品: {product_id}\n支付链接: {pay_url}"
 
         try:
-            amount = int(parts[0])
+            parsed_amount = _parse_payment_amount(parts[0])
+            if parsed_amount is None:
+                raise ValueError(parts[0])
+            amount = parsed_amount
         except ValueError:
-            return "金额必须是整数。"
+            return "金额格式不正确。支持 100、200M、1w 这类写法。"
         if amount <= 0:
             return "金额必须大于 0。"
 
@@ -2461,6 +2504,7 @@ class Plugin:
                     f"管理 {display_name} 站点。可执行标准子命令："
                     "bind/register/unbind/me/tokens/token.create/token.delete/token.update/token.key/"
                     "balance/stats/models/groups/subs/checkin/email/topup/pay/pay.status/aff/aff.transfer/pricing/help。"
+                    "其中 topup 仅用于查看充值信息或使用兑换码；在线支付一律使用 pay。"
                     "敏感命令在群聊会被拒绝；若群聊命令疑似包含密码会触发安全提醒。"
                 ),
                 parameters={
@@ -2500,6 +2544,7 @@ class Plugin:
                 "当用户只发 '/api'、'帮助'、'?' 时，优先调用 help。"
                 "对敏感命令（me/balance/tokens/stats/aff/email/topup/pay/pay.status/token.*）必须在私聊执行，群聊拒绝。"
                 "群聊出现 bind/register/email 且参数疑似密码时，也要调用 newapi_manage 对应命令，让插件触发撤回+提醒策略。"
+                "topup 只用于查看充值信息或使用兑换码；凡是在线支付、微信、支付宝、充值金额、200M/1000M 这类需求，都必须优先用 pay。"
                 "用户要求充值但未指定渠道时，先让用户在微信/支付宝等可用方式中二选一，不要直接默认渠道。"
                 "如果用户刚发起过 pay，随后又说已支付、支付成功、到账了吗、余额增加了，或者发送支付成功/余额截图，优先调用 pay.status 核对最近订单和当前余额，不要只根据截图直接回答。"
                 "当 newapi_binding 上下文里出现 recent_pending_payment 时，遇到支付相关追问必须先查 pay.status，再决定是否回复到账。"

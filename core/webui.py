@@ -14,17 +14,20 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
+import subprocess
+import tempfile
 import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlparse
 
 import httpx
 import yaml
-from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.requests import Request
 
 from core.recalled_messages import (
@@ -68,6 +71,7 @@ _SENSITIVE_PATHS = frozenset({
 _ROOT_DIR = Path(__file__).resolve().parents[1]
 _PROMPTS_FILE = _ROOT_DIR / "config" / "prompts.yml"
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SQLITE_HEADER = b"SQLite format 3\x00"
 
 
 def _default_prompts() -> dict:
@@ -316,6 +320,451 @@ def _open_sqlite_readonly(db_path: Path) -> sqlite3.Connection:
 def _open_sqlite_readwrite(db_path: Path) -> sqlite3.Connection:
     """以读写模式打开 SQLite 数据库。"""
     return sqlite3.connect(str(db_path))
+
+
+def _normalize_repo_http_url(remote_url: str) -> str:
+    remote = normalize_text(str(remote_url)).strip()
+    if not remote:
+        return ""
+
+    if remote.startswith(("http://", "https://")):
+        return remote.removesuffix(".git").rstrip("/")
+
+    ssh_match = re.match(r"^git@([^:]+):(.+?)(?:\.git)?$", remote)
+    if ssh_match:
+        host = ssh_match.group(1).strip()
+        path = ssh_match.group(2).strip().strip("/")
+        if host and path:
+            return f"https://{host}/{path}".rstrip("/")
+
+    parsed = urlparse(remote)
+    if parsed.scheme in {"ssh", "git"} and parsed.hostname and parsed.path:
+        path = parsed.path.strip("/").removesuffix(".git")
+        if path:
+            return f"https://{parsed.hostname}/{path}".rstrip("/")
+
+    return ""
+
+
+def _build_repo_artifact_urls(repo_http_url: str, branch: str) -> dict[str, str]:
+    repo_url = normalize_text(repo_http_url).strip().rstrip("/")
+    branch_name = normalize_text(branch).strip() or "main"
+    urls = {
+        "repo_http_url": repo_url,
+        "windows_zip_url": "",
+        "bootstrap_url": "",
+        "guide_url": "",
+    }
+    if not repo_url:
+        return urls
+
+    urls["windows_zip_url"] = f"{repo_url}/archive/refs/heads/{branch_name}.zip"
+    urls["guide_url"] = f"{repo_url}/blob/{branch_name}/docs/zh-CN/GUIDE.md"
+
+    github_match = re.match(r"^https://github\.com/([^/]+)/([^/]+)$", repo_url)
+    if github_match:
+        owner = github_match.group(1).strip()
+        repo = github_match.group(2).strip()
+        urls["bootstrap_url"] = (
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{branch_name}/bootstrap.sh"
+        )
+    return urls
+
+
+def _resolve_command(candidates: list[str]) -> str:
+    for candidate in candidates:
+        text = normalize_text(str(candidate)).strip()
+        if not text:
+            continue
+        path = Path(text)
+        if path.is_file():
+            return str(path)
+        found = shutil.which(text)
+        if found:
+            return found
+    return ""
+
+
+def _resolve_python_command() -> str:
+    return _resolve_command(
+        [
+            str(_ROOT_DIR / ".venv" / "Scripts" / "python.exe"),
+            str(_ROOT_DIR / ".venv" / "bin" / "python"),
+            "python3",
+            "python",
+        ]
+    )
+
+
+def _resolve_npm_command() -> str:
+    return _resolve_command(["npm.cmd", "npm"])
+
+
+def _clip_command_output(text: str, *, max_lines: int = 120, max_chars: int = 12_000) -> str:
+    raw = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return ""
+    rows = [line.rstrip() for line in raw.splitlines()]
+    if len(rows) > max_lines:
+        rows = rows[:max_lines] + ["...(output truncated)"]
+    clipped = "\n".join(rows)
+    if len(clipped) > max_chars:
+        clipped = clipped[:max_chars] + "\n...(output truncated)"
+    return clipped
+
+
+def _run_command_sync(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> tuple[int, str]:
+    proc = subprocess.run(
+        args,
+        cwd=str((cwd or _ROOT_DIR).resolve()),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        timeout=max(1.0, float(timeout_seconds)),
+        check=False,
+    )
+    merged = "\n".join(
+        part.strip()
+        for part in (proc.stdout or "", proc.stderr or "")
+        if normalize_text(part).strip()
+    ).strip()
+    return int(proc.returncode), _clip_command_output(merged)
+
+
+async def _run_command(
+    args: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout_seconds: float = 60.0,
+) -> tuple[int, str]:
+    return await asyncio.to_thread(
+        _run_command_sync,
+        args,
+        cwd=cwd,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+async def _collect_update_status(fetch_remote: bool = True) -> dict[str, Any]:
+    git_cmd = _resolve_command(["git.exe", "git"])
+    platform_name = "windows" if os.name == "nt" else "linux"
+    base = {
+        "ok": False,
+        "platform": platform_name,
+        "update_supported": False,
+        "git_available": bool(git_cmd),
+        "repo_available": bool((_ROOT_DIR / ".git").is_dir()),
+        "branch": "",
+        "upstream": "",
+        "local_commit": "",
+        "remote_commit": "",
+        "ahead": 0,
+        "behind": 0,
+        "dirty": False,
+        "repo_http_url": "",
+        "windows_zip_url": "",
+        "bootstrap_url": "",
+        "guide_url": "",
+        "message": "",
+        "logs": [],
+    }
+    if not git_cmd:
+        base["message"] = "当前环境缺少 git，无法检查远程更新"
+        return base
+    if not (_ROOT_DIR / ".git").is_dir():
+        base["message"] = f"当前目录不是 git 仓库: {_ROOT_DIR}"
+        return base
+
+    logs: list[str] = []
+    if fetch_remote:
+        rc, out = await _run_command(
+            [git_cmd, "-C", str(_ROOT_DIR), "fetch", "--prune", "--tags", "origin"],
+            timeout_seconds=180,
+        )
+        if out:
+            logs.append(out)
+        if rc != 0:
+            base["message"] = out or "git fetch 失败"
+            base["logs"] = logs
+            return base
+
+    rc, branch = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "rev-parse", "--abbrev-ref", "HEAD"],
+        timeout_seconds=30,
+    )
+    branch_name = normalize_text(branch)
+    if rc != 0 or not branch_name:
+        base["message"] = branch or "无法识别当前分支"
+        base["logs"] = logs
+        return base
+
+    rc, upstream_out = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+        timeout_seconds=30,
+    )
+    upstream_name = normalize_text(upstream_out) if rc == 0 else f"origin/{branch_name}"
+
+    rc, local_out = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "rev-parse", "--short", "HEAD"],
+        timeout_seconds=30,
+    )
+    local_commit = normalize_text(local_out) if rc == 0 else ""
+
+    rc, remote_out = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "rev-parse", "--short", upstream_name],
+        timeout_seconds=30,
+    )
+    remote_commit = normalize_text(remote_out) if rc == 0 else ""
+
+    ahead = 0
+    behind = 0
+    rc, counts_out = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "rev-list", "--left-right", "--count", f"{upstream_name}...HEAD"],
+        timeout_seconds=30,
+    )
+    if rc == 0:
+        parts = [p for p in counts_out.split() if p]
+        if len(parts) >= 2:
+            try:
+                ahead = int(parts[0] or 0)
+                behind = int(parts[1] or 0)
+            except ValueError:
+                ahead = 0
+                behind = 0
+
+    rc, dirty_out = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "status", "--porcelain"],
+        timeout_seconds=30,
+    )
+    dirty = bool(normalize_text(dirty_out)) if rc == 0 else False
+
+    rc, remote_url_out = await _run_command(
+        [git_cmd, "-C", str(_ROOT_DIR), "remote", "get-url", "origin"],
+        timeout_seconds=30,
+    )
+    repo_http_url = _normalize_repo_http_url(remote_url_out if rc == 0 else "")
+    artifacts = _build_repo_artifact_urls(repo_http_url, branch_name)
+
+    base.update(
+        {
+            "ok": True,
+            "update_supported": True,
+            "branch": branch_name,
+            "upstream": upstream_name,
+            "local_commit": local_commit,
+            "remote_commit": remote_commit,
+            "ahead": ahead,
+            "behind": behind,
+            "dirty": dirty,
+            "repo_http_url": artifacts["repo_http_url"],
+            "windows_zip_url": artifacts["windows_zip_url"],
+            "bootstrap_url": artifacts["bootstrap_url"],
+            "guide_url": artifacts["guide_url"],
+            "message": "ok",
+            "logs": logs,
+        }
+    )
+    return base
+
+
+async def _execute_update(
+    *,
+    allow_dirty: bool = False,
+    sync_python: bool = True,
+    build_webui: bool = True,
+) -> dict[str, Any]:
+    status = await _collect_update_status(fetch_remote=True)
+    if not bool(status.get("ok")):
+        return {
+            "ok": False,
+            "message": str(status.get("message", "无法检查更新")),
+            "logs": list(status.get("logs", [])),
+            "status": status,
+            "restart_required": False,
+            "restart_hint": "",
+        }
+
+    logs = list(status.get("logs", []))
+    logs.append(
+        "branch={branch} upstream={upstream} local={local} remote={remote} ahead={ahead} behind={behind} dirty={dirty}".format(
+            branch=status.get("branch", "-"),
+            upstream=status.get("upstream", "-"),
+            local=status.get("local_commit", "-"),
+            remote=status.get("remote_commit", "-"),
+            ahead=int(status.get("ahead", 0) or 0),
+            behind=int(status.get("behind", 0) or 0),
+            dirty=int(bool(status.get("dirty", False))),
+        )
+    )
+
+    if bool(status.get("dirty")) and not allow_dirty:
+        return {
+            "ok": False,
+            "message": "工作区存在未提交改动，已阻止自动更新。需要的话可在 WebUI 强制允许 dirty 更新。",
+            "logs": logs,
+            "status": status,
+            "restart_required": False,
+            "restart_hint": "",
+        }
+
+    git_cmd = _resolve_command(["git.exe", "git"])
+    assert git_cmd
+    pulled = False
+    if int(status.get("behind", 0) or 0) > 0:
+        rc, out = await _run_command(
+            [git_cmd, "-C", str(_ROOT_DIR), "pull", "--ff-only"],
+            timeout_seconds=600,
+        )
+        if out:
+            logs.append(out)
+        if rc != 0:
+            return {
+                "ok": False,
+                "message": out or "git pull 失败",
+                "logs": logs,
+                "status": status,
+                "restart_required": False,
+                "restart_hint": "",
+            }
+        pulled = True
+    else:
+        logs.append(f"Already up to date with {status.get('upstream') or 'origin'}")
+
+    if sync_python:
+        python_cmd = _resolve_python_command()
+        if not python_cmd:
+            logs.append("跳过 Python 依赖同步：未找到 python")
+        else:
+            rc, out = await _run_command(
+                [python_cmd, "-m", "pip", "install", "-r", str(_ROOT_DIR / "requirements.txt")],
+                timeout_seconds=1800,
+            )
+            if out:
+                logs.append(out)
+            if rc != 0:
+                return {
+                    "ok": False,
+                    "message": out or "pip install 失败",
+                    "logs": logs,
+                    "status": status,
+                    "restart_required": pulled,
+                    "restart_hint": "部分文件可能已更新，请在确认后手动重启服务。",
+                }
+
+    if build_webui and (_ROOT_DIR / "webui" / "package.json").is_file():
+        npm_cmd = _resolve_npm_command()
+        if not npm_cmd:
+            logs.append("跳过 WebUI 构建：未找到 npm")
+        else:
+            rc, out = await _run_command(
+                [npm_cmd, "install", "--no-audit", "--no-fund"],
+                cwd=_ROOT_DIR / "webui",
+                timeout_seconds=1800,
+            )
+            if out:
+                logs.append(out)
+            if rc != 0:
+                return {
+                    "ok": False,
+                    "message": out or "npm install 失败",
+                    "logs": logs,
+                    "status": status,
+                    "restart_required": pulled,
+                    "restart_hint": "代码可能已更新，但前端构建失败，请处理后再重启。",
+                }
+
+            rc, out = await _run_command(
+                [npm_cmd, "run", "build"],
+                cwd=_ROOT_DIR / "webui",
+                timeout_seconds=1800,
+            )
+            if out:
+                logs.append(out)
+            if rc != 0:
+                return {
+                    "ok": False,
+                    "message": out or "npm run build 失败",
+                    "logs": logs,
+                    "status": status,
+                    "restart_required": pulled,
+                    "restart_hint": "代码可能已更新，但前端构建失败，请处理后再重启。",
+                }
+
+    updated_status = await _collect_update_status(fetch_remote=False)
+    restart_required = pulled
+    restart_hint = (
+        "代码已拉取到最新版本。为了让 Python 代码更新真正生效，请手动重启当前服务/进程。"
+        if restart_required
+        else "当前已经是最新版本，没有新的代码需要重启生效。"
+    )
+    return {
+        "ok": True,
+        "message": "更新流程完成",
+        "logs": logs,
+        "status": updated_status,
+        "restart_required": restart_required,
+        "restart_hint": restart_hint,
+    }
+
+
+def _validate_sqlite_upload(db_file: Path) -> tuple[bool, list[str], str]:
+    try:
+        if not db_file.is_file():
+            return False, [], "上传文件不存在"
+        if db_file.stat().st_size < len(_SQLITE_HEADER):
+            return False, [], "文件太小，不像有效的 SQLite 数据库"
+        with db_file.open("rb") as fh:
+            header = fh.read(len(_SQLITE_HEADER))
+        if header != _SQLITE_HEADER:
+            return False, [], "文件头不是 SQLite 数据库"
+
+        conn = _open_sqlite_readonly(db_file)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA quick_check(1)")
+            row = cursor.fetchone()
+            check_value = normalize_text(str(row[0] if row else "")).lower()
+            if check_value and check_value != "ok":
+                return False, [], f"SQLite quick_check 未通过: {check_value}"
+            tables = _list_tables(conn, include_system=True)
+            return True, tables, ""
+        finally:
+            conn.close()
+    except Exception as exc:
+        return False, [], f"无法读取 SQLite 数据库: {exc}"
+
+
+def _build_db_backup_path(db_path: Path, *, label: str) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup_dir = _ROOT_DIR / "storage" / "backups" / "db"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    suffix = db_path.suffix or ".db"
+    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "-", normalize_text(label).strip() or "backup")
+    return backup_dir / f"{db_path.stem}-{safe_label}-{stamp}{suffix}"
+
+
+def _restore_sqlite_database(src_db: Path, target_db: Path) -> None:
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    if not target_db.exists():
+        shutil.copy2(src_db, target_db)
+        return
+
+    src_conn = _open_sqlite_readonly(src_db)
+    dest_conn = _open_sqlite_readwrite(target_db)
+    try:
+        src_conn.backup(dest_conn)
+        dest_conn.commit()
+    finally:
+        with contextlib.suppress(Exception):
+            src_conn.close()
+        with contextlib.suppress(Exception):
+            dest_conn.close()
 
 
 def _quote_ident(name: str) -> str:
@@ -676,6 +1125,27 @@ def _plugin_source_info(engine: Any, registry: Any, name: str) -> tuple[str, str
     return "default", ""
 
 
+def _resolve_plugin_local_config_file(registry: Any, plugin_name: str) -> Path:
+    plugin_cfg_dir = Path(str(getattr(registry, "_plugin_config_dir", _ROOT_DIR / "plugins" / "config")))
+    return plugin_cfg_dir / f"{plugin_name}.yml"
+
+
+def _should_write_plugin_local_config(current: dict[str, Any], registry: Any, plugin_name: str) -> bool:
+    config_target = normalize_text(str(current.get("config_target", "")))
+    if config_target.startswith(f"plugins/config/{plugin_name}.yml"):
+        return True
+
+    config_file = normalize_text(str(current.get("config_file", "")))
+    if config_file:
+        with contextlib.suppress(Exception):
+            current_path = Path(config_file).resolve()
+            local_path = _resolve_plugin_local_config_file(registry, plugin_name).resolve()
+            if current_path == local_path:
+                return True
+
+    return bool(current.get("supports_interactive_setup", False))
+
+
 def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
     """构建插件列表响应。"""
     registry = getattr(engine, "plugins", None)
@@ -722,6 +1192,12 @@ def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
         if not isinstance(args_schema, dict):
             args_schema = {}
 
+        config_schema = getattr(plugin_obj, "config_schema", None)
+        if not isinstance(config_schema, dict):
+            config_schema = schema.get("config_schema", {})
+        if not isinstance(config_schema, dict):
+            config_schema = {}
+
         rules = _normalize_plugin_rules(getattr(plugin_obj, "rules", None))
         if not rules:
             rules = _normalize_plugin_rules(schema.get("rules", []))
@@ -735,6 +1211,7 @@ def _collect_plugins_payload(engine: Any) -> list[dict[str, Any]]:
             "config_file": config_file,
             "config": config,
             "args_schema": args_schema,
+            "config_schema": config_schema,
             "rules": rules,
             "internal_only": bool(getattr(plugin_obj, "internal_only", False)),
             "agent_tool": bool(getattr(plugin_obj, "agent_tool", False)),
@@ -843,6 +1320,26 @@ async def status():
             desc = getattr(obj, "description", "") or ""
             plugin_list.append({"name": name, "description": str(desc)})
 
+    queue_cfg = e.config.get("queue", {}) if isinstance(getattr(e, "config", None), dict) else {}
+    if not isinstance(queue_cfg, dict):
+        queue_cfg = {}
+    runtime_agent_rows: list[dict[str, Any]] = []
+    runtime_state_provider = getattr(e, "runtime_agent_state_provider", None)
+    if callable(runtime_state_provider):
+        try:
+            provider_rows = runtime_state_provider(limit=200)
+            if inspect.isawaitable(provider_rows):
+                provider_rows = await provider_rows
+            if isinstance(provider_rows, list):
+                runtime_agent_rows = [row for row in provider_rows if isinstance(row, dict)]
+        except Exception:
+            runtime_agent_rows = []
+
+    group_concurrency = max(1, int(queue_cfg.get("group_concurrency", 1) or 1))
+    single_inflight = bool(queue_cfg.get("single_inflight_per_conversation", True))
+    max_concurrent_total = max(0, int(queue_cfg.get("max_concurrent_total", 0) or 0))
+    multi_conversation_enabled = (not single_inflight) and max_concurrent_total != 1
+
     return {
         "uptime_seconds": uptime,
         "message_count": msg_count,
@@ -853,7 +1350,38 @@ async def status():
         "safety_scale": scale,
         "bot_name": getattr(e, "bot_name", "YuKiKo"),
         "plugins": plugin_list,
+        "queue": {
+            "group_concurrency": group_concurrency,
+            "single_inflight_per_conversation": single_inflight,
+            "max_concurrent_total": max_concurrent_total,
+            "multi_conversation_enabled": multi_conversation_enabled,
+            "active_conversations": len(runtime_agent_rows),
+        },
     }
+
+
+@router.get("/system/update/status", dependencies=[Depends(_check_auth)])
+async def system_update_status():
+    status = await _collect_update_status(fetch_remote=True)
+    return {"status": status}
+
+
+@router.post("/system/update/run", dependencies=[Depends(_check_auth)])
+async def system_update_run(request: Request):
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+    if body is None:
+        body = {}
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    result = await _execute_update(
+        allow_dirty=bool(body.get("allow_dirty", False)),
+        sync_python=bool(body.get("sync_python", True)),
+        build_webui=bool(body.get("build_webui", True)),
+    )
+    if not bool(result.get("ok")):
+        raise HTTPException(400, str(result.get("message", "更新失败")))
+    return result
 
 
 @router.get("/config", dependencies=[Depends(_check_auth)])
@@ -1111,14 +1639,23 @@ async def put_plugin(plugin_name: str, request: Request):
 
     registry = getattr(e, "plugins", None)
     unified_path = _resolve_unified_plugins_file(registry)
+    write_local = _should_write_plugin_local_config(current, registry, plugin_name)
+    local_path = _resolve_plugin_local_config_file(registry, plugin_name)
+
     try:
         unified_data = _load_yaml_dict(unified_path, strict=True)
     except Exception as ex:
         raise HTTPException(500, f"读取插件配置失败: {ex}")
-    unified_data[plugin_name] = new_cfg
 
     try:
-        _save_yaml_dict(unified_path, unified_data)
+        if write_local:
+            _save_yaml_dict(local_path, new_cfg)
+            if plugin_name in unified_data:
+                unified_data.pop(plugin_name, None)
+                _save_yaml_dict(unified_path, unified_data)
+        else:
+            unified_data[plugin_name] = new_cfg
+            _save_yaml_dict(unified_path, unified_data)
     except Exception as ex:
         raise HTTPException(500, f"写入插件配置失败: {ex}")
 
@@ -1137,8 +1674,9 @@ async def put_plugin(plugin_name: str, request: Request):
         updated = copy.deepcopy(current)
         updated["config"] = new_cfg
         updated["enabled"] = bool(new_cfg.get("enabled", True))
-        updated["source"] = _display_path(unified_path)
-        updated["config_file"] = str(unified_path)
+        target_path = local_path if write_local else unified_path
+        updated["source"] = _display_path(target_path)
+        updated["config_file"] = str(target_path)
 
     return {"ok": True, "message": message, "plugin": updated}
 
@@ -1170,11 +1708,16 @@ async def db_overview():
             conn = _open_sqlite_readonly(db_file)
             tables = _list_tables(conn, include_system=False)
             conn.close()
+            stat = db_file.stat()
 
             databases.append({
                 "name": db_name,
                 "path": str(db_file),
+                "exists": True,
+                "size_bytes": int(stat.st_size or 0),
+                "modified_at": int(stat.st_mtime or 0),
                 "table_count": len(tables),
+                "tables": tables,
             })
             seen_names.add(db_name)
         except Exception as e:
@@ -1197,7 +1740,12 @@ async def db_tables(
     result = []
 
     for table in tables:
-        item = {"name": table}
+        columns = _table_columns(conn, table)
+        item = {
+            "name": table,
+            "column_count": len(columns),
+            "columns": columns,
+        }
         if with_counts:
             try:
                 cursor = conn.cursor()
@@ -1209,7 +1757,7 @@ async def db_tables(
         result.append(item)
 
     conn.close()
-    return {"tables": result}
+    return {"db": db_name, "path": str(db_path), "tables": result}
 
 
 @router.get("/db/{db_name}/rows", dependencies=[Depends(_check_auth)])
@@ -1273,6 +1821,8 @@ async def db_rows(
         result_rows.append(row_dict)
 
     return {
+        "db": db_name,
+        "table": table,
         "columns": columns,
         "rows": result_rows,
         "total": total,
@@ -1324,6 +1874,78 @@ async def db_clear_rows(request: Request, db_name: str):
         raise HTTPException(500, f"清空失败: {exc}") from exc
     finally:
         conn.close()
+
+
+@router.get("/db/{db_name}/export", dependencies=[Depends(_check_auth)])
+async def db_export(db_name: str):
+    db_path = _resolve_webui_db_path(db_name)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = db_path.suffix or ".db"
+    filename = f"{db_path.stem}-{stamp}{suffix}"
+    return FileResponse(
+        path=str(db_path),
+        filename=filename,
+        media_type="application/octet-stream",
+    )
+
+
+@router.post("/db/{db_name}/import", dependencies=[Depends(_check_auth)])
+async def db_import(db_name: str, file: UploadFile = File(...)):
+    db_path = _resolve_webui_db_path(db_name)
+    suffix = Path(normalize_text(file.filename or "upload.db")).suffix or ".db"
+    temp_dir = _ROOT_DIR / "storage" / "tmp" / "db-imports"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    temp_path_obj = tempfile.NamedTemporaryFile(
+        prefix=f"{db_name}-",
+        suffix=suffix,
+        dir=temp_dir,
+        delete=False,
+    )
+    temp_path = Path(temp_path_obj.name)
+    temp_path_obj.close()
+
+    try:
+        with temp_path.open("wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                fh.write(chunk)
+
+        ok, tables, error = _validate_sqlite_upload(temp_path)
+        if not ok:
+            raise HTTPException(400, error or "上传文件不是有效的 SQLite 数据库")
+
+        backup_path = _build_db_backup_path(db_path, label="before-import")
+        try:
+            shutil.copy2(db_path, backup_path)
+            _restore_sqlite_database(temp_path, db_path)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(500, f"导入数据库失败: {exc}") from exc
+
+        verified_ok, verified_tables, verified_error = _validate_sqlite_upload(db_path)
+        if not verified_ok:
+            raise HTTPException(500, verified_error or "导入后校验失败")
+
+        return {
+            "ok": True,
+            "message": f"数据库 {db_name} 已导入成功",
+            "db": db_name,
+            "path": str(db_path),
+            "backup_path": str(backup_path),
+            "table_count": len(verified_tables),
+            "tables": verified_tables[:40],
+            "size_bytes": int(db_path.stat().st_size or 0),
+            "restart_recommended": True,
+        }
+    finally:
+        with contextlib.suppress(Exception):
+            await file.close()
+        with contextlib.suppress(Exception):
+            temp_path.unlink(missing_ok=True)
 
 
 def _unwrap_onebot_payload(payload: Any) -> Any:

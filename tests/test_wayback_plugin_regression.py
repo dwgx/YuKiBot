@@ -88,6 +88,33 @@ class WaybackPluginRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.data.get("years"), [2012, 2023])
         self.assertIn("available-years fallback", result.display)
 
+    async def test_wayback_lookup_falls_back_to_closest_snapshot_when_cdx_fails(self) -> None:
+        plugin = Plugin()
+
+        async def fake_query_cdx(
+            *,
+            url: str,
+            from_ts: str = "",
+            to_ts: str = "",
+            limit: int = 8,
+            include_non_200: bool = False,
+        ) -> list[_Snapshot]:
+            raise TimeoutError(f"rate limited for {url}")
+
+        async def fake_resolve_snapshot(*, url: str, year: int | None, timestamp: str) -> tuple[_Snapshot | None, str]:
+            return _Snapshot(timestamp="20050701000000", original=url), "available_closest:http://example.com"
+
+        plugin._query_cdx = fake_query_cdx  # type: ignore[method-assign]
+        plugin._resolve_snapshot = fake_resolve_snapshot  # type: ignore[method-assign]
+
+        result = await plugin._handle_wayback_lookup({"url": "http://example.com", "year": 2005}, {})
+
+        self.assertTrue(result.ok)
+        self.assertTrue(result.data.get("approximate"))
+        self.assertEqual(result.data.get("count"), 1)
+        self.assertIn("closest snapshot", result.display)
+        self.assertEqual(result.data.get("recommended", {}).get("timestamp"), "20050701000000")
+
 
 if __name__ == "__main__":
     unittest.main()

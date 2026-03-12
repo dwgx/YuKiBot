@@ -20,14 +20,16 @@ class ApiClient {
     localStorage.removeItem("webui_token");
   }
 
-  private async request<T = unknown>(path: string, opts?: RequestInit): Promise<T> {
+  private async fetchWithAuth(path: string, opts?: RequestInit): Promise<Response> {
+    const headers = new Headers(opts?.headers || {});
+    headers.set("Authorization", `Bearer ${this.getToken()}`);
+    if (!(opts?.body instanceof FormData) && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+
     const res = await fetch(`${BASE}${path}`, {
       ...opts,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.getToken()}`,
-        ...opts?.headers,
-      },
+      headers,
     });
     if (res.status === 401) {
       this.clearToken();
@@ -38,7 +40,17 @@ class ApiClient {
       const text = await res.text();
       throw new Error(text || `HTTP ${res.status}`);
     }
+    return res;
+  }
+
+  private async request<T = unknown>(path: string, opts?: RequestInit): Promise<T> {
+    const res = await this.fetchWithAuth(path, opts);
     return res.json();
+  }
+
+  private async requestBlob(path: string, opts?: RequestInit): Promise<{ blob: Blob; response: Response }> {
+    const response = await this.fetchWithAuth(path, opts);
+    return { blob: await response.blob(), response };
   }
 
   auth(token: string) {
@@ -50,6 +62,25 @@ class ApiClient {
 
   getStatus() {
     return this.request<StatusData>("/status");
+  }
+
+  getSystemUpdateStatus() {
+    return this.request<{ status: SystemUpdateStatus }>("/system/update/status");
+  }
+
+  runSystemUpdate(payload?: {
+    allowDirty?: boolean;
+    syncPython?: boolean;
+    buildWebui?: boolean;
+  }) {
+    return this.request<SystemUpdateRunResponse>("/system/update/run", {
+      method: "POST",
+      body: JSON.stringify({
+        allow_dirty: Boolean(payload?.allowDirty),
+        sync_python: payload?.syncPython ?? true,
+        build_webui: payload?.buildWebui ?? true,
+      }),
+    });
   }
 
   getConfig() {
@@ -136,6 +167,19 @@ class ApiClient {
         body: JSON.stringify({ table }),
       },
     );
+  }
+
+  exportDb(db: string) {
+    return this.requestBlob(`/db/${encodeURIComponent(db)}/export`);
+  }
+
+  importDb(db: string, file: File) {
+    const form = new FormData();
+    form.append("file", file);
+    return this.request<DbImportResponse>(`/db/${encodeURIComponent(db)}/import`, {
+      method: "POST",
+      body: form,
+    });
   }
 
   getMemoryRecords(params: {
@@ -350,6 +394,43 @@ export interface StatusData {
   safety_scale: number;
   bot_name: string;
   plugins: { name: string; description: string }[];
+  queue: {
+    group_concurrency: number;
+    single_inflight_per_conversation: boolean;
+    max_concurrent_total: number;
+    multi_conversation_enabled: boolean;
+    active_conversations: number;
+  };
+}
+
+export interface SystemUpdateStatus {
+  ok: boolean;
+  platform: string;
+  update_supported: boolean;
+  git_available: boolean;
+  repo_available: boolean;
+  branch: string;
+  upstream: string;
+  local_commit: string;
+  remote_commit: string;
+  ahead: number;
+  behind: number;
+  dirty: boolean;
+  repo_http_url: string;
+  windows_zip_url: string;
+  bootstrap_url: string;
+  guide_url: string;
+  message: string;
+  logs: string[];
+}
+
+export interface SystemUpdateRunResponse {
+  ok: boolean;
+  message: string;
+  logs: string[];
+  status: SystemUpdateStatus;
+  restart_required: boolean;
+  restart_hint: string;
 }
 
 export interface DbOverviewItem {
@@ -396,6 +477,18 @@ export interface DbRowsResponse {
   total: number;
   columns: DbColumnInfo[];
   rows: Record<string, unknown>[];
+}
+
+export interface DbImportResponse {
+  ok: boolean;
+  message: string;
+  db: string;
+  path: string;
+  backup_path: string;
+  table_count: number;
+  tables: string[];
+  size_bytes: number;
+  restart_recommended: boolean;
 }
 
 export interface ImageGenTestRequest {

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from "react";
 import {
   Button,
   Card,
@@ -11,7 +11,7 @@ import {
   Spinner,
   Switch,
 } from "@heroui/react";
-import { Database, RefreshCw, Search } from "lucide-react";
+import { Database, Download, RefreshCw, Search, Upload } from "lucide-react";
 import {
   api,
   DbOverviewItem,
@@ -50,6 +50,19 @@ function renderCell(value: unknown): string {
   }
 }
 
+function resolveDownloadFilename(contentDisposition: string | null, fallback: string): string {
+  const raw = contentDisposition || "";
+  const utf8Match = raw.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match?.[1]) {
+    return decodeURIComponent(utf8Match[1]);
+  }
+  const basicMatch = raw.match(/filename="?([^";]+)"?/i);
+  if (basicMatch?.[1]) {
+    return basicMatch[1];
+  }
+  return fallback;
+}
+
 export default function DatabasePage() {
   const { notifications, confirm, success, danger } = useNotifications();
   const [overview, setOverview] = useState<DbOverviewItem[]>([]);
@@ -61,7 +74,10 @@ export default function DatabasePage() {
   const [loadingTables, setLoadingTables] = useState(false);
   const [loadingRows, setLoadingRows] = useState(false);
   const [clearingTable, setClearingTable] = useState(false);
+  const [exportingDb, setExportingDb] = useState(false);
+  const [importingDb, setImportingDb] = useState(false);
   const [error, setError] = useState("");
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const [queryInput, setQueryInput] = useState("");
   const [executedQuery, setExecutedQuery] = useState("");
@@ -193,9 +209,91 @@ export default function DatabasePage() {
     );
   }, [clearingTable, loadOverview, loadRows, loadTables, selectedDb, selectedTable, confirm, success, danger]);
 
+  const exportCurrentDb = useCallback(async () => {
+    if (!selectedDb || exportingDb) return;
+    setExportingDb(true);
+    try {
+      const { blob, response } = await api.exportDb(selectedDb);
+      const filename = resolveDownloadFilename(
+        response.headers.get("Content-Disposition"),
+        `${selectedDb}.db`,
+      );
+      const blobUrl = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = blobUrl;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(blobUrl);
+      success("导出成功", `已下载数据库备份：${filename}`);
+    } catch (e: unknown) {
+      danger("导出失败", e instanceof Error ? e.message : "数据库导出失败");
+    } finally {
+      setExportingDb(false);
+    }
+  }, [danger, exportingDb, selectedDb, success]);
+
+  const importDbFile = useCallback(async (file: File) => {
+    if (!selectedDb || importingDb) return;
+    setImportingDb(true);
+    try {
+      const res = await api.importDb(selectedDb, file);
+      success(
+        "导入成功",
+        `${res.message}。已自动备份原库到 ${res.backup_path}${res.restart_recommended ? "，建议随后重启服务让长连接模块完全刷新。" : ""}`,
+        6000,
+      );
+      setPage(1);
+      setQueryInput("");
+      setExecutedQuery("");
+      setQueryRefreshToken((v) => v + 1);
+      await loadOverview();
+      await loadTables();
+      await loadRows();
+    } catch (e: unknown) {
+      danger("导入失败", e instanceof Error ? e.message : "数据库导入失败");
+    } finally {
+      setImportingDb(false);
+      if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+      }
+    }
+  }, [danger, importingDb, loadOverview, loadRows, loadTables, selectedDb, success]);
+
+  const chooseImportFile = useCallback(() => {
+    fileInputRef.current?.click();
+  }, []);
+
+  const onImportFileChange = useCallback((event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file || !selectedDb) {
+      return;
+    }
+    confirm(
+      "确认导入数据库",
+      `即将用 ${file.name} 覆盖导入 ${selectedDb}。系统会先自动备份当前数据库，但导入后建议手动重启服务。确认继续吗？`,
+      () => {
+        void importDbFile(file);
+      },
+      {
+        type: "warning",
+        confirmText: "确认导入",
+        cancelText: "取消",
+      },
+    );
+  }, [confirm, importDbFile, selectedDb]);
+
   return (
     <>
       <NotificationContainer notifications={notifications} />
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".db,.sqlite,.sqlite3"
+        className="hidden"
+        onChange={onImportFileChange}
+      />
       <section className="space-y-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
@@ -217,6 +315,24 @@ export default function DatabasePage() {
               清空当前表
             </Button>
           )}
+          <Button
+            variant="flat"
+            startContent={<Upload size={16} />}
+            onPress={chooseImportFile}
+            isDisabled={!selectedDb || loadingOverview}
+            isLoading={importingDb}
+          >
+            导入当前库
+          </Button>
+          <Button
+            variant="flat"
+            startContent={<Download size={16} />}
+            onPress={exportCurrentDb}
+            isDisabled={!selectedDb || loadingOverview}
+            isLoading={exportingDb}
+          >
+            导出当前库
+          </Button>
           <Button
             variant="flat"
             startContent={<RefreshCw size={16} />}
@@ -285,6 +401,25 @@ export default function DatabasePage() {
             <Switch isSelected={includeSystem} onValueChange={(v) => setIncludeSystem(v)}>
               显示系统表
             </Switch>
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader className="pb-1">库维护</CardHeader>
+        <CardBody className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-2xl border border-default-200/60 bg-content2/40 p-4">
+            <p className="text-sm font-semibold">当前数据库</p>
+            <p className="mt-2 text-xs text-default-500 break-all">{currentDb?.path || "未选择"}</p>
+            <p className="mt-3 text-xs text-default-500">
+              导出会直接下载当前库文件；导入会先备份原库，再覆盖写入新数据库。
+            </p>
+          </div>
+          <div className="rounded-2xl border border-warning/40 bg-warning/5 p-4">
+            <p className="text-sm font-semibold text-warning-700">导入提醒</p>
+            <p className="mt-2 text-xs text-default-600">
+              导入完成后页面会自动刷新，但如果有长期持有数据库连接的模块，仍建议你手动重启服务，确保运行时完全切到新数据。
+            </p>
           </div>
         </CardBody>
       </Card>
@@ -399,4 +534,3 @@ export default function DatabasePage() {
     </>
   );
 }
-

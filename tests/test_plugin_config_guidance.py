@@ -74,6 +74,7 @@ class PluginConfigGuidanceTests(unittest.TestCase):
         self.assertEqual(payload[0]["config_guide"], ["配置入口: config/plugins.yml -> demo_plugin"])
         self.assertEqual(payload[0]["editable_keys"], ["enabled", "timeout_seconds"])
         self.assertTrue(payload[0]["configurable"])
+        self.assertEqual(payload[0]["config_schema"], _FakePlugin.config_schema)
 
 
 if __name__ == "__main__":

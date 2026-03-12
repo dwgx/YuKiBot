@@ -241,6 +241,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "cancel_previous_on_interrupt_request": True,
             "smart_interrupt_enable": True,
             "smart_interrupt_cross_user_enable": True,
+            "smart_interrupt_same_user_enable": False,
             "smart_interrupt_require_directed": True,
             "smart_interrupt_min_pending": 1,
             "group_isolate_by_user": True,
