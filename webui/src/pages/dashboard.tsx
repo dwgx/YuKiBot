@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Button, Card, CardBody, Chip, Spinner, Switch } from "@heroui/react";
 import { motion } from "framer-motion";
 import clsx from "clsx";
@@ -230,12 +230,12 @@ export default function DashboardPage() {
   }
 
   const scaleNames: Record<number, string> = { 1: "宽松", 2: "标准", 3: "严格", 4: "最严" };
-  const updateStageLabel = useMemo(() => formatUpdateStage(updateTask?.stage || ""), [updateTask?.stage]);
-  const updateProgress = useMemo(() => {
+  const updateStageLabel = formatUpdateStage(updateTask?.stage || "");
+  const updateProgress = (() => {
     const value = Number(updateTask?.progress || 0);
     if (!Number.isFinite(value)) return 0;
     return Math.max(0, Math.min(100, Math.round(value)));
-  }, [updateTask?.progress]);
+  })();
 
   return (
     <>
