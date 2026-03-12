@@ -74,6 +74,42 @@ textarea:-webkit-autofill:focus {
   transition: background-color 99999s ease-in-out 0s;
 }
 
+/* 全局强制：任何输入相关槽位都不允许出现白色内框/白色填充 */
+[data-slot="base"][data-focus="true"] [data-slot="main-wrapper"],
+[data-slot="base"][data-focus-visible="true"] [data-slot="main-wrapper"],
+[data-slot="base"][data-focus-within="true"] [data-slot="main-wrapper"],
+[data-slot="base"][data-focus="true"] [data-slot="input-wrapper"],
+[data-slot="base"][data-focus-visible="true"] [data-slot="input-wrapper"],
+[data-slot="base"][data-focus-within="true"] [data-slot="input-wrapper"],
+[data-slot="base"][data-focus="true"] [data-slot="inner-wrapper"],
+[data-slot="base"][data-focus-visible="true"] [data-slot="inner-wrapper"],
+[data-slot="base"][data-focus-within="true"] [data-slot="inner-wrapper"],
+[data-slot="base"][data-focus="true"] [data-slot="input"],
+[data-slot="base"][data-focus-visible="true"] [data-slot="input"],
+[data-slot="base"][data-focus-within="true"] [data-slot="input"],
+[data-slot="input-wrapper"],
+[data-slot="inner-wrapper"],
+[data-slot="main-wrapper"],
+[data-slot="input"],
+[data-slot="trigger"],
+input,
+textarea,
+select {
+  background-color: transparent !important;
+  background-image: none !important;
+  box-shadow: none !important;
+  outline: none !important;
+}
+
+/* Select / Autocomplete 触发器点击态常见白底兜底 */
+[data-slot="trigger"][data-focus="true"],
+[data-slot="trigger"][data-focus-visible="true"],
+[data-slot="trigger"][data-pressed="true"],
+[data-slot="trigger"][data-hover="true"] {
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
 @keyframes thinkingIslandGlow {
   0%, 100% {
     box-shadow:
