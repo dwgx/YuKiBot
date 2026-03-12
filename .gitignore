@@ -52,6 +52,9 @@ scripts/*vps*.py
 scripts/*vps*.sh
 scripts/*vps*.ps1
 
+# Claude Code 本地文件
+.claude/
+
 # WebUI 前端
 webui/node_modules/
 webui/dist/
