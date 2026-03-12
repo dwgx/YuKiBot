@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
@@ -2693,6 +2694,169 @@ async def chat_send_text(request: Request):
     elif isinstance(result, int):
         message_id = str(result)
     return {"ok": True, "message_id": message_id}
+
+
+@router.post("/chat/agent-text", dependencies=[Depends(_check_auth)])
+async def chat_agent_text(request: Request):
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    resolved_type = _normalize_chat_type(str(body.get("chat_type", "")))
+    peer_id = normalize_text(str(body.get("peer_id", "")))
+    text = normalize_text(str(body.get("text", "")))
+    reply_to_message_id = normalize_text(str(body.get("reply_to_message_id", "")))
+    bot_id = normalize_text(str(body.get("bot_id", "")))
+    context_user_id = normalize_text(str(body.get("context_user_id", "")))
+    context_user_name = normalize_text(str(body.get("context_user_name", "")))
+    context_sender_role = normalize_text(str(body.get("context_sender_role", "")))
+
+    if resolved_type not in {"group", "private"}:
+        raise HTTPException(400, "chat_type 仅支持 group/private")
+    if not peer_id:
+        raise HTTPException(400, "peer_id 不能为空")
+    if not text:
+        raise HTTPException(400, "text 不能为空")
+    if reply_to_message_id and not reply_to_message_id.isdigit():
+        raise HTTPException(400, "reply_to_message_id 必须是数字")
+
+    try:
+        peer_num = int(peer_id)
+    except Exception as exc:
+        raise HTTPException(400, "peer_id 必须是数字") from exc
+
+    if _engine is None:
+        raise HTTPException(503, "引擎未初始化")
+
+    bot_runtime = await _get_onebot_runtime(bot_id=bot_id)
+    bot_self_id = normalize_text(str(getattr(bot_runtime, "self_id", "")))
+
+    queue_cfg = _engine.config.get("queue", {}) if isinstance(getattr(_engine, "config", None), dict) else {}
+    if not isinstance(queue_cfg, dict):
+        queue_cfg = {}
+    isolate_group_by_user = bool(queue_cfg.get("group_isolate_by_user", True))
+    if resolved_type == "group" and isolate_group_by_user:
+        scoped_user = context_user_id or "webui"
+        conversation_id = f"group:{peer_id}:user:{scoped_user}"
+    else:
+        conversation_id = f"{resolved_type}:{peer_id}"
+
+    inferred_user_id = context_user_id or (peer_id if resolved_type == "private" else "webui")
+    inferred_user_name = context_user_name or inferred_user_id or "WebUI 用户"
+    trace_id = f"webui-{uuid.uuid4().hex[:10]}"
+    message_id = f"webui-{int(time.time() * 1000)}"
+
+    async def runtime_api_call(api: str, **kwargs: Any) -> Any:
+        payload = await bot_runtime.call_api(api, **kwargs)
+        return _unwrap_onebot_payload(payload)
+
+    try:
+        from core.engine import EngineMessage
+
+        result = await _engine.handle_message(
+            EngineMessage(
+                conversation_id=conversation_id,
+                user_id=inferred_user_id,
+                user_name=inferred_user_name,
+                text=text,
+                message_id=message_id,
+                seq=int(time.time() * 1000) % 1_000_000_000,
+                queue_depth=0,
+                mentioned=True,
+                is_private=resolved_type == "private",
+                timestamp=datetime.now(timezone.utc),
+                group_id=peer_num if resolved_type == "group" else 0,
+                bot_id=bot_self_id,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_user_id=context_user_id,
+                reply_to_user_name=context_user_name,
+                api_call=runtime_api_call,
+                trace_id=trace_id,
+                sender_role=context_sender_role,
+            )
+        )
+    except Exception as exc:
+        tail = clip_text(normalize_text(str(exc)), 260)
+        raise HTTPException(502, f"AI 处理失败: {tail}") from exc
+
+    if str(getattr(result, "action", "")) == "ignore":
+        return {
+            "ok": True,
+            "status": "ignored",
+            "reason": str(getattr(result, "reason", "")),
+            "conversation_id": conversation_id,
+            "trace_id": trace_id,
+        }
+
+    reply_text = normalize_text(str(getattr(result, "reply_text", "")))
+    image_url = normalize_text(str(getattr(result, "image_url", "")))
+    image_urls = getattr(result, "image_urls", []) or []
+    if not isinstance(image_urls, list):
+        image_urls = []
+    image_urls = [normalize_text(str(x)) for x in image_urls if normalize_text(str(x))]
+    if image_url and image_url not in image_urls:
+        image_urls.insert(0, image_url)
+    video_url = normalize_text(str(getattr(result, "video_url", "")))
+    audio_file = normalize_text(str(getattr(result, "audio_file", "")))
+
+    sent_message_id = ""
+    if reply_text:
+        send_text = f"[CQ:reply,id={reply_to_message_id}] {reply_text}" if reply_to_message_id else reply_text
+        if resolved_type == "group":
+            sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=send_text)
+        else:
+            sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=send_text)
+        if isinstance(sent, dict):
+            sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "")))
+        elif isinstance(sent, int):
+            sent_message_id = str(sent)
+
+    # 轻量媒体下发（避免 404 后完全无反馈）
+    for img in image_urls[:3]:
+        cq = f"[CQ:image,file={img}]"
+        if resolved_type == "group":
+            await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+        else:
+            await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
+
+    if video_url:
+        cq = f"[CQ:video,file={video_url}]"
+        try:
+            if resolved_type == "group":
+                await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+            else:
+                await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
+        except Exception:
+            if resolved_type == "group":
+                await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=f"视频链接: {video_url}")
+            else:
+                await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=f"视频链接: {video_url}")
+
+    if audio_file:
+        cq = f"[CQ:record,file={audio_file}]"
+        try:
+            if resolved_type == "group":
+                await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+            else:
+                await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
+        except Exception:
+            pass
+
+    if not reply_text and not image_urls and not video_url and not audio_file:
+        fallback_text = "处理完成。"
+        if resolved_type == "group":
+            await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=fallback_text)
+        else:
+            await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=fallback_text)
+
+    return {
+        "ok": True,
+        "status": "submitted",
+        "reason": str(getattr(result, "reason", "")),
+        "conversation_id": conversation_id,
+        "trace_id": trace_id,
+        "message_id": sent_message_id,
+    }
 
 
 @router.post("/chat/send-image", dependencies=[Depends(_check_auth)])
