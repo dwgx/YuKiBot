@@ -10,6 +10,7 @@ REPO_URL_DEFAULT="https://github.com/dwgx/YuKiKo.git"
 BRANCH_DEFAULT="main"
 INSTALL_DIR_DEFAULT=""
 KEEP_EXISTING=0
+INSTALL_DIR_EXPLICIT=0
 
 info() { printf '[BOOTSTRAP] %s\n' "$*"; }
 warn() { printf '[BOOTSTRAP][WARN] %s\n' "$*" >&2; }
@@ -74,6 +75,7 @@ parse_args() {
         ;;
       --install-dir)
         INSTALL_DIR="${2:-}"
+        INSTALL_DIR_EXPLICIT=1
         shift 2
         ;;
       --keep-existing)
@@ -96,15 +98,56 @@ parse_args() {
   done
 }
 
+is_yukiko_repo() {
+  local dir="$1"
+  [[ -n "$dir" && -d "$dir/.git" ]] || return 1
+  local remote_url
+  remote_url="$(git -C "$dir" remote get-url origin 2>/dev/null || true)"
+  [[ -n "$remote_url" ]] || return 1
+  local remote_lower
+  remote_lower="${remote_url,,}"
+  [[ "$remote_lower" == *"yukiko"* ]] || return 1
+  return 0
+}
+
+detect_existing_install_dir() {
+  local -a candidates=()
+  if [[ -n "${YUKIKO_ROOT:-}" ]]; then
+    candidates+=("$YUKIKO_ROOT")
+  fi
+  if [[ -n "${HOME:-}" ]]; then
+    candidates+=("$HOME/YuKiKo")
+  fi
+  candidates+=(
+    "/opt/YuKiKo"
+    "/home/ubuntu/YuKiKo"
+    "$PWD/YuKiKo"
+  )
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    [[ -n "$candidate" ]] || continue
+    if is_yukiko_repo "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
 prepare_repo() {
   local repo_url="$1"
   local branch="$2"
   local install_dir="$3"
 
   if [[ -d "$install_dir/.git" ]]; then
-    info "Existing git repo detected: $install_dir"
+    info "Existing git repo detected: $install_dir (auto update mode)"
     git -C "$install_dir" fetch --prune origin
-    git -C "$install_dir" checkout "$branch"
+    if git -C "$install_dir" show-ref --verify --quiet "refs/heads/$branch"; then
+      git -C "$install_dir" checkout "$branch"
+    else
+      git -C "$install_dir" checkout -B "$branch" "origin/$branch"
+    fi
     git -C "$install_dir" pull --ff-only origin "$branch"
     return
   fi
@@ -131,6 +174,15 @@ main() {
   FORWARD_ARGS=()
 
   parse_args "$@"
+
+  if [[ "$INSTALL_DIR_EXPLICIT" -eq 0 ]]; then
+    local existing_install_dir=""
+    existing_install_dir="$(detect_existing_install_dir || true)"
+    if [[ -n "$existing_install_dir" ]]; then
+      INSTALL_DIR="$existing_install_dir"
+      info "Detected existing YuKiKo installation: $INSTALL_DIR"
+    fi
+  fi
 
   if [[ -z "$INSTALL_DIR" ]]; then
     INSTALL_DIR="$(resolve_default_install_dir)"

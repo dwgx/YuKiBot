@@ -53,6 +53,13 @@ interface Plugin {
   internal_only: boolean;
 }
 
+const INPUT_CLASSES = {
+  input:
+    "text-sm !bg-transparent !outline-none !ring-0 focus:!outline-none focus:!ring-0 focus-visible:!outline-none focus-visible:!ring-0",
+  inputWrapper:
+    "bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:bg-content2/70 data-[focus=true]:bg-content2/80 data-[focus=true]:border-primary/55 data-[focus=true]:shadow-[0_0_0_1px_rgba(96,165,250,0.18)] data-[focus=true]:before:!bg-transparent data-[focus=true]:after:!bg-transparent before:!shadow-none after:!shadow-none",
+};
+
 type FieldGroup = {
   name: string;
   items: Array<{ key: string; schema: FieldSchema }>;
@@ -84,8 +91,12 @@ function getFieldGroups(properties: Record<string, FieldSchema>): FieldGroup[] {
   return [...groups.entries()].map(([name, items]) => ({ name, items }));
 }
 
-function parseTextareaValue(schema: FieldSchema, value: string): unknown {
-  if (schema.type === "array") {
+function parseTextareaValue(schema: FieldSchema, value: string, currentValue?: unknown): unknown {
+  const shouldParseArray =
+    schema.type === "array" ||
+    Array.isArray(currentValue) ||
+    Array.isArray(schema.default);
+  if (shouldParseArray) {
     return value
       .split(/[\n,，;；]/g)
       .map((item) => item.trim())
@@ -101,6 +112,7 @@ function parseTextareaValue(schema: FieldSchema, value: string): unknown {
 export default function PluginsPage() {
   const [plugins, setPlugins] = useState<Plugin[]>([]);
   const [rawConfigDrafts, setRawConfigDrafts] = useState<Record<string, string>>({});
+  const [fieldDrafts, setFieldDrafts] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState<string | null>(null);
   const [message, setMessage] = useState("");
@@ -174,6 +186,17 @@ export default function PluginsPage() {
     }));
   };
 
+  const fieldDraftKey = (pluginName: string, fieldKey: string) => `${pluginName}::${fieldKey}`;
+  const clearFieldDraft = (pluginName: string, fieldKey: string) => {
+    const key = fieldDraftKey(pluginName, fieldKey);
+    setFieldDrafts((prev) => {
+      if (!(key in prev)) return prev;
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  };
+
   const handleSave = async (pluginName: string, config: PluginConfig, enabled: boolean) => {
     setSaving(pluginName);
     setMessage("");
@@ -202,6 +225,9 @@ export default function PluginsPage() {
     const currentValue = plugin.config[fieldKey] ?? schema.default ?? "";
     const description = schema.description || "未提供说明";
     const defaultValue = schema.default;
+    const draftKey = fieldDraftKey(plugin.name, fieldKey);
+    const fallbackDisplayValue = Array.isArray(currentValue) ? currentValue.join(", ") : String(currentValue ?? "");
+    const displayValue = fieldDrafts[draftKey] ?? fallbackDisplayValue;
 
     if (schema.type === "boolean") {
       return (
@@ -260,19 +286,32 @@ export default function PluginsPage() {
             <Input
               type="number"
               value={String(currentValue ?? "")}
-              onValueChange={(value) => updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, value))}
+              onValueChange={(value) => updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, value, currentValue))}
               description={[
                 typeof schema.minimum === "number" ? `最小值 ${schema.minimum}` : "",
                 typeof schema.maximum === "number" ? `最大值 ${schema.maximum}` : "",
               ].filter(Boolean).join(" · ")}
+              classNames={INPUT_CLASSES}
             />
           ) : (
             <Textarea
-              value={Array.isArray(currentValue) ? currentValue.join(", ") : String(currentValue ?? "")}
-              onValueChange={(value) => updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, value))}
+              value={displayValue}
+              onValueChange={(value) => {
+                setFieldDrafts((prev) => ({ ...prev, [draftKey]: value }));
+                if (schema.type !== "array" && !Array.isArray(currentValue) && !Array.isArray(schema.default)) {
+                  updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, value, currentValue));
+                  clearFieldDraft(plugin.name, fieldKey);
+                }
+              }}
+              onBlur={() => {
+                const latest = fieldDrafts[draftKey] ?? displayValue;
+                updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, latest, currentValue));
+                clearFieldDraft(plugin.name, fieldKey);
+              }}
               minRows={schema.type === "array" ? 2 : 3}
               maxRows={8}
               description={schema.type === "array" ? "数组字段支持中英文逗号、分号或换行分隔多个值" : undefined}
+              classNames={INPUT_CLASSES}
             />
           )}
         </CardBody>
@@ -308,6 +347,7 @@ export default function PluginsPage() {
               onValueChange={setKeyword}
               placeholder="搜索插件名、配置入口、说明"
               startContent={<Search size={16} className="text-default-400" />}
+              classNames={INPUT_CLASSES}
             />
             <Button variant="flat" startContent={<RefreshCw size={16} />} onPress={loadPlugins}>
               刷新插件清单
@@ -485,6 +525,7 @@ export default function PluginsPage() {
                           // 保持当前编辑体验，不在每次输入时打断。
                         }
                       }}
+                      classNames={INPUT_CLASSES}
                     />
                     <div className="flex justify-end">
                       <Button

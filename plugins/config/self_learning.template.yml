@@ -1,0 +1,37 @@
+# SelfLearning 插件配置模板
+
+# 是否启用自我学习功能
+enabled: true
+
+# 沙盒模式
+# - isolated: 完全隔离的沙盒环境（推荐）
+# - restricted: 受限环境，可访问部分系统资源
+# - full: 完全访问（危险，仅用于开发）
+sandbox_mode: isolated
+
+# 是否自动测试新创建的代码
+auto_test: true
+
+# 是否在群里广播 DEVLOG
+devlog_broadcast: true
+
+# 学习源
+# - web: 从网络搜索学习
+# - docs: 从文档学习
+# - both: 两者都用
+learning_source: both
+
+# 是否保存成功的技能
+save_skills: true
+
+# 最大学习时间（秒）
+max_learning_time_seconds: 300
+
+# 最大代码行数限制
+max_code_lines: 500
+
+# 测试超时时间（秒）
+test_timeout_seconds: 60
+
+# DEVLOG 发送冷却时间（秒）
+devlog_cooldown_seconds: 30
