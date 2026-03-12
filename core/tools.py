@@ -1586,12 +1586,25 @@ class ToolExecutor:
         if not self._is_safe_public_http_url(target):
             return None
 
+        # 为特定平台添加cookie支持
+        headers = dict(self._http_headers)
+        try:
+            host = normalize_text(urlparse(target).netloc).lower()
+            if ("bilibili.com" in host or host.endswith("b23.tv")) and self._bilibili_cookie:
+                headers["Cookie"] = self._bilibili_cookie
+            elif ("douyin.com" in host or "iesdouyin.com" in host) and self._douyin_cookie:
+                headers["Cookie"] = self._douyin_cookie
+            elif ("kuaishou.com" in host or "chenzhongtech.com" in host) and self._kuaishou_cookie:
+                headers["Cookie"] = self._kuaishou_cookie
+        except Exception:
+            pass
+
         timeout = httpx.Timeout(float(self._web_fetch_timeout_seconds), connect=min(8.0, float(self._web_fetch_timeout_seconds)))
         try:
             async with httpx.AsyncClient(
                 timeout=timeout,
                 follow_redirects=True,
-                headers=self._http_headers,
+                headers=headers,
             ) as client:
                 resp = await client.get(target)
         except Exception:
@@ -4634,12 +4647,12 @@ class ToolExecutor:
         if self._looks_like_english_refusal(content):
             return "这张图我这次没法稳定识别完整内容。请发更清晰的图片，或告诉我要识别哪一部分。"
 
+        # 尝试翻译非中文内容
         if self._looks_like_non_chinese_text(content) and self._vision_retry_translate_enable:
             translated = await self._translate_to_chinese(content=content, prompt=prompt)
             if translated:
                 content = translated
-        if self._looks_like_non_chinese_text(content):
-            return "这张图识别到了部分内容，但结果不够稳定。你可以让我继续聚焦识别图里的文字或图标。"
+        # 移除过于严格的二次检查，即使内容包含英文也应返回，而不是丢弃
         return normalize_text(content)
 
     async def _normalize_vision_answer_with_retry(

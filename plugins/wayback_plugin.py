@@ -507,9 +507,37 @@ class Plugin:
         if to_ts:
             params["to"] = _normalize_timestamp(to_ts)
 
-        resp = await client.get(_WAYBACK_CDX_URL, params=params)
-        resp.raise_for_status()
-        data = resp.json()
+        # 添加重试机制处理429错误
+        max_retries = 3
+        retry_delay = 2.0
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                resp = await client.get(_WAYBACK_CDX_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except httpx.HTTPStatusError as exc:
+                last_error = exc
+                if exc.response.status_code == 429 and attempt < max_retries - 1:
+                    _log.warning(
+                        "wayback_cdx_rate_limited | url=%s | attempt=%d/%d | retry_after=%.1fs",
+                        url,
+                        attempt + 1,
+                        max_retries,
+                        retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2  # 指数退避
+                    continue
+                raise
+            except Exception as exc:
+                last_error = exc
+                raise
+
+        if last_error is not None and not isinstance(data, list):
+            raise last_error
         if not isinstance(data, list) or len(data) <= 1:
             return []
 

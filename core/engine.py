@@ -11779,33 +11779,25 @@ class YukikoEngine:
 
 
 
-            # 剥离 ```json {"name":"tool_name",...} ``` 格式的内嵌 tool call
-
-
+            # 剥离内嵌 tool call JSON（兼容 "name"/"tool" 两种字段）
             content = re.sub(
-
-
-                r"```(?:json)?\s*\{[^}]*\"name\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|fetch_url)[^}]*\}[^`]*```",
-
-
-                "", content, flags=re.DOTALL,
-
-
+                r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\")(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*?```",
+                "",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
             )
-
-
-            # 剥离裸露的 {"name":"tool_name",...} JSON tool call（非 code block）
-
-
             content = re.sub(
-
-
-                r'\{\s*"name"\s*:\s*"(?:think|final_answer|analyze_image|search_web|fetch_url)"[^}]*\}',
-
-
-                "", content, flags=re.DOTALL,
-
-
+                r"\{\s*\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\"(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*?\}",
+                "",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            # 兜底：剥离未闭合的 ```json tool call 片段。
+            content = re.sub(
+                r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\")(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*$",
+                "",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
             )
 
 
@@ -11935,6 +11927,16 @@ class YukikoEngine:
                 _log_sanitize.warning("sanitize_leaked_xml_tool_call")
 
 
+                return ""
+
+
+            if re.search(
+                r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"(?:think|final_answer|analyze_image|search_web|web_search|fetch_url)\")",
+                content,
+                flags=re.DOTALL | re.IGNORECASE,
+            ):
+                _log_sanitize = logging.getLogger("yukiko.sanitize")
+                _log_sanitize.warning("sanitize_leaked_tool_call_fenced")
                 return ""
 
 
@@ -17141,4 +17143,3 @@ class YukikoEngine:
 
 
         return bool(re.fullmatch(r"[?？!！~～…,.，]{1,8}", content))
-

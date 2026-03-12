@@ -6619,22 +6619,31 @@ def _make_learn_sticker_handler(model_client: Any) -> ToolHandler:
         if not sticker_mgr:
             return ToolCallResult(ok=False, data={}, display="表情系统未初始化")
 
-        # 从参数或 raw_segments 提取图片 URL / file 标识
+        # 从参数或 raw_segments / reply_media_segments 提取图片 URL / file 标识
         image_url = str(args.get("image_url", "")).strip()
         image_file = str(args.get("image_file", "")).strip()
         image_sub_type = str(args.get("image_sub_type", "")).strip()
+
+        # 优先从当前消息提取，然后从引用消息提取
+        raw_segments = context.get("raw_segments") or []
+        reply_media_segments = context.get("reply_media_segments") or []
+
         if not image_url or not image_file or not image_sub_type:
-            for seg in context.get("raw_segments") or []:
-                if isinstance(seg, dict) and seg.get("type") == "image":
-                    data = seg.get("data") or {}
-                    if not image_url:
-                        image_url = str(data.get("url", "")).strip()
-                    if not image_file:
-                        image_file = str(data.get("file", "")).strip()
-                    if not image_sub_type:
-                        image_sub_type = str(data.get("sub_type", "")).strip()
-                    if image_url and image_file and image_sub_type:
-                        break
+            for segs in (raw_segments, reply_media_segments):
+                for seg in segs:
+                    if isinstance(seg, dict) and seg.get("type") == "image":
+                        data = seg.get("data") or {}
+                        if not image_url:
+                            image_url = str(data.get("url", "")).strip()
+                        if not image_file:
+                            image_file = str(data.get("file", "")).strip()
+                        if not image_sub_type:
+                            image_sub_type = str(data.get("sub_type", "")).strip()
+                        if image_url and image_file and image_sub_type:
+                            break
+                if image_url and image_file and image_sub_type:
+                    break
+
         if not image_url and not image_file:
             return ToolCallResult(ok=False, data={}, display="没有找到图片，请用户发送图片并说'学习表情包'")
 
