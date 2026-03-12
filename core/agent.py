@@ -577,10 +577,23 @@ class AgentLoop:
                         reply_text="", action="reply", reason="agent_llm_error_silent",
                         total_time_ms=self._elapsed(t0),
                     )
-                fallback = _pl.get_message(
-                    "llm_error_fallback",
-                    _pl.get_message("generic_error", "我这边接口抖了，稍等我再试一次。"),
-                )
+                err_text = normalize_text(str(exc)).lower()
+                if (
+                    "http 401" in err_text
+                    or "invalid token" in err_text
+                    or "unauthorized" in err_text
+                    or "无效的令牌" in err_text
+                    or "认证失败" in err_text
+                ):
+                    fallback = _pl.get_message(
+                        "llm_auth_error_fallback",
+                        "AI 服务鉴权失败（令牌无效/过期），请管理员检查 API Key 后重试。",
+                    )
+                else:
+                    fallback = _pl.get_message(
+                        "llm_error_fallback",
+                        _pl.get_message("generic_error", "我这边接口抖了，稍等我再试一次。"),
+                    )
                 return AgentResult(
                     reply_text=fallback,
                     action="reply", reason="agent_llm_error",
@@ -2783,12 +2796,18 @@ class AgentLoop:
             parsed = self._parse_embedded_tool_payload(candidate)
             if parsed:
                 return parsed
+            recovered = self._try_recover_tool_call(candidate)
+            if recovered:
+                return recovered
             first_brace = candidate.find("{")
             last_brace = candidate.rfind("}")
             if first_brace >= 0 and last_brace > first_brace:
                 parsed = self._parse_embedded_tool_payload(candidate[first_brace:last_brace + 1])
                 if parsed:
                     return parsed
+                recovered = self._try_recover_tool_call(candidate[first_brace:last_brace + 1])
+                if recovered:
+                    return recovered
         return None
 
     @staticmethod

@@ -282,6 +282,7 @@ def _built_in_prompts_defaults() -> dict[str, Any]:
             "mention_only_fallback_with_name": "{name}，在。",
             "alias_call_hint": "用户在句首/句尾使用了别名“{alias}”唤醒你，这个别名不是用户想被记录的名字内容。",
             "llm_error_fallback": "刚刚处理失败了，你再发一次我马上重试。",
+            "llm_auth_error_fallback": "AI 服务鉴权失败（令牌无效/过期），请管理员检查 API Key 后重试。",
             "generic_error": "处理失败了，请换个说法再试一次。",
             "no_result": "这次没拿到有效结果，你补充一点信息我再来。",
             "tool_payload_leaked": "检测到模型输出了工具调用格式，我已自动重试处理。",

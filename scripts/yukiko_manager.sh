@@ -26,6 +26,18 @@ run_root() {
   fi
 }
 
+run_root_nonfatal() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if command_exists sudo; then
+    sudo -n "$@"
+    return $?
+  fi
+  return 127
+}
+
 service_path() {
   local service_name="$1"
   printf '/etc/systemd/system/%s.service' "$service_name"
@@ -107,6 +119,7 @@ Examples:
   yukiko --help
   yukiko install --host 0.0.0.0 --port 18081
   yukiko update --check-only
+  yukiko update --no-hot-reload
   yukiko update --restart
   yukiko register --service-name yukiko --user \$USER
   yukiko start
@@ -123,6 +136,7 @@ cmd_update() {
   local install_python=1
   local build_webui=1
   local allow_dirty=0
+  local hot_reload=1
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -148,6 +162,14 @@ cmd_update() {
         ;;
       --allow-dirty)
         allow_dirty=1
+        shift
+        ;;
+      --hot-reload)
+        hot_reload=1
+        shift
+        ;;
+      --no-hot-reload)
+        hot_reload=0
         shift
         ;;
       *)
@@ -247,6 +269,7 @@ cmd_update() {
     fi
   fi
 
+  local hot_reload_done=0
   if [[ "$restart_service" -eq 1 ]]; then
     if [[ -z "$service_name" ]]; then
       error "Service name cannot be empty."
@@ -254,9 +277,38 @@ cmd_update() {
     fi
     info "Restarting service: $service_name"
     run_root systemctl restart "$service_name"
+    hot_reload_done=1
+  elif [[ "$hot_reload" -eq 1 ]]; then
+    if [[ -z "$service_name" ]]; then
+      warn "Service name is empty, skipped automatic hot reload."
+    elif ! command_exists systemctl; then
+      warn "systemctl not found, skipped automatic hot reload."
+    else
+      local svc_path
+      svc_path="$(service_path "$service_name")"
+      if run_root_nonfatal test -f "$svc_path"; then
+        info "Hot reloading service via systemd restart: $service_name"
+        if run_root_nonfatal systemctl restart "$service_name"; then
+          info "Hot reload completed: service restarted."
+          hot_reload_done=1
+        else
+          warn "Hot reload failed: unable to restart service '$service_name'."
+        fi
+      else
+        warn "Service file not found ($svc_path), skipped automatic hot reload."
+      fi
+    fi
   fi
 
-  info "Update flow completed."
+  if [[ "$behind" -gt 0 ]]; then
+    if [[ "$hot_reload_done" -eq 1 ]]; then
+      info "Update flow completed. New code is already active."
+    else
+      warn "Update completed, but automatic hot reload did not finish. Please restart service manually to apply Python code."
+    fi
+  else
+    info "Update flow completed."
+  fi
 }
 
 register_service() {

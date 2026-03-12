@@ -1993,13 +1993,41 @@ async def _onebot_call(api: str, *, bot_id: str = "", **kwargs: Any) -> Any:
 
 
 def _render_message_text(raw_message: Any, segments: Any) -> str:
-    text = normalize_text(str(raw_message))
+    seg_list = segments if isinstance(segments, list) else []
+
+    # NapCat 某些接口会直接把消息段数组塞到 raw_message。
+    if not seg_list and isinstance(raw_message, list):
+        seg_list = raw_message
+
+    text = ""
+    if isinstance(raw_message, str):
+        text = normalize_text(raw_message)
+    elif raw_message is not None and not isinstance(raw_message, (list, dict)):
+        text = normalize_text(str(raw_message))
+    elif isinstance(raw_message, dict):
+        text = (
+            normalize_text(str(raw_message.get("raw_message", "")))
+            or normalize_text(str(raw_message.get("text", "")))
+            or normalize_text(str(raw_message.get("content", "")))
+            or normalize_text(str(raw_message.get("summary", "")))
+            or normalize_text(str(raw_message.get("msg", "")))
+        )
+        if not seg_list:
+            nested = (
+                raw_message.get("message")
+                or raw_message.get("segments")
+                or raw_message.get("msgSegs")
+                or raw_message.get("lastMsgSegs")
+                or raw_message.get("lastestMsg")
+            )
+            if isinstance(nested, list):
+                seg_list = nested
     if text:
         return text
-    if not isinstance(segments, list):
+    if not isinstance(seg_list, list):
         return ""
     parts: list[str] = []
-    for seg in segments:
+    for seg in seg_list:
         if not isinstance(seg, dict):
             continue
         seg_type = normalize_text(str(seg.get("type", ""))).lower()
@@ -2015,7 +2043,119 @@ def _render_message_text(raw_message: Any, segments: Any) -> str:
             parts.append(f"@{qq or 'someone'}")
         elif seg_type:
             parts.append(f"[{seg_type}]")
-    return normalize_text(" ".join(parts))
+    rendered = normalize_text(" ".join(parts))
+    if rendered:
+        return rendered
+    if seg_list:
+        return "[消息]"
+    return ""
+
+
+def _recent_contact_chat_type(item: dict[str, Any]) -> str:
+    raw = (
+        item.get("chatType")
+        or item.get("chat_type")
+        or item.get("conversationType")
+        or item.get("type")
+    )
+    lowered = normalize_text(str(raw)).lower()
+    if lowered in {"2", "group", "group_chat", "grp"}:
+        return "group"
+    with contextlib.suppress(Exception):
+        if int(raw) == 2:
+            return "group"
+    return "private"
+
+
+def _recent_contact_peer_id(item: dict[str, Any]) -> str:
+    direct = (
+        item.get("peerUin")
+        or item.get("peerUid")
+        or item.get("peer_id")
+        or item.get("peerId")
+        or item.get("peerID")
+        or item.get("target_id")
+        or item.get("targetId")
+        or item.get("group_id")
+        or item.get("user_id")
+        or item.get("uin")
+    )
+    peer_id = normalize_text(str(direct))
+    if peer_id:
+        return peer_id
+    peer_obj = item.get("peer", {})
+    if isinstance(peer_obj, dict):
+        nested = (
+            peer_obj.get("uin")
+            or peer_obj.get("uid")
+            or peer_obj.get("id")
+            or peer_obj.get("peerUin")
+            or peer_obj.get("peerUid")
+        )
+        return normalize_text(str(nested))
+    return ""
+
+
+def _recent_contact_peer_name(item: dict[str, Any], peer_id: str) -> str:
+    return (
+        normalize_text(str(item.get("peerName", "")))
+        or normalize_text(str(item.get("peer_name", "")))
+        or normalize_text(str(item.get("remark", "")))
+        or normalize_text(str(item.get("nickname", "")))
+        or normalize_text(str(item.get("groupName", "")))
+        or normalize_text(str(item.get("name", "")))
+        or normalize_text(str(item.get("displayName", "")))
+        or peer_id
+    )
+
+
+def _recent_contact_int(item: dict[str, Any], keys: list[str]) -> int:
+    for key in keys:
+        if key not in item:
+            continue
+        with contextlib.suppress(Exception):
+            return int(item.get(key) or 0)
+    return 0
+
+
+def _recent_contact_last_message(item: dict[str, Any]) -> str:
+    raw_candidate = (
+        item.get("lastMsg")
+        or item.get("lastestMsg")
+        or item.get("last_message")
+        or item.get("lastMessage")
+        or item.get("msgPreview")
+        or item.get("preview")
+        or item.get("msg")
+    )
+    seg_candidate = (
+        item.get("lastMsgSegs")
+        or item.get("lastestMsgSegs")
+        or item.get("last_message_segments")
+        or item.get("lastMessageSegs")
+        or item.get("msgSegs")
+        or item.get("segments")
+    )
+    text = _render_message_text(raw_candidate, seg_candidate)
+    if text:
+        return text
+
+    msg_record = item.get("msgRecord")
+    if isinstance(msg_record, dict):
+        text = _render_message_text(
+            msg_record.get("raw_message", "") or msg_record.get("text", "") or msg_record.get("msg", ""),
+            msg_record.get("message", []) or msg_record.get("segments", []),
+        )
+        if text:
+            return text
+    if raw_candidate is not None:
+        if isinstance(raw_candidate, list) and raw_candidate:
+            return "[消息]"
+        if isinstance(raw_candidate, dict):
+            guessed_type = normalize_text(str(raw_candidate.get("type", ""))).lower()
+            if guessed_type:
+                return f"[{guessed_type}]"
+    return ""
 
 
 def _format_chat_message_item(item: dict[str, Any], *, bot_self_id: str) -> dict[str, Any]:
@@ -2393,16 +2533,14 @@ async def chat_conversations(
     for item in recent:
         if not isinstance(item, dict):
             continue
-        chat_type = "group" if int(item.get("chatType", 0) or 0) == 2 else "private"
-        peer_id = normalize_text(str(item.get("peerUin", "") or item.get("peerUid", "") or item.get("peer_id", "")))
+        chat_type = _recent_contact_chat_type(item)
+        peer_id = _recent_contact_peer_id(item)
         if not peer_id:
             continue
-        peer_name = (
-            normalize_text(str(item.get("peerName", "")))
-            or normalize_text(str(item.get("remark", "")))
-            or peer_id
-        )
-        ts = int(item.get("msgTime", 0) or 0)
+        peer_name = _recent_contact_peer_name(item, peer_id)
+        ts = _recent_contact_int(item, ["msgTime", "lastTime", "last_time", "time", "timestamp"])
+        unread = _recent_contact_int(item, ["unreadCnt", "unread_count", "unreadNum", "unread"])
+        last_message = _recent_contact_last_message(item)
         rows.append(
             {
                 "conversation_id": f"{chat_type}:{peer_id}",
@@ -2410,8 +2548,8 @@ async def chat_conversations(
                 "peer_id": peer_id,
                 "peer_name": peer_name,
                 "last_time": ts,
-                "unread_count": int(item.get("unreadCnt", 0) or 0),
-                "last_message": _render_message_text(item.get("lastMsg", ""), item.get("lastMsgSegs", [])),
+                "unread_count": unread,
+                "last_message": last_message,
             }
         )
 

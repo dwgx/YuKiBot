@@ -323,11 +323,12 @@ class AdminEngine:
             "---------------------\n"
             "Update (Remote)\n"
             "  /yuki update check            check local/remote version\n"
-            "  /yuki update run              pull latest + sync deps + build webui\n"
+            "  /yuki update run              pull latest + sync deps + build webui + auto hot-reload\n"
             "  /yuki update restart          run update and restart service\n"
             "  /yuki update run --no-webui   skip webui build\n"
             "  /yuki update run --no-python  skip pip install\n"
             "  /yuki update run --allow-dirty\n"
+            "  /yuki update run --no-hot-reload\n"
             "---------------------\n"
             "Fuzzy match enabled - typos are auto-corrected"
         )
@@ -483,6 +484,7 @@ class AdminEngine:
                 "/yuki update run\n"
                 "/yuki update restart\n"
                 "/yuki update run --no-webui --no-python --allow-dirty\n"
+                "/yuki update run --no-hot-reload\n"
             )
 
         first = normalize_text(tokens[0]).lower()

@@ -25,6 +25,7 @@ const QUICK_FIELDS: QuickField[] = [
   { path: "messages.mention_only_fallback", label: "空@回复（无名字）", kind: "text" },
   { path: "messages.mention_only_fallback_with_name", label: "空@回复（带名字）", kind: "text" },
   { path: "messages.llm_error_fallback", label: "LLM 错误回复", kind: "text" },
+  { path: "messages.llm_auth_error_fallback", label: "LLM 鉴权失败回复", kind: "text" },
   { path: "messages.generic_error", label: "通用错误回复", kind: "text" },
   { path: "messages.search_followup_recent_media_title", label: "最近媒体结果标题", kind: "text" },
   { path: "messages.search_followup_recent_result_title", label: "最近搜索结果标题", kind: "text" },
