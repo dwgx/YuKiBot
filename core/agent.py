@@ -70,6 +70,7 @@ class AgentContext:
     verbosity: str = "medium"  # verbose / medium / brief / minimal
     output_style_instruction: str = ""  # 额外输出风格指令（可按群覆盖）
     sender_role: str = ""  # "owner" / "admin" / "member" — QQ群内角色
+    event_payload: dict[str, Any] = field(default_factory=dict)  # 原始 OneBot/NapCat 事件快照
     is_whitelisted_group: bool = False  # 当前群是否在白名单中
 
 
@@ -1125,6 +1126,7 @@ class AgentLoop:
                 "reply_to_user_id": ctx.reply_to_user_id,
                 "reply_to_user_name": ctx.reply_to_user_name,
                 "reply_to_text": ctx.reply_to_text,
+                "event_payload": ctx.event_payload,
                 "user_policies": ctx.user_policies,
                 "user_directives": ctx.user_directives,
                 "is_admin_user": perm_level in ("super_admin", "group_admin"),
@@ -1461,6 +1463,93 @@ class AgentLoop:
             return str(runtime_templates.get(key, ""))
         return default
 
+    @staticmethod
+    def _clip_json_for_prompt(payload: Any, max_chars: int = 1100) -> str:
+        try:
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+        except Exception:
+            text = normalize_text(str(payload))
+        return clip_text(normalize_text(text), max_chars)
+
+    def _build_napcat_event_anchor(self, ctx: AgentContext) -> str:
+        payload = ctx.event_payload if isinstance(ctx.event_payload, dict) else {}
+        if not payload:
+            return ""
+        sender = payload.get("sender", {})
+        if not isinstance(sender, dict):
+            sender = {}
+        raw = payload.get("raw", {})
+        if not isinstance(raw, dict):
+            raw = {}
+
+        anchor: dict[str, Any] = {
+            "post_type": payload.get("post_type", ""),
+            "message_type": payload.get("message_type", ""),
+            "sub_type": payload.get("sub_type", ""),
+            "time": payload.get("time", ""),
+            "message_id": payload.get("message_id", ""),
+            "message_seq": payload.get("message_seq", ""),
+            "real_id": payload.get("real_id", ""),
+            "real_seq": payload.get("real_seq", ""),
+            "group_id": payload.get("group_id", ""),
+            "group_name": payload.get("group_name", ""),
+            "user_id": payload.get("user_id", ""),
+            "to_me": bool(payload.get("to_me", False)),
+            "raw_message": clip_text(normalize_text(str(payload.get("raw_message", ""))), 220),
+        }
+        sender_info = {
+            "user_id": sender.get("user_id", ""),
+            "nickname": sender.get("nickname", ""),
+            "card": sender.get("card", ""),
+            "role": sender.get("role", ""),
+        }
+        if any(normalize_text(str(v)) for v in sender_info.values()):
+            anchor["sender"] = sender_info
+
+        if raw:
+            raw_anchor: dict[str, Any] = {}
+            for key in (
+                "id", "msgId", "msgSeq", "msgRandom", "chatType", "msgType", "subMsgType",
+                "sendType", "msgTime", "senderUid", "senderUin", "peerUid", "peerUin",
+                "peerName", "sendNickName", "sendMemberName",
+            ):
+                value = raw.get(key, "")
+                if value not in ("", None):
+                    raw_anchor[key] = value
+
+            elements = raw.get("elements", [])
+            if isinstance(elements, list) and elements:
+                previews: list[dict[str, Any]] = []
+                for element in elements[:3]:
+                    if not isinstance(element, dict):
+                        continue
+                    item: dict[str, Any] = {
+                        "elementType": element.get("elementType", ""),
+                    }
+                    text_ele = element.get("textElement", {})
+                    if isinstance(text_ele, dict):
+                        text_content = normalize_text(str(text_ele.get("content", "")))
+                        if text_content:
+                            item["text"] = clip_text(text_content, 80)
+                    if element.get("picElement") is not None:
+                        item["hasPic"] = True
+                    if element.get("videoElement") is not None:
+                        item["hasVideo"] = True
+                    if element.get("pttElement") is not None:
+                        item["hasPtt"] = True
+                    previews.append(item)
+                if previews:
+                    raw_anchor["elements_preview"] = previews
+                if len(elements) > 3:
+                    raw_anchor["elements_more"] = len(elements) - 3
+            if raw_anchor:
+                anchor["napcat_raw"] = raw_anchor
+
+        compact = self._clip_json_for_prompt(anchor, max_chars=1300)
+        if not compact:
+            return ""
+        return f"[NapCat事件锚点]\n{compact}"
+
     def _build_user_message(self, ctx: AgentContext) -> str:
         """构建用户消息。"""
         runtime_templates = _pl.get_dict("agent_runtime")
@@ -1468,6 +1557,10 @@ class AgentLoop:
         parts = [ctx.message_text]
         if rebuilt_query and rebuilt_query != normalize_text(ctx.message_text):
             parts.append(f"[语境补全: {rebuilt_query}]")
+
+        event_anchor = self._build_napcat_event_anchor(ctx)
+        if event_anchor:
+            parts.append(event_anchor)
 
         # @提及的其他用户（非 bot 自身）
         if ctx.at_other_user_ids:

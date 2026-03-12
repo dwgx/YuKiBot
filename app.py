@@ -1367,7 +1367,13 @@ def register_handlers(engine: YukikoEngine) -> None:
     @router.handle()
     async def handle_message(bot: Bot, event: MessageEvent) -> None:
         raw_segments = _extract_raw_segments(event)
-        _log_qq_message_event(event=event, raw_segments=raw_segments, bot_id=str(bot.self_id))
+        event_payload = _event_to_dict(event)
+        _log_qq_message_event(
+            event=event,
+            raw_segments=raw_segments,
+            bot_id=str(bot.self_id),
+            raw_payload=event_payload,
+        )
         if str(event.get_user_id()) == str(bot.self_id):
             return
 
@@ -1632,6 +1638,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             api_call=api_call,
             trace_id=trace_id,
             sender_role=_extract_sender_role(event),
+            event_payload=event_payload,
         )
         video_pre_ack_sent = False
         queue_cfg = queue_cfg_rt
@@ -2416,7 +2423,12 @@ def _event_timestamp(event: MessageEvent) -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _log_qq_message_event(event: MessageEvent, raw_segments: list[dict[str, Any]], bot_id: str) -> None:
+def _log_qq_message_event(
+    event: MessageEvent,
+    raw_segments: list[dict[str, Any]],
+    bot_id: str,
+    raw_payload: dict[str, Any] | None = None,
+) -> None:
     conversation_id = _build_conversation_id(event)
     message_type = str(getattr(event, "message_type", "") or "")
     group_id = int(getattr(event, "group_id", 0) or 0)
@@ -2426,7 +2438,7 @@ def _log_qq_message_event(event: MessageEvent, raw_segments: list[dict[str, Any]
         plain = normalize_text(event.get_plaintext())
     except Exception:
         plain = ""
-    raw_payload = _event_to_dict(event)
+    payload = raw_payload if isinstance(raw_payload, dict) else _event_to_dict(event)
     segment_summary = _summarize_segments(raw_segments)
     _log.info(
         "qq_recv | bot=%s | type=%s | conversation=%s | group=%s | user=%s | message_id=%s | plain=%s | segments=%s | raw=%s",
@@ -2438,7 +2450,7 @@ def _log_qq_message_event(event: MessageEvent, raw_segments: list[dict[str, Any]
         message_id or "-",
         clip_text(plain, 180) if plain else "-",
         segment_summary,
-        _safe_json_dumps(raw_payload, max_chars=900),
+        _safe_json_dumps(payload, max_chars=900),
     )
 
 

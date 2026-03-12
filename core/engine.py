@@ -228,6 +228,9 @@ class EngineMessage:
 
     sender_role: str = ""  # "owner" / "admin" / "member" — 来自 OneBot sender.role
 
+    # 原始 OneBot/NapCat 事件快照（用于 Agent 上下文和工具侧高级判断）
+    event_payload: dict[str, Any] = field(default_factory=dict)
+
 
 
 
@@ -6111,6 +6114,7 @@ class YukikoEngine:
 
 
                 sender_role=message.sender_role or "",
+                event_payload=message.event_payload or {},
 
 
                 is_whitelisted_group=self.admin.is_group_whitelisted(message.group_id) if not message.is_private else False,

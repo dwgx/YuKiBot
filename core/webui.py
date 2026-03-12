@@ -3127,6 +3127,23 @@ async def chat_agent_text(request: Request):
                 api_call=runtime_api_call,
                 trace_id=trace_id,
                 sender_role=context_sender_role,
+                event_payload={
+                    "post_type": "message",
+                    "message_type": resolved_type,
+                    "sub_type": "webui",
+                    "user_id": inferred_user_id,
+                    "group_id": peer_num if resolved_type == "group" else 0,
+                    "group_name": "",
+                    "message_id": message_id,
+                    "raw_message": text,
+                    "sender": {
+                        "user_id": inferred_user_id,
+                        "nickname": inferred_user_name,
+                        "card": inferred_user_name,
+                        "role": context_sender_role or "member",
+                    },
+                    "raw": {"source": "webui"},
+                },
             )
         )
     except Exception as exc:
