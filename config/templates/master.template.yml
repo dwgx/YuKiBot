@@ -194,16 +194,16 @@ config:
     non_whitelist_mode: silent
   trigger:
     ai_listen_enable: true
-    delegate_undirected_to_ai: true
-    ai_listen_min_messages: 2
-    ai_listen_min_score: 1.2
+    delegate_undirected_to_ai: false
+    ai_listen_min_messages: 3
+    ai_listen_min_score: 1.5
     followup_reply_window_seconds: 30
     followup_max_turns: 3
   routing:
     min_confidence: 0.55
     followup_min_confidence: 0.5
-    non_directed_min_confidence: 0.72
-    ai_gate_min_confidence: 0.66
+    non_directed_min_confidence: 0.80
+    ai_gate_min_confidence: 0.75
     followup_fast_path_enable: false
     zero_threshold_disables_undirected: true
     mode: ai_full
@@ -211,8 +211,8 @@ config:
   self_check:
     enable: true
     block_at_other: true
-    listen_probe_min_confidence: 0.6
-    non_direct_reply_min_confidence: 0.82
+    listen_probe_min_confidence: 0.78
+    non_direct_reply_min_confidence: 0.88
     cross_user_guard_seconds: 45
   queue:
     group_concurrency: 3
