@@ -1,50 +1,45 @@
-# PLUGIN_GUIDE
+# Plugin Guide
 
-## 简体中文
+## Overview
 
-插件配置建议使用“每插件一个模板文件”：
+YuKiKo supports hot-pluggable plugins in the `plugins/` directory. Each plugin has its own config file in `plugins/config/`.
 
-- 位置：`plugins/config/<plugin_name>.yml`
-- WebUI 插件页会读取 schema，按字段渲染配置
-- 保存后可从 `/api/webui/plugins` 系列接口查看最新状态
+## Config Location
 
-重点模板：
+| Type | Path |
+|------|------|
+| Plugin code | `plugins/<name>.py` |
+| Plugin config | `plugins/config/<name>.yml` |
+| Plugin template | See `plugins/example_plugin.py` |
 
-- NewAPI：`plugins/config/newapi.yml`
-- ConnectCLI：`plugins/config/connect_cli.yml`
+WebUI's plugin page reads each plugin's schema and renders editable fields. Saving writes back to the correct config file.
 
-详细参数说明请看：
+## Built-in Plugins
 
-- [zh-CN/GUIDE.md](zh-CN/GUIDE.md)
+| Plugin | Config File | Description |
+|--------|-------------|-------------|
+| NewAPI | `plugins/config/newapi.yml` | Payment/topup integration |
+| Wayback | `plugins/config/wayback.yml` | Internet Archive lookup |
+| ConnectCLI | `plugins/config/connect_cli.yml` | External CLI tool integration |
 
-## 繁體中文
+## Plugin Lifecycle
 
-建議採用「每個插件一個 yml」：
+```
+needs_setup() → interactive_setup() → setup() → handle() → teardown()
+```
 
-- 路徑：`plugins/config/<plugin_name>.yml`
-- 可在 WebUI 插件列表逐項管理，不必打開超大配置頁
+Plugins can:
+- Register Agent tools
+- Provide prompt hints
+- Inject context into conversations
+- Define their own config schema for WebUI rendering
 
-常用模板：
+## Writing a Plugin
 
-- `plugins/config/newapi.yml`
-- `plugins/config/connect_cli.yml`
+See [`plugins/example_plugin.py`](../plugins/example_plugin.py) for a complete template with comments.
 
-詳細說明：
-
-- [zh-TW/GUIDE.md](zh-TW/GUIDE.md)
-
-## English
-
-Use per-plugin template files:
-
-- Path: `plugins/config/<plugin_name>.yml`
-- Plugin UI can render schema-based fields from each plugin config
-
-Common templates:
-
-- `plugins/config/newapi.yml`
-- `plugins/config/connect_cli.yml`
-
-Details:
-
-- [en/GUIDE.md](en/GUIDE.md)
+Key points:
+- Inherit from the plugin base class
+- Define `config_schema` for WebUI integration
+- Implement `handle()` for message processing
+- Use `plugins/config/<your_plugin>.yml` for configuration

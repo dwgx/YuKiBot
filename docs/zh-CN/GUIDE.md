@@ -1,238 +1,324 @@
-# YuKiKo Bot 使用指南（简体中文）
+# YuKiKo Bot 部署与使用指南
 
-本指南按实际使用顺序写：先部署，再配置参数，最后讲所有运行方式。  
-目标是让你拿到仓库后，最快时间跑起来并稳定维护。
+本指南覆盖从零开始到稳定运行的完整流程，适用于 Linux / Windows / macOS。
 
-如果你准备发布上线，建议直接配合这份超详细手册一起使用：
+---
 
-- `docs/zh-CN/RELEASE_PLAYBOOK.md`（发布/升级/回滚/排障/Checklist，一次性覆盖）
-- `docs/zh-CN/PROJECT_DEEP_SUMMARY.md`（项目架构深度总结 + Prompt 维护 + 代码维护策略，700+ 行）
+## 目录
 
-## 1. 部署前准备
+- [1. 环境准备](#1-环境准备)
+  - [1.1 Linux（Ubuntu / Debian / CentOS）](#11-linuxubuntu--debian--centos)
+  - [1.2 Windows](#12-windows)
+  - [1.3 macOS](#13-macos)
+- [2. 部署安装](#2-部署安装)
+  - [2.1 Linux 一键部署](#21-linux-一键部署推荐)
+  - [2.2 Windows 部署](#22-windows-部署)
+  - [2.3 macOS 部署](#23-macos-部署)
+  - [2.4 手动部署（全平台）](#24-手动部署全平台)
+- [3. 连接 NapCat](#3-连接-napcat)
+- [4. 首次启动与 WebUI](#4-首次启动与-webui)
+- [5. 配置详解](#5-配置详解)
+- [6. 运行模式](#6-运行模式)
+- [7. 运维管理](#7-运维管理)
+- [8. 故障排查](#8-故障排查)
+- [9. 进阶文档](#9-进阶文档)
 
-### 1.1 环境要求
+---
 
-- Python 3.10+（建议 3.11 或 3.12）
-- Node.js 18+（用于构建 WebUI）
-- npm（随 Node.js 安装）
-- 已可用的 OneBot V11 服务（例如 NapCat）
+## 1. 环境准备
 
-### 1.2 克隆与进入目录
+### 1.1 Linux（Ubuntu / Debian / CentOS）
 
-```bash
-git clone <your-repo-url> YuKiKo
-cd YuKiKo
-```
+> 一键安装脚本会自动处理以下依赖，如果你使用 `install.sh` 可以跳过本节。
 
-### 1.3 准备环境变量
-
-```bash
-cp .env.example .env
-```
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-至少先改这几项：
-
-- `ONEBOT_ACCESS_TOKEN`：必须和 OneBot 服务保持一致
-- `WEBUI_TOKEN`：WebUI API 访问 token，务必改成随机字符串
-- `HOST` / `PORT`：按你本机和反向代理规划设置
-
-### 1.4 NapCat WS（反向 WebSocket）怎么配
-
-这部分 Linux / Windows 配置完全一致，只有 IP 地址可能不同。
-
-在 NapCat 的 OneBot V11 页面按下面填：
-
-1. 连接模式：`反向 WebSocket (Reverse WS)`
-2. WS 上报地址：`ws://<YuKiKo主机>:<PORT>/onebot/v11/ws`
-3. Access Token：`与 .env 的 ONEBOT_ACCESS_TOKEN 完全一致`
-4. 保存并启用
-
-示例（同机部署）：
-
-```text
-ws://127.0.0.1:8081/onebot/v11/ws
-```
-
-示例（跨机器）：
-
-```text
-ws://192.168.1.50:8081/onebot/v11/ws
-```
-
-`.env` 最小示例：
-
-```env
-HOST=0.0.0.0
-PORT=8081
-ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
-```
-
-注意：
-
-1. 如果 YuKiKo 在 Docker/云服务器，请放通 `PORT` 并确认路由可达。
-2. YuKiKo 的 WS 接入路径是 `/onebot/v11/ws`（也兼容 `/onebot/v11/`，推荐 `/onebot/v11/ws`）。
-
-## 2. 快速部署启动（推荐）
-
-### 2.1 Linux 一键部署（1Panel 风格）
+**Ubuntu / Debian：**
 
 ```bash
-bash install.sh
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip nodejs npm ffmpeg git curl
 ```
 
-GitHub 远程脚本直装（不用先手动 clone）：
+**CentOS / RHEL：**
+
+```bash
+sudo yum install -y python3 python3-pip nodejs npm ffmpeg git curl
+# 如果 yum 没有 ffmpeg，使用 RPM Fusion：
+# sudo yum install -y epel-release
+# sudo yum install -y ffmpeg
+```
+
+验证版本：
+
+```bash
+python3 --version   # 需要 3.10+
+node --version      # 需要 18+
+ffmpeg -version
+```
+
+### 1.2 Windows
+
+1. **Python 3.10+**
+   - 下载：https://www.python.org/downloads/
+   - 安装时务必勾选 **"Add Python to PATH"**
+   - 验证：打开 PowerShell，运行 `python --version`
+
+2. **Node.js 18+**
+   - 下载：https://nodejs.org/ （选 LTS 版本）
+   - 验证：`node --version` 和 `npm --version`
+
+3. **ffmpeg**
+   - 下载：https://www.gyan.dev/ffmpeg/builds/ （选 `ffmpeg-release-essentials.zip`）
+   - 解压到任意目录（如 `C:\ffmpeg`）
+   - 将 `C:\ffmpeg\bin` 添加到系统环境变量 PATH
+   - 验证：重启 PowerShell，运行 `ffmpeg -version`
+
+4. **Git**
+   - 下载：https://git-scm.com/download/win
+   - 验证：`git --version`
+
+### 1.3 macOS
+
+```bash
+# 使用 Homebrew
+brew install python@3.12 node ffmpeg git
+
+# 验证
+python3 --version
+node --version
+ffmpeg -version
+```
+
+---
+
+## 2. 部署安装
+
+### 2.1 Linux 一键部署（推荐）
+
+**远程一键安装（无需手动 clone）：**
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
-非交互直装示例：
+**本地安装（已 clone 仓库）：**
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+bash install.sh
 ```
 
-你会按步骤填写：
-
-- `HOST`（监听地址）
-- `PORT`（自定义端口）
-- `WEBUI_TOKEN`
-- systemd 服务名
+安装脚本会交互式询问：
+- 监听地址（HOST）和端口（PORT）
+- WebUI 管理令牌（WEBUI_TOKEN）
+- 是否注册 systemd 服务
 - 是否自动放行防火墙端口
+- 是否安装 NapCat
 
-脚本会自动完成：
+脚本自动完成：
+- 系统依赖安装（Python / Node.js / npm / ffmpeg）
+- Python 虚拟环境创建与依赖安装
+- WebUI 前端构建
+- `.env` 配置写入
+- systemd 服务注册（可选）
+- `yukiko` CLI 工具安装到 `/usr/local/bin/`
 
-- 系统依赖安装（Python/Node.js/npm/ffmpeg 等）
-- 虚拟环境和 Python 依赖部署
-- WebUI 构建
-- 写入 `.env` 的 `HOST/PORT`
-- 可选创建并启动 systemd 服务
-
-非交互示例（适合自动化）：
-
-```bash
-bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
-```
-
-常用运维命令：
+**非交互模式（适合自动化）：**
 
 ```bash
-yukiko --help
-yukiko update --check-only
-yukiko update --restart
-yukiko status
-yukiko logs --lines 200
-yukiko stop
-yukiko start
-yukiko register --service-name yukiko
-yukiko unregister --service-name yukiko
-yukiko uninstall --purge-runtime --purge-env
+bash install.sh --non-interactive --host 0.0.0.0 --port 8081 --service-name yukiko --open-firewall
 ```
 
-### 2.2 Windows 一键启动
+### 2.2 Windows 部署
 
-```bat
-start.bat
+```powershell
+# 克隆项目
+git clone https://github.com/dwgx/YuKiKo.git
+cd YuKiKo
+
+# 复制环境变量文件
+Copy-Item .env.example .env
+
+# 用记事本或 VS Code 编辑 .env，至少填写：
+#   ONEBOT_ACCESS_TOKEN=你的NapCat令牌
+#   WEBUI_TOKEN=一个随机字符串
+
+# 一键启动（自动创建虚拟环境 + 安装依赖 + 启动）
+.\start.bat
 ```
 
-### 2.3 Linux / macOS 一键启动（轻量模式）
+> `start.bat` 会自动检测虚拟环境，如果不存在会自动创建并安装依赖。
 
-```bash
-bash start.sh
-```
-
-这两个脚本会自动检查 `.venv` 是否可用。  
-如果虚拟环境缺失或损坏，会自动调用 `scripts/deploy.py --run` 做安装并启动。
-
-### 2.4 手动部署（可控模式）
-
-```bash
-python scripts/deploy.py
-python scripts/deploy.py --run
-```
-
-- `python scripts/deploy.py`：只做环境修复和依赖安装
-- `python scripts/deploy.py --run`：修复后直接运行 `main.py`
-
-## 3. 首次启动与 WebUI
-
-当 `config/config.yml` 不存在时：
-
-- 系统会进入首次配置模式
-- 如果 `webui/dist` 已构建，会提示打开 `/webui/setup`
-- 如果未构建，会自动回退到 CLI 向导
-
-构建 WebUI：
-
-Windows:
+**手动构建 WebUI（可选但推荐）：**
 
 ```bat
 build-webui.bat
 ```
 
-Linux / macOS:
+### 2.3 macOS 部署
 
 ```bash
-bash build-webui.sh
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+cp .env.example .env
+# 编辑 .env，填写 ONEBOT_ACCESS_TOKEN 和 WEBUI_TOKEN
+bash start.sh
 ```
 
-手动构建：
+### 2.4 手动部署（全平台）
+
+适合需要完全控制部署过程的用户：
 
 ```bash
-cd webui
-npm install
-npm run build
+# 1. 克隆
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+
+# 2. 创建虚拟环境
+python3 -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+# .venv\Scripts\activate         # Windows PowerShell
+# .venv\Scripts\activate.bat     # Windows CMD
+
+# 3. 安装 Python 依赖
+pip install -r requirements.txt
+
+# 4. 复制并编辑环境变量
+cp .env.example .env
+# 编辑 .env
+
+# 5. 构建 WebUI（可选）
+cd webui && npm install && npm run build && cd ..
+
+# 6. 启动
+python main.py
 ```
 
-## 4. 参数设置（核心）
+也可以使用部署脚本：
 
-参数分三层：`.env`、`config/config.yml`、`plugins/config/*.yml`。
+```bash
+python scripts/deploy.py          # 仅安装依赖
+python scripts/deploy.py --run    # 安装依赖后直接启动
+```
 
-### 4.1 `.env`（运行环境与密钥）
+---
 
-参考文件：`.env.example`。
+## 3. 连接 NapCat
 
-高频项：
+YuKiKo 通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 的 OneBot V11 协议接入 QQ。
 
-- `HOST` / `PORT`：服务监听地址与端口
-- `ONEBOT_API_TIMEOUT`：OneBot API 超时，发大文件建议调高
-- `ONEBOT_ACCESS_TOKEN`：OneBot 鉴权
-- `WEBUI_TOKEN`：WebUI API 鉴权
-- `SKIAPI_KEY` / `OPENAI_API_KEY` / `NEWAPI_API_KEY` 等：上游模型密钥
+### 安装 NapCat
 
-建议：
+Linux 安装脚本会自动检测并提示安装。手动安装：
 
-- 生产环境不要把真实密钥提交到 Git
-- 使用不同 token 区分测试环境和正式环境
+```bash
+curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh && bash napcat.sh
+```
 
-### 4.2 `config/config.yml`（全局业务参数）
+Windows 用户请从 [NapCat Releases](https://github.com/NapNeko/NapCatQQ/releases) 下载。
 
-模板来源：`config/templates/master.template.yml`。  
-`core/config_templates.py` 会负责默认值与自愈。
+### 配置反向 WebSocket
 
-重点分组：
+在 NapCat 的 OneBot V11 设置页面：
 
-- `bot`：机器人名字、昵称、回复形式、短呼叫词等
-- `api`：模型供应商、模型名、base_url、超时、token 上限
-- `agent`：Agent 步数、超时、高风险控制
-- `routing`：路由置信度与路由策略
-- `self_check`：本地自检阈值与防误接话控制
-- `queue`：并发、取消策略、中断策略
-- `music`：本地音源/解锁音源参数
-- `search`：网页抓取、视频解析、视觉分析参数
+| 配置项 | 值 |
+|--------|-----|
+| 连接模式 | 反向 WebSocket (Reverse WS) |
+| WS 上报地址 | `ws://<YuKiKo地址>:<端口>/onebot/v11/ws` |
+| Access Token | 与 `.env` 中 `ONEBOT_ACCESS_TOKEN` 完全一致 |
 
-### 4.3 `plugins/config/*.yml`（插件级参数模板）
+**示例：**
 
-这层是你提出的“模板化好操控”核心实践。  
-每个插件一个独立 yml，便于在 WebUI 插件页分插件管理。
+```text
+# 同机部署
+ws://127.0.0.1:8081/onebot/v11/ws
 
-#### NewAPI 模板示例（`plugins/config/newapi.yml`）
+# 跨机器（填 YuKiKo 所在机器的局域网 IP）
+ws://192.168.1.50:8081/onebot/v11/ws
+```
+
+**注意事项：**
+- Linux 和 Windows 配置方式完全一致，只是 IP 地址不同
+- Docker / 云服务器部署时，确保端口已放行且路由可达
+- WS 路径推荐 `/onebot/v11/ws`（也兼容 `/onebot/v11/`）
+
+---
+
+## 4. 首次启动与 WebUI
+
+首次启动时，如果 `config/config.yml` 不存在：
+- 如果 WebUI 已构建（`webui/dist` 存在），会提示访问 `/webui/setup` 完成配置
+- 如果未构建，会自动进入 CLI 配置向导
+
+**构建 WebUI：**
+
+| 平台 | 命令 |
+|------|------|
+| Linux / macOS | `bash build-webui.sh` |
+| Windows | `build-webui.bat` |
+| 手动 | `cd webui && npm install && npm run build` |
+
+**访问 WebUI：**
+
+```
+http://<HOST>:<PORT>/webui/login
+```
+
+使用 `.env` 中的 `WEBUI_TOKEN` 登录。WebUI 提供：
+- 配置在线编辑（热更新）
+- 插件管理
+- 系统提示词编辑
+- 在线聊天测试
+- 实时日志查看
+- 数据库导出/导入
+- 系统状态与版本检查
+
+---
+
+## 5. 配置详解
+
+YuKiKo 采用三层配置体系，优先级从高到低：
+
+### 5.1 `.env` — 环境变量与密钥
+
+基于 `.env.example`，包含运行时敏感信息：
+
+| 字段 | 说明 | 必填 |
+|------|------|------|
+| `HOST` | 监听地址（默认 `127.0.0.1`） | 是 |
+| `PORT` | 监听端口（默认 `8081`） | 是 |
+| `ONEBOT_ACCESS_TOKEN` | NapCat 鉴权令牌 | 是 |
+| `WEBUI_TOKEN` | WebUI 管理面板令牌 | 是 |
+| `SKIAPI_KEY` | 默认 AI 模型 API Key | 按需 |
+| `OPENAI_API_KEY` | OpenAI API Key | 按需 |
+| `DEEPSEEK_API_KEY` | DeepSeek API Key | 按需 |
+| `ANTHROPIC_API_KEY` | Claude API Key | 按需 |
+| `GEMINI_API_KEY` | Gemini API Key | 按需 |
+| `ONEBOT_API_TIMEOUT` | OneBot API 超时秒数（大文件建议调高） | 否 |
+
+> 生产环境切勿将真实密钥提交到 Git。
+
+### 5.2 `config/config.yml` — 全局业务配置
+
+首次启动时从 `config/templates/master.template.yml` 自动生成。支持通过 WebUI 在线编辑。
+
+| 分组 | 说明 |
+|------|------|
+| `bot` | 机器人名称、昵称、回复形式、分段策略、短呼叫词 |
+| `api` | 模型供应商、模型名、base_url、温度、max_tokens、超时 |
+| `agent` | Agent 最大步数、超时、工具调用策略、高风险控制 |
+| `routing` | 路由置信度阈值、路由模式（`ai_full` / `keyword` 等） |
+| `self_check` | 本地自检阈值、防误接话控制 |
+| `queue` | 并发数、智能中断、消息 TTL、取消策略 |
+| `music` | 本地音源、解锁源、歌手一致性保护 |
+| `search` | 网页抓取超时、视频解析、视觉分析 |
+| `safety` | 内容安全等级 |
+| `admin` | 超级管理员 QQ、白名单群 |
+
+配置缺失字段会自动从模板补齐（自愈机制），升级后无需手动迁移。
+
+### 5.3 `plugins/config/*.yml` — 插件独立配置
+
+每个插件一份独立 YAML 文件，在 WebUI 插件页可视化编辑。
+
+示例 `plugins/config/newapi.yml`：
 
 ```yaml
 enabled: true
@@ -241,118 +327,80 @@ response:
   force_plain_text: true
   strip_markdown_chars: true
 payment:
-  auto_require_method_selection_when_multiple: true
   auto_prefer_methods:
     - alipay
-  auto_fallback_method_when_info_unavailable: wxpay
-  include_epay_submit_url: true
-privacy_guard:
-  enabled: true
-  recall_message: true
-  notify_group: true
-  notify_private: true
 ```
 
-#### ConnectCLI 模板示例（`plugins/config/connect_cli.yml`）
+---
 
-```yaml
-enabled: true
-default_provider: codex_cli
-timeout_seconds: 120
-max_output_chars: 8000
-token_saving: false
-safety_mode: true
-inject_context: true
-filter_output: true
-open_mode: embedded
-providers:
-  codex_cli:
-    enabled: true
-    command: codex
-    model: gpt-5.4
-    api_key: ""
-```
+## 6. 运行模式
 
-## 5. 音乐接口维护建议（避免乱源）
+| 模式 | 命令 | 说明 |
+|------|------|------|
+| 正常启动 | `python main.py` | 标准运行模式 |
+| 一键启动 | `start.bat` / `bash start.sh` | 自动检查环境，缺失则自动修复 |
+| 首次配置 | 自动触发 | `config/config.yml` 不存在时进入 |
+| 强制 CLI 配置 | `python main.py --setup` | 跳过 WebUI，直接 CLI 向导 |
+| 仅部署 | `python scripts/deploy.py` | 只安装依赖，不启动 |
+| 部署并启动 | `python scripts/deploy.py --run` | 安装依赖后直接运行 |
 
-核心参数在 `config/config.yml -> music`：
+---
 
-- `local_source_enable`：是否启用本地源
-- `unblock_enable`：是否启用解锁源
-- `unblock_sources`：解锁源列表（逗号分隔）
-- `artist_guard_enable`：是否启用歌手一致性保护
+## 7. 运维管理
 
-稳定建议：
+### Linux systemd 服务
 
-- 先开 `local_source_enable=true`，验证本地链路稳定
-- `unblock_sources` 仅放真正解锁源（如 `qq,kuwo,migu`）
-- 避免混入不稳定或用途不同的 source，减少错误路由
-- 保持 `artist_guard_enable=true`，降低“播错歌”概率
-
-## 6. 所有运行方式（完整清单）
-
-### 6.1 正常运行模式
+安装脚本会注册 `yukiko` CLI 工具：
 
 ```bash
-python main.py
+yukiko status              # 查看服务状态
+yukiko logs --lines 200    # 查看最近日志
+yukiko restart             # 重启服务
+yukiko stop / start        # 停止 / 启动
+yukiko update --check-only # 检查是否有新版本
+yukiko update --restart    # 拉取更新并重启
+yukiko register            # 注册 systemd 服务
+yukiko unregister          # 注销 systemd 服务
+yukiko uninstall           # 卸载（可加 --purge-runtime --purge-env）
 ```
 
-或使用脚本：
+### WebUI 运维功能
 
-- Windows: `start.bat`
-- Linux/macOS: `bash start.sh`
+Dashboard 页面提供：
+- GitHub 版本检查与一键代码拉取
+- Python 依赖同步
+- WebUI 重新构建
+- 多会话 AI 并发状态监控
 
-### 6.2 首次配置 WebUI 模式（自动触发）
+Database 页面提供：
+- 数据库文件导出
+- SQLite 文件导入（自动备份旧库到 `storage/backups/db/`）
 
-触发条件：`config/config.yml` 不存在。  
-入口：`http://<HOST>:<PORT>/webui/setup`（需先构建前端）。
+---
 
-### 6.3 强制 CLI 配置模式
+## 8. 故障排查
 
-```bash
-python main.py --setup
-```
+| 问题 | 解决方案 |
+|------|----------|
+| `ModuleNotFoundError` | 运行 `python scripts/deploy.py` 重新安装依赖 |
+| WebUI 503 / 打不开 | 前端未构建：`cd webui && npm install && npm run build` |
+| NapCat 连不上 | 检查 `ONEBOT_ACCESS_TOKEN` 是否一致，WS 地址格式是否正确 |
+| 插件配置不生效 | 检查 `plugins/config/<name>.yml` 是否存在，或在 WebUI 插件页重新保存 |
+| ffmpeg 找不到 | Linux: `sudo apt install ffmpeg`；Windows: 下载后加入 PATH |
+| pip 安装超时 | 使用国内镜像：`pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple` |
+| Node.js 版本过低 | 升级到 18+：Linux 可用 `nvm install 18`；Windows 重新下载 LTS |
+| 端口被占用 | 修改 `.env` 中的 `PORT`，或查找占用进程：`lsof -i:<PORT>`（Linux）/ `netstat -ano | findstr <PORT>`（Windows） |
+| 配置文件损坏 | 删除 `config/config.yml`，重启后会从模板自动重建 |
+| 虚拟环境损坏 | 删除 `.venv` 目录，重新运行 `start.sh` / `start.bat` 或 `python scripts/deploy.py` |
 
-或：
+---
 
-```bash
-python main.py setup
-```
+## 9. 进阶文档
 
-### 6.4 仅部署不启动
-
-```bash
-python scripts/deploy.py
-```
-
-### 6.5 部署后立即启动
-
-```bash
-python scripts/deploy.py --run
-```
-
-### 6.6 仅构建前端
-
-```bash
-bash build-webui.sh
-```
-
-或 Windows:
-
-```bat
-build-webui.bat
-```
-
-## 7. 故障排查速查
-
-- 报 `ModuleNotFoundError`：先跑 `python scripts/deploy.py`
-- WebUI 503：前端没构建，执行 `npm run build`
-- OneBot 连不上：检查 `ONEBOT_ACCESS_TOKEN` 与上游是否一致
-- 插件参数不生效：检查对应 `plugins/config/<name>.yml` 与 WebUI 插件页保存结果
-
-## 8. 原理文档
-
-- 架构与数据流：`docs/zh-CN/ARCHITECTURE.md`
-- 里面包含 Agent、Router、自检、队列、插件配置模板的协作关系
-- 深度总结与维护手册：`docs/zh-CN/PROJECT_DEEP_SUMMARY.md`
-
+| 文档 | 说明 |
+|------|------|
+| [架构说明](ARCHITECTURE.md) | 消息链路、Router、Agent、Self-check 设计原理 |
+| [深度总结](PROJECT_DEEP_SUMMARY.md) | 项目架构深度分析、Prompt 维护、代码维护策略（700+ 行） |
+| [发布运维手册](RELEASE_PLAYBOOK.md) | 发布/升级/回滚/排障 SOP、400+ 项 Checklist |
+| [插件开发指南](../PLUGIN_GUIDE.md) | 插件配置模板与开发规范 |
+| [English Guide](../en/GUIDE.md) | English deployment & configuration guide |

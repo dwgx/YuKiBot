@@ -6,22 +6,21 @@ import {
   Bot,
   Clock,
   CloudDownload,
-  Copy,
   Cpu,
+  FileText,
   GitBranch,
   MessageSquare,
   Puzzle,
   RefreshCw,
-  Rocket,
+  Settings,
   Shield,
+  Terminal,
   Users,
   Wrench,
 } from "lucide-react";
 import { api, StatusData, SystemUpdateStatus } from "../api/client";
 import { NotificationContainer } from "../components/notification";
 import { useNotifications } from "../hooks/useNotifications";
-
-const FALLBACK_REPO_URL = "https://github.com/dwgx/YuKiKo";
 
 function formatUptime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -30,12 +29,6 @@ function formatUptime(seconds: number): string {
   if (h > 0) return `${h}h ${m}m`;
   if (m > 0) return `${m}m ${s}s`;
   return `${s}s`;
-}
-
-function deriveBootstrapUrl(repoUrl: string): string {
-  const match = repoUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)$/i);
-  if (!match) return "";
-  return `https://raw.githubusercontent.com/${match[1]}/${match[2]}/main/bootstrap.sh`;
 }
 
 const cardClass = clsx(
@@ -116,16 +109,6 @@ export default function DashboardPage() {
     return () => clearInterval(timer);
   }, [fetchStatus, fetchUpdateStatus]);
 
-  const copyText = useCallback(async (text: string, label: string) => {
-    if (!text) return;
-    try {
-      await navigator.clipboard.writeText(text);
-      success("已复制", `${label} 已复制到剪贴板`);
-    } catch (e: unknown) {
-      danger("复制失败", e instanceof Error ? e.message : "无法访问剪贴板");
-    }
-  }, [danger, success]);
-
   const runLatestUpdate = useCallback(async () => {
     setRunningUpdate(true);
     try {
@@ -147,23 +130,6 @@ export default function DashboardPage() {
       void fetchUpdateStatus();
     }
   }, [danger, fetchUpdateStatus, success]);
-
-  const repoUrl = useMemo(
-    () => updateInfo?.repo_http_url || FALLBACK_REPO_URL,
-    [updateInfo?.repo_http_url],
-  );
-  const bootstrapUrl = useMemo(
-    () => updateInfo?.bootstrap_url || deriveBootstrapUrl(repoUrl),
-    [repoUrl, updateInfo?.bootstrap_url],
-  );
-  const windowsZipUrl = useMemo(
-    () => updateInfo?.windows_zip_url || `${repoUrl}/archive/refs/heads/main.zip`,
-    [repoUrl, updateInfo?.windows_zip_url],
-  );
-  const vpsCommand = useMemo(
-    () => (bootstrapUrl ? `bash <(curl -fsSL ${bootstrapUrl})` : ""),
-    [bootstrapUrl],
-  );
 
   if (statusError && !data) {
     return <p className="text-danger">{statusError}</p>;
@@ -300,44 +266,37 @@ export default function DashboardPage() {
               <Card className={cardClass}>
                 <CardBody className="space-y-4 p-5">
                   <div>
-                    <p className="text-sm font-semibold">VPS 部署与 Windows 下载</p>
-                    <p className="text-xs text-default-500">
-                      Linux VPS 走一键 bootstrap，Windows 直接下载仓库 ZIP 或启动本地脚本。
-                    </p>
-                  </div>
-                  <div className="rounded-2xl border border-default-200/60 bg-content2/40 p-4">
-                    <p className="text-xs text-default-500">Linux VPS 一键部署命令</p>
-                    <code className="mt-2 block break-all text-xs">{vpsCommand || "等待仓库地址加载..."}</code>
+                    <p className="text-sm font-semibold">快捷导航</p>
+                    <p className="text-xs text-default-500">常用管理页面入口</p>
                   </div>
                   <div className="grid gap-2 sm:grid-cols-2">
                     <Button
                       variant="flat"
-                      startContent={<Copy size={16} />}
-                      onPress={() => void copyText(vpsCommand, "VPS 部署命令")}
-                      isDisabled={!vpsCommand}
+                      startContent={<Settings size={16} />}
+                      onPress={() => window.location.assign("/webui/config")}
                     >
-                      复制 VPS 命令
+                      配置编辑
                     </Button>
                     <Button
                       variant="flat"
-                      startContent={<Rocket size={16} />}
-                      onPress={() => window.open(updateInfo?.guide_url || `${repoUrl}/blob/main/docs/zh-CN/GUIDE.md`, "_blank", "noopener,noreferrer")}
+                      startContent={<Puzzle size={16} />}
+                      onPress={() => window.location.assign("/webui/plugins")}
                     >
-                      打开部署文档
+                      插件管理
                     </Button>
                     <Button
                       variant="flat"
-                      startContent={<CloudDownload size={16} />}
-                      onPress={() => window.open(windowsZipUrl, "_blank", "noopener,noreferrer")}
+                      startContent={<FileText size={16} />}
+                      onPress={() => window.location.assign("/webui/prompts")}
                     >
-                      Windows ZIP 下载
+                      提示词编辑
                     </Button>
                     <Button
                       variant="flat"
-                      startContent={<GitBranch size={16} />}
-                      onPress={() => window.open(repoUrl, "_blank", "noopener,noreferrer")}
+                      startContent={<Terminal size={16} />}
+                      onPress={() => window.location.assign("/webui/logs")}
                     >
-                      打开 GitHub 仓库
+                      实时日志
                     </Button>
                   </div>
                 </CardBody>
@@ -352,36 +311,29 @@ export default function DashboardPage() {
               <Card className={cardClass}>
                 <CardBody className="space-y-4 p-5">
                   <div>
-                    <p className="text-sm font-semibold">多会话 AI 并发</p>
-                    <p className="text-xs text-default-500">
-                      这里直接显示运行时队列配置，确保不同会话可以同时思考和回复。
-                    </p>
+                    <p className="text-sm font-semibold">队列与路由</p>
+                    <p className="text-xs text-default-500">当前消息处理管线状态</p>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-2xl border border-default-200/60 bg-content2/40 p-3">
+                      <p className="text-xs text-default-400">并发槽位</p>
+                      <p className="mt-1 text-lg font-semibold">{data.queue.group_concurrency}</p>
+                    </div>
+                    <div className="rounded-2xl border border-default-200/60 bg-content2/40 p-3">
+                      <p className="text-xs text-default-400">活跃会话</p>
+                      <p className="mt-1 text-lg font-semibold">{data.queue.active_conversations}</p>
+                    </div>
                   </div>
                   <div className="flex flex-wrap gap-2">
-                    <Chip
-                      size="sm"
-                      variant="flat"
-                      color={data.queue.multi_conversation_enabled ? "success" : "warning"}
-                    >
-                      {data.queue.multi_conversation_enabled ? "多会话并发已启用" : "当前受单会话限制"}
+                    <Chip size="sm" variant="flat" color={data.queue.multi_conversation_enabled ? "success" : "warning"}>
+                      {data.queue.multi_conversation_enabled ? "多会话并发" : "串行模式"}
+                    </Chip>
+                    <Chip size="sm" variant="flat" color={data.agent_enabled ? "success" : "default"}>
+                      Agent {data.agent_enabled ? "开启" : "关闭"}
                     </Chip>
                     <Chip size="sm" variant="flat" color="primary">
-                      每会话并发槽位 {data.queue.group_concurrency}
+                      安全尺度 {data.safety_scale}
                     </Chip>
-                    <Chip size="sm" variant="flat" color="secondary">
-                      活跃会话 {data.queue.active_conversations}
-                    </Chip>
-                  </div>
-                  <div className="rounded-2xl border border-default-200/60 bg-content2/40 p-4 text-xs text-default-600">
-                    <p>
-                      `single_inflight_per_conversation = {String(data.queue.single_inflight_per_conversation)}`
-                    </p>
-                    <p className="mt-1">
-                      `max_concurrent_total = {data.queue.max_concurrent_total || 0}`
-                    </p>
-                    <p className="mt-3">
-                      当前配置下，不同会话的 AI 任务可以并行执行；如果你把总并发硬限制成 1，才会重新退化成全局串行。
-                    </p>
                   </div>
                 </CardBody>
               </Card>

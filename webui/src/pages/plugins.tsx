@@ -290,15 +290,15 @@ export default function PluginsPage() {
 
   return (
     <div className="space-y-5">
-      <Card className="overflow-hidden border border-default-200/80 bg-[radial-gradient(circle_at_top_left,rgba(59,130,246,0.18),transparent_42%),linear-gradient(135deg,rgba(255,255,255,0.92),rgba(244,247,255,0.82))] shadow-sm">
+      <Card className="overflow-hidden border border-default-200/80 bg-[radial-gradient(circle_at_top_left,rgba(59,130,246,0.12),transparent_42%)] shadow-sm">
         <CardBody className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
-            <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary-700">
+            <div className="inline-flex items-center gap-2 rounded-full border border-primary/20 bg-primary/10 px-3 py-1 text-xs font-medium text-primary">
               <Sparkles size={14} />
               插件配置工作台
             </div>
-            <h2 className="mt-3 text-2xl font-semibold tracking-tight text-default-900">把插件参数调成真正可维护的状态</h2>
-            <p className="mt-2 max-w-3xl text-sm text-default-600">
+            <h2 className="mt-3 text-2xl font-semibold tracking-tight">把插件参数调成真正可维护的状态</h2>
+            <p className="mt-2 max-w-3xl text-sm text-default-500">
               这里会同时展示插件来源、实际写回位置、配置向导提示和按分组整理后的字段。改完直接热重载，不用再猜配置应该落在哪个文件。
             </p>
           </div>
@@ -317,7 +317,7 @@ export default function PluginsPage() {
       </Card>
 
       {message && (
-        <Card className={`border ${message.includes("失败") ? "border-danger/30 bg-danger-50/70" : "border-success/30 bg-success-50/70"} shadow-none`}>
+        <Card className={`border ${message.includes("失败") ? "border-danger/30 bg-danger/10" : "border-success/30 bg-success/10"} shadow-none`}>
           <CardBody className="text-sm">{message}</CardBody>
         </Card>
       )}
@@ -414,7 +414,7 @@ export default function PluginsPage() {
                         </CardBody>
                       </Card>
                     </div>
-                    <Card className="border border-default-200/70 bg-[linear-gradient(135deg,rgba(59,130,246,0.08),rgba(255,255,255,0.7))] shadow-none">
+                    <Card className="border border-default-200/70 bg-primary/5 shadow-none">
                       <CardBody className="gap-3">
                         <div className="flex items-center gap-2 text-sm font-semibold text-default-800">
                           <Wrench size={16} />

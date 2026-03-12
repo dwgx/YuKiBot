@@ -1,348 +1,261 @@
-# YuKiKo Bot Guide (English)
+# YuKiKo Bot — Deployment & Usage Guide
 
-This guide is intentionally ordered for real usage:
+Complete guide covering setup from scratch on Linux, Windows, and macOS.
 
-1. Deploy and boot fast
-2. Configure parameters
-3. Understand all runtime modes
+---
+
+## Table of Contents
+
+- [1. Prerequisites](#1-prerequisites)
+- [2. Installation](#2-installation)
+- [3. Connecting NapCat](#3-connecting-napcat)
+- [4. First Run & WebUI](#4-first-run--webui)
+- [5. Configuration](#5-configuration)
+- [6. Runtime Modes](#6-runtime-modes)
+- [7. Operations](#7-operations)
+- [8. Troubleshooting](#8-troubleshooting)
+
+---
 
 ## 1. Prerequisites
 
-- Python 3.10+ (3.11/3.12 recommended)
-- Node.js 18+ (for WebUI build)
-- npm
-- A working OneBot V11 service (for example NapCat)
+| Dependency | Version | Notes |
+|-----------|---------|-------|
+| Python | 3.10+ | 3.11 / 3.12 recommended |
+| Node.js | 18+ | For building WebUI |
+| ffmpeg | Latest | Audio/video processing |
+| Git | Latest | For cloning the repo |
+| OneBot V11 | — | [NapCat](https://github.com/NapNeko/NapCatQQ) recommended |
 
-Clone:
-
-```bash
-git clone <your-repo-url> YuKiKo
-cd YuKiKo
-```
-
-Copy env file:
+### Linux (Ubuntu / Debian)
 
 ```bash
-cp .env.example .env
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip nodejs npm ffmpeg git curl
 ```
 
-On Windows PowerShell:
+### Windows
 
-```powershell
-Copy-Item .env.example .env
-```
+1. **Python**: https://www.python.org/downloads/ — check "Add to PATH" during install
+2. **Node.js**: https://nodejs.org/ — LTS version
+3. **ffmpeg**: https://www.gyan.dev/ffmpeg/builds/ — add `bin` folder to system PATH
+4. **Git**: https://git-scm.com/download/win
 
-Minimum values to set first:
-
-- `ONEBOT_ACCESS_TOKEN` (must match OneBot side)
-- `WEBUI_TOKEN` (set a strong random token)
-- `HOST` and `PORT`
-
-### 1.1 NapCat WS (Reverse WebSocket) Setup
-
-This part is the same on Linux and Windows. Only the host/IP may differ.
-
-In NapCat OneBot V11 settings, fill:
-
-1. Connection mode: `Reverse WebSocket`
-2. WS target URL: `ws://<YuKiKo-host>:<PORT>/onebot/v11/ws`
-3. Access Token: exactly the same as `.env` `ONEBOT_ACCESS_TOKEN`
-4. Save and enable
-
-Same-machine example:
-
-```text
-ws://127.0.0.1:8081/onebot/v11/ws
-```
-
-Cross-machine example:
-
-```text
-ws://192.168.1.50:8081/onebot/v11/ws
-```
-
-Minimal `.env` example:
-
-```env
-HOST=0.0.0.0
-PORT=8081
-ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
-```
-
-Notes:
-
-1. If YuKiKo runs in Docker or cloud VM, make sure `PORT` is reachable from NapCat host.
-2. YuKiKo WS endpoint is `/onebot/v11/ws` (it also accepts `/onebot/v11/`, but `/onebot/v11/ws` is recommended).
-
-## 2. Quick Deploy and Start
-
-### 2.1 Linux one-click deploy (1Panel-like)
+### macOS
 
 ```bash
-bash install.sh
+brew install python@3.12 node ffmpeg git
 ```
 
-Direct remote bootstrap from GitHub (no manual clone required):
+---
+
+## 2. Installation
+
+### Linux — One-Click Deploy (Recommended)
+
+No manual clone needed:
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
-Non-interactive remote install example:
+The script handles everything: system deps, Python venv, WebUI build, systemd service.
+
+<details>
+<summary>Non-interactive mode</summary>
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) \
+  -- --non-interactive --host 0.0.0.0 --port 8081 --service-name yukiko --open-firewall
 ```
+</details>
 
-The installer asks for:
-
-- `HOST`
-- `PORT` (fully custom)
-- `WEBUI_TOKEN`
-- systemd service name
-- whether to open firewall port automatically
-
-It then performs:
-
-- system package install
-- Python venv + requirements bootstrap
-- WebUI build
-- `.env` updates for `HOST`/`PORT`
-- optional systemd create + start
-
-Non-interactive example:
+<details>
+<summary>Already cloned? Use local installer</summary>
 
 ```bash
-bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+bash install.sh
+```
+</details>
+
+### Windows
+
+```powershell
+git clone https://github.com/dwgx/YuKiKo.git
+cd YuKiKo
+Copy-Item .env.example .env
+# Edit .env — set ONEBOT_ACCESS_TOKEN and WEBUI_TOKEN
+.\start.bat
 ```
 
-Service operations:
+### macOS
 
 ```bash
-yukiko --help
-yukiko update --check-only
-yukiko update --restart
-yukiko status
-yukiko logs --lines 200
-yukiko stop
-yukiko start
-yukiko register --service-name yukiko
-yukiko unregister --service-name yukiko
-yukiko uninstall --purge-runtime --purge-env
-```
-
-### 2.2 One-command startup scripts
-
-Windows:
-
-```bat
-start.bat
-```
-
-Linux/macOS:
-
-```bash
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+cp .env.example .env
+# Edit .env — set ONEBOT_ACCESS_TOKEN and WEBUI_TOKEN
 bash start.sh
 ```
 
-Both scripts validate local `.venv`.  
-If missing/unhealthy, they auto-run `scripts/deploy.py --run`.
-
-### 2.3 Manual bootstrap
+### Manual Setup (All Platforms)
 
 ```bash
-python scripts/deploy.py
-python scripts/deploy.py --run
-```
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
 
-- `deploy.py`: bootstrap only
-- `deploy.py --run`: bootstrap + run `main.py`
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate        # Linux / macOS
+# .venv\Scripts\activate         # Windows
 
-## 3. First Run and WebUI Setup
+# Install dependencies
+pip install -r requirements.txt
 
-If `config/config.yml` does not exist:
+# Copy and edit env file
+cp .env.example .env
 
-- App enters setup flow
-- If `webui/dist` exists, setup is served at `/webui/setup`
-- If not built, it falls back to CLI setup wizard
+# Build WebUI (optional but recommended)
+cd webui && npm install && npm run build && cd ..
 
-Build WebUI:
-
-Windows:
-
-```bat
-build-webui.bat
-```
-
-Linux/macOS:
-
-```bash
-bash build-webui.sh
-```
-
-Manual:
-
-```bash
-cd webui
-npm install
-npm run build
-```
-
-## 4. Parameter Configuration
-
-Configuration is layered:
-
-1. `.env`
-2. `config/config.yml`
-3. `plugins/config/*.yml`
-
-### 4.1 `.env` (runtime and secrets)
-
-Based on `.env.example`. Important keys:
-
-- `HOST`, `PORT`
-- `ONEBOT_API_TIMEOUT`
-- `ONEBOT_ACCESS_TOKEN`
-- `WEBUI_TOKEN`
-- provider keys such as `SKIAPI_KEY`, `OPENAI_API_KEY`, `NEWAPI_API_KEY`
-
-### 4.2 `config/config.yml` (global behavior)
-
-Template source: `config/templates/master.template.yml`  
-Defaults + healing logic: `core/config_templates.py`
-
-Main sections:
-
-- `bot`
-- `api`
-- `agent`
-- `routing`
-- `self_check`
-- `queue`
-- `music`
-- `search`
-
-### 4.3 `plugins/config/*.yml` (plugin templates)
-
-This is the practical way to avoid one giant config page.  
-Each plugin keeps its own file and can be managed in plugin list UI.
-
-Example `plugins/config/newapi.yml`:
-
-```yaml
-enabled: true
-display_name: skiapi
-response:
-  force_plain_text: true
-  strip_markdown_chars: true
-payment:
-  auto_require_method_selection_when_multiple: true
-  auto_prefer_methods:
-    - alipay
-  auto_fallback_method_when_info_unavailable: wxpay
-  include_epay_submit_url: true
-privacy_guard:
-  enabled: true
-  recall_message: true
-  notify_group: true
-  notify_private: true
-```
-
-Example `plugins/config/connect_cli.yml`:
-
-```yaml
-enabled: true
-default_provider: codex_cli
-timeout_seconds: 120
-max_output_chars: 8000
-token_saving: false
-safety_mode: true
-inject_context: true
-filter_output: true
-open_mode: embedded
-providers:
-  codex_cli:
-    enabled: true
-    command: codex
-    model: gpt-5.4
-    api_key: ""
-```
-
-## 5. Music Interface Maintenance
-
-Focus on `config/config.yml -> music`:
-
-- `local_source_enable`
-- `unblock_enable`
-- `unblock_sources`
-- `artist_guard_enable`
-
-Recommended stability strategy:
-
-- Keep local source stable first
-- Keep `unblock_sources` limited to true unblock providers
-- Do not mix unrelated sources into unblock list
-- Keep artist guard enabled to reduce wrong-song playback
-
-## 6. All Runtime Modes
-
-### 6.1 Normal mode
-
-```bash
+# Start
 python main.py
 ```
 
-or use startup scripts (`start.bat` / `start.sh`).
+---
 
-### 6.2 Auto setup mode
+## 3. Connecting NapCat
 
-Triggered when `config/config.yml` is missing.  
-Serves setup page at `/webui/setup` if frontend is built.
+YuKiKo connects to QQ via [NapCat](https://github.com/NapNeko/NapCatQQ) using the OneBot V11 protocol.
 
-### 6.3 Forced CLI setup mode
+In NapCat's OneBot V11 settings:
+
+| Setting | Value |
+|---------|-------|
+| Connection mode | Reverse WebSocket |
+| WS URL | `ws://<YuKiKo-host>:<PORT>/onebot/v11/ws` |
+| Access Token | Must match `ONEBOT_ACCESS_TOKEN` in `.env` |
+
+```text
+# Same machine
+ws://127.0.0.1:8081/onebot/v11/ws
+
+# Cross-machine (use YuKiKo host's LAN IP)
+ws://192.168.1.50:8081/onebot/v11/ws
+```
+
+> The Linux installer auto-detects and offers to install NapCat. Manual install:
+> ```bash
+> curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh && bash napcat.sh
+> ```
+
+---
+
+## 4. First Run & WebUI
+
+On first launch (when `config/config.yml` doesn't exist):
+- If WebUI is built → setup wizard at `/webui/setup`
+- If not built → falls back to CLI setup wizard
+
+**Build WebUI:**
+
+| Platform | Command |
+|----------|---------|
+| Linux / macOS | `bash build-webui.sh` |
+| Windows | `build-webui.bat` |
+| Manual | `cd webui && npm install && npm run build` |
+
+**Access WebUI:** `http://<HOST>:<PORT>/webui/login` — log in with your `WEBUI_TOKEN`.
+
+---
+
+## 5. Configuration
+
+YuKiKo uses a three-layer config system:
+
+| Layer | File | Purpose |
+|-------|------|---------|
+| Environment | `.env` | Ports, secrets, API keys |
+| Global config | `config/config.yml` | Bot behavior, model params, routing |
+| Plugin configs | `plugins/config/*.yml` | Per-plugin settings |
+
+### .env Key Fields
+
+| Field | Description | Required |
+|-------|-------------|----------|
+| `HOST` | Listen address (default `127.0.0.1`) | Yes |
+| `PORT` | Listen port (default `8081`) | Yes |
+| `ONEBOT_ACCESS_TOKEN` | NapCat auth token | Yes |
+| `WEBUI_TOKEN` | WebUI admin token | Yes |
+| `SKIAPI_KEY` | Default AI model API key | As needed |
+| `OPENAI_API_KEY` | OpenAI API key | As needed |
+
+Full reference: [`.env.example`](../../.env.example)
+
+### config.yml Sections
+
+Auto-generated from template on first run. Editable via WebUI.
+
+| Section | Description |
+|---------|-------------|
+| `bot` | Name, nicknames, reply format, message splitting |
+| `api` | Model provider, model name, base_url, temperature, max_tokens |
+| `agent` | Max steps, timeouts, tool call strategy |
+| `routing` | Confidence thresholds, routing mode |
+| `queue` | Concurrency, smart interrupt, message TTL |
+| `music` | Music sources, unlock sources, artist guard |
+| `search` | Web scraping, video parsing, vision analysis |
+
+Missing fields are auto-filled from the template (self-healing).
+
+---
+
+## 6. Runtime Modes
+
+| Mode | Command | Description |
+|------|---------|-------------|
+| Normal | `python main.py` | Standard run |
+| Quick start | `start.bat` / `bash start.sh` | Auto-checks env, repairs if needed |
+| First-time setup | Automatic | Triggered when config is missing |
+| Force CLI setup | `python main.py --setup` | Skip WebUI, use CLI wizard |
+| Deploy only | `python scripts/deploy.py` | Install deps without starting |
+| Deploy & run | `python scripts/deploy.py --run` | Install deps then start |
+
+---
+
+## 7. Operations
+
+### Linux systemd (via `yukiko` CLI)
 
 ```bash
-python main.py --setup
+yukiko status              # Service status
+yukiko logs --lines 200    # Recent logs
+yukiko restart             # Restart service
+yukiko stop / start        # Stop / start
+yukiko update --check-only # Check for updates
+yukiko update --restart    # Pull updates and restart
+yukiko uninstall           # Uninstall
 ```
 
-or:
+---
 
-```bash
-python main.py setup
-```
+## 8. Troubleshooting
 
-### 6.4 Bootstrap only
+| Issue | Solution |
+|-------|----------|
+| `ModuleNotFoundError` | Run `python scripts/deploy.py` |
+| WebUI 503 | Build frontend: `cd webui && npm install && npm run build` |
+| NapCat won't connect | Check token match and WS URL format |
+| Plugin config not applied | Check `plugins/config/<name>.yml` or re-save in WebUI |
+| ffmpeg not found | Install it and add to PATH |
+| pip timeout | Use mirror: `pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple` |
+| Port in use | Change `PORT` in `.env` or find the process using it |
+| Broken config | Delete `config/config.yml` and restart (auto-rebuilds from template) |
+| Broken venv | Delete `.venv` and re-run `start.sh` / `start.bat` |
 
-```bash
-python scripts/deploy.py
-```
+---
 
-### 6.5 Bootstrap then run
+## Further Reading
 
-```bash
-python scripts/deploy.py --run
-```
-
-### 6.6 Frontend build only
-
-```bash
-bash build-webui.sh
-```
-
-Windows:
-
-```bat
-build-webui.bat
-```
-
-## 7. Quick Troubleshooting
-
-- `ModuleNotFoundError`: run `python scripts/deploy.py`
-- WebUI 503: build frontend (`npm run build`)
-- OneBot connection issues: verify token and upstream endpoint
-- Plugin config not applied: verify `plugins/config/<name>.yml` and save/reload in WebUI
-
-## 8. Principles and Internals
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for message flow, self-check logic, and template strategy.
-
+- [Architecture Notes](ARCHITECTURE.md) — message pipeline, Router, Agent, Self-check design
+- [简体中文指南](../zh-CN/GUIDE.md) — Chinese deployment guide
+- [Plugin Guide](../PLUGIN_GUIDE.md) — plugin development

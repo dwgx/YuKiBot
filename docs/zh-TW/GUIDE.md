@@ -1,347 +1,161 @@
-# YuKiKo Bot 使用指南（繁體中文）
+# YuKiKo Bot 部署與使用指南（繁體中文）
 
-本指南依照實際操作順序編排：先部署、再調參、最後看完整運行模式。  
-目標是讓你快速上線，後續也好維護。
+本指南涵蓋從零開始到穩定運行的完整流程，適用於 Linux / Windows / macOS。
 
-## 1. 部署前準備
+---
 
-### 1.1 環境需求
+## 目錄
 
-- Python 3.10+（建議 3.11 或 3.12）
-- Node.js 18+（用於建置 WebUI）
-- npm
-- 可用的 OneBot V11 服務（例如 NapCat）
+- [1. 環境準備](#1-環境準備)
+- [2. 部署安裝](#2-部署安裝)
+- [3. 連接 NapCat](#3-連接-napcat)
+- [4. 首次啟動與 WebUI](#4-首次啟動與-webui)
+- [5. 設定詳解](#5-設定詳解)
+- [6. 運行模式](#6-運行模式)
+- [7. 維運管理](#7-維運管理)
+- [8. 故障排查](#8-故障排查)
 
-### 1.2 下載與進入專案
+---
 
-```bash
-git clone <your-repo-url> YuKiKo
-cd YuKiKo
-```
+## 1. 環境準備
 
-### 1.3 建立環境變數檔
+| 依賴 | 版本 | 說明 |
+|------|------|------|
+| Python | 3.10+ | 建議 3.11 / 3.12 |
+| Node.js | 18+ | 建置 WebUI 用 |
+| ffmpeg | 最新 | 音視頻處理 |
+| OneBot V11 | — | 建議 [NapCat](https://github.com/NapNeko/NapCatQQ) |
 
-```bash
-cp .env.example .env
-```
-
-Windows PowerShell:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-至少先調整：
-
-- `ONEBOT_ACCESS_TOKEN`：必須和 OneBot 端一致
-- `WEBUI_TOKEN`：WebUI API 保護 token，請改成隨機值
-- `HOST` / `PORT`：依實際部署環境設定
-
-### 1.4 NapCat WS（反向 WebSocket）設定
-
-這部分 Linux / Windows 參數一致，只有主機位址可能不同。
-
-在 NapCat 的 OneBot V11 設定頁請填：
-
-1. 連線模式：`反向 WebSocket (Reverse WS)`
-2. WS 上報位址：`ws://<YuKiKo主機>:<PORT>/onebot/v11/ws`
-3. Access Token：必須和 `.env` 的 `ONEBOT_ACCESS_TOKEN` 完全一致
-4. 儲存並啟用
-
-同機範例：
-
-```text
-ws://127.0.0.1:8081/onebot/v11/ws
-```
-
-跨機範例：
-
-```text
-ws://192.168.1.50:8081/onebot/v11/ws
-```
-
-`.env` 最小範例：
-
-```env
-HOST=0.0.0.0
-PORT=8081
-ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
-```
-
-注意：
-
-1. 若 YuKiKo 跑在 Docker 或雲主機，請先放通 `PORT` 並確認路由可達。
-2. YuKiKo WS 入口為 `/onebot/v11/ws`（也相容 `/onebot/v11/`，建議使用 `/onebot/v11/ws`）。
-
-## 2. 快速部署啟動（建議）
-
-### 2.1 Linux 一鍵部署（1Panel 風格）
+### Linux（Ubuntu / Debian）
 
 ```bash
-bash install.sh
+sudo apt update
+sudo apt install -y python3 python3-venv python3-pip nodejs npm ffmpeg git curl
 ```
 
-GitHub 遠端腳本直裝（不用先手動 clone）：
+### Windows
+
+1. **Python**: https://www.python.org/downloads/ （安裝時勾選 "Add to PATH"）
+2. **Node.js**: https://nodejs.org/ （LTS 版本）
+3. **ffmpeg**: https://www.gyan.dev/ffmpeg/builds/ （解壓後將 `bin` 加入 PATH）
+4. **Git**: https://git-scm.com/download/win
+
+### macOS
+
+```bash
+brew install python@3.12 node ffmpeg git
+```
+
+---
+
+## 2. 部署安裝
+
+### Linux 一鍵部署（建議）
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
-非互動直裝範例：
+腳本自動完成：系統依賴 → Python 虛擬環境 → WebUI 建置 → systemd 服務。
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+### Windows
+
+```powershell
+git clone https://github.com/dwgx/YuKiKo.git
+cd YuKiKo
+Copy-Item .env.example .env
+# 編輯 .env，填寫 ONEBOT_ACCESS_TOKEN 和 WEBUI_TOKEN
+.\start.bat
 ```
 
-你會逐步設定：
-
-- `HOST`（監聽位址）
-- `PORT`（自訂端口）
-- `WEBUI_TOKEN`
-- systemd 服務名稱
-- 是否自動放行防火牆端口
-
-腳本會自動完成：
-
-- 系統依賴安裝（Python/Node.js/npm/ffmpeg 等）
-- 虛擬環境與 Python 套件部署
-- WebUI 建置
-- 寫入 `.env` 的 `HOST/PORT`
-- 可選建立並啟動 systemd 服務
-
-非互動模式範例：
+### macOS
 
 ```bash
-bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
-```
-
-常用維運命令：
-
-```bash
-yukiko --help
-yukiko update --check-only
-yukiko update --restart
-yukiko status
-yukiko logs --lines 200
-yukiko stop
-yukiko start
-yukiko register --service-name yukiko
-yukiko unregister --service-name yukiko
-yukiko uninstall --purge-runtime --purge-env
-```
-
-### 2.2 Windows 一鍵啟動
-
-```bat
-start.bat
-```
-
-### 2.3 Linux / macOS 一鍵啟動（輕量模式）
-
-```bash
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+cp .env.example .env
+# 編輯 .env
 bash start.sh
 ```
 
-以上腳本會先檢查 `.venv` 健康狀態。  
-若虛擬環境缺失或壞掉，會自動走 `scripts/deploy.py --run` 重新部署。
-
-### 2.4 手動部署
+### 手動部署
 
 ```bash
-python scripts/deploy.py
-python scripts/deploy.py --run
-```
-
-- `python scripts/deploy.py`：只做環境與依賴修復
-- `python scripts/deploy.py --run`：修復完成後直接啟動
-
-## 3. 首次啟動與 WebUI
-
-若 `config/config.yml` 不存在：
-
-- 系統會進入首次設定模式
-- 若 `webui/dist` 存在，會導向 `/webui/setup`
-- 若前端尚未建置，會回退到 CLI 設定精靈
-
-建置 WebUI：
-
-Windows:
-
-```bat
-build-webui.bat
-```
-
-Linux / macOS:
-
-```bash
-bash build-webui.sh
-```
-
-手動：
-
-```bash
-cd webui
-npm install
-npm run build
-```
-
-## 4. 參數設定（重點）
-
-參數分三層：`.env`、`config/config.yml`、`plugins/config/*.yml`。
-
-### 4.1 `.env`（執行環境與金鑰）
-
-參考 `.env.example`。常用欄位：
-
-- `HOST` / `PORT`
-- `ONEBOT_API_TIMEOUT`
-- `ONEBOT_ACCESS_TOKEN`
-- `WEBUI_TOKEN`
-- `SKIAPI_KEY` / `OPENAI_API_KEY` / `NEWAPI_API_KEY` 等
-
-建議：
-
-- 不要把真實金鑰提交到 Git
-- 測試與正式環境使用不同 token
-
-### 4.2 `config/config.yml`（全域業務設定）
-
-模板來源：`config/templates/master.template.yml`，  
-`core/config_templates.py` 會處理預設值與自我修復。
-
-高頻設定區：
-
-- `bot`：名稱、暱稱、回覆策略、短呼叫詞
-- `api`：模型供應商、模型名、超時、token
-- `agent`：步數、超時、高風險控制
-- `routing`：路由置信度策略
-- `self_check`：本地自檢閾值
-- `queue`：併發與中斷策略
-- `music`：本地音源與解鎖音源
-
-### 4.3 `plugins/config/*.yml`（插件模板化設定）
-
-這層就是你想要的「列表可控」配置方式：一個插件一個檔案。  
-比起超大單頁配置，維護更直觀。
-
-#### NewAPI 範例（`plugins/config/newapi.yml`）
-
-```yaml
-enabled: true
-display_name: skiapi
-response:
-  force_plain_text: true
-  strip_markdown_chars: true
-payment:
-  auto_require_method_selection_when_multiple: true
-  auto_prefer_methods:
-    - alipay
-  auto_fallback_method_when_info_unavailable: wxpay
-  include_epay_submit_url: true
-privacy_guard:
-  enabled: true
-  recall_message: true
-  notify_group: true
-  notify_private: true
-```
-
-#### ConnectCLI 範例（`plugins/config/connect_cli.yml`）
-
-```yaml
-enabled: true
-default_provider: codex_cli
-timeout_seconds: 120
-max_output_chars: 8000
-token_saving: false
-safety_mode: true
-inject_context: true
-filter_output: true
-open_mode: embedded
-providers:
-  codex_cli:
-    enabled: true
-    command: codex
-    model: gpt-5.4
-    api_key: ""
-```
-
-## 5. 音樂介面維護建議
-
-關鍵在 `config/config.yml -> music`：
-
-- `local_source_enable`
-- `unblock_enable`
-- `unblock_sources`
-- `artist_guard_enable`
-
-穩定策略：
-
-- 先確保本地源可用，再開解鎖源
-- `unblock_sources` 只放真正解鎖來源（如 `qq,kuwo,migu`）
-- 不要把用途不同的 source 混進去，避免誤路由
-
-## 6. 所有運行方式（完整）
-
-### 6.1 標準運行
-
-```bash
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+cd webui && npm install && npm run build && cd ..
 python main.py
 ```
 
-或腳本：
+---
 
-- Windows: `start.bat`
-- Linux/macOS: `bash start.sh`
+## 3. 連接 NapCat
 
-### 6.2 首次設定 WebUI 模式（自動）
+在 NapCat 的 OneBot V11 設定頁：
 
-觸發：`config/config.yml` 不存在。  
-入口：`/webui/setup`。
+| 設定項 | 值 |
+|--------|-----|
+| 連線模式 | 反向 WebSocket |
+| WS 上報位址 | `ws://<YuKiKo地址>:<端口>/onebot/v11/ws` |
+| Access Token | 與 `.env` 中 `ONEBOT_ACCESS_TOKEN` 一致 |
 
-### 6.3 強制 CLI 設定模式
+---
+
+## 4. 首次啟動與 WebUI
+
+首次啟動（`config/config.yml` 不存在時）會進入設定模式。
+
+建置 WebUI：`bash build-webui.sh`（Linux）/ `build-webui.bat`（Windows）
+
+存取 WebUI：`http://<HOST>:<PORT>/webui/login`
+
+---
+
+## 5. 設定詳解
+
+三層設定體系：
+
+| 層級 | 檔案 | 用途 |
+|------|------|------|
+| 環境變數 | `.env` | 端口、金鑰、API Key |
+| 全域設定 | `config/config.yml` | 機器人行為、模型參數 |
+| 插件設定 | `plugins/config/*.yml` | 每個插件獨立一份 |
+
+---
+
+## 6. 運行模式
+
+| 模式 | 命令 |
+|------|------|
+| 標準啟動 | `python main.py` |
+| 一鍵啟動 | `start.bat` / `bash start.sh` |
+| 強制 CLI 設定 | `python main.py --setup` |
+| 僅部署 | `python scripts/deploy.py` |
+| 部署並啟動 | `python scripts/deploy.py --run` |
+
+---
+
+## 7. 維運管理
 
 ```bash
-python main.py --setup
+yukiko status / logs / restart / stop / start
+yukiko update --check-only / --restart
+yukiko uninstall
 ```
 
-或：
+---
 
-```bash
-python main.py setup
-```
+## 8. 故障排查
 
-### 6.4 只部署不啟動
+| 問題 | 解決 |
+|------|------|
+| `ModuleNotFoundError` | `python scripts/deploy.py` |
+| WebUI 503 | `cd webui && npm install && npm run build` |
+| NapCat 連不上 | 確認 token 一致、WS 位址正確 |
+| ffmpeg 找不到 | 安裝後加入 PATH |
 
-```bash
-python scripts/deploy.py
-```
+---
 
-### 6.5 部署後直接啟動
-
-```bash
-python scripts/deploy.py --run
-```
-
-### 6.6 只建置前端
-
-```bash
-bash build-webui.sh
-```
-
-Windows:
-
-```bat
-build-webui.bat
-```
-
-## 7. 快速排錯
-
-- `ModuleNotFoundError`：先執行 `python scripts/deploy.py`
-- WebUI 503：前端未建置，執行 `npm run build`
-- OneBot 無法連線：確認 `ONEBOT_ACCESS_TOKEN` 與上游一致
-- 插件配置無效：檢查 `plugins/config/<name>.yml` 與 WebUI 插件頁保存結果
-
-## 8. 原理文件
-
-- `docs/zh-TW/ARCHITECTURE.md`
-
+進階文件：[架構說明](ARCHITECTURE.md) · [簡體中文指南](../zh-CN/GUIDE.md) · [English Guide](../en/GUIDE.md)

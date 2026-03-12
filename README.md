@@ -1,208 +1,320 @@
-# YuKiKo Bot Documentation Hub
+<div align="center">
 
-This repository currently focuses on runtime code and configuration templates.
-To make onboarding easier, the full docs are split by language:
+# YuKiKo Bot
 
-- 简体中文: [docs/zh-CN/GUIDE.md](docs/zh-CN/GUIDE.md)
-- 繁體中文: [docs/zh-TW/GUIDE.md](docs/zh-TW/GUIDE.md)
-- English: [docs/en/GUIDE.md](docs/en/GUIDE.md)
+**基于 NoneBot2 + OneBot V11 的智能 QQ 机器人**
 
-Architecture and design notes:
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![NoneBot2](https://img.shields.io/badge/NoneBot2-FastAPI-EA5252)](https://nonebot.dev/)
+[![React](https://img.shields.io/badge/React-18-61DAFB?logo=react&logoColor=white)](https://react.dev/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/dwgx/YuKiKo?style=social)](https://github.com/dwgx/YuKiKo)
 
-- 简体中文原理文档: [docs/zh-CN/ARCHITECTURE.md](docs/zh-CN/ARCHITECTURE.md)
-- 简体中文深度总览与维护手册（700+ 行）: [docs/zh-CN/PROJECT_DEEP_SUMMARY.md](docs/zh-CN/PROJECT_DEEP_SUMMARY.md)
-- 繁體中文原理文件: [docs/zh-TW/ARCHITECTURE.md](docs/zh-TW/ARCHITECTURE.md)
-- English architecture notes: [docs/en/ARCHITECTURE.md](docs/en/ARCHITECTURE.md)
+一个功能丰富的 AI 驱动 QQ 群聊/私聊机器人，支持多模型接入、Agent 工具调用、
+音乐点播、图片生成、视频解析、Web 管理面板等。
 
-If you are new, start from the GUIDE file in your language first.
+[快速开始](#-快速开始) · [功能特性](#-功能特性) · [配置说明](#-配置说明) · [文档](#-文档) · [English](docs/en/GUIDE.md)
 
-## 当前版本重点修复
+</div>
 
-- Linux 下载兼容：`smart_download` 在 NapCat 临时目录不可读时，会自动回退到本地 HTTP 下载，不再因为 `/root/.config/QQ/NapCat/temp/...` 权限问题直接失败。
-- Wayback 回退：`wayback_lookup` 在 CDX 查询失败或被限流时，会继续尝试最近可用快照，不再只返回空结果。
-- NewAPI 支付修正：
-  - `/api topup` 现在只负责“充值信息 / 兑换码”。
-  - 如果用户误输成 `/api topup 200 支付宝` 这类在线支付格式，会自动转给 `/api pay`。
-  - `/api pay` 支持 `200M`、`1w` 这类金额写法。
-- 多会话并发更稳：新增 `queue.smart_interrupt_same_user_enable`，默认关闭“同用户新任务自动打断旧任务”。
-- WebUI 体验更新：
-  - Thinking Island 取消滚轮改尺寸，改为右侧边缘拖拽调宽。
-  - Plugins 页面现在会显示真实配置入口、写回文件、向导提示和按组整理后的字段编辑面板。
-  - Dashboard 现在支持查看 GitHub 最新版本状态、拉取最新代码、查看多会话 AI 并发状态，并提供 VPS/Windows 部署下载入口。
-  - Database 页面新增当前库导出 / 导入按钮；导入前会自动备份旧库。
+---
 
-## 插件配置位置
+## ✨ 功能特性
 
-YuKiKo 现在同时支持两种插件配置写法：
+| 类别 | 功能 |
+|------|------|
+| **AI 对话** | 多模型（OpenAI / Claude / DeepSeek / Gemini / 通义千问 / Moonshot 等），上下文记忆，知识库自动学习 |
+| **Agent 系统** | 50+ 内置工具，自动推理与多步工具调用，置信度路由 |
+| **音乐点播** | 多平台搜索播放，VIP 歌曲解锁，歌手一致性保护，B站音频回退 |
+| **搜索引擎** | 联网搜索，网页智能摘要，结构化信息提取 |
+| **视频解析** | B站 / 抖音 / 快手 / AcFun 视频下载与内容分析 |
+| **图片生成** | DALL-E 等多模型，自动 NSFW 过滤 |
+| **Web 管理面板** | React 前端，配置热更新，日志实时查看，数据库管理，在线聊天测试 |
+| **插件系统** | 热插拔，独立配置文件，WebUI 可视化管理 |
+| **安全机制** | 内容过滤，权限三级分层，密钥加密存储，Self-check 防误回复 |
 
-- 统一配置：`config/plugins.yml`
-- 插件独立配置：`plugins/config/<plugin>.yml`
+## 📋 环境要求
 
-WebUI 会根据插件实际配置模式写回正确位置：
+| 依赖 | 版本 | 说明 |
+|------|------|------|
+| **Python** | 3.10+ | 推荐 3.11 / 3.12 |
+| **Node.js** | 18+ | 构建 WebUI 用 |
+| **ffmpeg** | 最新 | 音视频处理（Linux 安装脚本自动安装） |
+| **OneBot V11 服务** | — | 推荐 [NapCat](https://github.com/NapNeko/NapCatQQ) |
 
-- 支持独立配置/向导型插件：优先写到 `plugins/config/<plugin>.yml`
-- 普通插件：写到 `config/plugins.yml`
+> Windows 用户如果没有 Python / Node.js，请先安装：
+> - Python: https://www.python.org/downloads/ （安装时勾选 "Add to PATH"）
+> - Node.js: https://nodejs.org/ （LTS 版本即可）
+> - ffmpeg: https://www.gyan.dev/ffmpeg/builds/ （下载后加入系统 PATH）
 
-如果你之前觉得 “插件配置没了”，先检查这两个位置。
+## 🚀 快速开始
 
-## 推荐队列配置
+### 方式一：Linux 一键部署（推荐）
 
-如果你希望同一个用户在群里连续发多个任务时不要互相打断，确认配置里包含：
-
-```yaml
-queue:
-  smart_interrupt_enable: true
-  smart_interrupt_cross_user_enable: true
-  smart_interrupt_same_user_enable: false
-```
-
-这样可以保留“跨用户抢占保护”，同时允许同用户的多个任务继续并行排队/执行。
-
-## WebUI 运维入口
-
-现在 WebUI 里新增了几组直接可用的运维能力：
-
-- Dashboard：
-  - 检查当前仓库是否落后于 GitHub
-  - 一键拉取最新代码、同步 Python 依赖、重建 WebUI
-  - 显示“多会话 AI 并发”是否启用，以及当前活跃会话数
-  - 提供 Linux VPS 一键部署命令复制按钮
-  - 提供 Windows ZIP 下载入口
-- Database：
-  - 导出当前数据库文件
-  - 导入 SQLite 数据库文件
-  - 导入前自动备份原库到 `storage/backups/db/`
-
-说明：
-
-- WebUI 的“拉取最新”只会更新到当前 Git 仓库上游的最新版本，不支持切换到别的仓库或别的分支。
-- 代码拉取完成后，Python 新代码仍然建议手动重启服务后再正式生效。
-- 数据库导入成功后，也建议手动重启服务，以便长期持有连接的模块完全刷新。
-
-Release and operations deep dive (CN, 1000+ lines checklist + SOP):
-
-- [docs/zh-CN/RELEASE_PLAYBOOK.md](docs/zh-CN/RELEASE_PLAYBOOK.md)
-
-## 快速启动（Linux）
-
-1. 克隆项目并进入目录：
-
-```bash
-git clone https://github.com/dwgx/YuKiKo.git
-cd YuKiKo
-```
-
-2. 一键交互式部署（推荐）：
-
-```bash
-bash install.sh
-```
-
-3. 部署完成后访问 WebUI（默认地址）：
-
-```bash
-http://127.0.0.1:8081/webui/login
-```
-
-4. 常用管理命令：
-
-```bash
-yukiko --help
-yukiko status
-yukiko logs --lines 200
-yukiko restart
-```
-
-## Linux One-Click Deploy
-
-For a 1Panel-like interactive deploy flow (custom host/port + optional systemd):
-
-```bash
-bash install.sh
-```
-
-Remote bootstrap directly from GitHub:
+无需手动 clone，一条命令搞定：
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh)
 ```
 
-Pass installer args (for non-interactive deploy):
+脚本自动完成：系统依赖 → Python 虚拟环境 → WebUI 构建 → systemd 服务注册。
+
+<details>
+<summary>非交互模式（适合自动化 / CI）</summary>
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) -- --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+bash <(curl -fsSL https://raw.githubusercontent.com/dwgx/YuKiKo/main/bootstrap.sh) \
+  -- --non-interactive --host 0.0.0.0 --port 8081 --service-name yukiko --open-firewall
 ```
+</details>
 
-Non-interactive example:
+<details>
+<summary>已 clone 仓库？用本地安装脚本</summary>
 
 ```bash
-bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yukiko --open-firewall
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+bash install.sh
+```
+</details>
+
+### 方式二：Windows 手动部署
+
+```powershell
+# 1. 克隆项目
+git clone https://github.com/dwgx/YuKiKo.git
+cd YuKiKo
+
+# 2. 复制环境变量文件
+Copy-Item .env.example .env
+
+# 3. 编辑 .env，至少填写：
+#    ONEBOT_ACCESS_TOKEN=你的NapCat令牌
+#    WEBUI_TOKEN=随机字符串
+
+# 4. 一键启动（自动创建虚拟环境 + 安装依赖）
+.\start.bat
 ```
 
-After install, use the unified manager command:
+首次启动后访问 `http://127.0.0.1:8081/webui/setup` 完成初始配置。
+
+### 方式三：macOS / Linux 手动部署
 
 ```bash
-yukiko --help
-yukiko update --check-only
-yukiko update --restart
-yukiko status
-yukiko logs --lines 200
-yukiko restart
-yukiko stop
-yukiko start
-yukiko uninstall --purge-runtime --purge-env
+# 1. 克隆项目
+git clone https://github.com/dwgx/YuKiKo.git && cd YuKiKo
+
+# 2. 复制环境变量文件并编辑
+cp .env.example .env
+# 编辑 .env，填写 ONEBOT_ACCESS_TOKEN 和 WEBUI_TOKEN
+
+# 3. 一键启动
+bash start.sh
 ```
 
-## NapCat (QQ Adapter)
-
-YuKiKo uses [NapCat](https://github.com/NapNeko/NapCatQQ) as the OneBot V11 adapter for QQ.
-
-The Linux installer (`install.sh`) will auto-detect NapCat and offer to install it if missing. To skip:
+### 方式四：手动完全控制
 
 ```bash
-bash install.sh --skip-napcat
+# 创建虚拟环境
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# 安装依赖
+pip install -r requirements.txt
+
+# 构建 WebUI（可选但推荐）
+cd webui && npm install && npm run build && cd ..
+
+# 启动
+python main.py
 ```
 
-Manual install:
+## 🔗 连接 NapCat（QQ 适配器）
 
-```bash
-curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh && bash napcat.sh
-```
+YuKiKo 通过 [NapCat](https://github.com/NapNeko/NapCatQQ) 的 OneBot V11 协议接入 QQ。
 
-After NapCat is running, set `ONEBOT_ACCESS_TOKEN` in `.env` to match NapCat's token.
+**NapCat 侧配置：**
 
-### NapCat WS 参数配置（Linux / Windows 通用）
-
-YuKiKo 的 OneBot V11 WS 接入路径是：
+1. 连接模式选择 **反向 WebSocket (Reverse WS)**
+2. WS 上报地址填写：`ws://<YuKiKo地址>:<端口>/onebot/v11/ws`
+3. Access Token 与 `.env` 中的 `ONEBOT_ACCESS_TOKEN` **保持一致**
 
 ```text
-ws://<YuKiKo主机>:<PORT>/onebot/v11/ws
-```
-
-示例（同机部署）：
-
-```text
+# 同机部署示例
 ws://127.0.0.1:8081/onebot/v11/ws
+
+# 跨机器示例（填 YuKiKo 所在机器的 IP）
+ws://192.168.1.50:8081/onebot/v11/ws
 ```
 
-在 NapCat 的 OneBot V11 配置里，按下面填写：
+> Linux 安装脚本会自动检测并提示安装 NapCat。手动安装：
+> ```bash
+> curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh && bash napcat.sh
+> ```
 
-1. 连接模式：`反向 WebSocket (Reverse WS)`
-2. WS 上报地址：`ws://<YuKiKo主机>:<PORT>/onebot/v11/ws`
-3. Access Token：`与你 .env 中 ONEBOT_ACCESS_TOKEN 完全一致`
-4. 启用连接并保存
+## ⚙️ 配置说明
 
-`.env` 对应最小配置示例：
+YuKiKo 采用三层配置体系：
+
+| 层级 | 文件 | 用途 |
+|------|------|------|
+| **环境变量** | `.env` | 端口、密钥、API Key 等敏感信息 |
+| **全局配置** | `config/config.yml` | 机器人行为、模型参数、路由策略等 |
+| **插件配置** | `plugins/config/*.yml` | 每个插件独立一份配置文件 |
+
+### .env 关键字段
 
 ```env
-HOST=0.0.0.0
-PORT=8081
-ONEBOT_ACCESS_TOKEN=replace_with_napcat_token
+HOST=0.0.0.0                              # 监听地址
+PORT=8081                                  # 监听端口
+ONEBOT_ACCESS_TOKEN=your_napcat_token      # NapCat 鉴权令牌
+WEBUI_TOKEN=your_random_string             # WebUI 管理面板令牌
+SKIAPI_KEY=                                # 默认 AI 模型 API Key
+OPENAI_API_KEY=                            # OpenAI（按需）
+DEEPSEEK_API_KEY=                          # DeepSeek（按需）
+ANTHROPIC_API_KEY=                         # Claude（按需）
 ```
 
-说明：
+完整字段参考 [`.env.example`](.env.example)。
 
-1. Linux 和 Windows 参数完全一样，只是 `<YuKiKo主机>` 不同。
-2. 同一台机器可用 `127.0.0.1`；跨机器请填 YuKiKo 所在机器的局域网 IP。
-3. YuKiKo 监听的 WS 路径是 `/onebot/v11/ws`（也兼容 `/onebot/v11/`，推荐前者）。
+### config.yml 主要分组
 
+首次启动时会从模板自动生成，也可通过 WebUI 在线编辑。
+
+| 分组 | 说明 |
+|------|------|
+| `bot` | 机器人名称、昵称、回复形式、分段策略 |
+| `api` | 模型供应商、模型名、base_url、温度、token 上限 |
+| `agent` | Agent 步数上限、超时、工具调用策略 |
+| `routing` | 路由置信度阈值、路由模式 |
+| `queue` | 并发控制、智能中断、消息队列策略 |
+| `music` | 音源配置、解锁源、歌手保护 |
+| `search` | 网页抓取、视频解析、视觉分析 |
+| `safety` | 内容安全等级 |
+
+## 🖥️ WebUI 管理面板
+
+启动后访问 `http://<HOST>:<PORT>/webui/login`，使用 `.env` 中的 `WEBUI_TOKEN` 登录。
+
+| 页面 | 功能 |
+|------|------|
+| Dashboard | 系统状态、版本检查、一键更新、并发监控 |
+| Config | YAML 在线编辑器，支持热更新 |
+| Plugins | 插件列表、启用/禁用、独立配置编辑 |
+| Prompts | 系统提示词编辑 |
+| Chat | 在线聊天测试 |
+| Memory | 记忆管理与搜索 |
+| Database | 数据库导出/导入/浏览 |
+| Logs | 实时日志查看 |
+
+## 🔌 插件系统
+
+插件放在 `plugins/` 目录下，配置文件在 `plugins/config/` 中。
+
+内置插件：
+- **NewAPI** — 支付/充值集成
+- **Wayback** — Internet Archive 网页快照查询
+- **ConnectCLI** — 外部 CLI 工具接入
+
+开发自定义插件请参考 [`plugins/example_plugin.py`](plugins/example_plugin.py) 和 [插件开发指南](docs/PLUGIN_GUIDE.md)。
+
+## 🛠️ 运维命令
+
+安装脚本会注册 `yukiko` CLI 工具（仅 Linux）：
+
+```bash
+yukiko status              # 查看服务状态
+yukiko logs --lines 200    # 查看最近日志
+yukiko restart             # 重启服务
+yukiko stop                # 停止服务
+yukiko start               # 启动服务
+yukiko update --check-only # 检查更新
+yukiko update --restart    # 更新并重启
+yukiko uninstall           # 卸载
+```
+
+## 🔍 常见问题
+
+<details>
+<summary><b>报 ModuleNotFoundError</b></summary>
+
+虚拟环境依赖不完整，运行：
+```bash
+python scripts/deploy.py
+```
+</details>
+
+<details>
+<summary><b>WebUI 打不开 / 503</b></summary>
+
+前端未构建。运行：
+```bash
+cd webui && npm install && npm run build
+```
+或使用脚本：`bash build-webui.sh`（Linux）/ `build-webui.bat`（Windows）
+</details>
+
+<details>
+<summary><b>NapCat 连不上</b></summary>
+
+1. 确认 `.env` 中 `ONEBOT_ACCESS_TOKEN` 与 NapCat 侧完全一致
+2. 确认 NapCat 连接模式为"反向 WebSocket"
+3. 确认 WS 地址格式：`ws://<IP>:<PORT>/onebot/v11/ws`
+4. 跨机器部署时确认防火墙已放行端口
+</details>
+
+<details>
+<summary><b>Windows 下 ffmpeg 找不到</b></summary>
+
+1. 从 https://www.gyan.dev/ffmpeg/builds/ 下载 ffmpeg
+2. 解压后将 `bin` 目录加入系统 PATH
+3. 重启终端，运行 `ffmpeg -version` 验证
+</details>
+
+<details>
+<summary><b>插件配置不生效</b></summary>
+
+YuKiKo 支持两种插件配置位置：
+- `plugins/config/<plugin>.yml`（推荐，独立管理）
+- `config/plugins.yml`（统一管理）
+
+在 WebUI 插件页保存后会自动写回正确位置。如果手动编辑，请确认文件路径正确。
+</details>
+
+## 📁 项目结构
+
+```
+YuKiKo/
+├── main.py              # 入口
+├── app.py               # OneBot 事件处理
+├── core/                # 核心引擎（消息处理、路由、Agent、队列、WebUI 后端）
+├── plugins/             # 插件 + 插件配置模板
+│   └── config/          # 插件独立配置文件
+├── config/              # 全局配置
+│   └── templates/       # 配置模板（master.template.yml）
+├── services/            # 模型客户端 / 外部服务封装
+├── webui/               # React + Vite 管理面板前端
+├── scripts/             # 部署 / 构建脚本
+├── utils/               # 工具函数（文本处理、媒体、过滤器）
+├── storage/             # 运行时数据（缓存、数据库）
+├── deploy/              # systemd 服务模板
+├── tests/               # 测试
+├── install.sh           # Linux 交互式安装脚本
+├── bootstrap.sh         # 远程一键部署脚本
+├── start.sh / start.bat # 一键启动脚本
+└── .env.example         # 环境变量模板
+```
+
+## 📖 文档
+
+| 文档 | 说明 |
+|------|------|
+| [简体中文部署指南](docs/zh-CN/GUIDE.md) | 完整部署、配置、运行方式 |
+| [简体中文架构说明](docs/zh-CN/ARCHITECTURE.md) | 内部设计原理 |
+| [English Guide](docs/en/GUIDE.md) | Deployment & configuration |
+| [English Architecture](docs/en/ARCHITECTURE.md) | Internal design notes |
+| [繁體中文指南](docs/zh-TW/GUIDE.md) | 部署與設定 |
+| [插件开发指南](docs/PLUGIN_GUIDE.md) | 插件配置与开发 |
+
+## 📄 License
+
+[MIT](LICENSE)

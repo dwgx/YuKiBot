@@ -1,43 +1,52 @@
-# PROJECT_STRUCTURE
+# Project Structure
 
-## Tree (core folders)
-
-```text
+```
 YuKiKo/
-├─ main.py
-├─ app.py
-├─ core/                  # engine, queue, router, tools, config loader
-├─ plugins/               # plugin implementations + plugin config templates
-│  └─ config/
-├─ config/
-│  └─ templates/          # master.template.yml
-├─ services/              # model clients / external service wrappers
-├─ webui/                 # React + Vite admin frontend
-├─ scripts/               # deploy/build helpers
-└─ tests/                 # regression tests
+├── main.py                  # Entry point (startup + setup wizard)
+├── app.py                   # OneBot event handlers, message pipeline
+├── core/                    # Core engine
+│   ├── engine.py            # Main orchestrator (YukikoEngine)
+│   ├── queue.py             # Concurrency & conversation queue
+│   ├── router.py            # Intent routing with confidence scoring
+│   ├── tools.py             # Tool executor (50+ built-in tools)
+│   ├── agent.py             # Agent loop with reasoning
+│   ├── webui.py             # WebUI API backend
+│   ├── config_templates.py  # Config template merge & self-healing
+│   └── ...                  # Memory, search, music, safety, admin engines
+├── plugins/                 # Plugin implementations
+│   ├── config/              # Per-plugin config files (*.yml)
+│   ├── newapi_plugin.py     # Payment/topup integration
+│   ├── wayback_plugin.py    # Internet Archive lookup
+│   ├── connect_cli.py       # External CLI tool integration
+│   └── example_plugin.py    # Plugin template
+├── config/
+│   ├── templates/           # master.template.yml (canonical defaults)
+│   └── prompts.yml          # System prompts & agent rules
+├── services/                # Model clients & external service wrappers
+├── webui/                   # React + Vite + TypeScript admin frontend
+│   └── src/pages/           # Dashboard, Config, Plugins, Chat, Logs, etc.
+├── scripts/                 # deploy.py, build helpers
+├── utils/                   # Text processing, media utils, filters
+├── storage/                 # Runtime data (cache, databases, backups)
+├── deploy/                  # systemd service templates
+├── tests/                   # Test suite
+├── install.sh               # Linux interactive installer
+├── bootstrap.sh             # Remote one-click deploy
+├── start.sh / start.bat     # Quick start scripts
+├── build-webui.sh / .bat    # WebUI build scripts
+└── .env.example             # Environment variable template
 ```
 
-## 简体中文说明
+## Key Modules
 
-- `core/engine.py`：统一编排消息处理主链路
-- `core/queue.py`：并发和会话队列
-- `core/router.py`：路由决策
-- `core/tools.py`：工具执行与回传
-- `plugins/`：插件功能与插件模板配置
-- `webui/`：管理面板前端
-
-## 繁體中文說明
-
-- `core/`：核心處理邏輯
-- `plugins/`：插件與插件設定
-- `config/templates/`：全域模板
-- `webui/`：管理介面
-- `tests/`：回歸測試
-
-## English notes
-
-- `core/` holds runtime orchestration
-- `plugins/` holds plugin logic and plugin-level configs
-- `config/templates/` is the canonical default template source
-- `webui/` is the admin UI frontend
-- `tests/` holds regression coverage
+| Module | Role |
+|--------|------|
+| `core/engine.py` | Message processing orchestrator |
+| `core/queue.py` | Per-group concurrency, smart interrupt, TTL |
+| `core/router.py` | AI-based intent routing with confidence |
+| `core/tools.py` | Tool registration & execution |
+| `core/agent.py` | Multi-step reasoning agent loop |
+| `core/webui.py` | REST API for the management panel |
+| `plugins/` | Hot-pluggable plugin system |
+| `services/` | LLM provider clients (OpenAI-compatible) |
+| `webui/` | React admin dashboard |
