@@ -54,10 +54,13 @@ interface Plugin {
 }
 
 const INPUT_CLASSES = {
+  base: "bg-transparent",
+  mainWrapper: "bg-transparent",
+  innerWrapper: "bg-transparent",
   input:
     "text-sm !bg-transparent !outline-none !ring-0 focus:!outline-none focus:!ring-0 focus-visible:!outline-none focus-visible:!ring-0",
   inputWrapper:
-    "bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:bg-content2/70 data-[focus=true]:bg-content2/80 data-[focus=true]:border-primary/55 data-[focus=true]:shadow-[0_0_0_1px_rgba(96,165,250,0.18)] data-[focus=true]:before:!bg-transparent data-[focus=true]:after:!bg-transparent before:!shadow-none after:!shadow-none",
+    "!bg-content2/55 border border-default-400/35 shadow-none transition-all duration-200 data-[hover=true]:!bg-content2/70 data-[focus=true]:!bg-content2/80 data-[focus=true]:border-primary/55 data-[focus=true]:shadow-[0_0_0_1px_rgba(96,165,250,0.18)] before:!bg-transparent after:!bg-transparent before:!shadow-none after:!shadow-none",
 };
 
 type FieldGroup = {
@@ -197,22 +200,59 @@ export default function PluginsPage() {
     });
   };
 
-  const handleSave = async (pluginName: string, config: PluginConfig, enabled: boolean) => {
-    setSaving(pluginName);
+  const clearPluginDrafts = (pluginName: string) => {
+    const prefix = `${pluginName}::`;
+    setFieldDrafts((prev) => {
+      let changed = false;
+      const next: Record<string, string> = {};
+      Object.entries(prev).forEach(([key, value]) => {
+        if (key.startsWith(prefix)) {
+          changed = true;
+          return;
+        }
+        next[key] = value;
+      });
+      return changed ? next : prev;
+    });
+  };
+
+  const buildConfigWithFieldDrafts = (plugin: Plugin): PluginConfig => {
+    const nextConfig: PluginConfig = { ...plugin.config };
+    const properties = plugin.config_schema?.properties || {};
+    Object.entries(properties).forEach(([fieldKey, schema]) => {
+      const draft = fieldDrafts[fieldDraftKey(plugin.name, fieldKey)];
+      if (draft === undefined) return;
+      nextConfig[fieldKey] = parseTextareaValue(
+        schema,
+        draft,
+        nextConfig[fieldKey] ?? schema.default,
+      );
+    });
+    return nextConfig;
+  };
+
+  const handleSave = async (plugin: Plugin) => {
+    const nextConfig = buildConfigWithFieldDrafts(plugin);
+    setSaving(plugin.name);
     setMessage("");
+    updatePluginState(plugin.name, (prev) => ({
+      ...prev,
+      config: nextConfig,
+    }));
     try {
-      const res = await fetch(`/api/webui/plugins/${pluginName}`, {
+      const res = await fetch(`/api/webui/plugins/${plugin.name}`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${api.getToken()}`,
         },
-        body: JSON.stringify({ config, enabled, reload: true }),
+        body: JSON.stringify({ config: nextConfig, enabled: plugin.enabled, reload: true }),
       });
       if (!res.ok) {
         throw new Error(await res.text());
       }
-      setMessage(`${pluginName} 配置已保存并热重载`);
+      clearPluginDrafts(plugin.name);
+      setMessage(`${plugin.name} 配置已保存并热重载`);
       await loadPlugins();
     } catch (err: unknown) {
       setMessage(`保存失败: ${err instanceof Error ? err.message : "未知错误"}`);
@@ -270,17 +310,19 @@ export default function PluginsPage() {
           {schema.enum && Array.isArray(schema.enum) ? (
             <div className="space-y-2">
               <label className="text-xs font-medium text-default-500">候选值</label>
-              <select
-                className="w-full rounded-2xl border border-default-200 bg-content2/70 px-3 py-2 text-sm outline-none transition focus:border-primary/50"
-                value={String(currentValue ?? "")}
-                onChange={(evt) => updatePluginConfig(plugin.name, fieldKey, evt.target.value)}
-              >
-                {schema.enum.map((option) => (
-                  <option key={String(option)} value={String(option)}>
-                    {String(option)}
-                  </option>
-                ))}
-              </select>
+              <div className="rounded-2xl border border-default-400/35 bg-content2/55 px-3 transition-all duration-200 focus-within:border-primary/55 focus-within:shadow-[0_0_0_1px_rgba(96,165,250,0.18)]">
+                <select
+                  className="w-full appearance-none bg-transparent py-2 text-sm outline-none"
+                  value={String(currentValue ?? "")}
+                  onChange={(evt) => updatePluginConfig(plugin.name, fieldKey, evt.target.value)}
+                >
+                  {schema.enum.map((option) => (
+                    <option key={String(option)} value={String(option)}>
+                      {String(option)}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
           ) : schema.type === "integer" || schema.type === "number" ? (
             <Input
@@ -303,8 +345,8 @@ export default function PluginsPage() {
                   clearFieldDraft(plugin.name, fieldKey);
                 }
               }}
-              onBlur={() => {
-                const latest = fieldDrafts[draftKey] ?? displayValue;
+              onBlur={(event) => {
+                const latest = event.target.value;
                 updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, latest, currentValue));
                 clearFieldDraft(plugin.name, fieldKey);
               }}
@@ -532,7 +574,7 @@ export default function PluginsPage() {
                         color="primary"
                         startContent={<Save size={16} />}
                         isLoading={saving === plugin.name}
-                        onPress={() => handleSave(plugin.name, plugin.config, plugin.enabled)}
+                        onPress={() => handleSave(plugin)}
                       >
                         保存并热重载
                       </Button>
