@@ -1,9 +1,11 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { Accordion, AccordionItem, Button, Spinner, Textarea } from "@heroui/react";
-import { Save, RefreshCw } from "lucide-react";
+import { Save, RefreshCw, Undo2 } from "lucide-react";
 import CodeMirror from "@uiw/react-codemirror";
 import { yaml } from "@codemirror/lang-yaml";
 import { api } from "../api/client";
+import { NotificationContainer } from "../components/notification";
+import { useNotifications } from "../hooks/useNotifications";
 
 type AnyObj = Record<string, unknown>;
 
@@ -86,6 +88,9 @@ function setNestedValue(obj: AnyObj, path: string, value: unknown): AnyObj {
 }
 
 export default function PromptsPage() {
+  const { notifications, success, danger } = useNotifications();
+  const undoContentRef = useRef<string | null>(null);
+  const undoQuickRef = useRef<AnyObj | null>(null);
   const [content, setContent] = useState("");
   const [quick, setQuick] = useState<AnyObj>({});
   const [loading, setLoading] = useState(true);
@@ -114,13 +119,18 @@ export default function PromptsPage() {
     try {
       const text = String(content ?? "");
       if (!text.trim()) {
-        setMsg("提示词内容为空，先点击“全量重载”恢复默认模板后再保存。");
+        setMsg("提示词内容为空，先点击全量重载恢复默认模板后再保存。");
         return;
       }
+      undoContentRef.current = content;
       const res = await api.updatePrompts(text);
-      setMsg(res.ok ? "保存成功，提示词已重载" : `失败: ${res.message}`);
+      if (res.ok) {
+        success("保存成功", "提示词已重载", 4000);
+      } else {
+        danger("保存失败", res.message || "未知错误", 5000);
+      }
     } catch (e: unknown) {
-      setMsg(e instanceof Error ? e.message : "保存失败");
+      danger("保存失败", e instanceof Error ? e.message : "未知错误", 5000);
     } finally {
       setSaving(false);
     }
@@ -134,15 +144,44 @@ export default function PromptsPage() {
         const val = parseQuickFieldValue(item, getQuickFieldText(quick, item));
         return setNestedValue(acc, item.path, val);
       }, {});
+      undoQuickRef.current = JSON.parse(JSON.stringify(quick));
+      undoContentRef.current = content;
       const res = await api.patchPrompts(patch);
       setQuick(res.parsed || {});
       const full = await api.getPrompts();
       setContent(String(full.content ?? full.yaml_text ?? ""));
-      setMsg(res.ok ? "常用提示词已保存并重载" : `失败: ${res.message}`);
+      if (res.ok) {
+        success("保存成功", "常用提示词已保存并重载", 4000);
+      } else {
+        danger("保存失败", res.message || "未知错误", 5000);
+      }
     } catch (e: unknown) {
-      setMsg(e instanceof Error ? e.message : "保存失败");
+      danger("保存失败", e instanceof Error ? e.message : "未知错误", 5000);
     } finally {
       setSavingQuick(false);
+    }
+  };
+
+  const handleUndo = async () => {
+    if (!undoContentRef.current) return;
+    setSaving(true);
+    try {
+      const res = await api.updatePrompts(undoContentRef.current);
+      if (res.ok) {
+        setContent(undoContentRef.current);
+        if (undoQuickRef.current) {
+          setQuick(undoQuickRef.current);
+          undoQuickRef.current = null;
+        }
+        undoContentRef.current = null;
+        success("撤销成功", "已恢复到上次保存前的提示词", 4000);
+      } else {
+        danger("撤销失败", res.message || "未知错误", 5000);
+      }
+    } catch (e: unknown) {
+      danger("撤销失败", e instanceof Error ? e.message : "未知错误", 5000);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -164,10 +203,15 @@ export default function PromptsPage() {
   }
 
   return (
-    <div className="space-y-4 h-full flex flex-col">
+    <>
+      <NotificationContainer notifications={notifications} />
+      <div className="space-y-4 h-full flex flex-col">
       <div className="flex items-center justify-between">
         <h2 className="text-xl font-bold">提示词编辑</h2>
         <div className="flex gap-2">
+          {undoContentRef.current && (
+            <Button variant="flat" startContent={<Undo2 size={16} />} onPress={handleUndo} isLoading={saving}>撤销</Button>
+          )}
           <Button
             variant="flat"
             startContent={<RefreshCw size={16} />}
@@ -239,5 +283,6 @@ export default function PromptsPage() {
         />
       </div>
     </div>
+    </>
   );
 }

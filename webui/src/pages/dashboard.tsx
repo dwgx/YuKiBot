@@ -9,6 +9,7 @@ import {
   Cpu,
   FileText,
   GitBranch,
+  Github,
   MessageSquare,
   Puzzle,
   RefreshCw,
@@ -182,7 +183,10 @@ export default function DashboardPage() {
               <CardBody className="space-y-4 p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <p className="text-sm font-semibold">GitHub 最新版本更新</p>
+                    <div className="flex items-center gap-2">
+                      <Github size={18} className="text-default-600" />
+                      <p className="text-sm font-semibold">GitHub 最新版本更新</p>
+                    </div>
                     <p className="text-xs text-default-500">
                       WebUI 只拉当前仓库上游的最新代码，不允许切换到别的分支或别的源。
                     </p>

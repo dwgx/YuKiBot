@@ -1,11 +1,13 @@
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import {
   Card, CardBody, CardHeader, Input, Switch, Button, Select, SelectItem, Textarea,
   Spinner, Slider, Chip, Tabs, Tab,
 } from "@heroui/react";
-import { Save, ChevronLeft, ChevronRight } from "lucide-react";
+import { Save, ChevronLeft, ChevronRight, Undo2 } from "lucide-react";
 import { motion } from "framer-motion";
 import { api, type ImageGenTestResponse } from "../api/client";
+import { NotificationContainer } from "../components/notification";
+import { useNotifications } from "../hooks/useNotifications";
 
 type Cfg = Record<string, unknown>;
 type FieldType = "text" | "password" | "number" | "switch" | "select" | "slider" | "textarea" | "list" | "group_verbosity_map" | "group_text_map";
@@ -467,6 +469,8 @@ function mergeDefaults(def: unknown, cur: unknown): unknown {
 function withDefaults(raw: Cfg): Cfg { const merged = mergeDefaults(DEFAULT_CONFIG, raw); return merged && typeof merged === "object" && !Array.isArray(merged) ? (merged as Cfg) : { ...DEFAULT_CONFIG }; }
 
 export default function ConfigPage() {
+  const { notifications, success, danger } = useNotifications();
+  const undoSnapshotRef = useRef<Cfg | null>(null);
   const [config, setConfig] = useState<Cfg>({});
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, string>>({});
   const [numberDrafts, setNumberDrafts] = useState<Record<string, string>>({});
@@ -670,13 +674,37 @@ export default function ConfigPage() {
     setMsg("");
     try {
       const payload = resolveConfigForAction();
+      undoSnapshotRef.current = JSON.parse(JSON.stringify(config));
       const res = await api.updateConfig(payload);
-      setMsg(res.ok ? "保存成功，已重载" : `失败: ${res.message}`);
-      if (res.ok) await load();
+      if (res.ok) {
+        success("保存成功", "配置已保存并热重载", 4000);
+        await load();
+      } else {
+        danger("保存失败", res.message || "未知错误", 5000);
+      }
     } catch (e: unknown) {
       const detail = e instanceof Error ? e.message : "未知错误";
       setRawConfigError(`JSON 解析失败: ${detail}`);
-      setMsg("保存失败");
+      danger("保存失败", detail, 5000);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleUndo = async () => {
+    if (!undoSnapshotRef.current) return;
+    setSaving(true);
+    try {
+      const res = await api.updateConfig(undoSnapshotRef.current);
+      if (res.ok) {
+        success("撤销成功", "已恢复到上次保存前的配置", 4000);
+        undoSnapshotRef.current = null;
+        await load();
+      } else {
+        danger("撤销失败", res.message || "未知错误", 5000);
+      }
+    } catch (e: unknown) {
+      danger("撤销失败", e instanceof Error ? e.message : "未知错误", 5000);
     } finally {
       setSaving(false);
     }
@@ -815,10 +843,17 @@ export default function ConfigPage() {
   if (loading) return <div className="flex justify-center py-20"><Spinner size="lg" /></div>;
 
   return (
-    <div className="space-y-4 max-w-none">
+    <>
+      <NotificationContainer notifications={notifications} />
+      <div className="space-y-4 max-w-none">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2"><h2 className="text-xl font-bold">配置编辑</h2><Chip size="sm" variant="flat" color="primary">{active.label}</Chip></div>
-        <Button color="primary" startContent={<Save size={16} />} isLoading={saving} onPress={handleSave}>保存并重载</Button>
+        <div className="flex items-center gap-2">
+          {undoSnapshotRef.current && (
+            <Button variant="flat" startContent={<Undo2 size={16} />} onPress={handleUndo} isLoading={saving}>撤销</Button>
+          )}
+          <Button color="primary" startContent={<Save size={16} />} isLoading={saving} onPress={handleSave}>保存并重载</Button>
+        </div>
       </div>
       {msg && <p className={msg.includes("成功") ? "text-success" : "text-danger"}>{msg}</p>}
 
@@ -1036,5 +1071,6 @@ export default function ConfigPage() {
         </CardBody>
       </Card>
     </div>
+    </>
   );
 }

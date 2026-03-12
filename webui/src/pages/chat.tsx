@@ -94,6 +94,11 @@ const THINKING_ISLAND_PREVIEW_HEIGHT_CLASS: Record<ThinkingIslandSize, string> =
   lg: "max-h-44",
 };
 
+const THINKING_ISLAND_MIN_HEIGHT = 100;
+const THINKING_ISLAND_MAX_HEIGHT = 500;
+const THINKING_ISLAND_DEFAULT_HEIGHT = 160;
+const THINKING_ISLAND_HEIGHT_STORAGE_KEY = "yukiko-thinking-island-height-v1";
+
 function stateBelongsToConversation(stateConversationId: string, selectedConversationId: string): boolean {
   const stateId = String(stateConversationId || "").trim();
   const selectedId = String(selectedConversationId || "").trim();
@@ -460,7 +465,13 @@ export default function ChatPage() {
   const historyCacheRef = useRef<Record<string, { items: ChatMessageItem[]; permission: ChatHistoryPermission }>>({});
   const thinkingIslandDragOriginRef = useRef<ThinkingIslandOffset>({ x: 0, y: 0 });
   const thinkingIslandWidthRef = useRef(thinkingIslandWidth);
-  const thinkingIslandResizeOriginRef = useRef<{ width: number; startX: number }>({ width: thinkingIslandWidth, startX: 0 });
+  const thinkingIslandResizeOriginRef = useRef<{ width: number; startX: number; height: number; startY: number }>({ width: thinkingIslandWidth, startX: 0, height: THINKING_ISLAND_DEFAULT_HEIGHT, startY: 0 });
+  const [thinkingIslandHeight, setThinkingIslandHeight] = useState(() => {
+    if (typeof window === "undefined") return THINKING_ISLAND_DEFAULT_HEIGHT;
+    const raw = Number(window.localStorage.getItem(THINKING_ISLAND_HEIGHT_STORAGE_KEY) || 0);
+    return (Number.isFinite(raw) && raw > 0) ? Math.max(THINKING_ISLAND_MIN_HEIGHT, Math.min(THINKING_ISLAND_MAX_HEIGHT, raw)) : THINKING_ISLAND_DEFAULT_HEIGHT;
+  });
+  const thinkingIslandHeightRef = useRef(thinkingIslandHeight);
   const pendingThinkingLogsRef = useRef<PendingThinkingLog[]>([]);
   const autoStickToBottomRef = useRef(true);
   const traceRef = useRef("");
@@ -576,6 +587,9 @@ export default function ChatPage() {
   useEffect(() => {
     thinkingIslandWidthRef.current = thinkingIslandWidth;
   }, [thinkingIslandWidth]);
+  useEffect(() => {
+    thinkingIslandHeightRef.current = thinkingIslandHeight;
+  }, [thinkingIslandHeight]);
   const beginThinkingIslandDrag = useCallback((evt: ReactPointerEvent<HTMLDivElement>) => {
     if (evt.button !== 0) return;
     evt.preventDefault();
@@ -593,15 +607,27 @@ export default function ChatPage() {
     if (evt.button !== 0) return;
     evt.preventDefault();
     evt.stopPropagation();
+    const isBottom = evt.currentTarget.dataset.resizeDir === "bottom";
+    const isLeft = evt.currentTarget.dataset.resizeDir === "left";
     thinkingIslandResizeOriginRef.current = {
       width: thinkingIslandWidthRef.current,
       startX: evt.clientX,
+      height: thinkingIslandHeightRef.current,
+      startY: evt.clientY,
     };
     const handleMove = (moveEvt: PointerEvent) => {
-      const nextWidth = clampThinkingIslandWidth(
-        thinkingIslandResizeOriginRef.current.width + (moveEvt.clientX - thinkingIslandResizeOriginRef.current.startX),
-      );
-      setThinkingIslandWidth(nextWidth);
+      if (isBottom) {
+        const nextHeight = Math.max(THINKING_ISLAND_MIN_HEIGHT, Math.min(THINKING_ISLAND_MAX_HEIGHT,
+          thinkingIslandResizeOriginRef.current.height + (moveEvt.clientY - thinkingIslandResizeOriginRef.current.startY),
+        ));
+        setThinkingIslandHeight(nextHeight);
+      } else {
+        const delta = moveEvt.clientX - thinkingIslandResizeOriginRef.current.startX;
+        const nextWidth = clampThinkingIslandWidth(
+          thinkingIslandResizeOriginRef.current.width + (isLeft ? -delta : delta),
+        );
+        setThinkingIslandWidth(nextWidth);
+      }
     };
     const handleUp = () => {
       window.removeEventListener("pointermove", handleMove);
@@ -807,6 +833,11 @@ export default function ChatPage() {
   }, [thinkingIslandSize, thinkingIslandWidth]);
 
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    window.localStorage.setItem(THINKING_ISLAND_HEIGHT_STORAGE_KEY, String(Math.round(thinkingIslandHeight)));
+  }, [thinkingIslandHeight]);
+
+  useEffect(() => {
     const handleResize = () => {
       setThinkingIslandWidth((prev) => clampThinkingIslandWidth(prev));
       setThinkingIslandOffset((prev) => clampThinkingIslandOffset(prev, thinkingIslandWidthRef.current));
@@ -889,7 +920,7 @@ export default function ChatPage() {
             continue;
           }
 
-          // 全局 thinking 流：即使不是当前会话，也在灵动岛显示，避免“有处理但看不到”。
+          // 全局 thinking 流：即使不是当前会话，也在灵动岛显示，避免"有处理但看不到"。
           if (looksAgentLine && display) {
             if (conversationId) {
               touchThinkingPresence(conversationId, 15000);
@@ -1150,7 +1181,7 @@ export default function ChatPage() {
       setImageFileName(file.name || `clipboard-image.${mimeSuffix}`);
       setImagePreviewUrl(dataUrl);
       setImageUrl("");
-      setError("[OK] 已从剪贴板读取图片，点击“发图”即可发送");
+      setError("[OK] 已从剪贴板读取图片，点击发图即可发送");
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "剪贴板图片读取失败");
     }
@@ -1629,10 +1660,10 @@ export default function ChatPage() {
                       title="拖动右侧边缘调整宽度"
                     />
                     <div
-                      className="thinking-island-resize-grip absolute bottom-2 right-2 z-20 h-4 w-4 cursor-nwse-resize rounded-full border border-white/45 bg-primary/20"
+                      className="thinking-island-resize-handle absolute inset-y-3 left-0 z-20 w-2 cursor-ew-resize"
+                      data-resize-dir="left"
                       onPointerDown={beginThinkingIslandResize}
-                      onDoubleClick={() => setThinkingIslandWidth(THINKING_ISLAND_DEFAULT_WIDTH.md)}
-                      title="拖动边缘调整宽度，双击恢复默认"
+                      title="拖动左侧边缘调整宽度"
                     />
                     <div
                       className="flex select-none items-start gap-2 px-3 py-2"
@@ -1765,7 +1796,8 @@ export default function ChatPage() {
                           </div>
                           <div
                             ref={thinkingScrollRef}
-                            className={`${THINKING_ISLAND_PREVIEW_HEIGHT_CLASS[thinkingIslandSize]} mt-1 space-y-1.5 overflow-auto px-3 py-2`}
+                            style={{ maxHeight: `${thinkingIslandHeight}px` }}
+                            className="mt-1 space-y-1.5 overflow-auto px-3 py-2"
                           >
                             {thinkingPreviewLines.length === 0 && (
                               <p className="text-xs text-default-500">已接入会话，等待更具体的思考流。</p>
@@ -1825,6 +1857,12 @@ export default function ChatPage() {
                         </motion.div>
                       )}
                     </AnimatePresence>
+                    <div
+                      className="thinking-island-resize-handle-bottom absolute inset-x-3 bottom-0 z-20 h-2 cursor-ns-resize"
+                      data-resize-dir="bottom"
+                      onPointerDown={beginThinkingIslandResize}
+                      title="拖动底部边缘调整高度"
+                    />
                   </motion.div>
                 </motion.div>
               )}
@@ -1862,7 +1900,7 @@ export default function ChatPage() {
                       {thinkingActive ? "处理中途沟通模式" : "普通提问模式"}
                     </Chip>
                     <span>Enter 原样发送 · Ctrl+Enter 交给AI · Esc 清空输入</span>
-                    {thinkingActive && <span>“交给AI”会追加需求，不中断；要改方向请点“取消当前任务”</span>}
+                    {thinkingActive && <span>"交给AI"会追加需求，不中断；要改方向请点"取消当前任务"</span>}
                   </div>
                 </div>
               )}

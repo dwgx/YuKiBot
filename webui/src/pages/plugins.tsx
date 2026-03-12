@@ -507,7 +507,7 @@ export default function PluginsPage() {
       {filteredPlugins.length === 0 && (
         <Card className="border border-dashed border-default-300 shadow-none">
           <CardBody className="py-10 text-center text-default-500">
-            没有匹配到插件。试试搜索插件名、配置入口，或者点一下“刷新插件清单”。
+            没有匹配到插件。试试搜索插件名、配置入口，或者点一下"刷新插件清单"。
           </CardBody>
         </Card>
       )}

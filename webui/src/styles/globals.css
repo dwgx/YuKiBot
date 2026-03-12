@@ -24,35 +24,47 @@ html.theme-animating * {
 
 /* HeroUI Input/Textarea: 去掉聚焦时底部白条伪元素 */
 [data-slot="input-wrapper"]::before,
-[data-slot="input-wrapper"]::after {
+[data-slot="input-wrapper"]::after,
+[data-slot="inner-wrapper"]::before,
+[data-slot="inner-wrapper"]::after {
   box-shadow: none !important;
+  background: transparent !important;
 }
 
 [data-slot="input-wrapper"][data-focus="true"]::before,
 [data-slot="input-wrapper"][data-focus="true"]::after,
 [data-slot="input-wrapper"][data-focus-visible="true"]::before,
-[data-slot="input-wrapper"][data-focus-visible="true"]::after {
+[data-slot="input-wrapper"][data-focus-visible="true"]::after,
+[data-slot="input-wrapper"][data-focus-within="true"]::before,
+[data-slot="input-wrapper"][data-focus-within="true"]::after,
+[data-slot="inner-wrapper"][data-focus="true"]::before,
+[data-slot="inner-wrapper"][data-focus="true"]::after {
   background: transparent !important;
   opacity: 0 !important;
+  box-shadow: none !important;
+}
+
+/* HeroUI Textarea 底部高亮条 */
+[data-slot="input-wrapper"] [data-slot="highlight"],
+[data-slot="input-wrapper"] .absolute.bottom-0 {
+  display: none !important;
 }
 
 @keyframes thinkingIslandGlow {
   0%, 100% {
     box-shadow:
-      0 18px 42px rgba(15, 23, 42, 0.12),
-      0 0 0 1px rgba(59, 130, 246, 0.08),
-      0 0 0 6px rgba(59, 130, 246, 0.04);
+      0 12px 32px rgba(15, 23, 42, 0.10),
+      0 0 0 1px rgba(59, 130, 246, 0.06);
   }
   50% {
     box-shadow:
-      0 22px 54px rgba(15, 23, 42, 0.18),
-      0 0 0 1px rgba(59, 130, 246, 0.14),
-      0 0 0 8px rgba(59, 130, 246, 0.06);
+      0 16px 40px rgba(15, 23, 42, 0.14),
+      0 0 0 1px rgba(59, 130, 246, 0.10);
   }
 }
 
 .thinking-island-live {
-  animation: thinkingIslandGlow 2.8s cubic-bezier(0.33, 1, 0.68, 1) infinite;
+  animation: thinkingIslandGlow 3.2s cubic-bezier(0.33, 1, 0.68, 1) infinite;
 }
 
 @keyframes thinkingProgressSweep {
@@ -113,37 +125,28 @@ html.theme-animating * {
   left: 0;
   width: 2px;
   border-radius: 999px;
-  background: linear-gradient(
-    180deg,
-    rgba(59, 130, 246, 0) 0%,
-    rgba(59, 130, 246, 0.42) 18%,
-    rgba(59, 130, 246, 0.7) 50%,
-    rgba(59, 130, 246, 0.42) 82%,
-    rgba(59, 130, 246, 0) 100%
-  );
-  opacity: 0.35;
-  transition: opacity 180ms ease, transform 180ms ease;
+  background: rgba(148, 163, 184, 0.3);
+  opacity: 0;
+  transition: opacity 180ms ease;
 }
 
-.thinking-island-resize-handle:hover::before,
-.thinking-island-resize-grip:hover {
+.thinking-island-resize-handle:hover::before {
   opacity: 1;
-  transform: scale(1.02);
 }
 
-.thinking-island-resize-grip {
-  box-shadow:
-    0 6px 16px rgba(15, 23, 42, 0.18),
-    inset 0 1px 0 rgba(255, 255, 255, 0.28);
-  transition: transform 180ms ease, opacity 180ms ease, box-shadow 180ms ease;
-}
-
-.thinking-island-resize-grip::before {
+.thinking-island-resize-handle-bottom::before {
   content: "";
   position: absolute;
-  inset: 3px;
+  left: 16px;
+  right: 16px;
+  top: 0;
+  height: 2px;
   border-radius: 999px;
-  border-right: 1.5px solid rgba(255, 255, 255, 0.6);
-  border-bottom: 1.5px solid rgba(255, 255, 255, 0.6);
-  transform: rotate(0deg);
+  background: rgba(148, 163, 184, 0.3);
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.thinking-island-resize-handle-bottom:hover::before {
+  opacity: 1;
 }
