@@ -45,6 +45,13 @@ Thumbs.db
 Desktop.ini
 .DS_Store
 
+# SSH 脚本（包含敏感信息）
+scripts/*ssh*.exp
+scripts/*ssh*.py
+scripts/*vps*.py
+scripts/*vps*.sh
+scripts/*vps*.ps1
+
 # WebUI 前端
 webui/node_modules/
 webui/dist/
