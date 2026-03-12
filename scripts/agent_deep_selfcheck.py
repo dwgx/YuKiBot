@@ -111,11 +111,11 @@ def _check_agent_parse_and_prompt() -> list[_Check]:
 
     now = datetime.now(timezone.utc)
     ctx = AgentContext(
-        conversation_id="group:***REMOVED***",
-        user_id="***REMOVED***",
+        conversation_id="group:123456",
+        user_id="10001",
         user_name="tester",
-        group_id=***REMOVED***,
-        bot_id="***REMOVED***",
+        group_id=123456,
+        bot_id="3223915831",
         is_private=False,
         mentioned=True,
         message_text="这张图里是谁",

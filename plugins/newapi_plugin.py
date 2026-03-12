@@ -63,8 +63,8 @@ _PLUGIN_RUNTIME_DEFAULTS: dict[str, Any] = {
     },
     "payment": {
         "auto_require_method_selection_when_multiple": True,
-        "auto_prefer_methods": ["wxpay", "alipay", "qqpay"],
-        "auto_fallback_method_when_info_unavailable": "wxpay",  # wxpay/alipay/qqpay/stripe/none
+        "auto_prefer_methods": ["wxpay", "alipay"],
+        "auto_fallback_method_when_info_unavailable": "wxpay",  # wxpay/alipay/stripe/none
         "include_epay_submit_url": True,
         "show_amount_unit_hint": True,
         "show_topup_command_hints": True,
@@ -120,7 +120,7 @@ def _build_runtime_config(raw_config: dict[str, Any]) -> dict[str, Any]:
         if isinstance(methods_raw, list):
             for item in methods_raw:
                 method = _normalize_pay_method(str(item))
-                if method in {"wxpay", "alipay", "qqpay"} and method not in methods:
+                if method in {"wxpay", "alipay"} and method not in methods:
                     methods.append(method)
         if not methods:
             methods = list(cfg["payment"]["auto_prefer_methods"])
@@ -132,7 +132,7 @@ def _build_runtime_config(raw_config: dict[str, Any]) -> dict[str, Any]:
                 cfg["payment"]["auto_fallback_method_when_info_unavailable"],
             )),
         )
-        if fallback_raw not in {"wxpay", "alipay", "qqpay", "stripe", "none"}:
+        if fallback_raw not in {"wxpay", "alipay", "stripe", "none"}:
             fallback_raw = str(cfg["payment"]["auto_fallback_method_when_info_unavailable"])
         cfg["payment"]["auto_fallback_method_when_info_unavailable"] = fallback_raw
 
@@ -496,7 +496,7 @@ def _topup_record_is_success(record: dict[str, Any] | None) -> bool:
 def _pending_payment_brief(pending: dict[str, Any]) -> str:
     order_no = str(pending.get("site_order_no", "")).strip() or "-"
     method = _normalize_pay_method(str(pending.get("method", "")))
-    method_name = {"wxpay": "微信", "alipay": "支付宝", "qqpay": "QQ", "stripe": "Stripe", "creem": "Creem"}.get(method, method or "-")
+    method_name = {"wxpay": "微信", "alipay": "支付宝", "stripe": "Stripe", "creem": "Creem"}.get(method, method or "-")
     amount = _safe_int(pending.get("amount"), 0)
     created_at = _safe_int(pending.get("created_at"), 0)
     return f"订单号 {order_no}，渠道 {method_name}，充值额度 {amount}，发起时间 {_fmt_local_time(created_at)}"
@@ -1192,9 +1192,6 @@ def _normalize_pay_method(raw_method: str) -> str:
         "alipay": "alipay",
         "zfb": "alipay",
         "支付宝": "alipay",
-        "qq": "qqpay",
-        "qq支付": "qqpay",
-        "qqpay": "qqpay",
         "stripe": "stripe",
         "creem": "creem",
     }
@@ -1235,7 +1232,7 @@ def _looks_like_online_payment_args(raw_args: str) -> bool:
         return False
     if len(parts) == 1:
         return True
-    return any(_normalize_pay_method(part) in {"auto", "wxpay", "alipay", "qqpay", "stripe", "creem"} for part in parts[1:])
+    return any(_normalize_pay_method(part) in {"auto", "wxpay", "alipay", "stripe", "creem"} for part in parts[1:])
 
 
 def _remember_pending_payment(
@@ -1785,7 +1782,7 @@ async def _cmd_topup(args: str, context: dict) -> str:
 
         if show_topup_command_hints:
             lines.append("")
-            lines.append("使用 /api pay <金额> [auto/wxpay/alipay/qqpay/stripe] 发起在线支付")
+            lines.append("使用 /api pay <金额> [auto/wxpay/alipay/stripe] 发起在线支付")
             lines.append("支付完成后可用 /api pay.status 查询是否到账")
             lines.append("使用 /api pay creem <product_id> 发起 Creem 支付")
             lines.append("使用 /api topup <兌換碼> 使用兌換碼充值")
@@ -1795,16 +1792,16 @@ async def _cmd_topup(args: str, context: dict) -> str:
 
 
 async def _cmd_pay(args: str, context: dict) -> str:
-    """发起支付: /api pay <金额> [auto/wxpay/alipay/qqpay/stripe] | /api pay creem <product_id>"""
+    """发起支付: /api pay <金额> [auto/wxpay/alipay/stripe] | /api pay creem <product_id>"""
     runtime_cfg = _get_runtime_cfg()
     payment_cfg = runtime_cfg.get("payment", {}) if isinstance(runtime_cfg, dict) else {}
     if not isinstance(payment_cfg, dict):
         payment_cfg = {}
     require_method_selection = bool(payment_cfg.get("auto_require_method_selection_when_multiple", True))
-    prefer_methods_raw = payment_cfg.get("auto_prefer_methods", ["wxpay", "alipay", "qqpay"])
-    prefer_methods = [m for m in prefer_methods_raw if m in {"wxpay", "alipay", "qqpay"}] if isinstance(prefer_methods_raw, list) else ["wxpay", "alipay", "qqpay"]
+    prefer_methods_raw = payment_cfg.get("auto_prefer_methods", ["wxpay", "alipay"])
+    prefer_methods = [m for m in prefer_methods_raw if m in {"wxpay", "alipay"}] if isinstance(prefer_methods_raw, list) else ["wxpay", "alipay"]
     if not prefer_methods:
-        prefer_methods = ["wxpay", "alipay", "qqpay"]
+        prefer_methods = ["wxpay", "alipay"]
     fallback_method = _normalize_pay_method(str(payment_cfg.get("auto_fallback_method_when_info_unavailable", "wxpay")))
     include_epay_submit_url = bool(payment_cfg.get("include_epay_submit_url", True))
     show_amount_unit_hint = bool(payment_cfg.get("show_amount_unit_hint", True))
@@ -1813,7 +1810,7 @@ async def _cmd_pay(args: str, context: dict) -> str:
     if not parts:
         return (
             "用法:\n"
-            "/api pay <金额> [auto/wxpay/alipay/qqpay/stripe]\n"
+            "/api pay <金额> [auto/wxpay/alipay/stripe]\n"
             "/api pay creem <product_id>\n"
             "示例: /api pay 100 auto"
         )
@@ -1867,7 +1864,7 @@ async def _cmd_pay(args: str, context: dict) -> str:
                         if not isinstance(m, dict):
                             continue
                         t = _normalize_pay_method(m.get("type", ""))
-                        if t in {"wxpay", "alipay", "qqpay"}:
+                        if t in {"wxpay", "alipay"}:
                             epay_methods.append(t)
 
             unique_methods = list(dict.fromkeys(epay_methods))
@@ -1875,7 +1872,6 @@ async def _cmd_pay(args: str, context: dict) -> str:
                 labels = {
                     "wxpay": "微信",
                     "alipay": "支付宝",
-                    "qqpay": "QQ",
                 }
                 human = "、".join(f"{labels.get(m, m)}({m})" for m in unique_methods)
                 suggest_lines = [f"检测到可用支付方式: {human}"]
@@ -1896,12 +1892,12 @@ async def _cmd_pay(args: str, context: dict) -> str:
                 return "❌ 当前站点仅检测到 Creem 支付，请使用 /api pay creem <product_id>。"
             else:
                 # topup/info 不可用时，按配置选择回退策略
-                if fallback_method in {"wxpay", "alipay", "qqpay", "stripe"}:
+                if fallback_method in {"wxpay", "alipay", "stripe"}:
                     method = fallback_method
                 else:
                     return "❌ 当前无法自动判断支付方式，请手动指定：/api pay <金额> wxpay 或 alipay。"
 
-        if method in {"wxpay", "alipay", "qqpay"}:
+        if method in {"wxpay", "alipay"}:
             # 显式选择支付方式时不强依赖 topup/info；仅在有信息时做金额提示
             if not info_data:
                 topup_info = await client.get_topup_info()
@@ -1943,7 +1939,7 @@ async def _cmd_pay(args: str, context: dict) -> str:
             full_pay_url = _build_epay_submit_url(r) if include_epay_submit_url else ""
             if not pay_url and not full_pay_url:
                 return "❌ 未获取到支付链接，请检查站点支付配置。"
-            method_name = {"wxpay": "微信", "alipay": "支付宝", "qqpay": "QQ"}.get(method, method)
+            method_name = {"wxpay": "微信", "alipay": "支付宝"}.get(method, method)
             site_order_no = ""
             if isinstance(r.get("data"), dict):
                 site_order_no = str(r.get("data", {}).get("out_trade_no", "")).strip()
@@ -2001,7 +1997,7 @@ async def _cmd_pay(args: str, context: dict) -> str:
             lines.append(f"支付链接: {pay_url}")
             return "\n".join(lines)
 
-        return f"不支持的支付方式: {method}\n可选: auto, wxpay, alipay, qqpay, stripe, creem"
+        return f"不支持的支付方式: {method}\n可选: auto, wxpay, alipay, stripe, creem"
     finally:
         await client.close()
 
@@ -2085,7 +2081,7 @@ async def _cmd_pay_status(args: str, context: dict) -> str:
                 lines.append(f"实付金额: ¥{money:.2f}")
             payment_method = _normalize_pay_method(str(matched.get("payment_method", "")))
             if payment_method:
-                method_name = {"wxpay": "微信", "alipay": "支付宝", "qqpay": "QQ", "stripe": "Stripe", "creem": "Creem"}.get(payment_method, payment_method)
+                method_name = {"wxpay": "微信", "alipay": "支付宝", "stripe": "Stripe", "creem": "Creem"}.get(payment_method, payment_method)
                 lines.append(f"支付方式: {method_name}")
             create_time = _safe_int(matched.get("create_time"), 0)
             if create_time > 0:
@@ -2301,13 +2297,13 @@ class Plugin:
             },
             "payment.auto_prefer_methods": {
                 "type": "array",
-                "description": "auto 模式优先顺序（wxpay,alipay,qqpay）",
-                "default": ["wxpay", "alipay", "qqpay"],
+                "description": "auto 模式优先顺序（wxpay,alipay）",
+                "default": ["wxpay", "alipay"],
             },
             "payment.auto_fallback_method_when_info_unavailable": {
                 "type": "string",
                 "description": "topup info 不可用时 auto 回退方式",
-                "enum": ["wxpay", "alipay", "qqpay", "stripe", "none"],
+                "enum": ["wxpay", "alipay", "stripe", "none"],
                 "default": "wxpay",
             },
             "payment.include_epay_submit_url": {

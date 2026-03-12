@@ -266,7 +266,7 @@ class NewAPIClient:
         ])
 
     async def request_epay(self, amount: int, payment_method: str = "wxpay") -> dict:
-        """发起 Epay 支付，返回支付 URL。payment_method: wxpay / alipay / qqpay"""
+        """发起 Epay 支付，返回支付 URL。payment_method: wxpay / alipay"""
         return await self._post_with_fallback([
             "/api/user/self/pay",
             "/api/user/pay",

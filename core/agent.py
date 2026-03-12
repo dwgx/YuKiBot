@@ -2549,8 +2549,16 @@ class AgentLoop:
         t = (text or "").lower()
         cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
         if not cues:
-            return False
-        return any(c in t for c in cues)
+            cues = [
+                "图里", "图中", "这图", "这张图", "看图", "图片", "照片", "截图", "动图", "gif",
+                "这是什么图", "图上", "图里的", "识图", "看不懂图",
+            ]
+        if any(c in t for c in cues):
+            return True
+        # 弱兜底：出现“图像词 + 提问词”时也视为图片提问。
+        ask_words = ("是谁", "是什么", "谁", "啥", "怎么", "哪", "有没有", "在干嘛", "干什么")
+        image_words = ("图", "图片", "照片", "截图", "动图", "gif")
+        return any(a in t for a in ask_words) and any(w in t for w in image_words)
 
     @staticmethod
     def _looks_like_all_images_request(text: str) -> bool:

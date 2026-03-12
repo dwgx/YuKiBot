@@ -11,10 +11,11 @@ import contextlib
 import asyncio
 import logging
 import re
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import unescape
-from typing import Any
+from typing import Any, Awaitable, Callable, TypeVar
 from urllib.parse import quote, unquote, urlparse
 
 import httpx
@@ -49,6 +50,7 @@ _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _MULTI_NL_RE = re.compile(r"\n{3,}")
 _MULTI_SP_RE = re.compile(r"[ \t]{2,}")
 _TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_T = TypeVar("_T")
 
 
 @dataclass(slots=True)
@@ -315,7 +317,12 @@ class Plugin:
 
     def __init__(self) -> None:
         self._enabled = True
-        self._timeout_seconds = 8.0  # 减少超时时间从 18 秒到 8 秒
+        self._timeout_seconds = 18.0
+        self._operation_budget_seconds = 14.0
+        self._variant_stagger_seconds = 0.05
+        self._variant_max_parallel = 2
+        self._cdx_max_retries = 2
+        self._cdx_retry_base_delay = 0.8
         self._default_limit = 8
         self._max_text_chars = 12000
         self._llm_input_chars = 6500
@@ -325,12 +332,23 @@ class Plugin:
         self._ua = _DEFAULT_UA
         self._client: httpx.AsyncClient | None = None
         self._model_client: Any = None
-        self._cache: dict[str, tuple[list[_Snapshot], float]] = {}  # 添加缓存
-        self._cache_ttl = 300.0  # 缓存 5 分钟
+        self._cache: dict[str, tuple[list[_Snapshot], float]] = {}
+        self._cache_ttl = 300.0
 
     async def setup(self, config: dict[str, Any], context: Any) -> None:
         self._enabled = bool(config.get("enabled", True))
         self._timeout_seconds = float(config.get("timeout_seconds", 18.0))
+        budget_default = max(8.0, min(self._timeout_seconds - 2.0, 14.0))
+        self._operation_budget_seconds = float(config.get("operation_budget_seconds", budget_default))
+        self._operation_budget_seconds = max(4.0, self._operation_budget_seconds)
+        self._variant_stagger_seconds = float(config.get("variant_stagger_seconds", 0.05))
+        self._variant_stagger_seconds = max(0.01, min(1.2, self._variant_stagger_seconds))
+        self._variant_max_parallel = int(config.get("variant_max_parallel", 2))
+        self._variant_max_parallel = max(1, min(4, self._variant_max_parallel))
+        self._cdx_max_retries = int(config.get("cdx_max_retries", 2))
+        self._cdx_max_retries = max(1, min(5, self._cdx_max_retries))
+        self._cdx_retry_base_delay = float(config.get("cdx_retry_base_delay", 0.8))
+        self._cdx_retry_base_delay = max(0.2, min(5.0, self._cdx_retry_base_delay))
         self._default_limit = max(1, min(20, int(config.get("default_limit", 8))))
         self._max_text_chars = max(2000, min(30000, int(config.get("max_text_chars", 12000))))
         self._llm_input_chars = max(1200, min(self._max_text_chars, int(config.get("llm_input_chars", 6500))))
@@ -351,8 +369,10 @@ class Plugin:
 
         self._register_tools(registry)
         _log.info(
-            "wayback_plugin setup | timeout=%.1fs | default_limit=%d | max_text=%d",
+            "wayback_plugin setup | timeout=%.1fs | budget=%.1fs | parallel=%d | default_limit=%d | max_text=%d",
             self._timeout_seconds,
+            self._operation_budget_seconds,
+            self._variant_max_parallel,
             self._default_limit,
             self._max_text_chars,
         )
@@ -474,6 +494,106 @@ class Plugin:
             )
         return self._client
 
+    def _new_deadline(self, budget_seconds: float | None = None) -> float:
+        budget = float(budget_seconds if budget_seconds is not None else self._operation_budget_seconds)
+        budget = max(0.2, budget)
+        return asyncio.get_running_loop().time() + budget
+
+    def _remaining(self, deadline: float | None) -> float:
+        if deadline is None:
+            return self._timeout_seconds
+        return deadline - asyncio.get_running_loop().time()
+
+    async def _await_with_deadline(
+        self,
+        awaitable: Awaitable[_T],
+        *,
+        deadline: float | None,
+        minimum: float = 0.05,
+    ) -> _T:
+        if deadline is None:
+            return await awaitable
+        remaining = self._remaining(deadline)
+        if remaining <= 0:
+            raise TimeoutError("deadline_exceeded")
+        timeout = max(minimum, remaining)
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+    async def _race_variants(
+        self,
+        *,
+        variants: list[str],
+        worker: Callable[[str], Awaitable[_T]],
+        is_success: Callable[[_T], bool],
+        deadline: float | None,
+        errors: list[str] | None = None,
+    ) -> tuple[str, _T | None]:
+        if not variants:
+            return "", None
+
+        pending: dict[asyncio.Task[tuple[str, _T | None, Exception | None]], str] = {}
+        next_index = 0
+
+        async def _runner(variant: str) -> tuple[str, _T | None, Exception | None]:
+            try:
+                value = await worker(variant)
+                return variant, value, None
+            except Exception as exc:
+                return variant, None, exc
+
+        def _launch_one() -> bool:
+            nonlocal next_index
+            if next_index >= len(variants):
+                return False
+            if deadline is not None and self._remaining(deadline) <= 0:
+                return False
+            variant = variants[next_index]
+            next_index += 1
+            task = asyncio.create_task(_runner(variant))
+            pending[task] = variant
+            return True
+
+        _launch_one()
+        while pending:
+            if deadline is not None and self._remaining(deadline) <= 0:
+                break
+            wait_budget = self._variant_stagger_seconds
+            if deadline is not None:
+                wait_budget = min(wait_budget, max(0.01, self._remaining(deadline)))
+            done, _ = await asyncio.wait(
+                list(pending.keys()),
+                timeout=wait_budget,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not done:
+                if len(pending) < self._variant_max_parallel:
+                    _launch_one()
+                continue
+
+            for task in done:
+                pending.pop(task, None)
+                variant, value, err = await task
+                if err is not None:
+                    if errors is not None:
+                        errors.append(f"{variant}:{err}")
+                    continue
+                if value is not None and is_success(value):
+                    for rest in pending:
+                        rest.cancel()
+                    with contextlib.suppress(Exception):
+                        await asyncio.gather(*pending.keys(), return_exceptions=True)
+                    return variant, value
+
+            while len(pending) < self._variant_max_parallel and next_index < len(variants):
+                if not _launch_one():
+                    break
+
+        for task in pending:
+            task.cancel()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(*pending.keys(), return_exceptions=True)
+        return "", None
+
     async def _query_cdx(
         self,
         *,
@@ -482,9 +602,9 @@ class Plugin:
         to_ts: str = "",
         limit: int = 8,
         include_non_200: bool = False,
+        deadline: float | None = None,
     ) -> list[_Snapshot]:
-        # 检查缓存
-        import time
+        started = asyncio.get_running_loop().time()
         cache_key = f"{url}:{from_ts}:{to_ts}:{limit}:{include_non_200}"
         if cache_key in self._cache:
             cached_data, cached_time = self._cache[cache_key]
@@ -507,29 +627,47 @@ class Plugin:
         if to_ts:
             params["to"] = _normalize_timestamp(to_ts)
 
-        # 添加重试机制处理429错误
-        max_retries = 3
-        retry_delay = 2.0
-        last_error = None
+        max_retries = self._cdx_max_retries
+        retry_delay = self._cdx_retry_base_delay
+        last_error: Exception | None = None
+        data: Any = []
 
         for attempt in range(max_retries):
             try:
-                resp = await client.get(_WAYBACK_CDX_URL, params=params)
+                resp = await self._await_with_deadline(
+                    client.get(_WAYBACK_CDX_URL, params=params),
+                    deadline=deadline,
+                )
                 resp.raise_for_status()
                 data = resp.json()
                 break
+            except TimeoutError as exc:
+                last_error = exc
+                if attempt >= max_retries - 1:
+                    raise
+                remaining = self._remaining(deadline)
+                if remaining <= 0.2:
+                    raise
+                pause = min(retry_delay, max(0.05, remaining - 0.1))
+                await asyncio.sleep(pause)
+                retry_delay *= 1.7
             except httpx.HTTPStatusError as exc:
                 last_error = exc
                 if exc.response.status_code == 429 and attempt < max_retries - 1:
+                    remaining = self._remaining(deadline)
+                    if remaining <= 0.2:
+                        raise TimeoutError("cdx_rate_limit_deadline_exceeded")
+                    pause = min(retry_delay, max(0.05, remaining - 0.1))
                     _log.warning(
-                        "wayback_cdx_rate_limited | url=%s | attempt=%d/%d | retry_after=%.1fs",
+                        "wayback_cdx_rate_limited | url=%s | attempt=%d/%d | retry_after=%.2fs | remaining=%.2fs",
                         url,
                         attempt + 1,
                         max_retries,
-                        retry_delay,
+                        pause,
+                        max(0.0, remaining),
                     )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # 指数退避
+                    await asyncio.sleep(pause)
+                    retry_delay *= 1.7
                     continue
                 raise
             except Exception as exc:
@@ -565,25 +703,84 @@ class Plugin:
                 )
             )
 
-        # 保存到缓存
-        import time
         self._cache[cache_key] = (out, time.time())
-        # 清理过期缓存
         if len(self._cache) > 100:
             now = time.time()
             expired = [k for k, (_, t) in self._cache.items() if now - t > self._cache_ttl]
             for k in expired:
                 self._cache.pop(k, None)
 
+        _log.debug(
+            "wayback_cdx_done | url=%s | rows=%d | elapsed_ms=%d",
+            url,
+            len(out),
+            int((asyncio.get_running_loop().time() - started) * 1000),
+        )
+
         return out
 
-    async def _lookup_closest(self, *, url: str, timestamp: str = "") -> _Snapshot | None:
+    async def _query_cdx_with_budget(
+        self,
+        *,
+        url: str,
+        from_ts: str = "",
+        to_ts: str = "",
+        limit: int = 8,
+        include_non_200: bool = False,
+        deadline: float | None = None,
+    ) -> list[_Snapshot]:
+        try:
+            return await self._query_cdx(
+                url=url,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                include_non_200=include_non_200,
+                deadline=deadline,
+            )
+        except TypeError as exc:
+            # Compatibility path for monkeypatched tests/older signatures.
+            if "deadline" not in str(exc):
+                raise
+            return await self._query_cdx(
+                url=url,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=limit,
+                include_non_200=include_non_200,
+            )
+
+    async def _lookup_closest_with_budget(
+        self,
+        *,
+        url: str,
+        timestamp: str = "",
+        deadline: float | None = None,
+    ) -> _Snapshot | None:
+        try:
+            return await self._lookup_closest(url=url, timestamp=timestamp, deadline=deadline)
+        except TypeError as exc:
+            # Compatibility path for monkeypatched tests/older signatures.
+            if "deadline" not in str(exc):
+                raise
+            return await self._lookup_closest(url=url, timestamp=timestamp)
+
+    async def _lookup_closest(
+        self,
+        *,
+        url: str,
+        timestamp: str = "",
+        deadline: float | None = None,
+    ) -> _Snapshot | None:
         client = await self._get_client()
         params = {"url": url}
         ts = _normalize_timestamp(timestamp)
         if ts:
             params["timestamp"] = ts
-        resp = await client.get(_WAYBACK_AVAILABLE_URL, params=params)
+        resp = await self._await_with_deadline(
+            client.get(_WAYBACK_AVAILABLE_URL, params=params),
+            deadline=deadline,
+        )
         resp.raise_for_status()
         data = resp.json()
         if not isinstance(data, dict):
@@ -605,7 +802,15 @@ class Plugin:
         _ = (url, from_year, to_year)
         return []
 
-    async def _resolve_snapshot(self, *, url: str, year: int | None, timestamp: str) -> tuple[_Snapshot | None, str]:
+    async def _resolve_snapshot(
+        self,
+        *,
+        url: str,
+        year: int | None,
+        timestamp: str,
+        deadline: float | None = None,
+    ) -> tuple[_Snapshot | None, str]:
+        op_deadline = deadline if deadline is not None else self._new_deadline()
         parsed_wayback = _parse_wayback_url(url)
         if parsed_wayback:
             return parsed_wayback, "input_wayback_url"
@@ -617,137 +822,149 @@ class Plugin:
         if not variants:
             return None, "invalid_url"
 
-        # 1) Timestamp-oriented search across URL variants.
+        errors: list[str] = []
+
+        # 1) Timestamp-oriented search.
         if target_ts:
             ts_target_int = int(target_ts)
-            closest_hits: list[tuple[int, _Snapshot, str]] = []
 
-            async def _lookup_variant(variant: str) -> tuple[str, _Snapshot | None]:
-                return variant, await self._lookup_closest(url=variant, timestamp=target_ts)
+            async def _lookup_variant(variant: str) -> _Snapshot | None:
+                return await self._lookup_closest_with_budget(
+                    url=variant,
+                    timestamp=target_ts,
+                    deadline=op_deadline,
+                )
 
-            tasks = [asyncio.create_task(_lookup_variant(variant)) for variant in variants]
-            try:
-                for done in asyncio.as_completed(tasks):
-                    try:
-                        variant, closest = await done
-                    except Exception:
-                        continue
-                    if not closest or not closest.timestamp:
-                        continue
-                    with contextlib.suppress(Exception):
-                        diff = abs(int(closest.timestamp) - ts_target_int)
-                        closest_hits.append((diff, closest, f"available_closest:{variant}"))
-                    # First successful closest match should not wait for slow variants.
-                    if closest_hits:
-                        break
-            finally:
-                for task in tasks:
-                    if not task.done():
-                        task.cancel()
-                with contextlib.suppress(Exception):
-                    await asyncio.gather(*tasks, return_exceptions=True)
-            if closest_hits:
-                closest_hits.sort(key=lambda x: x[0])
-                _, snap, mode = closest_hits[0]
-                return snap, mode
+            variant, closest = await self._race_variants(
+                variants=variants,
+                worker=_lookup_variant,
+                is_success=lambda snap: bool(snap and snap.timestamp),
+                deadline=op_deadline,
+                errors=errors,
+            )
+            if closest and closest.timestamp:
+                return closest, f"available_closest:{variant}"
 
             win_from, win_to = _ts_window_around(target_ts, days=150)
             if win_from and win_to:
-                near_hits: list[tuple[int, _Snapshot, str]] = []
-                for variant in variants:
-                    with contextlib.suppress(Exception):
-                        rows = await self._query_cdx(
-                            url=variant,
-                            from_ts=win_from,
-                            to_ts=win_to,
-                            limit=max(self._default_limit, 40),
-                            include_non_200=self._include_non_200_default,
-                        )
-                        for row in rows:
-                            diff = abs(int(row.timestamp) - ts_target_int)
-                            near_hits.append((diff, row, f"cdx_window:{variant}"))
-                if near_hits:
-                    near_hits.sort(key=lambda x: x[0])
-                    _, snap, mode = near_hits[0]
-                    return snap, mode
+                async def _query_window(variant: str) -> list[_Snapshot]:
+                    return await self._query_cdx_with_budget(
+                        url=variant,
+                        from_ts=win_from,
+                        to_ts=win_to,
+                        limit=max(self._default_limit, 24),
+                        include_non_200=self._include_non_200_default,
+                        deadline=op_deadline,
+                    )
 
-        # 2) Year-oriented search across URL variants.
+                variant, rows = await self._race_variants(
+                    variants=variants,
+                    worker=_query_window,
+                    is_success=lambda items: bool(items),
+                    deadline=op_deadline,
+                    errors=errors,
+                )
+                if rows:
+                    picked = min(rows, key=lambda row: abs(int(row.timestamp) - ts_target_int))
+                    return picked, f"cdx_window:{variant}"
+
+        # 2) Year-oriented search.
         if year:
             y_from, y_to = _ts_year_window(year)
-            year_hits: list[tuple[int, _Snapshot, str]] = []
             target_for_pick = target_ts or y_from
             target_int = int(target_for_pick)
-            for variant in variants:
-                with contextlib.suppress(Exception):
-                    rows = await self._query_cdx(
-                        url=variant,
-                        from_ts=y_from,
-                        to_ts=y_to,
-                        limit=max(self._default_limit, 30),
-                        include_non_200=self._include_non_200_default,
-                    )
-                    for row in rows:
-                        diff = abs(int(row.timestamp) - target_int)
-                        year_hits.append((diff, row, f"cdx_year:{variant}"))
-            if year_hits:
-                year_hits.sort(key=lambda x: x[0])
-                _, snap, mode = year_hits[0]
-                return snap, mode
+
+            async def _query_year(variant: str) -> list[_Snapshot]:
+                return await self._query_cdx_with_budget(
+                    url=variant,
+                    from_ts=y_from,
+                    to_ts=y_to,
+                    limit=max(self._default_limit, 18),
+                    include_non_200=self._include_non_200_default,
+                    deadline=op_deadline,
+                )
+
+            variant, rows = await self._race_variants(
+                variants=variants,
+                worker=_query_year,
+                is_success=lambda items: bool(items),
+                deadline=op_deadline,
+                errors=errors,
+            )
+            if rows:
+                picked = min(rows, key=lambda row: abs(int(row.timestamp) - target_int))
+                return picked, f"cdx_year:{variant}"
 
             # Retry nearby years when the exact year has no usable snapshot.
             for offset in range(1, self._retry_nearby + 1):
-                near_hits: list[tuple[int, _Snapshot, str]] = []
                 for yy in (year - offset, year + offset):
                     if yy < 1900 or yy > 2099:
                         continue
                     y_from2, y_to2 = _ts_year_window(yy)
                     target2 = int(target_ts or y_from2)
-                    for variant in variants:
-                        with contextlib.suppress(Exception):
-                            rows = await self._query_cdx(
-                                url=variant,
-                                from_ts=y_from2,
-                                to_ts=y_to2,
-                                limit=max(self._default_limit, 25),
-                                include_non_200=self._include_non_200_default,
-                            )
-                            for row in rows:
-                                diff = abs(int(row.timestamp) - target2)
-                                near_hits.append((diff, row, f"cdx_nearby_year:{yy}:{variant}"))
-                if near_hits:
-                    near_hits.sort(key=lambda x: x[0])
-                    _, snap, mode = near_hits[0]
-                    return snap, mode
+
+                    async def _query_nearby(variant: str, _from: str = y_from2, _to: str = y_to2) -> list[_Snapshot]:
+                        return await self._query_cdx_with_budget(
+                            url=variant,
+                            from_ts=_from,
+                            to_ts=_to,
+                            limit=max(self._default_limit, 14),
+                            include_non_200=self._include_non_200_default,
+                            deadline=op_deadline,
+                        )
+
+                    variant, rows = await self._race_variants(
+                        variants=variants,
+                        worker=_query_nearby,
+                        is_success=lambda items: bool(items),
+                        deadline=op_deadline,
+                        errors=errors,
+                    )
+                    if rows:
+                        picked = min(rows, key=lambda row: abs(int(row.timestamp) - target2))
+                        return picked, f"cdx_nearby_year:{yy}:{variant}"
 
         # If caller explicitly constrained by year/timestamp, avoid unrelated latest fallback.
         if year or target_ts:
+            if errors:
+                _log.debug("wayback_resolve_constraint_not_found | url=%s | errors=%s", url, clip_text("; ".join(errors), 300))
             return None, "constraint_not_found"
 
         # 3) Unconstrained fallback (latest snapshot).
-        latest_hits: list[_Snapshot] = []
-        for variant in variants:
-            with contextlib.suppress(Exception):
-                latest = await self._lookup_closest(url=variant)
-                if latest and latest.timestamp:
-                    latest_hits.append(latest)
-        if latest_hits:
-            latest_hits.sort(key=lambda s: s.timestamp, reverse=True)
-            return latest_hits[0], "available_latest"
+        async def _lookup_latest(variant: str) -> _Snapshot | None:
+            return await self._lookup_closest_with_budget(url=variant, deadline=op_deadline)
 
-        fallback_rows: list[_Snapshot] = []
-        for variant in variants:
-            with contextlib.suppress(Exception):
-                rows = await self._query_cdx(
-                    url=variant,
-                    limit=self._default_limit,
-                    include_non_200=self._include_non_200_default,
-                )
-                if rows:
-                    fallback_rows.extend(rows)
-        if fallback_rows:
-            fallback_rows.sort(key=lambda s: s.timestamp, reverse=True)
-            return fallback_rows[0], "cdx_fallback"
+        variant, latest = await self._race_variants(
+            variants=variants,
+            worker=_lookup_latest,
+            is_success=lambda snap: bool(snap and snap.timestamp),
+            deadline=op_deadline,
+            errors=errors,
+        )
+        if latest and latest.timestamp:
+            return latest, f"available_latest:{variant}"
 
+        async def _query_latest_rows(variant: str) -> list[_Snapshot]:
+            return await self._query_cdx_with_budget(
+                url=variant,
+                limit=self._default_limit,
+                include_non_200=self._include_non_200_default,
+                deadline=op_deadline,
+            )
+
+        variant, rows = await self._race_variants(
+            variants=variants,
+            worker=_query_latest_rows,
+            is_success=lambda items: bool(items),
+            deadline=op_deadline,
+            errors=errors,
+        )
+        if rows:
+            rows = sorted(rows, key=lambda s: s.timestamp, reverse=True)
+            return rows[0], f"cdx_fallback:{variant}"
+
+        if errors:
+            _log.debug("wayback_resolve_not_found | url=%s | errors=%s", url, clip_text("; ".join(errors), 300))
         return None, "not_found"
 
     async def _fetch_snapshot_text(
@@ -755,6 +972,7 @@ class Plugin:
         snapshot: _Snapshot,
         *,
         max_chars: int,
+        deadline: float | None = None,
     ) -> dict[str, Any]:
         client = await self._get_client()
         candidates = [snapshot.raw_url(), snapshot.ui_url()]
@@ -762,7 +980,10 @@ class Plugin:
 
         for page_url in candidates:
             try:
-                resp = await client.get(page_url)
+                resp = await self._await_with_deadline(
+                    client.get(page_url),
+                    deadline=deadline,
+                )
             except Exception as exc:
                 errors.append(f"{page_url} -> {exc}")
                 continue
@@ -835,6 +1056,8 @@ class Plugin:
 
         if not self._enabled:
             return ToolCallResult(ok=False, error="disabled", display="wayback plugin is disabled")
+        started = asyncio.get_running_loop().time()
+        deadline = self._new_deadline()
 
         url = _normalize_url(args.get("url", ""))
         if not url:
@@ -855,38 +1078,25 @@ class Plugin:
         errors: list[str] = []
         source_variant = ""
 
-        async def _run_variant(variant: str) -> tuple[str, list[_Snapshot] | None, Exception | None]:
-            try:
-                rows = await self._query_cdx(
-                    url=variant,
-                    from_ts=from_ts,
-                    to_ts=to_ts,
-                    limit=max(limit, 20),
-                    include_non_200=include_non_200,
-                )
-                return variant, rows, None
-            except Exception as exc:
-                return variant, None, exc
+        async def _query_variant(variant: str) -> list[_Snapshot]:
+            return await self._query_cdx_with_budget(
+                url=variant,
+                from_ts=from_ts,
+                to_ts=to_ts,
+                limit=max(limit, 12),
+                include_non_200=include_non_200,
+                deadline=deadline,
+            )
 
-        tasks = [asyncio.create_task(_run_variant(variant)) for variant in variants]
-        try:
-            for done in asyncio.as_completed(tasks):
-                variant, rows, err = await done
-                if err is not None:
-                    errors.append(f"{variant}:{err}")
-                    continue
-                if not rows:
-                    continue
-                source_variant = variant
-                rows_all.extend(rows)
-                # Do not block on slow variants once we have a successful source.
-                break
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            with contextlib.suppress(Exception):
-                await asyncio.gather(*tasks, return_exceptions=True)
+        source_variant, first_rows = await self._race_variants(
+            variants=variants,
+            worker=_query_variant,
+            is_success=lambda items: bool(items),
+            deadline=deadline,
+            errors=errors,
+        )
+        if first_rows:
+            rows_all.extend(first_rows)
 
         rows = _dedupe_snapshots(rows_all)
         rows.sort(key=lambda s: s.timestamp, reverse=True)
@@ -896,11 +1106,21 @@ class Plugin:
             fallback_snapshot: _Snapshot | None = None
             fallback_mode = ""
             try:
-                fallback_snapshot, fallback_mode = await self._resolve_snapshot(
-                    url=url,
-                    year=year or None,
-                    timestamp=from_ts or to_ts,
-                )
+                try:
+                    fallback_snapshot, fallback_mode = await self._resolve_snapshot(
+                        url=url,
+                        year=year or None,
+                        timestamp=from_ts or to_ts,
+                        deadline=deadline,
+                    )
+                except TypeError as exc:
+                    if "deadline" not in str(exc):
+                        raise
+                    fallback_snapshot, fallback_mode = await self._resolve_snapshot(
+                        url=url,
+                        year=year or None,
+                        timestamp=from_ts or to_ts,
+                    )
             except Exception as exc:
                 errors.append(f"resolve_snapshot:{exc}")
 
@@ -910,6 +1130,13 @@ class Plugin:
                     f"1. {_pretty_ts(fallback_snapshot.timestamp)} | status={fallback_snapshot.statuscode or '-'} | {clip_text(fallback_snapshot.ui_url(), 120)}",
                     f"mode: {fallback_mode}",
                 ]
+                _log.info(
+                    "wayback_lookup_done | url=%s | count=1 | source=%s | approximate=true | elapsed_ms=%d | errors=%d",
+                    url,
+                    fallback_mode or "-",
+                    int((asyncio.get_running_loop().time() - started) * 1000),
+                    len(errors),
+                )
                 return ToolCallResult(
                     ok=True,
                     data={
@@ -931,6 +1158,12 @@ class Plugin:
                 msg += f" in {year}"
             if errors:
                 msg += f" | variants_errors={clip_text('; '.join(errors), 220)}"
+            _log.info(
+                "wayback_lookup_done | url=%s | count=0 | elapsed_ms=%d | errors=%d",
+                url,
+                int((asyncio.get_running_loop().time() - started) * 1000),
+                len(errors),
+            )
             return ToolCallResult(ok=False, error="no_snapshot", display=msg)
 
         target = ""
@@ -950,6 +1183,14 @@ class Plugin:
             f"recommended: {_pretty_ts(recommended.timestamp)} | {clip_text(recommended.ui_url(), 140)}"
         )
 
+        _log.info(
+            "wayback_lookup_done | url=%s | count=%d | source=%s | elapsed_ms=%d | errors=%d",
+            url,
+            len(rows),
+            source_variant or "-",
+            int((asyncio.get_running_loop().time() - started) * 1000),
+            len(errors),
+        )
         return ToolCallResult(
             ok=True,
             data={
@@ -970,6 +1211,8 @@ class Plugin:
 
         if not self._enabled:
             return ToolCallResult(ok=False, error="disabled", display="wayback plugin is disabled")
+        started = asyncio.get_running_loop().time()
+        deadline = self._new_deadline()
 
         url = _normalize_url(args.get("url", ""))
         if not url:
@@ -981,7 +1224,21 @@ class Plugin:
         max_chars = int(args.get("max_chars", self._max_text_chars) or self._max_text_chars)
         max_chars = max(1000, min(self._max_text_chars, max_chars))
 
-        snapshot, resolve_mode = await self._resolve_snapshot(url=url, year=year, timestamp=timestamp)
+        try:
+            snapshot, resolve_mode = await self._resolve_snapshot(
+                url=url,
+                year=year,
+                timestamp=timestamp,
+                deadline=deadline,
+            )
+        except TypeError as exc:
+            if "deadline" not in str(exc):
+                raise
+            snapshot, resolve_mode = await self._resolve_snapshot(
+                url=url,
+                year=year,
+                timestamp=timestamp,
+            )
         if not snapshot:
             return ToolCallResult(
                 ok=False,
@@ -990,7 +1247,7 @@ class Plugin:
             )
 
         try:
-            page = await self._fetch_snapshot_text(snapshot, max_chars=max_chars)
+            page = await self._fetch_snapshot_text(snapshot, max_chars=max_chars, deadline=deadline)
         except Exception as exc:
             return ToolCallResult(ok=False, error=f"fetch_failed:{exc}", display=f"snapshot fetch failed: {exc}")
 
@@ -1019,6 +1276,13 @@ class Plugin:
         display_lines.append("")
         display_lines.append(clip_text(extracted, 2200))
 
+        _log.info(
+            "wayback_extract_done | url=%s | mode=%s | status=%s | elapsed_ms=%d",
+            url,
+            resolve_mode,
+            page.get("status_code", 0),
+            int((asyncio.get_running_loop().time() - started) * 1000),
+        )
         return ToolCallResult(
             ok=True,
             data={
@@ -1040,6 +1304,8 @@ class Plugin:
 
         if not self._enabled:
             return ToolCallResult(ok=False, error="disabled", display="wayback plugin is disabled")
+        started = asyncio.get_running_loop().time()
+        deadline = self._new_deadline()
 
         url = _normalize_url(args.get("url", ""))
         if not url:
@@ -1057,12 +1323,13 @@ class Plugin:
             to_ts = f"{max(1900, min(2099, to_year))}1231235959"
 
         try:
-            rows = await self._query_cdx(
+            rows = await self._query_cdx_with_budget(
                 url=url,
                 from_ts=from_ts,
                 to_ts=to_ts,
                 limit=limit,
                 include_non_200=self._include_non_200_default,
+                deadline=deadline,
             )
         except Exception as exc:
             with contextlib.suppress(Exception):
@@ -1101,6 +1368,13 @@ class Plugin:
                 f"latest: {_pretty_ts(rows[0].timestamp)} | {clip_text(rows[0].ui_url(), 120)}"
             )
 
+        _log.info(
+            "wayback_timeline_done | url=%s | years=%d | scanned=%d | elapsed_ms=%d",
+            url,
+            len(years),
+            len(rows),
+            int((asyncio.get_running_loop().time() - started) * 1000),
+        )
         return ToolCallResult(
             ok=True,
             data={
