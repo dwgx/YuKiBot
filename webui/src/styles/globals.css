@@ -50,6 +50,30 @@ html.theme-animating * {
   display: none !important;
 }
 
+/* 输入区域保持透明，避免出现内层白色块 */
+[data-slot="inner-wrapper"],
+[data-slot="input"],
+[data-slot="input"] input,
+[data-slot="input"] textarea,
+input[data-slot="input"],
+textarea[data-slot="input"] {
+  background-color: transparent !important;
+  box-shadow: none !important;
+}
+
+/* 浏览器自动填充（尤其 Chrome）会注入白色/浅色背景，统一抹掉 */
+input:-webkit-autofill,
+input:-webkit-autofill:hover,
+input:-webkit-autofill:focus,
+textarea:-webkit-autofill,
+textarea:-webkit-autofill:hover,
+textarea:-webkit-autofill:focus {
+  -webkit-text-fill-color: inherit !important;
+  -webkit-box-shadow: 0 0 0 1000px transparent inset !important;
+  background-color: transparent !important;
+  transition: background-color 99999s ease-in-out 0s;
+}
+
 @keyframes thinkingIslandGlow {
   0%, 100% {
     box-shadow:

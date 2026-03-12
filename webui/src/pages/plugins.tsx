@@ -87,7 +87,7 @@ function getFieldGroups(properties: Record<string, FieldSchema>): FieldGroup[] {
 function parseTextareaValue(schema: FieldSchema, value: string): unknown {
   if (schema.type === "array") {
     return value
-      .split(",")
+      .split(/[\n,，;；]/g)
       .map((item) => item.trim())
       .filter(Boolean);
   }
@@ -272,7 +272,7 @@ export default function PluginsPage() {
               onValueChange={(value) => updatePluginConfig(plugin.name, fieldKey, parseTextareaValue(schema, value))}
               minRows={schema.type === "array" ? 2 : 3}
               maxRows={8}
-              description={schema.type === "array" ? "数组字段使用英文逗号分隔多个值" : undefined}
+              description={schema.type === "array" ? "数组字段支持中英文逗号、分号或换行分隔多个值" : undefined}
             />
           )}
         </CardBody>
