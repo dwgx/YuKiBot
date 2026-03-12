@@ -378,6 +378,26 @@ function isOneBotUnavailableError(error: unknown): boolean {
   );
 }
 
+const TRANSIENT_NETWORK_HINT = "连接暂时中断，正在自动重试...";
+
+function isTransientNetworkError(error: unknown): boolean {
+  const msg = String(error instanceof Error ? error.message : error || "").trim().toLowerCase();
+  if (!msg) return false;
+  return (
+    msg === "failed to fetch"
+    || msg.includes("failed to fetch")
+    || msg.includes("networkerror")
+    || msg.includes("network request failed")
+    || msg.includes("fetch failed")
+    || msg.includes("load failed")
+  );
+}
+
+function normalizeRequestError(error: unknown, fallback: string): string {
+  if (isTransientNetworkError(error)) return TRANSIENT_NETWORK_HINT;
+  return error instanceof Error ? error.message : fallback;
+}
+
 function normalizeCopyPayload(msg: ChatMessageItem): string {
   const text = String(msg.text || "").trim();
   if (text && text !== "[空消息]") return text;
@@ -477,6 +497,7 @@ export default function ChatPage() {
   const traceRef = useRef("");
   const traceCandidatesRef = useRef<string[]>([]);
   const conversationRef = useRef("");
+  const transientErrorTimerRef = useRef<number | null>(null);
   const thinkingDragControls = useDragControls();
   const thinkingIslandSize = useMemo<ThinkingIslandSize>(
     () => widthToThinkingIslandSize(thinkingIslandWidth),
@@ -563,6 +584,20 @@ export default function ChatPage() {
   const closeContextMenu = useCallback(() => {
     setContextMenu((prev) => (prev.open ? { open: false, x: 0, y: 0, message: null } : prev));
   }, []);
+  const clearTransientErrorTimer = useCallback(() => {
+    if (transientErrorTimerRef.current != null) {
+      window.clearTimeout(transientErrorTimerRef.current);
+      transientErrorTimerRef.current = null;
+    }
+  }, []);
+  const showTransientNetworkHint = useCallback(() => {
+    clearTransientErrorTimer();
+    setError(TRANSIENT_NETWORK_HINT);
+    transientErrorTimerRef.current = window.setTimeout(() => {
+      transientErrorTimerRef.current = null;
+      setError((prev) => (prev === TRANSIENT_NETWORK_HINT ? "" : prev));
+    }, 3200);
+  }, [clearTransientErrorTimer]);
   const touchThinkingPresence = useCallback((conversationId: string, ttlMs = 12000) => {
     if (!conversationId) return;
     setClockMs(Date.now());
@@ -587,6 +622,9 @@ export default function ChatPage() {
   useEffect(() => {
     thinkingIslandWidthRef.current = thinkingIslandWidth;
   }, [thinkingIslandWidth]);
+  useEffect(() => () => {
+    clearTransientErrorTimer();
+  }, [clearTransientErrorTimer]);
   useEffect(() => {
     thinkingIslandHeightRef.current = thinkingIslandHeight;
   }, [thinkingIslandHeight]);
@@ -658,12 +696,16 @@ export default function ChatPage() {
       if (isOneBotUnavailableError(e)) {
         setBotRuntimeStatus("offline");
       }
-      setError(e instanceof Error ? e.message : "读取会话失败");
+      if (opts?.silent && isTransientNetworkError(e)) {
+        showTransientNetworkHint();
+        return;
+      }
+      setError(normalizeRequestError(e, "读取会话失败"));
     } finally {
       loadConversationsInFlightRef.current = false;
       if (!opts?.silent) setLoadingConvs(false);
     }
-  }, [selectedId]);
+  }, [selectedId, showTransientNetworkHint]);
 
   const loadHistory = useCallback(async (opts?: { silent?: boolean }) => {
     const target = selected;
@@ -696,13 +738,17 @@ export default function ChatPage() {
       if (isOneBotUnavailableError(e)) {
         setBotRuntimeStatus("offline");
       }
-      setError(e instanceof Error ? e.message : "读取聊天记录失败");
+      if (opts?.silent && isTransientNetworkError(e)) {
+        showTransientNetworkHint();
+        return;
+      }
+      setError(normalizeRequestError(e, "读取聊天记录失败"));
     } finally {
       if (reqSeq === historyRequestSeqRef.current && !opts?.silent) {
         setLoadingHistory(false);
       }
     }
-  }, [selected]);
+  }, [selected, showTransientNetworkHint]);
 
   const loadAgentState = useCallback(async (opts?: { silent?: boolean }) => {
     if (loadAgentStateInFlightRef.current) return;
@@ -713,12 +759,16 @@ export default function ChatPage() {
       setAgentStates(Array.isArray(res.items) ? res.items : []);
       setError("");
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : "读取运行状态失败");
+      if (opts?.silent && isTransientNetworkError(e)) {
+        showTransientNetworkHint();
+        return;
+      }
+      setError(normalizeRequestError(e, "读取运行状态失败"));
     } finally {
       loadAgentStateInFlightRef.current = false;
       if (!opts?.silent) setLoadingState(false);
     }
-  }, []);
+  }, [showTransientNetworkHint]);
 
   useEffect(() => {
     loadConversations();

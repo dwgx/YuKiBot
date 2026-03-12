@@ -50,65 +50,7 @@ html.theme-animating * {
   display: none !important;
 }
 
-/* 输入区域保持透明，避免出现内层白色块 */
-[data-slot="inner-wrapper"],
-[data-slot="input"],
-[data-slot="input"] input,
-[data-slot="input"] textarea,
-input[data-slot="input"],
-textarea[data-slot="input"] {
-  background-color: transparent !important;
-  box-shadow: none !important;
-}
-
-/* 浏览器自动填充（尤其 Chrome）会注入白色/浅色背景，统一抹掉 */
-input:-webkit-autofill,
-input:-webkit-autofill:hover,
-input:-webkit-autofill:focus,
-textarea:-webkit-autofill,
-textarea:-webkit-autofill:hover,
-textarea:-webkit-autofill:focus {
-  -webkit-text-fill-color: inherit !important;
-  -webkit-box-shadow: 0 0 0 1000px transparent inset !important;
-  background-color: transparent !important;
-  transition: background-color 99999s ease-in-out 0s;
-}
-
-/* 全局强制：任何输入相关槽位都不允许出现白色内框/白色填充 */
-[data-slot="base"][data-focus="true"] [data-slot="main-wrapper"],
-[data-slot="base"][data-focus-visible="true"] [data-slot="main-wrapper"],
-[data-slot="base"][data-focus-within="true"] [data-slot="main-wrapper"],
-[data-slot="base"][data-focus="true"] [data-slot="input-wrapper"],
-[data-slot="base"][data-focus-visible="true"] [data-slot="input-wrapper"],
-[data-slot="base"][data-focus-within="true"] [data-slot="input-wrapper"],
-[data-slot="base"][data-focus="true"] [data-slot="inner-wrapper"],
-[data-slot="base"][data-focus-visible="true"] [data-slot="inner-wrapper"],
-[data-slot="base"][data-focus-within="true"] [data-slot="inner-wrapper"],
-[data-slot="base"][data-focus="true"] [data-slot="input"],
-[data-slot="base"][data-focus-visible="true"] [data-slot="input"],
-[data-slot="base"][data-focus-within="true"] [data-slot="input"],
-[data-slot="input-wrapper"],
-[data-slot="inner-wrapper"],
-[data-slot="main-wrapper"],
-[data-slot="input"],
-[data-slot="trigger"],
-input,
-textarea,
-select {
-  background-color: transparent !important;
-  background-image: none !important;
-  box-shadow: none !important;
-  outline: none !important;
-}
-
-/* Select / Autocomplete 触发器点击态常见白底兜底 */
-[data-slot="trigger"][data-focus="true"],
-[data-slot="trigger"][data-focus-visible="true"],
-[data-slot="trigger"][data-pressed="true"],
-[data-slot="trigger"][data-hover="true"] {
-  background-color: transparent !important;
-  box-shadow: none !important;
-}
+/* 仅处理高亮条，不再全局强制输入背景透明（会破坏页面明暗层次） */
 
 @keyframes thinkingIslandGlow {
   0%, 100% {

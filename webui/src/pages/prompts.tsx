@@ -92,6 +92,10 @@ export default function PromptsPage() {
   const { notifications, success, danger } = useNotifications();
   const undoContentRef = useRef<string | null>(null);
   const undoQuickRef = useRef<AnyObj | null>(null);
+  const [isDark, setIsDark] = useState<boolean>(() => {
+    if (typeof document === "undefined") return true;
+    return document.documentElement.classList.contains("dark");
+  });
   const [content, setContent] = useState("");
   const [quick, setQuick] = useState<AnyObj>({});
   const [loading, setLoading] = useState(true);
@@ -113,6 +117,15 @@ export default function PromptsPage() {
   }, []);
 
   useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const root = document.documentElement;
+    const observer = new MutationObserver(() => {
+      setIsDark(root.classList.contains("dark"));
+    });
+    observer.observe(root, { attributes: true, attributeFilter: ["class"] });
+    return () => observer.disconnect();
+  }, []);
 
   const handleSave = async () => {
     setSaving(true);
@@ -206,7 +219,7 @@ export default function PromptsPage() {
   return (
     <>
       <NotificationContainer notifications={notifications} />
-      <div className="space-y-4 h-full flex flex-col">
+      <div className="space-y-4 h-full flex flex-col rounded-2xl border border-default-300/35 bg-content1/45 p-4 backdrop-blur-sm">
       <div className="flex items-center justify-between">
         <h2 className="text-xl font-bold">提示词编辑</h2>
         <div className="flex gap-2">
@@ -239,7 +252,7 @@ export default function PromptsPage() {
       </p>
       <Accordion selectionMode="multiple" defaultExpandedKeys={["quick_prompts"]}>
         <AccordionItem key="quick_prompts" title="常用提示词可视化编辑">
-          <div className="space-y-3">
+          <div className="space-y-3 rounded-xl border border-default-300/30 bg-content2/30 p-3">
             {QUICK_FIELDS.map((item) => (
               <Textarea
                 key={item.path}
@@ -256,6 +269,7 @@ export default function PromptsPage() {
                   base: "w-full",
                   label: "text-sm font-semibold mb-1.5",
                   input: "text-sm",
+                  inputWrapper: "bg-content1/70 border border-default-300/35 data-[focus=true]:border-primary/60",
                 }}
               />
             ))}
@@ -273,12 +287,12 @@ export default function PromptsPage() {
           </div>
         </AccordionItem>
       </Accordion>
-      <div className="flex-1 min-h-0 border border-divider rounded-lg overflow-hidden">
+      <div className="flex-1 min-h-0 border border-default-300/35 rounded-lg overflow-hidden bg-content2/35">
         <CodeMirror
           value={content}
           onChange={setContent}
           extensions={[yaml()]}
-          theme="dark"
+          theme={isDark ? "dark" : "light"}
           height="100%"
           style={{ height: "calc(100vh - 220px)" }}
         />

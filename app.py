@@ -877,6 +877,13 @@ def register_handlers(engine: YukikoEngine) -> None:
         aliases = sorted(set(aliases), key=len, reverse=True)
         return any(content.startswith(alias) for alias in aliases)
 
+    def _looks_like_explicit_user_command(text: str) -> bool:
+        content = normalize_text(text).strip()
+        if not content:
+            return False
+        # 显式命令（如 /点歌、/搜图）在 mention-only 模式下也应进入处理。
+        return bool(re.match(r"^[/／][^\s]{1,64}", content))
+
     def _parse_private_chat_whitelist(raw: Any) -> set[str]:
         values: list[str] = []
         if isinstance(raw, list):
@@ -894,6 +901,32 @@ def register_handlers(engine: YukikoEngine) -> None:
                 bot_cfg_any.get("private_chat_whitelist", [])
             )
         return False
+
+    def _resolve_admin_action(text: str) -> str:
+        raw = normalize_text(text).strip()
+        if not raw:
+            return ""
+        parts = raw.split(maxsplit=2)
+        first = parts[0].lower()
+        top_map = getattr(engine.admin, "_TOP", {})
+        if isinstance(top_map, dict) and first in top_map:
+            return normalize_text(str(top_map.get(first, ""))).lower()
+
+        if first not in {"/yuki", "/yuki帮助"}:
+            return ""
+        sub = normalize_text(parts[1]).lower() if len(parts) > 1 else "help"
+        if first == "/yuki帮助":
+            sub = "help"
+        sub_map = getattr(engine.admin, "_SUB", {})
+        action = sub_map.get(sub) if isinstance(sub_map, dict) else ""
+        if not action:
+            fuzzy = getattr(engine.admin, "_fuzzy_match_command", None)
+            if callable(fuzzy):
+                try:
+                    action = fuzzy(sub)
+                except Exception:
+                    action = ""
+        return normalize_text(str(action or "")).lower()
 
     _SELF_NAME_PATTERNS = (
         re.compile(r"(?:^|[\s，,。.!！？?])(?:以后|今后|之后|从现在开始)?(?:请)?(?:就)?(?:叫我|喊我|称呼我)(?:做|为|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
@@ -1421,6 +1454,7 @@ def register_handlers(engine: YukikoEngine) -> None:
         raw_text = _extract_text_segments(raw_segments) or event.get_plaintext().strip()
         admin_command = engine.admin.is_admin_command(raw_text)
         alias_prefix_call = _starts_with_bot_alias(raw_text, runtime_bot_cfg)
+        explicit_command = _looks_like_explicit_user_command(raw_text)
 
         # 私聊开关：off | whitelist | all（管理员命令保留兜底入口）。
         if is_private_message and not admin_command:
@@ -1433,7 +1467,13 @@ def register_handlers(engine: YukikoEngine) -> None:
         if is_group_message and not allow_non_to_me_rt and not admin_command:
             event_to_me = bool(getattr(event, "to_me", False))
             fast_at_me = any(item in {"all", str(bot.self_id)} for item in at_targets)
-            if not event_to_me and not fast_at_me and not _extract_reply_message_id(event) and not alias_prefix_call:
+            if (
+                not event_to_me
+                and not fast_at_me
+                and not _extract_reply_message_id(event)
+                and not alias_prefix_call
+                and not explicit_command
+            ):
                 _log.debug("matcher_skip_non_to_me | conv=%s | user=%s", conversation_id, event.get_user_id())
                 return
 
@@ -1474,7 +1514,14 @@ def register_handlers(engine: YukikoEngine) -> None:
                     mentioned = True
                     text = text[len(_nick):].lstrip()
                     break
-        if is_group_message and not allow_non_to_me_rt and not mentioned and not admin_command and not alias_prefix_call:
+        if (
+            is_group_message
+            and not allow_non_to_me_rt
+            and not mentioned
+            and not admin_command
+            and not alias_prefix_call
+            and not explicit_command
+        ):
             _log.debug("matcher_skip_non_to_me_resolved | conv=%s | user=%s", conversation_id, event.get_user_id())
             return
         if not text and mentioned and not has_media:
@@ -1594,12 +1641,22 @@ def register_handlers(engine: YukikoEngine) -> None:
                 and engine.admin.non_whitelist_mode == "silent"
                 and not engine.admin.is_group_whitelisted(event_group_id)
             ):
+                admin_action = _resolve_admin_action(text)
+                # silent 模式下放行“加白”引导命令，避免新群无法自助纳管。
+                if admin_action != "white_add":
+                    _log.debug(
+                        "admin_command_silent_skip | group=%s | user=%s | action=%s",
+                        event_group_id,
+                        event.get_user_id(),
+                        admin_action or "-",
+                    )
+                    return
                 _log.debug(
-                    "admin_command_silent_skip | group=%s | user=%s",
+                    "admin_command_silent_allow_bootstrap | group=%s | user=%s | action=%s",
                     event_group_id,
                     event.get_user_id(),
+                    admin_action,
                 )
-                return
             admin_reply = await engine.admin.handle_command(
                 text=text,
                 user_id=str(event.get_user_id()),
@@ -1690,6 +1747,15 @@ def register_handlers(engine: YukikoEngine) -> None:
             voice_send_music_force_full = bool(send_opts["voice_send_music_force_full"])
             voice_send_music_disable_split = bool(send_opts["voice_send_music_disable_split"])
             if getattr(result, "action", "") == "ignore":
+                _log.info(
+                    "send_skip_ignore | trace=%s | conversation=%s | reason=%s | mentioned=%s | private=%s | text=%s",
+                    payload.trace_id,
+                    payload.conversation_id,
+                    normalize_text(str(getattr(result, "reason", "") or "")) or "-",
+                    bool(payload.mentioned),
+                    bool(payload.is_private),
+                    clip_text(text, 80),
+                )
                 return
 
             action = str(getattr(result, "action", "") or "")
