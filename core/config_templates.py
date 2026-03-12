@@ -44,7 +44,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
     return {
         "control": {
             "chat_mode": "balanced",
-            "undirected_policy": "mention_only",
+            "undirected_policy": "high_confidence_only",
             "knowledge_learning": "aggressive",
             "memory_recall_level": "light",
             "emoji_level": "medium",
