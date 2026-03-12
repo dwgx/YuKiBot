@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
-import { Button, Card, CardBody, Chip, Spinner } from "@heroui/react";
+import { Button, Card, CardBody, Chip, Spinner, Switch } from "@heroui/react";
 import { motion } from "framer-motion";
 import clsx from "clsx";
 import {
@@ -75,6 +75,7 @@ export default function DashboardPage() {
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [runningUpdate, setRunningUpdate] = useState(false);
   const [updateLogs, setUpdateLogs] = useState<string[]>([]);
+  const [allowDirty, setAllowDirty] = useState(false);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -116,7 +117,7 @@ export default function DashboardPage() {
       const res = await api.runSystemUpdate({
         syncPython: true,
         buildWebui: true,
-        allowDirty: false,
+        allowDirty,
       });
       setUpdateInfo(res.status);
       setUpdateLogs(res.logs || []);
@@ -130,7 +131,7 @@ export default function DashboardPage() {
       setRunningUpdate(false);
       void fetchUpdateStatus();
     }
-  }, [danger, fetchUpdateStatus, success]);
+  }, [allowDirty, danger, fetchUpdateStatus, success]);
 
   if (statusError && !data) {
     return <p className="text-danger">{statusError}</p>;
@@ -210,6 +211,21 @@ export default function DashboardPage() {
                     </Button>
                   </div>
                 </div>
+
+                {updateInfo?.dirty && (
+                  <div className="flex items-center gap-3 rounded-2xl border border-warning/40 bg-warning/5 px-4 py-3">
+                    <Switch
+                      size="sm"
+                      color="warning"
+                      isSelected={allowDirty}
+                      onValueChange={setAllowDirty}
+                    />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium text-warning-700">允许 dirty 更新</p>
+                      <p className="text-xs text-default-500">工作区有未提交改动，开启后将跳过 dirty 检查强制拉取</p>
+                    </div>
+                  </div>
+                )}
 
                 <div className="grid gap-3 md:grid-cols-2">
                   <div className="rounded-2xl border border-default-200/60 bg-content2/40 p-4">
