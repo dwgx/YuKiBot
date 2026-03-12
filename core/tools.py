@@ -3377,6 +3377,28 @@ class ToolExecutor:
                     "url": resolved_explicit,
                 }
             )
+        if explicit_url and conversation_id and allow_recent_fallback:
+            recent = self._get_recent_media(conversation_id=conversation_id, media_type="image")
+            if recent and recent_only_when_unique and len(recent) > 1:
+                _tool_log.info(
+                    "vision_recent_fallback_skip%s | reason=ambiguous_recent_cache | count=%d",
+                    _tool_trace_tag(),
+                    len(recent),
+                )
+            elif recent:
+                recent_candidates = recent[:1] if recent_only_when_unique else recent
+                for item in recent_candidates:
+                    normalized_recent = normalize_text(item)
+                    if not normalized_recent:
+                        continue
+                    candidates.append(normalized_recent)
+                    candidate_meta.append(
+                        {
+                            "source": "recent_cache_fallback",
+                            "message_id": "-",
+                            "url": normalized_recent,
+                        }
+                    )
         if not candidates:
             message_candidates = self._extract_message_media_urls(raw_segments, media_type="image")
             candidates.extend(message_candidates)
@@ -8554,6 +8576,8 @@ class ToolExecutor:
         value = normalize_text(str(raw or ""))
         if not value:
             return ""
+        if value.startswith("data:"):
+            return value
         if value.startswith("base64://"):
             return value
         if re.match(r"^[a-zA-Z]:[\\/]", value):
@@ -8564,12 +8588,15 @@ class ToolExecutor:
             return value
         if re.match(r"^https?://", value, flags=re.IGNORECASE):
             return value
-        path = Path(value)
-        if path.exists() and path.is_file():
-            try:
-                return path.resolve().as_uri()
-            except Exception:
-                return str(path.resolve())
+        try:
+            path = Path(value)
+            if path.exists() and path.is_file():
+                try:
+                    return path.resolve().as_uri()
+                except Exception:
+                    return str(path.resolve())
+        except OSError:
+            return ""
         return value
 
     def _is_blocked_image_text(self, text: str) -> bool:

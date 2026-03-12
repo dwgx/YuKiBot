@@ -3361,16 +3361,19 @@ class YukikoEngine:
 
 
 
-        short_ping_call = self._is_short_ping_message(text) and (
-
-
-            message.is_private or message.mentioned or (not self.short_ping_require_directed)
-
-
+        undirected_high_confidence = (
+            self.non_directed_high_confidence_only
+            and not message.is_private
+            and not message.mentioned
         )
+        short_ping_call = False
+        if not undirected_high_confidence:
+            short_ping_call = self._is_short_ping_message(text) and (
+                message.is_private or message.mentioned or (not self.short_ping_require_directed)
+            )
+        alias_only_call = self._is_bot_alias_only_message(text) and not undirected_high_confidence
 
-
-        if text == "__mention_only__" or self._is_bot_alias_only_message(text) or short_ping_call:
+        if text == "__mention_only__" or alias_only_call or short_ping_call:
 
 
             quick_reply = await self._build_mention_only_reply_auto(message)
@@ -3391,7 +3394,7 @@ class YukikoEngine:
                 quick_reason = "mention_only"
 
 
-            elif self._is_bot_alias_only_message(text):
+            elif alias_only_call:
 
 
                 quick_reason = "alias_only_call"

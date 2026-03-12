@@ -82,14 +82,8 @@ config:
     mention_only_reply_template_with_name: '{name}，在。'
     mention_only_ai_prompt: 用户只喊了我名字，请给一句自然、简短、友好的中文回应。
     mention_only_ai_system_prompt: ''
-    short_ping_phrases:
-    - yuki
-    - 雪
-    - 在吗
-    - 在不在
-    - 喂
-    - yo
-    short_ping_require_directed: false
+    short_ping_phrases: []
+    short_ping_require_directed: true
     sanitize_banned_phrases:
     - <function_calls>
     - <invoke
@@ -123,13 +117,24 @@ config:
     music_fast_path_enable: false
     high_risk_control:
       enable: true
-      default_require_confirmation: false
+      default_require_confirmation: true
       pending_ttl_seconds: 180
       use_confirm_token: false
       categories:
       - admin
-      tool_name_patterns: []
-      description_patterns: []
+      tool_name_patterns:
+      - ^set_group_
+      - ^delete_
+      - ^ban_
+      - ^kick_
+      - ^recall_recent_messages$
+      - ^send_group_notice$
+      description_patterns:
+      - 管理员权限
+      - 禁言
+      - 踢出群
+      - 删除
+      - 不可逆
       user_enable_patterns: []
       user_disable_patterns: []
     runtime_rules: ''

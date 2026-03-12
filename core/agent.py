@@ -278,6 +278,21 @@ class AgentLoop:
                 return "group_admin"
         return "user"
 
+    def _is_explicit_bot_addressed(self, ctx: "AgentContext") -> bool:
+        """是否明确在和机器人说话（用于高风险管理工具额外护栏）。"""
+        if ctx.is_private or ctx.mentioned:
+            return True
+        content = normalize_text(ctx.message_text).lower()
+        if not content:
+            return False
+        bot_cfg = self.config.get("bot", {}) if isinstance(self.config, dict) else {}
+        aliases = {normalize_text(str(bot_cfg.get("name", ""))).lower()}
+        for item in bot_cfg.get("nicknames", []) or []:
+            aliases.add(normalize_text(str(item)).lower())
+        aliases.update({"yuki", "yukiko", "雪"})
+        aliases.discard("")
+        return any(alias and alias in content for alias in aliases)
+
     @staticmethod
     def _compile_regex_patterns(values: Any) -> tuple[re.Pattern[str], ...]:
         if isinstance(values, str):
@@ -1001,6 +1016,20 @@ class AgentLoop:
                 messages.append({"role": "assistant", "content": response_text})
                 messages.append({"role": "user", "content": json.dumps(
                     {"tool_result": {"tool": tool_name, "ok": False, "error": "权限不足，该操作需要群管理员或超级管理员权限"}},
+                    ensure_ascii=False,
+                )})
+                continue
+            if tool_name in self._group_admin_tools and not self._is_explicit_bot_addressed(ctx):
+                steps.append({"step": step_idx, "tool": tool_name, "blocked": "explicit_bot_address_required"})
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append({"role": "user", "content": json.dumps(
+                    {
+                        "tool_result": {
+                            "tool": tool_name,
+                            "ok": False,
+                            "error": "执行群管理操作前，需要明确点名机器人（@我或直接叫YUKI）",
+                        }
+                    },
                     ensure_ascii=False,
                 )})
                 continue
