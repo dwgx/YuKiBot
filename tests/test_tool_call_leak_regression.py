@@ -88,6 +88,38 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
             with self.subTest(payload=payload):
                 self.assertEqual(engine._sanitize_reply_output(payload, action="reply"), "")
 
+    def test_engine_sanitizes_english_provider_refusal_leak(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.sanitize_banned_phrases = ()
+        engine._apply_privacy_output_guard = lambda text, action="": text
+        engine._build_mention_only_reply = lambda text: text
+
+        payload = (
+            "I'm Claude, an AI assistant made by Anthropic. "
+            "I'm a text-based AI assistant and cannot generate images directly."
+        )
+
+        self.assertEqual(
+            engine._sanitize_reply_output(payload, action="reply"),
+            "刚刚处理失败了，你再发一次我马上重试。",
+        )
+
+    def test_engine_sanitizes_chinese_provider_refusal_leak(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.sanitize_banned_phrases = ()
+        engine._apply_privacy_output_guard = lambda text, action="": text
+        engine._build_mention_only_reply = lambda text: text
+
+        payload = (
+            "抱歉，我无法查看图片内容。我是一个文本助手，只能处理文字信息。"
+            "我目前无法直接生成图片，不具备图像生成功能。"
+        )
+
+        self.assertEqual(
+            engine._sanitize_reply_output(payload, action="reply"),
+            "刚刚处理失败了，你再发一次我马上重试。",
+        )
+
     def test_agent_marks_generic_fenced_tool_payload_as_leak(self) -> None:
         loop = AgentLoop.__new__(AgentLoop)
         payload = (

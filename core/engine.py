@@ -11801,6 +11801,24 @@ class YukikoEngine:
                 content = _pl.get_message("refusal", "")
 
 
+            if self._looks_like_provider_refusal_text(content):
+
+
+                logging.getLogger("yukiko.sanitize").warning("sanitize_provider_refusal_leak")
+
+
+                return _pl.get_message(
+
+
+                    "llm_error_fallback",
+
+
+                    "刚刚处理失败了，你再发一次我马上重试。",
+
+
+                )
+
+
 
 
 
@@ -11969,6 +11987,85 @@ class YukikoEngine:
         return normalize_text(guarded)
 
 
+
+
+
+    @staticmethod
+
+
+    def _looks_like_provider_refusal_text(text: str) -> bool:
+
+
+        content = normalize_text(text)
+
+
+        if not content:
+
+
+            return False
+
+
+        lower = content.lower()
+
+
+        patterns = (
+
+
+            r"\b(i am|i'm)\b.{0,48}\b(text[- ]based|text only|ai)\b.{0,32}\b(assistant|model|bot)\b",
+
+
+            r"\b(made by|created by)\s+(anthropic|openai)\b",
+
+
+            r"\b(i can'?t|i cannot|i'm not able to|i am not able to|unable to)\b.{0,64}\b(generate|create|produce|view|see|analy[sz]e|process|access)\b.{0,32}\b(image|images|picture|pictures|photo|photos|video|videos|gif|gifs)\b",
+
+
+            r"\b(only|just)\b.{0,24}\b(handle|process)\b.{0,24}\b(text|textual)\b",
+
+
+            r"\b(i don't have access to|i do not have access to)\b.{0,32}\b(api keys?|credentials?|secrets?)\b",
+
+
+            r"抱歉[^。！？\n]*(无法|不能|没法)[^。！？\n]*(查看|识别|分析)[^。！？\n]*(图片|图像|视频|gif|动图)",
+
+
+            r"我是一个?文本(?:对话)?助手[^。！？\n]*(只能|仅能)[^。！？\n]*(处理|理解)[^。！？\n]*(文字|文本)",
+
+
+            r"(目前|现在)?无法直接(生成|创建|制作)(图片|图像|照片|插画)",
+
+
+            r"不具备(图像|图片)(生成|识别|分析)功能",
+
+
+            r"(不能|无法|不可以)提供[^。！？\n]*(skkey|api key|apikey|令牌|密钥)",
+
+
+        )
+
+
+        if any(re.search(pattern, content, flags=re.IGNORECASE) for pattern in patterns):
+
+
+            return True
+
+
+        vendor_hint = bool(re.search(r"\b(openai|chatgpt|anthropic|claude|gemini|kiro|deepseek)\b", lower))
+
+
+        assistant_hint = bool(
+
+
+            re.search(r"\b(ai assistant|assistant made by|language model|text[- ]based)\b", lower)
+
+
+            or re.search(r"(文本助手|文本对话助手|语言模型|ai 助手|人工智能助手)", content, flags=re.IGNORECASE)
+
+
+        )
+
+
+        return vendor_hint and assistant_hint
 
 
 
