@@ -1,12 +1,45 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from core.agent import AgentContext, AgentLoop
+from core.agent_tools import ToolCallResult
 from core.engine import YukikoEngine
 
 
 class ToolCallLeakRegressionTests(unittest.TestCase):
+    class _StubRegistry:
+        def __init__(self, names: set[str]):
+            self._names = set(names)
+
+        def has_tool(self, name: str) -> bool:
+            return name in self._names
+
+    class _SequencedModelClient:
+        def __init__(self, responses: list[str]):
+            self._responses = list(responses)
+
+        async def chat_text_with_retry(self, messages, max_tokens=0, retries=0, backoff=0.0):
+            _ = (messages, max_tokens, retries, backoff)
+            if not self._responses:
+                raise AssertionError("No more model responses prepared for test")
+            return self._responses.pop(0)
+
+    class _RunnableRegistry(_StubRegistry):
+        def __init__(self, names: set[str]):
+            super().__init__(names)
+            self.calls: list[tuple[str, dict[str, str]]] = []
+
+        async def call(self, name: str, args: dict[str, str], context: dict[str, str]) -> ToolCallResult:
+            _ = context
+            self.calls.append((name, dict(args)))
+            return ToolCallResult(
+                ok=True,
+                data={"image_url": "https://example.com/generated.png"},
+                display="图片已生成",
+            )
+
     @staticmethod
     def _make_ctx(**overrides) -> AgentContext:
         base = AgentContext(
@@ -126,6 +159,54 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         )
         forced = loop._select_forced_media_tool(ctx)
         self.assertEqual(forced, ("analyze_voice", {"url": "https://example.com/demo.mp3"}))
+
+    def test_agent_prefers_enhanced_image_generation_tool(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.tool_registry = self._StubRegistry({"generate_image_enhanced", "generate_image"})
+        ctx = self._make_ctx(message_text="帮我生成一张猫娘图片，眼睛里有爱心")
+        forced = loop._select_forced_media_tool(ctx)
+        self.assertEqual(
+            forced,
+            ("generate_image_enhanced", {"prompt": "猫娘图片，眼睛里有爱心"}),
+        )
+
+    def test_agent_falls_back_to_basic_image_generation_tool(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        loop.tool_registry = self._StubRegistry({"generate_image"})
+        ctx = self._make_ctx(message_text="画个猫娘")
+        forced = loop._select_forced_media_tool(ctx)
+        self.assertEqual(forced, ("generate_image", {"prompt": "猫娘"}))
+
+    def test_agent_blocks_direct_refusal_and_recovers_with_image_tool(self) -> None:
+        registry = self._RunnableRegistry({"generate_image"})
+        loop = AgentLoop(
+            model_client=self._SequencedModelClient(
+                [
+                    "I'm a text-based AI assistant and cannot generate images directly.",
+                    '{"tool":"generate_image","args":{}}',
+                    '{"tool":"final_answer","args":{"text":"好了，已经帮你生成。"}}',
+                ]
+            ),
+            tool_registry=registry,
+            config={},
+        )
+        loop.max_steps = 4
+        loop.high_risk_control_enable = False
+        loop.fallback_on_parse_error = False
+        loop._build_system_prompt = lambda ctx: "system"  # type: ignore[assignment]
+        loop._build_user_message = lambda ctx: ctx.message_text  # type: ignore[assignment]
+
+        result = asyncio.run(loop.run(self._make_ctx(message_text="帮我生成一张猫娘图片，眼睛里有爱心")))
+
+        self.assertEqual(result.reason, "agent_final_answer")
+        self.assertEqual(result.reply_text, "好了，已经帮你生成。")
+        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(
+            registry.calls,
+            [("generate_image", {"prompt": "猫娘图片，眼睛里有爱心"})],
+        )
+        self.assertEqual(result.steps[0]["tool"], "policy_guard")
+        self.assertEqual(result.steps[0]["error"], "tool_required_before_direct_reply")
 
 
 if __name__ == "__main__":

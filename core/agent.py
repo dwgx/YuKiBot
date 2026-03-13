@@ -683,6 +683,31 @@ class AgentLoop:
                 if response_text.strip().startswith("{"):
                     _log.warning("agent_unparseable_json | trace=%s | step=%d", ctx.trace_id, step_idx)
                     break
+                if force_tool_first and tool_calls_made == 0:
+                    _log.info(
+                        "agent_force_tool_first_direct_text_block | trace=%s | step=%d | text=%s",
+                        ctx.trace_id,
+                        step_idx,
+                        clip_text(response_text, 160),
+                    )
+                    steps.append({"step": step_idx, "tool": "policy_guard", "error": "tool_required_before_direct_reply"})
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "tool_result": {
+                                        "tool": "policy_guard",
+                                        "ok": False,
+                                        "error": "这是工具型请求，不能直接自然语言作答，必须先调用最合适的工具。",
+                                    }
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+                    continue
                 _log.info("agent_direct_reply | trace=%s | step=%d", ctx.trace_id, step_idx)
                 return AgentResult(
                     reply_text=response_text,
@@ -1992,6 +2017,8 @@ class AgentLoop:
                 _set_if_empty("qq_number", str(qq_id))
         elif tool_name in {"send_emoji", "send_sticker"}:
             _set_if_empty("query", self._infer_emoji_query(contextual_query or text))
+        elif tool_name in {"generate_image", "generate_image_enhanced"}:
+            _set_if_empty("prompt", self._infer_image_generation_prompt(contextual_query or text))
 
         return fixed
 
@@ -2012,6 +2039,8 @@ class AgentLoop:
             "search_web_media": ["query"],
             "search_download_resources": ["query"],
             "cli_invoke": ["prompt"],
+            "generate_image": ["prompt"],
+            "generate_image_enhanced": ["prompt"],
             "get_user_info": ["user_id"],
             "get_message": ["message_id"],
             "get_qzone_profile": ["qq_number"],
@@ -2703,6 +2732,111 @@ class AgentLoop:
     def _looks_like_profile_analysis_request(self, text: str) -> bool:
         return _shared_qq_profile_request(text, config=self.config)
 
+    @staticmethod
+    def _looks_like_image_generation_request(text: str) -> bool:
+        t = normalize_text(text).lower()
+        if not t:
+            return False
+        direct_cues = (
+            "生图",
+            "生圖",
+            "画图",
+            "畫圖",
+            "绘图",
+            "繪圖",
+            "作图",
+            "作圖",
+            "出图",
+            "出圖",
+            "生成图片",
+            "生成圖片",
+            "生成一张图",
+            "生成一張圖",
+            "画一张",
+            "畫一張",
+            "来一张图",
+            "來一張圖",
+            "画个",
+            "畫個",
+            "帮我画",
+            "幫我畫",
+        )
+        if any(cue in t for cue in direct_cues):
+            return True
+        request_verbs = ("生成", "画", "畫", "绘", "繪", "做", "整", "出")
+        subject_cues = (
+            "图",
+            "圖",
+            "图片",
+            "圖片",
+            "照片",
+            "头像",
+            "頭像",
+            "壁纸",
+            "壁紙",
+            "插画",
+            "插畫",
+            "立绘",
+            "立繪",
+            "封面",
+            "表情包",
+            "猫娘",
+            "貓娘",
+            "二次元",
+            "anime",
+        )
+        return any(verb in t for verb in request_verbs) and any(cue in t for cue in subject_cues)
+
+    @staticmethod
+    def _infer_image_generation_prompt(text: str) -> str:
+        content = normalize_text(text)
+        if not content:
+            return ""
+        stripped = content
+        prefixes = (
+            "请",
+            "請",
+            "麻烦",
+            "麻煩",
+            "帮我",
+            "幫我",
+            "给我",
+            "給我",
+            "来",
+            "來",
+            "生成",
+            "画",
+            "畫",
+            "绘",
+            "繪",
+            "做",
+            "整",
+            "出",
+            "一张",
+            "一張",
+            "一个",
+            "一個",
+            "张",
+            "張",
+            "个",
+            "個",
+        )
+        changed = True
+        while changed:
+            changed = False
+            for prefix in prefixes:
+                if stripped.lower().startswith(prefix.lower()):
+                    stripped = normalize_text(stripped[len(prefix) :])
+                    changed = True
+        stripped = re.sub(
+            r"(图片|圖片|图|圖|照片|头像|頭像|壁纸|壁紙)\s*$",
+            "",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+        stripped = normalize_text(stripped)
+        return stripped or content
+
     def _should_force_tool_first(self, ctx: AgentContext) -> bool:
         """判断当前请求是否必须先进行工具调用。"""
         text = normalize_text(ctx.message_text).lower()
@@ -2916,6 +3050,21 @@ class AgentLoop:
         return any(cue in text for cue in voice_cues)
 
     def _select_forced_media_tool(self, ctx: AgentContext) -> tuple[str, dict[str, Any]] | None:
+        if self._looks_like_image_generation_request(ctx.message_text):
+            prompt = self._infer_image_generation_prompt(ctx.message_text)
+            tool_name = ""
+            registry = getattr(self, "tool_registry", None)
+            if registry is not None and hasattr(registry, "has_tool"):
+                if registry.has_tool("generate_image_enhanced"):
+                    tool_name = "generate_image_enhanced"
+                elif registry.has_tool("generate_image"):
+                    tool_name = "generate_image"
+            if tool_name:
+                forced_args: dict[str, Any] = {}
+                if prompt:
+                    forced_args["prompt"] = prompt
+                return tool_name, forced_args
+
         if self._should_force_image_tool_first(ctx):
             forced_args: dict[str, Any] = {}
             first_url = self._extract_first_url(ctx.message_text)
