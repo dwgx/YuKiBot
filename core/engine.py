@@ -4069,52 +4069,76 @@ class YukikoEngine:
         if self.agent.enable and self.model_client.enabled:
 
 
-            agent_result = await self._try_agent_path(
+            if self._should_prefer_router_for_plain_text(message=message, text=text, trigger=trigger):
 
 
-                message=message,
+                self.logger.info(
 
 
-                text=text,
+                    "agent_bypass_plain_text | trace=%s | scene=%s | text=%s",
 
 
-                trigger=trigger,
-                explicit_bot_addressed=explicit_bot_addressed,
-
-                thread_state=thread_state,
-
-                runtime_group_context=runtime_group_context,
+                    message.trace_id,
 
 
-
-                memory_context=memory_context,
-
-
-                related_memories=related_memories,
+                    normalize_text(getattr(trigger, "scene_hint", "")) or "chat",
 
 
-                user_profile_summary=user_profile_summary,
+                    clip_text(text, 120),
 
 
-                preferred_name=preferred_name,
+                )
 
 
-                recent_speakers=recent_speakers,
+            else:
 
 
-                user_policies=user_policies,
+                agent_result = await self._try_agent_path(
 
 
-                user_directives=user_directives,
+                    message=message,
 
 
-            )
+                    text=text,
 
 
-            if agent_result is not None:
+                    trigger=trigger,
+                    explicit_bot_addressed=explicit_bot_addressed,
+
+                    thread_state=thread_state,
+
+                    runtime_group_context=runtime_group_context,
 
 
-                return agent_result
+
+                    memory_context=memory_context,
+
+
+                    related_memories=related_memories,
+
+
+                    user_profile_summary=user_profile_summary,
+
+
+                    preferred_name=preferred_name,
+
+
+                    recent_speakers=recent_speakers,
+
+
+                    user_policies=user_policies,
+
+
+                    user_directives=user_directives,
+
+
+                )
+
+
+                if agent_result is not None:
+
+
+                    return agent_result
 
 
 
@@ -7146,6 +7170,137 @@ class YukikoEngine:
 
         return "", {}, ""
 
+
+
+
+
+    def _should_prefer_router_for_plain_text(self, message: EngineMessage, text: str, trigger: Any) -> bool:
+
+
+        content = normalize_text(text)
+
+
+        if not content:
+
+
+            return False
+
+
+        if content.startswith("/"):
+
+
+            return False
+
+
+        if message.raw_segments or message.reply_media_segments:
+
+
+            return False
+
+
+        if self._extract_first_image_url_from_text(content) or self._extract_first_video_url_from_text(content):
+
+
+            return False
+
+
+        if self._extract_first_url(content):
+
+
+            return False
+
+
+        if self._looks_like_download_task_intent(content):
+
+
+            return False
+
+
+        if self._looks_like_local_file_request(content) and self._pick_local_path_candidate(content):
+
+
+            return False
+
+
+        if self._looks_like_github_request(content) and (
+
+
+            self._looks_like_repo_readme_request(content) or self._looks_like_explicit_request(content)
+
+
+        ):
+
+
+            return False
+
+
+        if self._looks_like_qq_avatar_intent(content):
+
+
+            return False
+
+
+        if (
+
+
+            self._looks_like_image_analyze_intent(content)
+
+
+            or self._looks_like_video_request(content)
+
+
+            or self._looks_like_video_analysis_intent(content)
+
+
+            or self._looks_like_video_resolve_intent(content)
+
+
+        ):
+
+
+            return False
+
+
+        directed = bool(
+
+
+            message.is_private
+
+
+            or message.mentioned
+
+
+            or getattr(trigger, "active_session", False)
+
+
+            or self._looks_like_bot_call(content)
+
+
+        )
+
+
+        if not directed:
+
+
+            return False
+
+
+        scene_hint = normalize_text(str(getattr(trigger, "scene_hint", ""))).lower()
+
+
+        if scene_hint in {"chat", "emotion_support", "conflict_mediation", "followup"}:
+
+
+            return True
+
+
+        if len(content) <= 160:
+
+
+            return True
+
+
+        return False
 
 
 

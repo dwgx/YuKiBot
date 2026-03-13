@@ -231,6 +231,78 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertIsNone(YukikoEngine._extract_choice_index("\u90091"))
         self.assertIsNone(YukikoEngine._extract_choice_index("\u53d1\u7ed9\u6211\u7b2c\u4e00\u4e2a"))
 
+    def test_engine_prefers_router_for_directed_plain_text_chat(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine._extract_first_image_url_from_text = lambda text: ""
+        engine._extract_first_video_url_from_text = lambda text: ""
+        engine._extract_first_url = lambda text: ""
+        engine._looks_like_download_task_intent = lambda text: False
+        engine._looks_like_local_file_request = lambda text: False
+        engine._pick_local_path_candidate = lambda text: ""
+        engine._looks_like_github_request = lambda text: False
+        engine._looks_like_repo_readme_request = lambda text: False
+        engine._looks_like_explicit_request = lambda text: False
+        engine._looks_like_qq_avatar_intent = lambda text: False
+        engine._looks_like_image_analyze_intent = lambda text: False
+        engine._looks_like_video_request = lambda text: False
+        engine._looks_like_video_analysis_intent = lambda text: False
+        engine._looks_like_video_resolve_intent = lambda text: False
+        engine._looks_like_bot_call = lambda text: False
+
+        message = EngineMessage(
+            conversation_id="group:1",
+            user_id="2",
+            user_name="tester",
+            text="你好呀",
+            mentioned=True,
+            is_private=False,
+        )
+        trigger = SimpleNamespace(scene_hint="chat", active_session=False)
+
+        self.assertTrue(engine._should_prefer_router_for_plain_text(message, "你好呀", trigger))
+
+    def test_engine_keeps_agent_for_media_or_tool_tasks(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine._extract_first_image_url_from_text = lambda text: ""
+        engine._extract_first_video_url_from_text = lambda text: ""
+        engine._extract_first_url = lambda text: ""
+        engine._looks_like_download_task_intent = lambda text: False
+        engine._looks_like_local_file_request = lambda text: False
+        engine._pick_local_path_candidate = lambda text: ""
+        engine._looks_like_github_request = lambda text: False
+        engine._looks_like_repo_readme_request = lambda text: False
+        engine._looks_like_explicit_request = lambda text: False
+        engine._looks_like_qq_avatar_intent = lambda text: False
+        engine._looks_like_image_analyze_intent = lambda text: False
+        engine._looks_like_video_request = lambda text: False
+        engine._looks_like_video_analysis_intent = lambda text: False
+        engine._looks_like_video_resolve_intent = lambda text: False
+        engine._looks_like_bot_call = lambda text: False
+
+        media_message = EngineMessage(
+            conversation_id="group:1",
+            user_id="2",
+            user_name="tester",
+            text="这是什么",
+            mentioned=True,
+            raw_segments=[{"type": "image", "data": {"url": "https://example.com/a.png"}}],
+        )
+        trigger = SimpleNamespace(scene_hint="chat", active_session=False)
+        self.assertFalse(engine._should_prefer_router_for_plain_text(media_message, "这是什么", trigger))
+
+        tool_message = EngineMessage(
+            conversation_id="group:1",
+            user_id="2",
+            user_name="tester",
+            text="帮我看看这个仓库 README",
+            mentioned=True,
+        )
+        engine._looks_like_github_request = lambda text: True
+        engine._looks_like_repo_readme_request = lambda text: True
+        self.assertFalse(
+            engine._should_prefer_router_for_plain_text(tool_message, "帮我看看这个仓库 README", trigger)
+        )
+
     def test_tools_require_explicit_avatar_and_download_controls(self) -> None:
         executor = _DummyExecutor()
 
