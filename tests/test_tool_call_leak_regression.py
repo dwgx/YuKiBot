@@ -47,6 +47,19 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         )
         self.assertTrue(loop._looks_like_embedded_tool_payload_text(payload))
 
+    def test_agent_detects_image_hint_from_multimodal_event_text(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        text = (
+            "MULTIMODAL_EVENT_AT user mentioned bot and sent multimodal message: "
+            "image:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123"
+        )
+        self.assertTrue(loop._text_has_image_hint(text))
+
+    def test_agent_treats_ntqq_download_url_as_image(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        url = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123"
+        self.assertTrue(loop._looks_like_image_url(url))
+
 
 if __name__ == "__main__":
     unittest.main()

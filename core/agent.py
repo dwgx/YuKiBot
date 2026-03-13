@@ -707,7 +707,7 @@ class AgentLoop:
                 )
                 forced_args: dict[str, Any] = {}
                 first_url = self._extract_first_url(ctx.message_text)
-                if first_url and re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?|$)", first_url, re.IGNORECASE):
+                if first_url and self._looks_like_image_url(first_url):
                     forced_args["url"] = first_url
                 question = normalize_text(ctx.message_text)
                 if question:
@@ -2050,6 +2050,30 @@ class AgentLoop:
         return m.group(0).strip().rstrip(").,，。!?！？")
 
     @staticmethod
+    def _looks_like_image_url(url: str) -> bool:
+        target = normalize_text(url).lower()
+        if not target:
+            return False
+        if target.startswith("data:image/"):
+            return True
+        if re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?:\?|$)", target):
+            return True
+        # QQ/NT 常见图片下载链接没有文件后缀
+        if "multimedia.nt.qq.com.cn/download" in target:
+            return True
+        return False
+
+    @classmethod
+    def _text_has_image_hint(cls, text: str) -> bool:
+        norm = normalize_text(text).lower()
+        if not norm:
+            return False
+        if "image:" in norm:
+            return True
+        url = cls._extract_first_url(norm)
+        return bool(url and cls._looks_like_image_url(url))
+
+    @staticmethod
     def _looks_like_video_url(url: str) -> bool:
         target = normalize_text(url).lower()
         if not target:
@@ -2736,6 +2760,8 @@ class AgentLoop:
         has_image = (
             any(item.startswith("image:") for item in (ctx.media_summary or []))
             or any(item.startswith("image:") for item in (ctx.reply_media_summary or []))
+            or self._text_has_image_hint(ctx.message_text)
+            or self._text_has_image_hint(ctx.reply_to_text)
             or any(
                 normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
                 for seg in (ctx.raw_segments or [])

@@ -213,9 +213,18 @@ class ModelClient:
         retries: int = 2,
         backoff: float = 1.0,
     ) -> str:
-        return await self._get_active_client().chat_text_with_retry(
-            messages, max_tokens=max_tokens, retries=retries, backoff=backoff,
-        )
+        # 统一走 ModelClient.chat_text，确保可触发 provider 级 failover。
+        import asyncio as _aio
+
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return await self.chat_text(messages=messages, max_tokens=max_tokens)
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    await _aio.sleep(backoff * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
 
     async def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
         return await self._get_active_client().chat_json(messages)
