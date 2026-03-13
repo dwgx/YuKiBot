@@ -3432,6 +3432,65 @@ class YukikoEngine:
 
 
 
+        if (
+
+
+            (message.mentioned or message.is_private or self._looks_like_bot_call(text))
+
+
+            and self._looks_like_recursive_event_dump_message(text)
+
+
+        ):
+
+
+            loop_reply = "别把事件日志或我刚才那段分析继续贴回来啦，直接说你想让我做什么。"
+
+
+            loop_reply = self._apply_tone_guard(loop_reply)
+
+
+            loop_reply = self._limit_reply_text(loop_reply, "short", proactive=False)
+
+
+            rendered = self.markdown.render(loop_reply)
+
+
+            self.logger.info(
+
+
+                "消息已处理 | 会话=%s | 用户=%s | 动作=%s | 原因=%s | 回复长度=%d",
+
+
+                message.conversation_id,
+
+
+                message.user_id,
+
+
+                "reply",
+
+
+                "recursive_event_dump_guard",
+
+
+                len(rendered),
+
+
+            )
+
+
+            await self._after_reply(message, rendered, proactive=False, action="reply", open_followup=False)
+
+
+            self._record_intent(message, action="reply", reason="recursive_event_dump_guard", text=text)
+
+
+            return EngineResponse(action="reply", reason="recursive_event_dump_guard", reply_text=rendered)
+
+
+
+
 
         allow_memory = bool(self.config.get("bot", {}).get("allow_memory", True))
 
@@ -10255,6 +10314,137 @@ class YukikoEngine:
 
         return bool(re.search(r"(?<!\d)[1-9]\d{5,11}(?!\d)", content) or self._has_control_token(text, "target=self", "/me"))
 
+
+
+
+
+    @staticmethod
+
+
+    def _looks_like_recursive_event_dump_message(text: str) -> bool:
+
+
+        content = normalize_text(text)
+
+
+        if len(content) < 80:
+
+
+            return False
+
+
+        lower = content.lower()
+
+
+        direct_cues = (
+
+
+            "this is a qq group chat message event",
+
+
+            "this appears to be a qq bot event log",
+
+
+            "message event from napcat",
+
+
+            "recursive or self-referential",
+
+
+            "recursive loop",
+
+
+            "infinite reflection pattern",
+
+
+            "self-referential loop",
+
+
+            "qq bot event log",
+
+
+            "典型的消息循环",
+
+
+            "形成递归",
+
+
+            "事件日志",
+
+
+            "机器人回复内容",
+
+
+        )
+
+
+        if any(cue in lower for cue in direct_cues):
+
+
+            return True
+
+
+        score = 0
+
+
+        cue_groups = (
+
+
+            ("napcat", "onebot", "qq group chat", "qq bot"),
+
+
+            ("current event:", "key information:", "message content:", "bot was mentioned"),
+
+
+            ("message id", "timestamp", "sender:", "group:"),
+
+
+            ("recursive", "self-referential", "infinite loop", "reflection pattern"),
+
+
+            ("递归", "自指", "循环", "复述"),
+
+
+        )
+
+
+        for group in cue_groups:
+
+
+            if any(token in lower for token in group):
+
+
+                score += 1
+
+
+        if score >= 3:
+
+
+            return True
+
+
+        structured_hits = sum(
+
+
+            1
+
+
+            for token in ("group:", "sender:", "message id", "timestamp", "current event:", "key information:")
+
+
+            if token in lower
+
+
+        )
+
+
+        if ("napcat" in lower or "onebot" in lower or "qq bot" in lower) and structured_hits >= 2:
+
+
+            return True
+
+
+        return False
 
 
 

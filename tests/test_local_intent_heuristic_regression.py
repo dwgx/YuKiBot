@@ -303,6 +303,19 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             engine._should_prefer_router_for_plain_text(tool_message, "帮我看看这个仓库 README", trigger)
         )
 
+    def test_engine_detects_recursive_event_dump_messages(self) -> None:
+        sample = (
+            "This is a QQ group chat message event from NapCat showing: **Key Information:** "
+            "- **Group**: 小南娘社区备用 - **Sender**: 武庸 - **Message ID**: 1799314502 "
+            "- **Timestamp**: 1773398893 - **Bot mentioned**: Yes. "
+            "This appears to be a recursive or self-referential message event."
+        )
+        self.assertTrue(YukikoEngine._looks_like_recursive_event_dump_message(sample))
+
+    def test_engine_does_not_flag_normal_chat_as_recursive_event_dump(self) -> None:
+        sample = "你刚才那句话什么意思，直接讲白一点。"
+        self.assertFalse(YukikoEngine._looks_like_recursive_event_dump_message(sample))
+
     def test_tools_require_explicit_avatar_and_download_controls(self) -> None:
         executor = _DummyExecutor()
 
