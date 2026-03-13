@@ -168,7 +168,6 @@ class RouterEngine:
             {
                 "name": item.get("name", ""),
                 "description": item.get("description", ""),
-                "intent_examples": item.get("intent_examples", []),
                 "args_schema": item.get("args_schema", {}),
                 "rules": item.get("rules", []),
             }

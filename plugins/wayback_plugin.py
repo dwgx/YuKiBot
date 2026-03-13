@@ -311,7 +311,6 @@ class Plugin:
     description = "Agent internal tools for Wayback Machine snapshot lookup and extraction."
     agent_tool = True
     internal_only = True
-    intent_examples: list[str] = []
     rules: list[str] = []
     args_schema: dict[str, str] = {}
 
@@ -465,6 +464,7 @@ class Plugin:
                     "before generic web search."
                 ),
                 priority=35,
+                tool_names=("wayback_lookup", "wayback_extract", "wayback_timeline"),
             )
         )
         registry.register_prompt_hint(
@@ -478,6 +478,7 @@ class Plugin:
                     "Do not loop too many times: normally no more than 2 extract attempts."
                 ),
                 priority=35,
+                tool_names=("wayback_lookup", "wayback_extract", "wayback_timeline"),
             )
         )
 

@@ -65,6 +65,8 @@ class AgentContext:
     recent_speakers: list[tuple[str, str, str]] = field(default_factory=list)
     user_policies: dict[str, Any] = field(default_factory=dict)
     user_directives: list[str] = field(default_factory=list)
+    thread_state: dict[str, Any] = field(default_factory=dict)
+    runtime_group_context: list[str] = field(default_factory=list)
     media_summary: list[str] = field(default_factory=list)
     reply_media_summary: list[str] = field(default_factory=list)
     at_other_user_ids: list[str] = field(default_factory=list)
@@ -417,10 +419,21 @@ class AgentLoop:
             "reply_to_user_name": ctx.reply_to_user_name,
             "reply_to_text": ctx.reply_to_text,
             "at_other_user_ids": ctx.at_other_user_ids,
+            "at_other_user_names": ctx.at_other_user_names,
+            "memory_context": ctx.memory_context,
+            "related_memories": ctx.related_memories,
+            "user_profile_summary": ctx.user_profile_summary,
+            "preferred_name": ctx.preferred_name,
             "recent_speakers": ctx.recent_speakers,
+            "thread_state": ctx.thread_state,
+            "runtime_group_context": ctx.runtime_group_context,
+            "media_summary": ctx.media_summary,
+            "reply_media_summary": ctx.reply_media_summary,
             "event_payload": ctx.event_payload,
             "user_policies": ctx.user_policies,
             "user_directives": ctx.user_directives,
+            "sender_role": ctx.sender_role,
+            "is_whitelisted_group": ctx.is_whitelisted_group,
             "is_admin_user": permission_level in ("super_admin", "group_admin"),
             "permission_level": permission_level,
             "config": self.config,
@@ -1183,42 +1196,7 @@ class AgentLoop:
                     continue
 
             # 执行工具
-            tool_context = {
-                "api_call": ctx.api_call,
-                "admin_handler": ctx.admin_handler,
-                "config_patch_handler": ctx.config_patch_handler,
-                "sticker_manager": ctx.sticker_manager,
-                "tool_executor": ctx.tool_executor,
-                "crawler_hub": ctx.crawler_hub,
-                "knowledge_base": ctx.knowledge_base,
-                "memory_engine": ctx.memory_engine,
-                "conversation_id": ctx.conversation_id,
-                "user_id": ctx.user_id,
-                "user_name": ctx.user_name,
-                "group_id": ctx.group_id,
-                "bot_id": ctx.bot_id,
-                "is_private": ctx.is_private,
-                "mentioned": ctx.mentioned,
-                "explicit_bot_addressed": ctx.explicit_bot_addressed,
-                "trace_id": ctx.trace_id,
-                "message_text": ctx.message_text,
-                "original_message_text": ctx.original_message_text or ctx.message_text,
-                "message_id": ctx.message_id,
-                "raw_segments": ctx.raw_segments,
-                "reply_media_segments": ctx.reply_media_segments,
-                "reply_to_message_id": ctx.reply_to_message_id,
-                "reply_to_user_id": ctx.reply_to_user_id,
-                "reply_to_user_name": ctx.reply_to_user_name,
-                "reply_to_text": ctx.reply_to_text,
-                "at_other_user_ids": ctx.at_other_user_ids,
-                "recent_speakers": ctx.recent_speakers,
-                "event_payload": ctx.event_payload,
-                "user_policies": ctx.user_policies,
-                "user_directives": ctx.user_directives,
-                "is_admin_user": perm_level in ("super_admin", "group_admin"),
-                "permission_level": perm_level,
-                "config": self.config,
-            }
+            tool_context = self._build_tool_context(ctx, perm_level)
             remaining_for_tool = deadline_ts - time.monotonic()
             if remaining_for_tool <= 3:
                 return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "total_timeout")
@@ -1422,6 +1400,18 @@ class AgentLoop:
                 context_parts.append(
                     "多人对话规则: 先判断用户在回复谁；出现“他/她/这个人”等指代时，优先结合 @对象、回复锚点和最近活跃用户再作答。"
                 )
+        if ctx.runtime_group_context:
+            rows = [
+                f"- {clip_text(normalize_text(item), 100)}"
+                for item in ctx.runtime_group_context[:8]
+                if normalize_text(item)
+            ]
+            if rows:
+                context_parts.append("群聊近期上下文:\n" + "\n".join(rows))
+        if ctx.thread_state:
+            state_text = self._clip_json_for_prompt(ctx.thread_state, max_chars=360)
+            if normalize_text(state_text):
+                context_parts.append(f"会话线程状态: {state_text}")
         if ctx.user_directives:
             context_parts.append("用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[:5]))
         context_block = "\n\n".join(context_parts) if context_parts else "(无额外上下文)"
@@ -1445,21 +1435,31 @@ class AgentLoop:
             "## 执行预算（硬约束）\n"
             f"- 本轮最多 {self.max_steps} 步，优先选择成功率最高的路径，不要重复同类搜索。\n"
             "- 下载类任务若工具返回扩展名/签名不匹配，必须立即换源或改用资源检索，不得继续复述失败结果。\n\n"
+            "## 上下文判定优先级（必须遵守）\n"
+            "- 当前消息、当前附带媒体、引用锚点优先于旧记忆。\n"
+            "- 当前用户近期 > 引用对象近期 > 相关记忆 > 群聊缓存。\n"
+            "- 用户事实、偏好、身份不要套给其他群成员；多人群聊先确认对象再回答。\n"
+            "- 会话线程状态和群聊近期上下文用于补全语境，但不能覆盖用户当前这条的明确意思。\n"
+            "- 证据冲突时优先更近、更具体、更可验证的信息；拿不准就先确认。\n"
+            "- GIF/动图按多帧内容理解，优先回答它在表达什么，不要只盯单帧。\n\n"
             "## 上下文关联（极其重要）\n"
             f"{context_rules_text}"
         )
         # 插件注入的规则
-        plugin_rules = self.tool_registry.get_prompt_hints_text("rules")
+        plugin_rules = self.tool_registry.get_prompt_hints_text("rules", tool_names=selected_tools)
         if plugin_rules:
             prompt += f"{plugin_rules}\n"
-        plugin_tools_guidance = self.tool_registry.get_prompt_hints_text("tools_guidance")
+        plugin_tools_guidance = self.tool_registry.get_prompt_hints_text("tools_guidance", tool_names=selected_tools)
         if plugin_tools_guidance:
             prompt += f"## 工具使用指南（插件）\n{plugin_tools_guidance}\n\n"
-        plugin_context = self.tool_registry.get_prompt_hints_text("context")
+        plugin_context = self.tool_registry.get_prompt_hints_text("context", tool_names=selected_tools)
         if plugin_context:
             prompt += f"## 插件上下文\n{plugin_context}\n\n"
         # 动态上下文提供者
-        dynamic_context = self.tool_registry.get_dynamic_context({"ctx": ctx, "config": self.config})
+        dynamic_context = self.tool_registry.get_dynamic_context(
+            {"ctx": ctx, "config": self.config, "selected_tools": selected_tools},
+            tool_names=selected_tools,
+        )
         if dynamic_context:
             prompt += f"## 动态上下文\n{dynamic_context}\n\n"
 
@@ -1755,6 +1755,17 @@ class AgentLoop:
                 )
                 if normalize_text(line):
                     parts.append(line)
+            if video_count:
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_user_video",
+                        "[提示: 用户发了视频；如果是在问内容、解析链接或要总结视频，优先用 parse_video / analyze_video]",
+                    ),
+                    {"video_count": video_count},
+                )
+                if normalize_text(line):
+                    parts.append(line)
             if voice_count:
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
@@ -1766,14 +1777,52 @@ class AgentLoop:
                 )
                 if normalize_text(line):
                     parts.append(line)
+            if self._has_animated_image_summary(ctx.media_summary):
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_user_gif",
+                        "[提示: 用户发的是 GIF/动图，分析时按多帧理解动作、情绪和想表达的意思]",
+                    ),
+                    {},
+                )
+                if normalize_text(line):
+                    parts.append(line)
+        # 检测用户消息中的链接
+        first_url = self._extract_first_url(ctx.message_text)
+        if first_url:
+            if "b23.tv" in first_url or "bilibili.com" in first_url or "douyin.com" in first_url or "kuaishou.com" in first_url:
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_video_url",
+                        "[检测到视频链接 {url}，用 parse_video 解析]",
+                    ),
+                    {"url": first_url},
+                )
+                if normalize_text(line):
+                    parts.append(line)
+            elif first_url.startswith("http"):
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_web_url",
+                        "[检测到网页链接 {url}，用 fetch_webpage 打开]",
+                    ),
+                    {"url": first_url},
+                )
+                if normalize_text(line):
+                    parts.append(line)
         if ctx.reply_media_summary:
             reply_image_count = sum(1 for m in ctx.reply_media_summary if m.startswith("image:"))
+            reply_video_count = sum(1 for m in ctx.reply_media_summary if m.startswith("video:"))
             reply_voice_count = sum(1 for m in ctx.reply_media_summary if m.startswith("record") or m.startswith("audio"))
             reply_media_line = self._render_runtime_tpl(
                 self._runtime_tpl(runtime_templates, "reply_media_line", "[引用消息中的媒体: {reply_media_desc}]"),
                 {
                     "reply_media_desc": ", ".join(ctx.reply_media_summary[:5]),
                     "reply_image_count": reply_image_count,
+                    "reply_video_count": reply_video_count,
                     "reply_voice_count": reply_voice_count,
                 },
             )
@@ -1801,6 +1850,17 @@ class AgentLoop:
                 )
                 if normalize_text(line):
                     parts.append(line)
+            if reply_video_count:
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_reply_video",
+                        "[提示: 引用消息里有视频；如果用户在问这条引用内容，优先 parse_video / analyze_video，并以引用视频为目标]",
+                    ),
+                    {"reply_video_count": reply_video_count},
+                )
+                if normalize_text(line):
+                    parts.append(line)
             if reply_voice_count:
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
@@ -1812,7 +1872,22 @@ class AgentLoop:
                 )
                 if normalize_text(line):
                     parts.append(line)
+            if self._has_animated_image_summary(ctx.reply_media_summary):
+                line = self._render_runtime_tpl(
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "hint_reply_gif",
+                        "[提示: 引用消息里的是 GIF/动图；如果用户在问这条内容，要按多帧理解它的动作和语气]",
+                    ),
+                    {},
+                )
+                if normalize_text(line):
+                    parts.append(line)
         return "\n".join(parts)
+
+    @staticmethod
+    def _has_animated_image_summary(rows: list[str] | None) -> bool:
+        return any(normalize_text(str(item)).lower().startswith("image:animated:") for item in (rows or []))
 
     def _normalize_tool_args(self, tool_name: str, args: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
         """对常见工具进行缺参兜底，减少 args={} 造成的空调用。"""
@@ -1823,8 +1898,7 @@ class AgentLoop:
         first_url = self._extract_first_url(text)
         reply_url = self._extract_first_url(normalize_text(ctx.reply_to_text))
         candidate_url = first_url or reply_url
-        if not candidate_url and self._looks_like_reference_to_previous_link(text):
-            candidate_url = self._extract_recent_url(ctx)
+        recent_video_url = self._extract_recent_media_url(ctx, "video")
         qq_id = self._extract_candidate_qq_id(ctx)
 
         def _set_if_empty(key: str, value: Any) -> None:
@@ -1848,7 +1922,7 @@ class AgentLoop:
         elif tool_name in {"lookup_wiki"}:
             _set_if_empty("keyword", self._infer_lookup_keyword(contextual_query or text))
         elif tool_name == "split_video":
-            _set_if_empty("url", candidate_url)
+            _set_if_empty("url", recent_video_url or candidate_url)
             inferred_mode = self._infer_split_video_mode(contextual_query or text)
             if inferred_mode:
                 _set_if_empty("mode", inferred_mode)
@@ -1867,7 +1941,10 @@ class AgentLoop:
                 if frame_hint > 0:
                     _set_if_empty("max_frames", frame_hint)
         elif tool_name in {"parse_video", "analyze_video", "fetch_webpage", "download_file", "smart_download"}:
-            _set_if_empty("url", candidate_url)
+            if tool_name in {"parse_video", "analyze_video"}:
+                _set_if_empty("url", recent_video_url or candidate_url)
+            else:
+                _set_if_empty("url", candidate_url)
             if tool_name in {"download_file", "smart_download"}:
                 _set_if_empty("query", contextual_query or text)
                 _set_if_empty("kind", "auto")
@@ -1973,6 +2050,46 @@ class AgentLoop:
         return m.group(0).strip().rstrip(").,，。!?！？")
 
     @staticmethod
+    def _looks_like_video_url(url: str) -> bool:
+        target = normalize_text(url).lower()
+        if not target:
+            return False
+        if re.search(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)", target):
+            return True
+        return any(host in target for host in ("bilibili.com/video/", "b23.tv/", "douyin.com/", "kuaishou.com/", "acfun.cn/v/ac"))
+
+    @classmethod
+    def _extract_recent_media_url(cls, ctx: AgentContext, media_type: str) -> str:
+        wanted = normalize_text(media_type).lower()
+        summary_rows = list(ctx.reply_media_summary or []) + list(ctx.media_summary or [])
+        for row in summary_rows:
+            text = normalize_text(row)
+            if not text:
+                continue
+            if wanted == "video" and not text.startswith("video:"):
+                continue
+            if wanted == "image" and not text.startswith("image:"):
+                continue
+            if wanted == "audio" and not (text.startswith("audio:") or text.startswith("record:")):
+                continue
+            url = cls._extract_first_url(text)
+            if url:
+                return url
+        recent_rows = list(ctx.memory_context or []) + list(ctx.related_memories or [])
+        for row in reversed(recent_rows):
+            text = normalize_text(row)
+            if not text:
+                continue
+            url = cls._extract_first_url(text)
+            if not url:
+                continue
+            if wanted == "video" and cls._looks_like_video_url(url):
+                return url
+            if wanted != "video":
+                return url
+        return ""
+
+    @staticmethod
     def _looks_like_reference_to_previous_link(text: str) -> bool:
         t = normalize_text(text).lower()
         if not t:
@@ -1996,8 +2113,20 @@ class AgentLoop:
         return any(re.search(pattern, t) for pattern in patterns)
 
     def _extract_recent_url(self, ctx: AgentContext) -> str:
+        for direct_text in (normalize_text(ctx.reply_to_text), normalize_text(ctx.message_text)):
+            url = self._extract_first_url(direct_text)
+            if url:
+                return url
+        for media_type in ("video", "image", "audio"):
+            url = self._extract_recent_media_url(ctx, media_type)
+            if url:
+                return url
         # 优先从最近上下文里找 URL（通常包含机器人上一条发出的链接）
         for line in reversed(ctx.memory_context[-16:]):
+            url = self._extract_first_url(normalize_text(line))
+            if url:
+                return url
+        for line in reversed(ctx.related_memories[:8]):
             url = self._extract_first_url(normalize_text(line))
             if url:
                 return url

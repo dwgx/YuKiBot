@@ -523,19 +523,10 @@ class PluginRegistry:
                 description = normalize_text(str(getattr(plugin, "description", "")))
 
 
-                intent_examples = getattr(plugin, "intent_examples", [])
-
-
                 args_schema = getattr(plugin, "args_schema", {})
 
 
                 rules_raw = getattr(plugin, "rules", [])
-
-
-                if not isinstance(intent_examples, list):
-
-
-                    intent_examples = []
 
 
                 if not isinstance(args_schema, dict):
@@ -635,9 +626,6 @@ class PluginRegistry:
 
 
                         "description": description or f"插件 {name}",
-
-
-                        "intent_examples": [normalize_text(str(item)) for item in intent_examples if str(item).strip()],
 
 
                         "args_schema": args_schema,
@@ -3743,16 +3731,18 @@ class YukikoEngine:
                     memory_context = (memory_context + [f"[引用对象近期]{item}" for item in reply_target_recent])[-16:]
 
             if message.reply_to_message_id and hasattr(self.memory, "get_message_media_artifacts"):
-                reply_media_items = self.memory.get_message_media_artifacts(
-                    message_id=message.reply_to_message_id,
-                    conversation_id=message.conversation_id,
-                    media_type="image",
-                    limit=3,
-                )
-                if reply_media_items:
-                    reply_media_lines = self._build_reply_media_memory_lines(reply_media_items, limit=2)
-                    if reply_media_lines:
-                        memory_context = (memory_context + reply_media_lines)[-22:]
+                reply_media_lines: list[str] = []
+                for reply_media_type in ("image", "video", "audio", "record"):
+                    reply_media_items = self.memory.get_message_media_artifacts(
+                        message_id=message.reply_to_message_id,
+                        conversation_id=message.conversation_id,
+                        media_type=reply_media_type,
+                        limit=3,
+                    )
+                    if reply_media_items:
+                        reply_media_lines.extend(self._build_reply_media_memory_lines(reply_media_items, limit=2))
+                if reply_media_lines:
+                    memory_context = (memory_context + reply_media_lines)[-22:]
 
 
             if not memory_context:
@@ -4067,166 +4057,7 @@ class YukikoEngine:
 
 
 
-        # ── 音乐快速通道：可配置地跳过 Agent/Router，直接执行 ──
-
-
-        agent_cfg = self.config.get("agent", {}) if isinstance(self.config, dict) else {}
-
-
-        music_fast_path_enable = False
-
-
-        if isinstance(agent_cfg, dict):
-
-
-            music_fast_path_enable = bool(agent_cfg.get("music_fast_path_enable", False))
-
-
-        if music_fast_path_enable and (message.mentioned or message.is_private) and self._looks_like_music_request(text):
-
-
-            keyword = self._extract_music_keyword(text)
-
-
-            if keyword:
-
-
-                action = "music_search" if self._looks_like_music_search_request(text) else "music_play"
-
-
-                tool_args = {"keyword": keyword, "limit": 8} if action == "music_search" else {"keyword": keyword}
-
-
-                self.logger.info(
-
-
-                    "music_fast_path | trace=%s | action=%s | keyword=%s",
-
-
-                    message.trace_id, action, clip_text(keyword, 60),
-
-
-                )
-
-
-                tool_result = await self.tools.execute(
-
-
-                    action=action,
-
-
-                    tool_name=action,
-
-
-                    tool_args=tool_args,
-
-
-                    message_text=text,
-
-
-                    conversation_id=message.conversation_id,
-
-
-                    user_id=message.user_id,
-
-
-                    user_name=message.user_name,
-
-
-                    group_id=message.group_id,
-
-
-                    api_call=message.api_call,
-
-
-                    raw_segments=message.raw_segments,
-
-
-                    bot_id=message.bot_id,
-
-
-                    trace_id=message.trace_id,
-
-
-                )
-
-
-                reply_text = ""
-
-
-                record_b64 = ""
-
-
-                audio_file = ""
-
-
-                video_url = ""
-
-
-                if tool_result is not None:
-
-
-                    reply_text = normalize_text(str(tool_result.payload.get("text", "")))
-
-
-                    record_b64 = normalize_text(str(tool_result.payload.get("record_b64", "")))
-
-
-                    audio_file = normalize_text(str(tool_result.payload.get("audio_file", "")))
-
-
-                if not reply_text:
-
-
-                    reply_text = await self._ai_error_reply(
-
-
-                        user_text=text,
-
-
-                        error_context=f"用户想点歌，但播放失败了。用户原文：{text}。请用简短自然的语气告诉用户这首歌没播出来，可以换个关键词再试。",
-
-
-                        memory_context=memory_context,
-
-
-                        scene_hint="music_error",
-
-
-                    )
-
-
-                rendered = self.markdown.render(reply_text)
-
-
-                await self._after_reply(message, rendered, proactive=False, action=action, open_followup=True)
-
-
-                self._record_intent(message, action=action, reason="music_fast_path", text=text)
-
-
-                return EngineResponse(
-
-
-                    action=action,
-
-
-                    reason="music_fast_path",
-
-
-                    reply_text=rendered,
-
-
-                    video_url=video_url,
-
-
-                    record_b64=record_b64,
-
-
-                    audio_file=audio_file,
-
-
-                )
+        # 本地关键词音乐快速通道已停用：点歌/搜歌交给 Router + Prompt 自行判断。
 
 
 
@@ -6114,6 +5945,12 @@ class YukikoEngine:
                 user_directives=user_directives or [],
 
 
+                thread_state=thread_state if isinstance(thread_state, dict) else {},
+
+
+                runtime_group_context=runtime_group_context or [],
+
+
                 media_summary=media_summary,
 
 
@@ -6958,108 +6795,11 @@ class YukikoEngine:
 
 
     def _failover_decision(self, payload: RouterInput, reason: str) -> RouterDecision | None:
-
-
-        is_media = self._looks_like_media_request(payload.text)
-
-
-        is_video = self._looks_like_video_request(payload.text) if is_media else False
-
-
-        is_music = self._looks_like_music_request(payload.text)
-
-
         self.logger.info(
-
-
-            "failover_check | reason=%s | is_media=%s | is_video=%s | is_music=%s | text=%s",
-
-
-            reason, is_media, is_video, is_music, clip_text(payload.text, 60),
-
-
+            "failover_check | reason=%s | local_intent_fallback=disabled | text=%s",
+            reason,
+            clip_text(payload.text, 60),
         )
-
-
-        if reason in {"router_timeout", "router_parse_error"} and is_music:
-
-
-            keyword = self._extract_music_keyword(payload.text)
-
-
-            action = "music_search" if self._looks_like_music_search_request(payload.text) else "music_play"
-
-
-            return RouterDecision(
-
-
-                should_handle=True,
-
-
-                action=action,
-
-
-                reason=f"{reason}_music_fallback",
-
-
-                confidence=0.74,
-
-
-                reply_style="short",
-
-
-                tool_args={"keyword": keyword},
-
-
-            )
-
-
-        if reason in {"router_timeout", "router_parse_error"} and is_media:
-
-
-            mode = "video" if is_video else "image"
-
-
-            query = payload.text
-
-
-            # BV/av 号自动补全为完整 URL
-
-
-            bv_match = re.search(r"(BV\w{10})", query, flags=re.IGNORECASE)
-
-
-            if bv_match and "bilibili.com" not in query.lower():
-
-
-                query = f"https://www.bilibili.com/video/{bv_match.group(1)}"
-
-
-                mode = "video"
-
-
-            return RouterDecision(
-
-
-                should_handle=True,
-
-
-                action="search",
-
-
-                reason=f"{reason}_media_fallback",
-
-
-                confidence=0.72,
-
-
-                reply_style="short",
-
-
-                tool_args={"mode": mode, "query": query},
-
-
-            )
 
 
 
@@ -11557,14 +11297,24 @@ class YukikoEngine:
         rows = media_items[-max(1, limit) :]
         if not rows:
             return []
-        lines: list[str] = [f"[引用图片记忆] 已缓存 {len(media_items)} 张图片(base64)"]
+        media_type = normalize_text(str(rows[0].get("media_type", ""))).lower() or "image"
+        if media_type == "video":
+            label = "视频"
+        elif media_type in {"audio", "record"}:
+            label = "音频"
+        else:
+            label = "图片"
+        lines: list[str] = [f"[引用{label}记忆] 已缓存 {len(media_items)} 条{label}媒体"]
         for idx, item in enumerate(rows, start=1):
             data_uri = normalize_text(str(item.get("data_uri", "")))
             url = normalize_text(str(item.get("url", "")))
+            file_id = normalize_text(str(item.get("file_id", "")))
             if data_uri.startswith("data:image"):
-                lines.append(f"[引用图片base64#{idx}] {clip_text(data_uri, 96)}")
+                lines.append(f"[引用{label}base64#{idx}] {clip_text(data_uri, 96)}")
             elif url:
-                lines.append(f"[引用图片URL#{idx}] {clip_text(url, 96)}")
+                lines.append(f"[引用{label}URL#{idx}] {clip_text(url, 96)}")
+            elif file_id:
+                lines.append(f"[引用{label}文件#{idx}] {clip_text(file_id, 96)}")
         return lines
 
 
@@ -12675,19 +12425,19 @@ class YukikoEngine:
         if reply_style == "short":
 
 
-            limit = min(limit, 72)
+            limit = min(limit, 110)
 
 
         elif reply_style == "casual":
 
 
-            limit = min(limit, 110)
+            limit = min(limit, 180)
 
 
         elif reply_style == "serious":
 
 
-            limit = min(limit, 180)
+            limit = min(limit, 280)
 
 
         elif reply_style == "long":
@@ -12726,7 +12476,14 @@ class YukikoEngine:
         selected: list[str] = []
 
 
-        max_sentences = 1 if reply_style == "short" else 2 if reply_style == "casual" else 4
+        if reply_style == "short":
+            max_sentences = 2
+        elif reply_style == "casual":
+            max_sentences = 3
+        elif reply_style == "serious":
+            max_sentences = 5
+        else:
+            max_sentences = 6
 
 
         for part in parts:
@@ -15522,6 +15279,12 @@ class YukikoEngine:
                     or row.startswith("[引用图片记忆]")
                     or row.startswith("[引用图片base64")
                     or row.startswith("[引用图片URL")
+                    or row.startswith("[引用视频记忆]")
+                    or row.startswith("[引用视频URL")
+                    or row.startswith("[引用视频文件")
+                    or row.startswith("[引用音频记忆]")
+                    or row.startswith("[引用音频URL")
+                    or row.startswith("[引用音频文件")
                 )
 
 

@@ -114,7 +114,6 @@ config:
     llm_step_timeout_seconds_after_tool: 36
     total_timeout_seconds: 0
     queue_timeout_margin_seconds: 8
-    music_fast_path_enable: false
     high_risk_control:
       enable: true
       default_require_confirmation: true
@@ -157,9 +156,7 @@ config:
       search_max_duration_seconds: 600
       search_send_max_duration_seconds: 1800
       search_analysis_max_duration_seconds: 2400
-    intent_shortcut_enable: true
     tool_interface:
-      auto_method_enable: true
       enable: true
       browser_enable: true
       github_enable: false

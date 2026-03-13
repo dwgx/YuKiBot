@@ -22,19 +22,19 @@ class _DummyModelClient:
 class _DummyToolRegistry:
     tool_count = 8
 
-    def select_tools_for_intent(self, message_text: str, perm_level: str) -> list[str]:
-        _ = (message_text, perm_level)
+    def select_tools_for_intent(self, message_text: str, perm_level: str, force_filter: bool = False) -> list[str]:
+        _ = (message_text, perm_level, force_filter)
         return ["web_search", "analyze_image", "final_answer"]
 
     def get_schemas_for_prompt_filtered(self, selected_tools: list[str]) -> str:
         return "\n".join(f"- {name}" for name in selected_tools)
 
-    def get_prompt_hints_text(self, section: str) -> str:
-        _ = section
+    def get_prompt_hints_text(self, section: str, tool_names: list[str] | None = None) -> str:
+        _ = (section, tool_names)
         return ""
 
-    def get_dynamic_context(self, payload: dict[str, Any]) -> str:
-        _ = payload
+    def get_dynamic_context(self, payload: dict[str, Any], tool_names: list[str] | None = None) -> str:
+        _ = (payload, tool_names)
         return ""
 
 
@@ -120,6 +120,8 @@ def _check_agent_parse_and_prompt() -> list[_Check]:
         mentioned=True,
         message_text="这张图里是谁",
         trace_id="selfcheck-ctx",
+        thread_state={"topic": "测试主题", "turn": 2},
+        runtime_group_context=["群里刚刚在聊测试主题"],
         media_summary=["image:https://example.com/a.png"],
         raw_segments=[{"type": "image", "data": {"url": "https://example.com/a.png"}}],
         verbosity="medium",
@@ -129,9 +131,22 @@ def _check_agent_parse_and_prompt() -> list[_Check]:
 
     prompt = loop._build_system_prompt(ctx)
     user_msg = loop._build_user_message(ctx)
+    tool_ctx = loop._build_tool_context(ctx, "super_admin")
     checks.append(_Check("agent.build_system_prompt", ok="## 可用工具" in prompt and "## 身份" in prompt))
     checks.append(_Check("agent.build_user_message_media_hint", ok="analyze_image" in user_msg))
     checks.append(_Check("agent.force_tool_first_image", ok=loop._should_force_image_tool_first(ctx)))
+    checks.append(
+        _Check(
+            "agent.context_runtime_group_and_thread",
+            ok="群聊近期上下文" in prompt and "会话线程状态" in prompt,
+        )
+    )
+    checks.append(
+        _Check(
+            "agent.tool_context_runtime_group_and_thread",
+            ok=tool_ctx.get("thread_state", {}).get("turn") == 2 and tool_ctx.get("runtime_group_context") == ["群里刚刚在聊测试主题"],
+        )
+    )
 
     return checks
 

@@ -77,7 +77,7 @@ class MemoryEngine:
             1024,
             int(config.get("media_memory_max_data_uri_chars", 2_000_000)),
         )
-        self.media_memory_store_non_image = bool(config.get("media_memory_store_non_image", False))
+        self.media_memory_store_non_image = bool(config.get("media_memory_store_non_image", True))
         self.media_memory_max_rows = max(200, min(50_000, int(config.get("media_memory_max_rows", 4_000))))
         if self.heuristic_rules_enable:
             self.preferred_name_patterns = self._compile_regex_list(config.get("preferred_name_patterns", []))

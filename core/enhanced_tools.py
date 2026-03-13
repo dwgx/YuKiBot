@@ -47,6 +47,7 @@ def register_enhanced_tools(
             "图片生成: 用 generate_image_enhanced 生成图片，自动 NSFW 过滤。"
         ),
         priority=20,
+        tool_names=("checkin", "get_affinity", "affinity_leaderboard", "send_json_card", "send_music_card", "generate_image_enhanced"),
     ))
 
 

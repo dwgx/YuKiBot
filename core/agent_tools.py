@@ -41,7 +41,6 @@ class ToolSchema:
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     category: str = "general"  # general / napcat / search / media / admin
-    group: str = ""  # 语义分组: core / messaging / group_query / group_manage / social / file / search / knowledge / media / sticker / qzone / utility / admin
 
 
 @dataclass(slots=True)
@@ -66,6 +65,7 @@ class PromptHint:
     section: str
     content: str
     priority: int = 50
+    tool_names: tuple[str, ...] = ()
 
 
 ToolHandler = Callable[..., Awaitable[ToolCallResult]]
@@ -137,7 +137,7 @@ class AgentToolRegistry:
         self._schemas: dict[str, ToolSchema] = {}
         self._handlers: dict[str, ToolHandler] = {}
         self._prompt_hints: list[PromptHint] = []
-        self._context_providers: dict[str, tuple[ContextProvider, int]] = {}
+        self._context_providers: dict[str, tuple[ContextProvider, int, tuple[str, ...]]] = {}
         self._intent_keyword_routing_enabled = False
 
     def register(self, schema: ToolSchema, handler: ToolHandler) -> None:
@@ -148,24 +148,57 @@ class AgentToolRegistry:
         """注册静态提示词块，会被注入到 Agent 系统提示的对应 section。"""
         self._prompt_hints.append(hint)
 
-    def get_prompt_hints(self, section: str | None = None) -> list[PromptHint]:
+    @staticmethod
+    def _normalize_tool_names(tool_names: list[str] | tuple[str, ...] | set[str] | None) -> tuple[str, ...]:
+        if not tool_names:
+            return ()
+        out: list[str] = []
+        seen: set[str] = set()
+        for name in tool_names:
+            normalized = normalize_text(str(name)).lower()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            out.append(normalized)
+        return tuple(out)
+
+    def get_prompt_hints(
+        self,
+        section: str | None = None,
+        tool_names: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> list[PromptHint]:
         """获取提示词块，按 priority 排序。"""
         hints = self._prompt_hints if section is None else [
             h for h in self._prompt_hints if h.section == section
         ]
+        selected_tools = set(self._normalize_tool_names(tool_names))
+        if selected_tools:
+            hints = [
+                h
+                for h in hints
+                if not h.tool_names
+                or bool(selected_tools & set(self._normalize_tool_names(h.tool_names)))
+            ]
         return sorted(hints, key=lambda h: h.priority)
 
     def register_context_provider(
-        self, name: str, provider: ContextProvider, priority: int = 50,
+        self,
+        name: str,
+        provider: ContextProvider,
+        priority: int = 50,
+        tool_names: list[str] | tuple[str, ...] | set[str] | None = None,
     ) -> None:
         """注册动态上下文提供者，每次构建 prompt 时调用。"""
-        self._context_providers[name] = (provider, priority)
+        self._context_providers[name] = (provider, priority, self._normalize_tool_names(tool_names))
 
     async def gather_dynamic_context(self, runtime_info: dict[str, Any]) -> list[str]:
         """调用所有上下文提供者，返回按 priority 排序的文本列表。"""
         results: list[tuple[int, str]] = []
-        for name, (provider, prio) in self._context_providers.items():
+        selected_tools = set(self._normalize_tool_names(runtime_info.get("selected_tools")))
+        for name, (provider, prio, related_tools) in self._context_providers.items():
             try:
+                if related_tools and selected_tools and not (selected_tools & set(related_tools)):
+                    continue
                 result = provider(runtime_info)
                 if inspect.isawaitable(result):
                     result = await result
@@ -206,18 +239,29 @@ class AgentToolRegistry:
             lines.append(f"### {s['name']}\n{s['description']}\n参数:\n{param_block}")
         return "\n\n".join(lines)
 
-    def get_prompt_hints_text(self, section: str) -> str:
+    def get_prompt_hints_text(
+        self,
+        section: str,
+        tool_names: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> str:
         """获取指定 section 的提示词块，拼接为文本。"""
-        hints = self.get_prompt_hints(section)
+        hints = self.get_prompt_hints(section, tool_names=tool_names)
         if not hints:
             return ""
         return "\n".join(h.content for h in hints if h.content.strip())
 
-    def get_dynamic_context(self, runtime_info: dict[str, Any]) -> str:
+    def get_dynamic_context(
+        self,
+        runtime_info: dict[str, Any],
+        tool_names: list[str] | tuple[str, ...] | set[str] | None = None,
+    ) -> str:
         """同步包装: 调用所有上下文提供者，返回拼接文本。"""
         parts: list[str] = []
-        for name, (provider, prio) in sorted(self._context_providers.items(), key=lambda x: x[1][1]):
+        selected_tools = set(self._normalize_tool_names(tool_names or runtime_info.get("selected_tools")))
+        for name, (provider, prio, related_tools) in sorted(self._context_providers.items(), key=lambda x: x[1][1]):
             try:
+                if related_tools and selected_tools and not (selected_tools & set(related_tools)):
+                    continue
                 result = provider(runtime_info)
                 if inspect.isawaitable(result):
                     continue  # 同步调用跳过 async provider
@@ -228,29 +272,11 @@ class AgentToolRegistry:
                 _log.warning("context_provider_error | name=%s", name, exc_info=True)
         return "\n".join(parts)
 
-    # ── 智能工具过滤 ──
-
-    # 语义分组 → 意图关键词映射
-    _INTENT_GROUP_MAP: dict[str, list[str]] = {
-        "core": [],  # final_answer, think — 始终包含
-        "messaging": ["发消息", "私聊", "群消息", "转发", "合并转发", "回复", "发送"],
-        "group_query": ["群", "成员", "群信息", "群列表", "群荣誉", "禁言列表", "群文件", "群公告", "精华", "聊天记录", "历史"],
-        "group_manage": ["禁言", "踢", "管理", "群名", "群名片", "头衔", "全员禁言", "精华", "公告", "撤回", "删除"],
-        "social": ["戳", "poke", "点赞", "表情", "好友", "头像", "签到", "状态", "名片"],
-        "file": ["文件", "上传", "下载", "资源", "安装包", "压缩包"],
-        "search": ["搜索", "搜", "查", "找", "热搜", "热榜", "知乎", "百科", "wiki", "github", "网页", "链接", "url", "抓取", "提取", "摘要", "总结这个"],
-        "knowledge": ["知识", "记住", "学习", "知识库", "梗", "记忆", "记忆库", "回忆", "历史记录", "整理记忆", "去重", "合并重复"],
-        "media": ["图片", "图", "视频", "语音", "音频", "识图", "ocr", "分析", "看图", "抖音", "壁纸", "头像"],
-        "sticker": ["表情包", "表情", "emoji", "贴纸", "sticker"],
-        "qzone": ["空间", "qzone", "说说", "相册"],
-        "utility": ["翻译", "缓存", "状态", "版本"],
-        "admin": ["配置", "管理员", "命令", "cli"],
-    }
-
     # 每个分组始终包含的工具名
     _ALWAYS_INCLUDE = {"final_answer", "think"}
 
     def set_intent_keyword_routing_enabled(self, enabled: bool) -> None:
+        # 保留兼容入口，但 Agent 不再根据本地关键词裁剪工具。
         self._intent_keyword_routing_enabled = bool(enabled)
 
     def _tool_visible_for_permission(self, name: str, permission_level: str) -> bool:
@@ -274,67 +300,15 @@ class AgentToolRegistry:
                 selected.append(must_keep)
         return selected
 
-    def select_tools_for_intent(self, message_text: str, permission_level: str = "user") -> list[str]:
-        """根据用户消息意图，选择相关的工具子集。
-
-        返回工具名列表。始终包含 core 组 + 匹配到的意图组。
-        如果没有匹配到任何意图，返回全量工具（兜底）。
-        """
-        if not self._intent_keyword_routing_enabled:
-            return self._list_tools_for_permission(permission_level)
-
-        text = message_text.lower()
-        matched_groups: set[str] = {"core"}  # core 始终包含
-
-        for group, keywords in self._INTENT_GROUP_MAP.items():
-            if group == "core":
-                continue
-            for kw in keywords:
-                if kw in text:
-                    matched_groups.add(group)
-                    break
-
-        # 如果没匹配到任何意图组，返回全量
-        if matched_groups == {"core"}:
-            return self._list_tools_for_permission(permission_level)
-
-        # 搜索意图自动带上 knowledge
-        if "search" in matched_groups:
-            matched_groups.add("knowledge")
-        # 媒体意图自动带上 search（可能需要搜图/搜视频）
-        if "media" in matched_groups:
-            matched_groups.add("search")
-        # 文件意图自动带上 search
-        if "file" in matched_groups:
-            matched_groups.add("search")
-        # group_manage 自动带上 group_query
-        if "group_manage" in matched_groups:
-            matched_groups.add("group_query")
-
-        # 权限过滤: 普通用户不展示管理工具
-        if permission_level == "user":
-            matched_groups.discard("group_manage")
-            matched_groups.discard("admin")
-
-        selected: list[str] = []
-        for name, schema in self._schemas.items():
-            if name in self._ALWAYS_INCLUDE:
-                selected.append(name)
-                continue
-            if schema.group and schema.group in matched_groups:
-                selected.append(name)
-                continue
-            # 兼容: 没有 group 标记的工具，用 category 兜底
-            if not schema.group:
-                cat_to_group = {
-                    "general": "core", "search": "search", "media": "media",
-                    "admin": "admin", "napcat": "messaging", "cli": "admin",
-                }
-                fallback_group = cat_to_group.get(schema.category, "")
-                if fallback_group in matched_groups:
-                    selected.append(name)
-
-        return selected
+    def select_tools_for_intent(
+        self,
+        message_text: str,
+        permission_level: str = "user",
+        force_filter: bool = False,
+    ) -> list[str]:
+        """返回当前权限可见的完整工具列表，不做本地关键词裁剪。"""
+        _ = (message_text, force_filter)
+        return self._list_tools_for_permission(permission_level)
 
     def get_schemas_for_prompt_filtered(self, tool_names: list[str]) -> str:
         """只渲染指定工具名的 schema 文档。"""
@@ -596,176 +570,6 @@ def register_builtin_tools(
     _register_ai_method_tools(registry)
     _register_qzone_tools(registry, config)
     _register_scrapy_llm_tools(registry, model_client)
-    _assign_tool_groups(registry)
-
-
-# ── 工具语义分组映射 ──
-
-_TOOL_GROUP_MAP: dict[str, str] = {
-    # core — 始终可用
-    "final_answer": "core",
-    "think": "core",
-    # messaging — 发消息/转发
-    "send_group_message": "messaging",
-    "send_private_message": "messaging",
-    "send_msg": "messaging",
-    "forward_group_single_msg": "messaging",
-    "forward_friend_single_msg": "messaging",
-    "send_group_forward_msg": "messaging",
-    "send_private_forward_msg": "messaging",
-    "send_forward_msg": "messaging",
-    "get_forward_msg": "messaging",
-    # group_query — 群信息查询
-    "get_group_info": "group_query",
-    "get_group_info_ex": "group_query",
-    "get_group_member_list": "group_query",
-    "get_group_member_info": "group_query",
-    "get_group_list": "group_query",
-    "get_group_honor_info": "group_query",
-    "get_group_msg_history": "group_query",
-    "get_group_shut_list": "group_query",
-    "get_group_at_all_remain": "group_query",
-    "get_group_system_msg": "group_query",
-    "get_essence_msg_list": "group_query",
-    "get_group_notice": "group_query",
-    "get_group_root_files": "group_query",
-    "get_group_files_by_folder": "group_query",
-    "get_group_file_system_info": "group_query",
-    "get_group_file_url": "group_query",
-    # group_manage — 群管理操作
-    "set_group_ban": "group_manage",
-    "set_group_kick": "group_manage",
-    "set_group_whole_ban": "group_manage",
-    "set_group_admin": "group_manage",
-    "set_group_name": "group_manage",
-    "set_group_card": "group_manage",
-    "set_group_special_title": "group_manage",
-    "set_group_portrait": "group_manage",
-    "set_group_leave": "group_manage",
-    "send_group_notice": "group_manage",
-    "del_group_notice": "group_manage",
-    "delete_message": "group_manage",
-    "recall_recent_messages": "group_manage",
-    "set_essence_msg": "group_manage",
-    "delete_essence_msg": "group_manage",
-    "delete_group_file": "group_manage",
-    "create_group_file_folder": "group_manage",
-    "set_friend_add_request": "group_manage",
-    "set_group_add_request": "group_manage",
-    # social — 社交互动
-    "group_poke": "social",
-    "friend_poke": "social",
-    "send_like": "social",
-    "set_msg_emoji_like": "social",
-    "set_group_sign": "social",
-    "set_input_status": "social",
-    "get_user_info": "social",
-    "get_login_info": "social",
-    "nc_get_user_status": "social",
-    "get_friend_list": "social",
-    "get_friends_with_category": "social",
-    "get_recent_contact": "social",
-    "get_profile_like": "social",
-    "delete_friend": "social",
-    "mark_msg_as_read": "social",
-    "mark_all_as_read": "social",
-    "get_friend_msg_history": "social",
-    # file — 文件操作
-    "upload_group_file": "file",
-    "upload_private_file": "file",
-    "download_file": "file",
-    "smart_download": "file",
-    "search_download_resources": "file",
-    # search — 搜索
-    "web_search": "search",
-    "search_web_media": "search",
-    "fetch_webpage": "search",
-    "github_search": "search",
-    "github_readme": "search",
-    "get_hot_trends": "search",
-    "search_zhihu": "search",
-    "lookup_wiki": "search",
-    # knowledge — 知识库
-    "search_knowledge": "knowledge",
-    "learn_knowledge": "knowledge",
-    "memory_list": "knowledge",
-    "memory_add": "knowledge",
-    "memory_update": "knowledge",
-    "memory_delete": "knowledge",
-    "memory_audit": "knowledge",
-    "memory_compact": "knowledge",
-    # media — 媒体处理
-    "generate_image": "media",
-    "parse_video": "media",
-    "analyze_video": "media",
-    "analyze_local_video": "media",
-    "split_video": "media",
-    "analyze_image": "media",
-    "analyze_voice": "media",
-    "douyin_search": "media",
-    "get_qq_avatar": "media",
-    "ocr_image": "media",
-    "get_ai_characters": "media",
-    "send_group_ai_record": "media",
-    "get_ai_record": "media",
-    "get_image": "media",
-    "get_record": "media",
-    "get_message": "media",
-    # sticker — 表情包
-    "send_face": "sticker",
-    "send_emoji": "sticker",
-    "send_sticker": "sticker",
-    "list_faces": "sticker",
-    "list_emojis": "sticker",
-    "browse_sticker_categories": "sticker",
-    "learn_sticker": "sticker",
-    "correct_sticker": "sticker",
-    "scan_stickers": "sticker",
-    "fetch_custom_face": "sticker",
-    "fetch_emoji_like": "sticker",
-    # qzone — QQ空间
-    "get_qzone_profile": "qzone",
-    "get_qzone_moods": "qzone",
-    "get_qzone_albums": "qzone",
-    "analyze_qzone": "qzone",
-    "get_qzone_photos": "qzone",
-    # utility — 杂项
-    "translate_en2zh": "utility",
-    "check_url_safely": "utility",
-    "get_status": "utility",
-    "get_version_info": "utility",
-    "nc_get_packet_status": "utility",
-    "clean_cache": "utility",
-    "create_collection": "utility",
-    "get_collection_list": "utility",
-    "ark_share_peer": "utility",
-    "get_mini_app_ark": "utility",
-    "set_self_longnick": "utility",
-    "set_qq_avatar": "utility",
-    "set_online_status": "utility",
-    "music_play": "utility",
-    # admin — 管理
-    "admin_command": "admin",
-    "config_update": "admin",
-    "cli_invoke": "admin",
-    # scrapy_llm — 智能网页抓取
-    "scrape_extract": "search",
-    "scrape_summarize": "search",
-    "scrape_structured": "search",
-    "scrape_follow_links": "search",
-}
-
-
-def _assign_tool_groups(registry: AgentToolRegistry) -> None:
-    """批量为已注册工具分配语义分组。"""
-    for name, group in _TOOL_GROUP_MAP.items():
-        schema = registry._schemas.get(name)
-        if schema:
-            schema.group = group
-    # 统计
-    grouped = sum(1 for s in registry._schemas.values() if s.group)
-    total = len(registry._schemas)
-    _log.info("tool_groups_assigned | grouped=%d/%d", grouped, total)
 
 def _register_napcat_tools(registry: AgentToolRegistry) -> None:
     """注册 NapCat OneBot V11 API 工具，让 Agent 可以直接操作 QQ。"""
@@ -937,6 +741,7 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
                 "能执行撤回就直接执行，不要只口头说“我帮你撤回”。"
             ),
             priority=28,
+            tool_names=("delete_message", "recall_recent_messages"),
         )
     )
 
@@ -6676,6 +6481,7 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
             section="tools_guidance",
             content="当用户说“学错了/描述不对/帮我改这个表情包”时，优先用 correct_sticker 修正元数据并写回知识库。",
             priority=35,
+            tool_names=("correct_sticker",),
         )
     )
 
@@ -6929,6 +6735,7 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "若需要去重整理，先 memory_compact dry_run 预览，再带 note 执行。"
             ),
             priority=30,
+            tool_names=("memory_list", "memory_add", "memory_update", "memory_delete", "memory_compact"),
         )
     )
 
@@ -7146,7 +6953,6 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": [],
             },
             category="search",
-            group="knowledge",
         ),
         _handle_memory_list,
     )
@@ -7168,7 +6974,6 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": ["content"],
             },
             category="utility",
-            group="knowledge",
         ),
         _handle_memory_add,
     )
@@ -7188,7 +6993,6 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": ["record_id", "content", "note"],
             },
             category="utility",
-            group="knowledge",
         ),
         _handle_memory_update,
     )
@@ -7207,7 +7011,6 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": ["record_id", "note"],
             },
             category="utility",
-            group="knowledge",
         ),
         _handle_memory_delete,
     )
@@ -7226,7 +7029,6 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": [],
             },
             category="search",
-            group="knowledge",
         ),
         _handle_memory_audit,
     )
@@ -7249,7 +7051,6 @@ def _register_memory_tools(registry: AgentToolRegistry) -> None:
                 "required": [],
             },
             category="utility",
-            group="knowledge",
         ),
         _handle_memory_compact,
     )

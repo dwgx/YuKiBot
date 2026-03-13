@@ -47,7 +47,6 @@ class Plugin:
     必须属性:
         name            : str          插件唯一标识 (与文件名对应)
         description     : str          功能描述 (Router 用来判断是否调用)
-        intent_examples : list[str]    触发意图示例 (帮助 Router 识别)
         rules           : list[str]    行为约束 (注入到 Agent/Router 提示词)
         args_schema     : dict         参数说明 (告诉 Agent 如何传参)
 
@@ -59,13 +58,6 @@ class Plugin:
     # ── 必须属性 ──
     name = "example"
     description = "示例插件，演示 /ping、/echo、/time 命令。"
-
-    intent_examples = [
-        "调用 example 插件",
-        "帮我 ping 一下",
-        "回显这段话",
-        "现在几点了",
-    ]
 
     rules = [
         "仅处理轻量文本请求，不执行系统命令。",
@@ -217,6 +209,7 @@ class Plugin:
             section="rules",
             content="example_lookup 仅用于演示，不要在正式对话中使用。",
             priority=90,  # 低优先级
+            tool_names=("example_lookup",),
         ))
 
         # ── 3. 注册动态上下文 (每次对话时实时生成) ──
@@ -227,6 +220,7 @@ class Plugin:
             "example_status",
             lambda info: "示例插件状态: 正常运行中。",
             priority=90,
+            tool_names=("example_lookup",),
         )
 
         _log.info("example plugin: agent tools registered")
@@ -261,7 +255,6 @@ class Plugin:
 #   class Plugin:
 #       name = "my_plugin"
 #       description = "做某件事"
-#       intent_examples = ["触发示例"]
 #       rules = ["行为约束"]
 #       args_schema = {"message": "string"}
 #
@@ -277,7 +270,6 @@ class Plugin:
 #       description = "..."
 #       agent_tool = True          # 标记为 Agent 工具
 #       internal_only = True       # Router 不可见
-#       intent_examples = []
 #       rules = []
 #       args_schema = {}
 #

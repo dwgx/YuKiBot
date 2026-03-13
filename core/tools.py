@@ -348,7 +348,6 @@ class ToolExecutor:
         self._tool_interface_enable = bool(tool_iface_cfg.get("enable", True))
         self._tool_interface_browser_enable = bool(tool_iface_cfg.get("browser_enable", True))
         self._tool_interface_local_enable = bool(tool_iface_cfg.get("local_enable", True))
-        self._tool_interface_auto_method_enable = bool(tool_iface_cfg.get("auto_method_enable", True))
         self._tool_interface_allow_private_network = bool(tool_iface_cfg.get("allow_private_network", False))
         self._tool_interface_local_allow_project_root = bool(tool_iface_cfg.get("local_allow_project_root", False))
         self._tool_interface_local_allow_sensitive_files = bool(tool_iface_cfg.get("local_allow_sensitive_files", False))
@@ -376,12 +375,6 @@ class ToolExecutor:
         self._language_preference = normalize_text(
             str(search_cfg.get("language_preference", raw_cfg.get("language_preference", "zh")))
         ).lower() or "zh"
-        self._search_intent_shortcut_enable = bool(
-            search_cfg.get("intent_shortcut_enable", raw_cfg.get("intent_shortcut_enable", True))
-        )
-        self._qq_avatar_shortcut_enable = bool(
-            search_cfg.get("qq_avatar_shortcut_enable", raw_cfg.get("qq_avatar_shortcut_enable", False))
-        )
         self._last_video_download_error: dict[str, str] = {}
         self._last_video_resolve_diagnostic: dict[str, str] = {}
         self._github_headers = {
@@ -582,88 +575,7 @@ class ToolExecutor:
             return ToolResult(ok=False, tool_name="search", error="empty_query")
         self._remember_recent_media(conversation_id=conversation_id, raw_segments=raw_segments)
         query = self._normalize_multimodal_query(query)
-        query_type = self._detect_query_type(query)
-        query = self._apply_query_type_hints(query, query_type)
-        query = self._rewrite_query_with_context(query, conversation_id=conversation_id, user_id=user_id)
-        query = self._rewrite_safe_beauty_query(query)
-        merged_text = normalize_text(f"{query}\n{raw_message_text}")
-        # 意图识别只看当前这条消息，避免被 query 重写历史污染
-        intent_text = self._normalize_multimodal_query(raw_message_text)
-        image_candidates = self._extract_message_media_urls(raw_segments, media_type="image")
-        if not image_candidates and conversation_id:
-            image_candidates = self._get_recent_media(conversation_id=conversation_id, media_type="image")
-        method_name_peek = normalize_text(str(tool_args.get("method", "")))
-        has_video_media = any(
-            normalize_text(str((seg or {}).get("type", ""))).lower() == "video"
-            for seg in raw_segments
-            if isinstance(seg, dict)
-        )
-
-        if image_candidates and not method_name_peek and self._looks_like_image_analysis_request(intent_text):
-            analyzed = await self._analyze_image_from_message(
-                query=query,
-                message_text=message_text,
-                raw_segments=raw_segments,
-                conversation_id=conversation_id,
-                api_call=api_call,
-            )
-            if analyzed is not None:
-                return analyzed
-
-        if image_candidates and not method_name_peek and self._is_passive_multimodal_text(raw_message_text):
-            has_intent = self._looks_like_image_analysis_request(intent_text) or self._looks_like_image_send_request(intent_text)
-            mentioned_event = "MULTIMODAL_EVENT_AT" in raw_message_text.upper()
-            if not has_intent:
-                if mentioned_event:
-                    return ToolResult(
-                        ok=True,
-                        tool_name="vision_wait_for_instruction",
-                        payload={"text": "图我收到了。要我识图的话，直接说“分析这张图/识别图里文字/这是什么”。"},
-                    )
-                return ToolResult(
-                    ok=False,
-                    tool_name="vision_wait_for_instruction",
-                    payload={"silent_ignore": True},
-                    error="passive_multimodal_no_intent",
-                )
-
-        if self._tool_interface_enable and self._tool_interface_auto_method_enable and not method_name_peek:
-            inferred_method, inferred_args, inferred_reason = self._infer_auto_method_plan(
-                query=query,
-                message_text=message_text,
-                intent_text=intent_text,
-                has_image_media=bool(image_candidates),
-                has_video_media=has_video_media,
-            )
-            if inferred_method:
-                _tool_log.info(
-                    "tool_auto_plan%s | method=%s | reason=%s",
-                    _tool_trace_tag(),
-                    inferred_method,
-                    inferred_reason,
-                )
-                auto_method_result = await self._execute_ai_method(
-                    method_name=inferred_method,
-                    method_args=inferred_args,
-                    query=query,
-                    message_text=message_text,
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    user_name=user_name,
-                    group_id=group_id,
-                    api_call=api_call,
-                    raw_segments=raw_segments,
-                    bot_id=bot_id,
-                )
-                if auto_method_result is not None and auto_method_result.ok:
-                    return auto_method_result
-                if auto_method_result is not None:
-                    _tool_log.warning(
-                        "tool_auto_plan_fail%s | method=%s | error=%s",
-                        _tool_trace_tag(),
-                        inferred_method,
-                        normalize_text(str(getattr(auto_method_result, "error", ""))),
-                    )
+        query_type = "general"
 
         method_name = normalize_text(str(tool_args.get("method", "")))
         if self._tool_interface_enable and method_name:
@@ -686,58 +598,9 @@ class ToolExecutor:
             if method_result is not None:
                 return method_result
 
-        github_shortcut = await self._try_github_shortcut(query=query, message_text=message_text)
-        if github_shortcut is not None:
-            return github_shortcut
-
-        if self._looks_like_image_send_request(intent_text) and not self._extract_urls(query):
-            picked = await self._method_media_pick_image("media.pick_image_from_message", raw_segments)
-            if picked.ok:
-                return picked
-
-        if self._looks_like_video_send_request(intent_text) and not self._extract_urls(query):
-            picked = await self._method_media_pick_video("media.pick_video_from_message", raw_segments)
-            if picked.ok:
-                return picked
-
         direct_image = await self._try_direct_image_fetch(query=query, message_text=message_text)
         if direct_image is not None:
             return direct_image
-
-        if self._qq_avatar_shortcut_enable:
-            avatar_quick = await self._search_qq_avatar(
-                query=query,
-                message_text=message_text,
-                user_id=user_id,
-                user_name=user_name,
-                group_id=group_id,
-                api_call=api_call,
-                raw_segments=raw_segments,
-                bot_id=bot_id,
-            )
-            if avatar_quick is not None:
-                return avatar_quick
-
-        deep_web_analysis = self._looks_like_deep_web_analysis_request(f"{raw_message_text}\n{query}")
-        if deep_web_analysis and not self._looks_like_media_request(intent_text):
-            direct_urls = [self._unwrap_redirect_url(u) for u in self._extract_urls(merged_text)]
-            if direct_urls:
-                page = await self._fetch_webpage_summary(direct_urls[0])
-                if page:
-                    page_evidence = self._build_page_evidence(page)
-                    text_out = self._compose_direct_web_summary_text(query=query, page=page)
-                    return ToolResult(
-                        ok=True,
-                        tool_name="search_webpage_summary",
-                        payload={
-                            "query": query,
-                            "query_type": query_type,
-                            "text": text_out,
-                            "final_url": page.get("final_url", ""),
-                            "evidence": page_evidence,
-                        },
-                        evidence=page_evidence,
-                    )
 
         mode = normalize_text(str(tool_args.get("mode", "text"))).lower() or "text"
         if mode in {"image", "img", "picture", "photo"}:
@@ -755,34 +618,6 @@ class ToolExecutor:
         if mode in {"video", "movie", "clip"}:
             return await self._search_video(query)
 
-        if self._search_intent_shortcut_enable and self._looks_like_image_request(intent_text):
-            image_try = await self._search_image(
-                query=query,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                user_name=user_name,
-                group_id=group_id,
-                api_call=api_call,
-                message_text=message_text,
-                raw_segments=raw_segments,
-                bot_id=bot_id,
-            )
-            if image_try.ok:
-                return image_try
-
-        if self._search_intent_shortcut_enable and self._looks_like_music_request(intent_text):
-            music_try = await self._music_play(
-                tool_args={"keyword": query}, message_text=message_text,
-                api_call=api_call, group_id=group_id,
-            )
-            if music_try.ok:
-                return music_try
-
-        if self._search_intent_shortcut_enable and self._looks_like_video_request(intent_text):
-            video_try = await self._search_video(query)
-            if video_try.ok:
-                return video_try
-
         try:
             results = await self._search_text_with_variants(query=query, query_type=query_type)
         except Exception as exc:
@@ -791,24 +626,6 @@ class ToolExecutor:
 
         evidence = self._build_evidence_from_results(results)
         text = self._format_search_text(query, results, evidence=evidence, query_type=query_type)
-        should_deep_analyze = (
-            results
-            and not self._looks_like_media_request(intent_text)
-            and (
-                deep_web_analysis
-                or self._should_auto_web_analysis(query=query, query_type=query_type, intent_text=intent_text)
-            )
-        )
-        if should_deep_analyze:
-            deep_text, deep_evidence = await self._compose_result_web_analysis_text(
-                query=query,
-                results=results,
-                query_type=query_type,
-            )
-            if deep_text:
-                text = deep_text
-                if deep_evidence:
-                    evidence = deep_evidence
         payload = {
             "query": query,
             "query_type": query_type,
@@ -859,20 +676,6 @@ class ToolExecutor:
         raw_segments: list[dict[str, Any]],
         bot_id: str,
     ) -> ToolResult:
-        if self._qq_avatar_shortcut_enable:
-            avatar_quick = await self._search_qq_avatar(
-                query=query,
-                message_text=message_text,
-                user_id=user_id,
-                user_name=user_name,
-                group_id=group_id,
-                api_call=api_call,
-                raw_segments=raw_segments,
-                bot_id=bot_id,
-            )
-            if avatar_quick is not None:
-                return avatar_quick
-
         if self._is_blocked_image_text(f"{query}\n{message_text}"):
             return ToolResult(
                 ok=False,
@@ -978,30 +781,6 @@ class ToolExecutor:
                     },
                 )
         return None
-
-    async def _try_github_shortcut(self, query: str, message_text: str) -> ToolResult | None:
-        if not self._tool_interface_enable or not self._tool_interface_browser_enable:
-            return None
-        if not self._tool_interface_github_enable:
-            return None
-
-        merged = normalize_text(f"{query}\n{message_text}")
-        if not self._looks_like_github_request(merged):
-            return None
-
-        repo = self._extract_github_repo_from_text(merged)
-        if repo and self._looks_like_repo_readme_request(merged):
-            return await self._method_browser_github_readme(
-                "browser.github_readme",
-                {"repo": repo},
-                merged,
-            )
-
-        return await self._method_browser_github_search(
-            "browser.github_search",
-            {"query": query},
-            merged,
-        )
 
     async def _search_qq_avatar(
         self,
@@ -1308,56 +1087,6 @@ class ToolExecutor:
                 },
             },
         ]
-
-    def _infer_auto_method_plan(
-        self,
-        query: str,
-        message_text: str,
-        intent_text: str,
-        has_image_media: bool,
-        has_video_media: bool,
-    ) -> tuple[str, dict[str, Any], str]:
-        merged = normalize_text(f"{query}\n{message_text}")
-        urls = [self._unwrap_redirect_url(item) for item in self._extract_urls(merged)]
-        image_url = self._pick_best_image_url(urls)
-        video_url = self._pick_best_video_url(urls, merged)
-        local_path = self._pick_local_path_candidate(merged)
-
-        if self._looks_like_image_analysis_request(intent_text) and (has_image_media or bool(image_url)):
-            args: dict[str, Any] = {"url": image_url} if image_url else {}
-            return "media.analyze_image", args, "auto_image_analyze"
-
-        if self._looks_like_video_send_request(intent_text) or self._looks_like_video_analysis_request(intent_text):
-            if video_url:
-                return "browser.resolve_video", {"url": video_url}, "auto_video_resolve"
-            if has_video_media:
-                return "media.pick_video_from_message", {}, "auto_pick_video"
-
-        if self._looks_like_douyin_search_request(intent_text):
-            return "douyin.search_video", {"query": query}, "auto_douyin_search_video"
-
-        if self._looks_like_image_send_request(intent_text) and has_image_media:
-            return "media.pick_image_from_message", {}, "auto_pick_image"
-
-        if local_path and self._looks_like_local_file_request(merged):
-            if self._looks_like_local_media_request(merged) or self._looks_like_media_file_path(local_path):
-                return "local.media_from_path", {"path": local_path}, "auto_local_media_from_path"
-            return "local.read_text", {"path": local_path}, "auto_local_read_text"
-
-        if self._looks_like_software_download_request(merged):
-            return "browser.github_search", {"query": query, "sort": "stars"}, "auto_software_download_search"
-
-        if self._looks_like_github_request(merged):
-            # 多意图检测：如果同时包含其他平台关键词，不强制走 github
-            multi_intent_cues = ("哔哩哔哩", "b站", "bilibili", "抖音", "douyin", "快手", "kuaishou", "视频", "搜索")
-            has_other_intent = any(cue in merged.lower() for cue in multi_intent_cues)
-            if not has_other_intent:
-                repo = self._extract_github_repo_from_text(merged)
-                if repo and self._looks_like_repo_readme_request(merged):
-                    return "browser.github_readme", {"repo": repo}, "auto_github_readme"
-                return "browser.github_search", {"query": query}, "auto_github_search"
-
-        return "", {}, ""
 
     def _pick_best_image_url(self, urls: list[str]) -> str:
         for item in urls:

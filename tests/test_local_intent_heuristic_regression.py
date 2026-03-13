@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
-from core.agent import AgentLoop
+from core.agent import AgentContext, AgentLoop
 from core.config_templates import _built_in_config_defaults
 from core.engine import EngineMessage, YukikoEngine
 from core.router import RouterDecision, RouterEngine
@@ -14,6 +14,29 @@ from core.trigger import TriggerEngine
 class _DummyExecutor(ToolExecutor):
     def __init__(self) -> None:
         super().__init__(None, None, lambda *args, **kwargs: None, {})
+
+
+class _DummyModelClient:
+    enabled = True
+
+
+class _DummyToolRegistry:
+    tool_count = 4
+
+    def select_tools_for_intent(self, message_text: str, perm_level: str, force_filter: bool = False) -> list[str]:
+        _ = (message_text, perm_level, force_filter)
+        return ["analyze_image", "parse_video", "web_search", "final_answer"]
+
+    def get_schemas_for_prompt_filtered(self, selected_tools: list[str]) -> str:
+        return "\n".join(f"- {name}" for name in selected_tools)
+
+    def get_prompt_hints_text(self, section: str, tool_names: list[str] | None = None) -> str:
+        _ = (section, tool_names)
+        return ""
+
+    def get_dynamic_context(self, payload: dict, tool_names: list[str] | None = None) -> str:
+        _ = (payload, tool_names)
+        return ""
 
 
 class LocalIntentHeuristicRegressionTests(unittest.TestCase):
@@ -248,6 +271,38 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         huge_data_uri = "data:image/png;base64," + ("a" * 12000)
         normalized = executor._normalize_message_media_value(huge_data_uri)
         self.assertTrue(normalized.startswith("data:image/png;base64,"))
+
+    def test_agent_context_includes_thread_group_and_gif_hints(self) -> None:
+        loop = AgentLoop(_DummyModelClient(), _DummyToolRegistry(), {"agent": {"enable": True}})
+        ctx = AgentContext(
+            conversation_id="group:123",
+            user_id="10001",
+            user_name="tester",
+            group_id=123,
+            bot_id="3223915831",
+            is_private=False,
+            mentioned=True,
+            message_text="这个动图什么意思",
+            trace_id="ctx-test",
+            thread_state={"topic": "b站视频", "turn": 3},
+            runtime_group_context=["A 在聊刚刚那个 b23 视频", "B 说想看解析结果"],
+            media_summary=["image:animated:https://example.com/demo.gif"],
+            recent_speakers=[("10002", "背影", "刚刚那个视频挺抽象的")],
+        )
+
+        prompt = loop._build_system_prompt(ctx)
+        user_message = loop._build_user_message(ctx)
+        tool_context = loop._build_tool_context(ctx, "user")
+
+        self.assertIn("群聊近期上下文", prompt)
+        self.assertIn("会话线程状态", prompt)
+        self.assertIn("GIF/动图按多帧内容理解", prompt)
+        self.assertIn("GIF/动图", user_message)
+        self.assertEqual(tool_context.get("thread_state"), {"topic": "b站视频", "turn": 3})
+        self.assertEqual(
+            tool_context.get("runtime_group_context"),
+            ["A 在聊刚刚那个 b23 视频", "B 说想看解析结果"],
+        )
 
     def test_built_in_defaults_disable_short_ping_heuristics_and_enable_risk_confirm(self) -> None:
         defaults = _built_in_config_defaults()

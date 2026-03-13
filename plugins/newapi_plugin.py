@@ -2231,26 +2231,6 @@ class Plugin:
     name = "newapi"
     description = "管理 NewAPI 站点: 账号绑定、令牌管理、余额查看、模型列表、签到等。"
 
-    intent_examples = [
-        "/api help",
-        "/api bind https://example.com username password",
-        "/api me",
-        "/api tokens",
-        "/api token.create",
-        "/api token.update 123 expire_days=1",
-        "/api balance",
-        "/api pay.status",
-        "/api models",
-        "/api checkin",
-        "列出我的令牌",
-        "把我的令牌改成明天过期",
-        "给我发支付二维码",
-        "我刚支付成功了，帮我查下到账没",
-        "查看我的API余额",
-        "创建一个新令牌",
-        "帮我签到",
-    ]
-
     rules = [
         "涉及个人数据的命令 (me/balance/tokens/stats/aff/email/topup/pay/pay.status/token.create/token.delete/token.update/token.key) 只能在私聊中使用，群聊一律拒绝。",
         "绝不在群聊中展示任何用户的密钥、密码、邮箱、余额、令牌列表等敏感信息。",
@@ -2529,25 +2509,23 @@ class Plugin:
             "newapi_binding",
             self._agent_context_summary,
             priority=35,
+            tool_names=("newapi_manage",),
         )
 
         registry.register_prompt_hint(PromptHint(
             source="newapi",
             section="tools_guidance",
             content=(
-                f"newapi_manage 用于管理用户绑定的 {display_name} 账号。"
-                "先看 newapi_binding 上下文；未绑定时优先引导 /api bind。"
-                "当用户只发 '/api'、'帮助'、'?' 时，优先调用 help。"
-                "对敏感命令（me/balance/tokens/stats/aff/email/topup/pay/pay.status/token.*）必须在私聊执行，群聊拒绝。"
-                "群聊出现 bind/register/email 且参数疑似密码时，也要调用 newapi_manage 对应命令，让插件触发撤回+提醒策略。"
-                "topup 只用于查看充值信息或使用兑换码；凡是在线支付、微信、支付宝、充值金额、200M/1000M 这类需求，都必须优先用 pay。"
-                "用户要求充值但未指定渠道时，先让用户在微信/支付宝等可用方式中二选一，不要直接默认渠道。"
-                "如果用户刚发起过 pay，随后又说已支付、支付成功、到账了吗、余额增加了，或者发送支付成功/余额截图，优先调用 pay.status 核对最近订单和当前余额，不要只根据截图直接回答。"
-                "当 newapi_binding 上下文里出现 recent_pending_payment 时，遇到支付相关追问必须先查 pay.status，再决定是否回复到账。"
-                "command 参数必须使用 enum 中的标准命令，不要自造 token.list 之类别名。"
-                "newapi 相关 final_answer 必须使用纯文本，禁止使用 Markdown 粗体和反引号。"
+                f"newapi_manage 是用来管理 {display_name} 账号的。"
+                "用户没绑定账号时，引导他们用 /api bind 绑定。"
+                "用户只说 '/api' 或 '帮助' 时，调用 help 命令。"
+                "涉及账号信息的操作（余额、令牌、邮箱、充值等）只能在私聊进行，群聊要拒绝并提醒用户私聊。"
+                "用户要充值时，先问他们用微信还是支付宝，不要自己猜。充值用 pay 命令，兑换码用 topup 命令。"
+                "用户说已支付或发支付截图时，用 pay.status 查订单状态，不要只看截图就回答。"
+                "回复时用纯文本，不要用 Markdown 格式。"
             ),
             priority=30,
+            tool_names=("newapi_manage",),
         ))
 
     async def _agent_handle(self, args: dict[str, Any], context: dict[str, Any]) -> Any:

@@ -151,7 +151,6 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "llm_step_timeout_seconds_after_tool": 36,
             "total_timeout_seconds": 0,
             "queue_timeout_margin_seconds": 8,
-            "music_fast_path_enable": False,
             "high_risk_control": {
                 "enable": True,
                 "default_require_confirmation": True,
@@ -166,9 +165,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
         },
         "search": {
             "enable": True,
-            "intent_shortcut_enable": True,
             "tool_interface": {
-                "auto_method_enable": True,
                 "enable": True,
                 "browser_enable": True,
                 "github_enable": False,

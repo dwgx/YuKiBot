@@ -61,7 +61,6 @@ class Plugin:
     description = "Agent 内部工具: 调用外部 CLI (Claude / Codex) 执行复杂推理、搜索等任务。"
     agent_tool = True
     internal_only = True
-    intent_examples: list[str] = []
     rules: list[str] = []
     args_schema: dict[str, str] = {}
 
@@ -346,6 +345,7 @@ class Plugin:
                 "你无法回答的专业问题。日常闲聊和普通搜索勿用(执行慢)"
             ),
             priority=80,
+            tool_names=("cli_invoke",),
         ))
 
         # 注入工具使用指南: 详细告诉 Agent 如何正确使用
@@ -362,6 +362,7 @@ class Plugin:
                 f"可用 provider: {provider_desc}。"
             ),
             priority=10,
+            tool_names=("cli_invoke",),
         ))
 
         # 注册动态上下文: 让 Agent 知道 CLI 当前状态
@@ -370,6 +371,7 @@ class Plugin:
                 "cli_status",
                 lambda info: self._context_status_line(),
                 priority=90,
+                tool_names=("cli_invoke",),
             )
 
     async def _handle_invoke(self, args: dict[str, Any], context: dict[str, Any]) -> Any:

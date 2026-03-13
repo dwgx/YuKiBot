@@ -75,7 +75,6 @@ const SECTIONS: SectionDef[] = [
       { value: "large", label: "很大 (1500字符)" },
     ]},
     { path: "agent.auto_compress_to_memory", label: "自动压缩上下文到记忆库", type: "switch" },
-    { path: "agent.music_fast_path_enable", label: "音乐本地快速通道", type: "switch" },
     { path: "agent.runtime_rules", label: "Agent 运行时规则注入", type: "textarea", rows: 8 },
     { path: "agent.high_risk_control.enable", label: "高风险二次确认", type: "switch" },
     { path: "agent.high_risk_control.default_require_confirmation", label: "默认需确认", type: "switch" },
@@ -137,8 +136,6 @@ const SECTIONS: SectionDef[] = [
   ]},
   { key: "search", label: "搜索设置", fields: [
     { path: "search.enable", label: "启用搜索", type: "switch" },
-    { path: "search.intent_shortcut_enable", label: "搜索意图快捷通道", type: "switch" },
-    { path: "search.tool_interface.auto_method_enable", label: "工具自动方法推断", type: "switch" },
     { path: "search.tool_interface.enable", label: "启用工具接口", type: "switch" },
     { path: "search.tool_interface.browser_enable", label: "启用通用网页抓取(含 Gitee/CSDN/论坛)", type: "switch" },
     { path: "search.scrape.timeout_seconds", label: "网页抓取超时(秒)", type: "number", min: 5, max: 60 },

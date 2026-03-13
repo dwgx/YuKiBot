@@ -109,7 +109,6 @@ class Plugin:
     description = "Agent 自我学习系统: 让 AI 自己学习、写代码、创建技能、测试和改进。"
     agent_tool = True
     internal_only = False
-    intent_examples: list[str] = []
     rules: list[str] = []
     args_schema: dict[str, str] = {}
 
@@ -363,6 +362,7 @@ class Plugin:
                 "告诉用户你的进展（用白话文，不要太技术化）。"
             ),
             priority=70,
+            tool_names=("learn_from_web", "create_skill", "test_in_sandbox", "send_devlog", "list_my_skills"),
         ))
 
         # 注入工具使用指南
@@ -381,6 +381,7 @@ class Plugin:
                 "  '测试了一下新写的图片处理代码，成功了！以后可以帮你压缩图片啦'"
             ),
             priority=10,
+            tool_names=("learn_from_web", "create_skill", "test_in_sandbox", "send_devlog", "list_my_skills"),
         ))
 
     async def _handle_learn_from_web(self, args: dict[str, Any], context: dict[str, Any]) -> Any:
