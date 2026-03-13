@@ -6,6 +6,7 @@ Agent 接收用户消息后，进入 think → act → observe 循环：
 3. 把结果喂回 LLM，继续循环
 4. 当 LLM 调用 final_answer 时，循环结束
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -23,14 +24,18 @@ from core.agent_tools import AgentToolRegistry, ToolCallResult
 from core import prompt_loader as _pl
 from core.prompt_policy import PromptPolicy
 from services.model_client import ModelClient
-from utils.intent import looks_like_qq_profile_analysis_request as _shared_qq_profile_request
+from utils.intent import (
+    looks_like_qq_profile_analysis_request as _shared_qq_profile_request,
+)
 from utils.text import clip_text, normalize_text
 
 _log = logging.getLogger("yukiko.agent")
 
+
 @dataclass(slots=True)
 class AgentContext:
     """Agent 单次运行的上下文。"""
+
     conversation_id: str
     user_id: str
     user_name: str
@@ -50,7 +55,9 @@ class AgentContext:
     reply_to_text: str = ""
     api_call: Any = None
     admin_handler: Any = None  # async fn(text, user_id, group_id) -> str|None
-    config_patch_handler: Any = None  # async fn(patch, actor_user_id, reason, dry_run) -> tuple[bool, str, dict]
+    config_patch_handler: Any = (
+        None  # async fn(patch, actor_user_id, reason, dry_run) -> tuple[bool, str, dict]
+    )
     sticker_manager: Any = None  # StickerManager instance
     tool_executor: Any = None  # ToolExecutor instance (for video parsing etc.)
     crawler_hub: Any = None  # CrawlerHub instance
@@ -74,13 +81,16 @@ class AgentContext:
     verbosity: str = "medium"  # verbose / medium / brief / minimal
     output_style_instruction: str = ""  # 额外输出风格指令（可按群覆盖）
     sender_role: str = ""  # "owner" / "admin" / "member" — QQ群内角色
-    event_payload: dict[str, Any] = field(default_factory=dict)  # 原始 OneBot/NapCat 事件快照
+    event_payload: dict[str, Any] = field(
+        default_factory=dict
+    )  # 原始 OneBot/NapCat 事件快照
     is_whitelisted_group: bool = False  # 当前群是否在白名单中
 
 
 @dataclass(slots=True)
 class AgentResult:
     """Agent 循环的最终输出。"""
+
     reply_text: str = ""
     image_url: str = ""
     image_urls: list[str] = field(default_factory=list)
@@ -105,37 +115,48 @@ class AgentLoop:
     """
 
     # 有副作用的发送工具（避免 final_answer 重复发送）
-    _SIDE_EFFECT_SEND_TOOLS = frozenset({
-        "send_group_message", "send_private_message", "send_emoji", "send_sticker",
-        "learn_sticker",
-    })
-    _EXTERNAL_FACT_TOOLS = frozenset({
-        "web_search",
-        "fetch_webpage",
-        "github_search",
-        "github_readme",
-        "search_web_media",
-        "search_download_resources",
-        "douyin_search",
-        "scrape_extract",
-        "extract_structured",
-        "extract_links_and_content",
-    })
-    _FALLBACK_RAW_DISPLAY_SKIP_TOOLS = frozenset({
-        "scrape_extract",
-        "scrape_summarize",
-        "scrape_structured",
-        "extract_structured",
-        "extract_links_and_content",
-        "fetch_webpage",
-    })
-    _DOWNLOAD_LLM_EXTRACT_TOOLS = frozenset({
-        "scrape_extract",
-        "scrape_summarize",
-        "scrape_structured",
-        "extract_structured",
-        "extract_links_and_content",
-    })
+    _SIDE_EFFECT_SEND_TOOLS = frozenset(
+        {
+            "send_group_message",
+            "send_private_message",
+            "send_emoji",
+            "send_sticker",
+            "learn_sticker",
+        }
+    )
+    _EXTERNAL_FACT_TOOLS = frozenset(
+        {
+            "web_search",
+            "fetch_webpage",
+            "github_search",
+            "github_readme",
+            "search_web_media",
+            "search_download_resources",
+            "douyin_search",
+            "scrape_extract",
+            "extract_structured",
+            "extract_links_and_content",
+        }
+    )
+    _FALLBACK_RAW_DISPLAY_SKIP_TOOLS = frozenset(
+        {
+            "scrape_extract",
+            "scrape_summarize",
+            "scrape_structured",
+            "extract_structured",
+            "extract_links_and_content",
+            "fetch_webpage",
+        }
+    )
+    _DOWNLOAD_LLM_EXTRACT_TOOLS = frozenset(
+        {
+            "scrape_extract",
+            "scrape_summarize",
+            "scrape_structured",
+            "extract_structured",
+            "extract_links_and_content",
+        }
+    )
 
     def __init__(
         self,
@@ -178,16 +199,32 @@ class AgentLoop:
 
         # 安全: 需要管理员权限的工具 (与 AgentToolRegistry 保持同步)
         self._super_admin_tools = {
-            "set_group_leave", "delete_friend", "cli_invoke", "config_update",
-            "admin_command", "clean_cache", "set_qq_avatar", "set_online_status",
+            "set_group_leave",
+            "delete_friend",
+            "cli_invoke",
+            "config_update",
+            "admin_command",
+            "clean_cache",
+            "set_qq_avatar",
+            "set_online_status",
             "set_self_longnick",
         }
         self._group_admin_tools = {
-            "set_group_ban", "set_group_kick", "set_group_whole_ban",
-            "set_group_admin", "set_group_name", "send_group_notice",
-            "delete_message", "set_group_special_title", "set_essence_msg",
-            "delete_essence_msg", "set_group_card", "set_group_portrait",
-            "delete_group_file", "create_group_file_folder", "del_group_notice",
+            "set_group_ban",
+            "set_group_kick",
+            "set_group_whole_ban",
+            "set_group_admin",
+            "set_group_name",
+            "send_group_notice",
+            "delete_message",
+            "set_group_special_title",
+            "set_essence_msg",
+            "delete_essence_msg",
+            "set_group_card",
+            "set_group_portrait",
+            "delete_group_file",
+            "create_group_file_folder",
+            "del_group_notice",
         }
         self._admin_only_tools = self._super_admin_tools | self._group_admin_tools
         self.refresh_runtime_config(config)
@@ -195,23 +232,39 @@ class AgentLoop:
     def refresh_runtime_config(self, config: dict[str, Any]) -> None:
         """热更新 Agent 的运行参数和管理员权限集合。"""
         self.config = config if isinstance(config, dict) else {}
-        agent_cfg = self.config.get("agent", {}) if isinstance(self.config, dict) else {}
+        agent_cfg = (
+            self.config.get("agent", {}) if isinstance(self.config, dict) else {}
+        )
         if not isinstance(agent_cfg, dict):
             agent_cfg = {}
         self.max_steps = max(1, min(15, int(agent_cfg.get("max_steps", 8))))
         self.max_tokens = max(512, int(agent_cfg.get("max_tokens", 4096)))
         self.enable = bool(agent_cfg.get("enable", True))
-        self.fallback_on_parse_error = bool(agent_cfg.get("fallback_on_parse_error", True))
-        self.allow_silent_on_llm_error = bool(agent_cfg.get("allow_silent_on_llm_error", False))
-        self.repeat_tool_guard_enable = bool(agent_cfg.get("repeat_tool_guard_enable", True))
-        self.max_same_tool_call = max(2, min(8, int(agent_cfg.get("max_same_tool_call", 3))))
-        self.max_consecutive_think = max(2, min(8, int(agent_cfg.get("max_consecutive_think", 3))))
-        self.tool_timeout_seconds = max(8, min(120, int(agent_cfg.get("tool_timeout_seconds", 28))))
+        self.fallback_on_parse_error = bool(
+            agent_cfg.get("fallback_on_parse_error", True)
+        )
+        self.allow_silent_on_llm_error = bool(
+            agent_cfg.get("allow_silent_on_llm_error", False)
+        )
+        self.repeat_tool_guard_enable = bool(
+            agent_cfg.get("repeat_tool_guard_enable", True)
+        )
+        self.max_same_tool_call = max(
+            2, min(8, int(agent_cfg.get("max_same_tool_call", 3)))
+        )
+        self.max_consecutive_think = max(
+            2, min(8, int(agent_cfg.get("max_consecutive_think", 3)))
+        )
+        self.tool_timeout_seconds = max(
+            8, min(120, int(agent_cfg.get("tool_timeout_seconds", 28)))
+        )
         self.tool_timeout_seconds_media = max(
             self.tool_timeout_seconds,
             min(180, int(agent_cfg.get("tool_timeout_seconds_media", 45))),
         )
-        self.llm_step_timeout_seconds = max(6, min(120, int(agent_cfg.get("llm_step_timeout_seconds", 30))))
+        self.llm_step_timeout_seconds = max(
+            6, min(120, int(agent_cfg.get("llm_step_timeout_seconds", 30)))
+        )
         self.llm_step_timeout_seconds_after_tool = max(
             self.llm_step_timeout_seconds,
             min(
@@ -224,11 +277,19 @@ class AgentLoop:
                 ),
             ),
         )
-        self.total_timeout_seconds = max(0, int(agent_cfg.get("total_timeout_seconds", 0)))
-        self.queue_timeout_margin_seconds = max(1, min(30, int(agent_cfg.get("queue_timeout_margin_seconds", 8))))
+        self.total_timeout_seconds = max(
+            0, int(agent_cfg.get("total_timeout_seconds", 0))
+        )
+        self.queue_timeout_margin_seconds = max(
+            1, min(30, int(agent_cfg.get("queue_timeout_margin_seconds", 8)))
+        )
         self.prompt_policy = PromptPolicy.from_config(self.config)
         self._refresh_high_risk_control(agent_cfg)
-        followup_cfg = self.config.get("search_followup", {}) if isinstance(self.config, dict) else {}
+        followup_cfg = (
+            self.config.get("search_followup", {})
+            if isinstance(self.config, dict)
+            else {}
+        )
         if not isinstance(followup_cfg, dict):
             followup_cfg = {}
         resend_media_cues_raw = followup_cfg.get("resend_media_cues", [])
@@ -241,7 +302,9 @@ class AgentLoop:
         ]
         self.search_followup_resend_media_cues = tuple(dict.fromkeys(resend_media_cues))
 
-        admin_cfg = self.config.get("admin", {}) if isinstance(self.config, dict) else {}
+        admin_cfg = (
+            self.config.get("admin", {}) if isinstance(self.config, dict) else {}
+        )
         if not isinstance(admin_cfg, dict):
             admin_cfg = {}
         self._admin_ids = set()
@@ -309,11 +372,19 @@ class AgentLoop:
             values = [values]
         if not isinstance(values, list):
             values = list(default)
-        rows = [normalize_text(str(item)).lower() for item in values if normalize_text(str(item))]
+        rows = [
+            normalize_text(str(item)).lower()
+            for item in values
+            if normalize_text(str(item))
+        ]
         return tuple(rows) if rows else default
 
     def _refresh_high_risk_control(self, agent_cfg: dict[str, Any]) -> None:
-        control = agent_cfg.get("high_risk_control", {}) if isinstance(agent_cfg, dict) else {}
+        control = (
+            agent_cfg.get("high_risk_control", {})
+            if isinstance(agent_cfg, dict)
+            else {}
+        )
         if not isinstance(control, dict):
             control = {}
         default_name_patterns = [
@@ -327,9 +398,19 @@ class AgentLoop:
             "^upload_group_file$",
             "^smart_download$",
         ]
-        default_description_patterns = ["不可逆", "踢出群", "删除", "封禁", "禁言", "管理员权限", "可执行文件"]
+        default_description_patterns = [
+            "不可逆",
+            "踢出群",
+            "删除",
+            "封禁",
+            "禁言",
+            "管理员权限",
+            "可执行文件",
+        ]
         self.high_risk_control_enable = bool(control.get("enable", True))
-        self.high_risk_default_require_confirmation = bool(control.get("default_require_confirmation", True))
+        self.high_risk_default_require_confirmation = bool(
+            control.get("default_require_confirmation", True)
+        )
         categories_raw = control.get("categories", ["admin"])
         if isinstance(categories_raw, str):
             categories_raw = [categories_raw]
@@ -341,7 +422,9 @@ class AgentLoop:
             } or {"admin"}
         else:
             self.high_risk_categories = {"admin"}
-        self.high_risk_pending_ttl_seconds = max(30, int(control.get("pending_ttl_seconds", 180)))
+        self.high_risk_pending_ttl_seconds = max(
+            30, int(control.get("pending_ttl_seconds", 180))
+        )
         self.high_risk_name_patterns = self._compile_regex_patterns(
             control.get("tool_name_patterns", default_name_patterns)
         )
@@ -390,7 +473,9 @@ class AgentLoop:
         except Exception:
             return str(args or {})
 
-    def _build_tool_context(self, ctx: AgentContext, permission_level: str) -> dict[str, Any]:
+    def _build_tool_context(
+        self, ctx: AgentContext, permission_level: str
+    ) -> dict[str, Any]:
         return {
             "api_call": ctx.api_call,
             "admin_handler": ctx.admin_handler,
@@ -451,7 +536,9 @@ class AgentLoop:
             return f"{tool_name} 执行失败：{error}"
         return f"{tool_name} 执行失败。"
 
-    def _is_confirmation_text(self, text: str, pending: dict[str, Any] | None = None) -> bool:
+    def _is_confirmation_text(
+        self, text: str, pending: dict[str, Any] | None = None
+    ) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
@@ -461,7 +548,9 @@ class AgentLoop:
                 return True
         return any(cue in content for cue in self.high_risk_confirm_cues)
 
-    def _is_cancellation_text(self, text: str, pending: dict[str, Any] | None = None) -> bool:
+    def _is_cancellation_text(
+        self, text: str, pending: dict[str, Any] | None = None
+    ) -> bool:
         content = normalize_text(text).lower()
         if not content:
             return False
@@ -473,13 +562,20 @@ class AgentLoop:
 
     def _tool_is_high_risk(self, tool_name: str) -> bool:
         schema = self.tool_registry.get_schema(tool_name)
-        category = normalize_text(getattr(schema, "category", "")).lower() if schema else ""
-        description = normalize_text(getattr(schema, "description", "")) if schema else ""
+        category = (
+            normalize_text(getattr(schema, "category", "")).lower() if schema else ""
+        )
+        description = (
+            normalize_text(getattr(schema, "description", "")) if schema else ""
+        )
         if category and category in self.high_risk_categories:
             return True
         if any(pattern.search(tool_name) for pattern in self.high_risk_name_patterns):
             return True
-        if description and any(pattern.search(description) for pattern in self.high_risk_description_patterns):
+        if description and any(
+            pattern.search(description)
+            for pattern in self.high_risk_description_patterns
+        ):
             return True
         return False
 
@@ -487,12 +583,20 @@ class AgentLoop:
         policies = ctx.user_policies if isinstance(ctx.user_policies, dict) else {}
         if "high_risk_confirmation_required" in policies:
             return bool(policies.get("high_risk_confirmation_required"))
-        directives = [normalize_text(str(item)) for item in (ctx.user_directives or []) if normalize_text(str(item))]
+        directives = [
+            normalize_text(str(item))
+            for item in (ctx.user_directives or [])
+            if normalize_text(str(item))
+        ]
         for row in directives:
-            if any(pattern.search(row) for pattern in self.high_risk_user_disable_patterns):
+            if any(
+                pattern.search(row) for pattern in self.high_risk_user_disable_patterns
+            ):
                 return False
         for row in directives:
-            if any(pattern.search(row) for pattern in self.high_risk_user_enable_patterns):
+            if any(
+                pattern.search(row) for pattern in self.high_risk_user_enable_patterns
+            ):
                 return True
         return self.high_risk_default_require_confirmation
 
@@ -521,12 +625,18 @@ class AgentLoop:
             )
             return prompt, confirm_token, cancel_token
         return (
-            f"这是高风险操作：{tool_name}{detail}。"
-            "请二次确认后我才会执行。"
-            "请回复“确认执行”，或回复“取消”。"
-        ), confirm_token, cancel_token
+            (
+                f"这是高风险操作：{tool_name}{detail}。"
+                "请二次确认后我才会执行。"
+                "请回复“确认执行”，或回复“取消”。"
+            ),
+            confirm_token,
+            cancel_token,
+        )
 
-    def _guard_high_risk_tool_call(self, ctx: AgentContext, tool_name: str, tool_args: dict[str, Any]) -> str:
+    def _guard_high_risk_tool_call(
+        self, ctx: AgentContext, tool_name: str, tool_args: dict[str, Any]
+    ) -> str:
         if not self.high_risk_control_enable:
             return ""
         if not self._tool_is_high_risk(tool_name):
@@ -547,15 +657,24 @@ class AgentLoop:
         if pending:
             pending_tool = normalize_text(str(pending.get("tool_name", "")))
             pending_sig = normalize_text(str(pending.get("args_sig", "")))
-            if self._is_confirmation_text(msg_text, pending) and pending_tool == tool_name and pending_sig == current_args_sig:
+            if (
+                self._is_confirmation_text(msg_text, pending)
+                and pending_tool == tool_name
+                and pending_sig == current_args_sig
+            ):
                 self._pending_high_risk_actions.pop(key, None)
                 return ""
             if pending_tool == tool_name and pending_sig == current_args_sig:
-                return normalize_text(str(pending.get("prompt", ""))) or self._build_high_risk_confirm_prompt(tool_name, tool_args)[0]
+                return (
+                    normalize_text(str(pending.get("prompt", "")))
+                    or self._build_high_risk_confirm_prompt(tool_name, tool_args)[0]
+                )
             # 用户在同会话发起了新的高风险操作，覆盖旧待确认项
             self._pending_high_risk_actions.pop(key, None)
 
-        prompt, confirm_token, cancel_token = self._build_high_risk_confirm_prompt(tool_name, tool_args)
+        prompt, confirm_token, cancel_token = self._build_high_risk_confirm_prompt(
+            tool_name, tool_args
+        )
         self._pending_high_risk_actions[key] = {
             "tool_name": tool_name,
             "args_sig": current_args_sig,
@@ -604,16 +723,23 @@ class AgentLoop:
                     elapsed,
                     total_timeout,
                 )
-                return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "total_timeout")
+                return await self._build_fallback_result(
+                    ctx, steps, tool_calls_made, t0, "total_timeout"
+                )
             # 调用 LLM（带重试，agent loop 是关键路径）
             llm_budget = float(self.llm_step_timeout_seconds)
             if tool_calls_made > 0:
-                llm_budget = max(llm_budget, float(self.llm_step_timeout_seconds_after_tool))
+                llm_budget = max(
+                    llm_budget, float(self.llm_step_timeout_seconds_after_tool)
+                )
             llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
             try:
                 raw_response = await asyncio.wait_for(
                     self.model_client.chat_text_with_retry(
-                        messages, max_tokens=self.max_tokens, retries=1, backoff=1.0,
+                        messages,
+                        max_tokens=self.max_tokens,
+                        retries=1,
+                        backoff=1.0,
                     ),
                     timeout=llm_timeout,
                 )
@@ -625,7 +751,9 @@ class AgentLoop:
                     llm_timeout,
                 )
                 if steps:
-                    return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "llm_timeout")
+                    return await self._build_fallback_result(
+                        ctx, steps, tool_calls_made, t0, "llm_timeout"
+                    )
                 fallback = _pl.get_message(
                     "llm_timeout_fallback",
                     "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
@@ -637,14 +765,27 @@ class AgentLoop:
                     total_time_ms=self._elapsed(t0),
                 )
             except Exception as exc:
-                _log.warning("agent_llm_error | trace=%s | step=%d | %s", ctx.trace_id, step_idx, exc)
+                _log.warning(
+                    "agent_llm_error | trace=%s | step=%d | %s",
+                    ctx.trace_id,
+                    step_idx,
+                    exc,
+                )
                 if steps:
                     # 有之前的步骤结果，用最后一步的信息兜底
-                    return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "llm_error")
+                    return await self._build_fallback_result(
+                        ctx, steps, tool_calls_made, t0, "llm_error"
+                    )
                 # undirected 场景可按配置静默，默认不静默，避免用户感知“装死”。
-                if self.allow_silent_on_llm_error and not ctx.mentioned and not ctx.is_private:
+                if (
+                    self.allow_silent_on_llm_error
+                    and not ctx.mentioned
+                    and not ctx.is_private
+                ):
                     return AgentResult(
-                        reply_text="", action="reply", reason="agent_llm_error_silent",
+                        reply_text="",
+                        action="reply",
+                        reason="agent_llm_error_silent",
                         total_time_ms=self._elapsed(t0),
                     )
                 err_text = normalize_text(str(exc)).lower()
@@ -662,11 +803,14 @@ class AgentLoop:
                 else:
                     fallback = _pl.get_message(
                         "llm_error_fallback",
-                        _pl.get_message("generic_error", "我这边接口抖了，稍等我再试一次。"),
+                        _pl.get_message(
+                            "generic_error", "我这边接口抖了，稍等我再试一次。"
+                        ),
                     )
                 return AgentResult(
                     reply_text=fallback,
-                    action="reply", reason="agent_llm_error",
+                    action="reply",
+                    reason="agent_llm_error",
                     total_time_ms=self._elapsed(t0),
                 )
 
@@ -681,7 +825,11 @@ class AgentLoop:
                 # 无法解析为 tool_call
                 # 安全检查：如果内容看起来像 JSON，不要当作回复发出去
                 if response_text.strip().startswith("{"):
-                    _log.warning("agent_unparseable_json | trace=%s | step=%d", ctx.trace_id, step_idx)
+                    _log.warning(
+                        "agent_unparseable_json | trace=%s | step=%d",
+                        ctx.trace_id,
+                        step_idx,
+                    )
                     break
                 if force_tool_first and tool_calls_made == 0:
                     _log.info(
@@ -690,7 +838,13 @@ class AgentLoop:
                         step_idx,
                         clip_text(response_text, 160),
                     )
-                    steps.append({"step": step_idx, "tool": "policy_guard", "error": "tool_required_before_direct_reply"})
+                    steps.append(
+                        {
+                            "step": step_idx,
+                            "tool": "policy_guard",
+                            "error": "tool_required_before_direct_reply",
+                        }
+                    )
                     messages.append({"role": "assistant", "content": response_text})
                     messages.append(
                         {
@@ -708,10 +862,13 @@ class AgentLoop:
                         }
                     )
                     continue
-                _log.info("agent_direct_reply | trace=%s | step=%d", ctx.trace_id, step_idx)
+                _log.info(
+                    "agent_direct_reply | trace=%s | step=%d", ctx.trace_id, step_idx
+                )
                 return AgentResult(
                     reply_text=response_text,
-                    action="reply", reason="agent_direct_reply",
+                    action="reply",
+                    reason="agent_direct_reply",
                     tool_calls_made=tool_calls_made,
                     total_time_ms=self._elapsed(t0),
                     steps=steps,
@@ -721,9 +878,15 @@ class AgentLoop:
             tool_args = parsed.get("args", {})
             if not isinstance(tool_args, dict):
                 tool_args = {}
-            tool_name, tool_args = self._rewrite_download_tool_if_needed(tool_name, tool_args, ctx)
+            tool_name, tool_args = self._rewrite_download_tool_if_needed(
+                tool_name, tool_args, ctx
+            )
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
-            if forced_media_tool and tool_calls_made == 0 and tool_name not in {forced_media_tool[0], "think"}:
+            if (
+                forced_media_tool
+                and tool_calls_made == 0
+                and tool_name not in {forced_media_tool[0], "think"}
+            ):
                 forced_name, forced_args = forced_media_tool
                 _log.info(
                     "agent_force_media_tool_first | trace=%s | step=%d | from=%s | to=%s",
@@ -738,26 +901,32 @@ class AgentLoop:
 
             _log.info(
                 "agent_tool_call | trace=%s | step=%d | tool=%s | args=%s",
-                ctx.trace_id, step_idx, tool_name, json.dumps(tool_args, ensure_ascii=False)[:200],
+                ctx.trace_id,
+                step_idx,
+                tool_name,
+                json.dumps(tool_args, ensure_ascii=False)[:200],
             )
 
             if missing_args:
                 miss_text = ", ".join(missing_args)
                 miss_key = f"{tool_name}:{'|'.join(sorted(missing_args))}"
                 missing_arg_counts[miss_key] = missing_arg_counts.get(miss_key, 0) + 1
-                steps.append({
-                    "step": step_idx,
-                    "tool": tool_name,
-                    "ok": False,
-                    "error": f"missing_required_args:{miss_text}",
-                })
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": tool_name,
+                        "ok": False,
+                        "error": f"missing_required_args:{miss_text}",
+                    }
+                )
                 if missing_arg_counts[miss_key] >= 3:
                     fallback_text = await self._ai_fallback_reply(
                         ctx,
                         f"工具 {tool_name} 连续缺少参数({miss_text})，无法继续执行",
                     )
                     return AgentResult(
-                        reply_text=fallback_text or "我先停一下，当前这步参数一直不完整。你补一句更具体的目标，我立刻继续。",
+                        reply_text=fallback_text
+                        or "我先停一下，当前这步参数一直不完整。你补一句更具体的目标，我立刻继续。",
                         action="reply",
                         reason="agent_missing_args_loop_break",
                         tool_calls_made=tool_calls_made,
@@ -765,20 +934,22 @@ class AgentLoop:
                         steps=steps,
                     )
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "tool_result": {
-                                "tool": tool_name,
-                                "ok": False,
-                                "error": f"工具 {tool_name} 缺少必填参数: {miss_text}",
-                                "display": f"{tool_name} 缺少参数({miss_text})，请补全后重试。",
-                            }
-                        },
-                        ensure_ascii=False,
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_result": {
+                                    "tool": tool_name,
+                                    "ok": False,
+                                    "error": f"工具 {tool_name} 缺少必填参数: {miss_text}",
+                                    "display": f"{tool_name} 缺少参数({miss_text})，请补全后重试。",
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
                 continue
 
             # final_answer 特殊处理 — 直接返回
@@ -788,7 +959,9 @@ class AgentLoop:
                 video_url = str(tool_args.get("video_url", "")).strip()
                 audio_file = str(tool_args.get("audio_file", "")).strip()
                 if audio_file.lower().endswith(".silk"):
-                    preferred_audio = self._last_success_audio_file(steps, prefer_non_silk=True)
+                    preferred_audio = self._last_success_audio_file(
+                        steps, prefer_non_silk=True
+                    )
                     if preferred_audio:
                         _log.info(
                             "agent_audio_file_override | trace=%s | step=%d | from=%s | to=%s",
@@ -815,7 +988,9 @@ class AgentLoop:
                 raw_image_urls = tool_args.get("image_urls", [])
                 image_urls: list[str] = []
                 if isinstance(raw_image_urls, list):
-                    image_urls = [str(u).strip() for u in raw_image_urls if str(u).strip()]
+                    image_urls = [
+                        str(u).strip() for u in raw_image_urls if str(u).strip()
+                    ]
                 if image_url and image_url not in image_urls:
                     image_urls.insert(0, image_url)
                 if image_urls and not image_url:
@@ -851,26 +1026,45 @@ class AgentLoop:
                     )
                     continue
                 media_candidates = [
-                    normalize_text(url) for url in [image_url, *image_urls, video_url, audio_file] if normalize_text(url)
+                    normalize_text(url)
+                    for url in [image_url, *image_urls, video_url, audio_file]
+                    if normalize_text(url)
                 ]
                 if media_candidates:
-                    known_media_urls = self._collect_known_media_urls(steps=steps, ctx=ctx)
-                    known_local_media_paths = self._collect_known_local_media_paths(steps=steps, ctx=ctx)
+                    known_media_urls = self._collect_known_media_urls(
+                        steps=steps, ctx=ctx
+                    )
+                    known_local_media_paths = self._collect_known_local_media_paths(
+                        steps=steps, ctx=ctx
+                    )
                     out_of_chain_urls: list[str] = []
                     for candidate in media_candidates:
                         if self._is_local_media_path(candidate):
                             local_norm = self._normalize_local_media_path(candidate)
-                            if not local_norm or local_norm not in known_local_media_paths:
+                            if (
+                                not local_norm
+                                or local_norm not in known_local_media_paths
+                            ):
                                 out_of_chain_urls.append(candidate)
                             continue
-                        if not self._url_matches_known_media(candidate, known_media_urls):
+                        if not self._url_matches_known_media(
+                            candidate, known_media_urls
+                        ):
                             out_of_chain_urls.append(candidate)
                     if out_of_chain_urls:
-                        dropped = {normalize_text(item) for item in out_of_chain_urls if normalize_text(item)}
+                        dropped = {
+                            normalize_text(item)
+                            for item in out_of_chain_urls
+                            if normalize_text(item)
+                        }
                         if dropped:
                             if image_url and normalize_text(image_url) in dropped:
                                 image_url = ""
-                            image_urls = [u for u in image_urls if normalize_text(u) not in dropped]
+                            image_urls = [
+                                u
+                                for u in image_urls
+                                if normalize_text(u) not in dropped
+                            ]
                             if video_url and normalize_text(video_url) in dropped:
                                 video_url = ""
                             if audio_file and normalize_text(audio_file) in dropped:
@@ -892,7 +1086,9 @@ class AgentLoop:
                                     "error": "media_url_not_from_tool_chain",
                                 }
                             )
-                            messages.append({"role": "assistant", "content": response_text})
+                            messages.append(
+                                {"role": "assistant", "content": response_text}
+                            )
                             messages.append(
                                 {
                                     "role": "user",
@@ -923,14 +1119,24 @@ class AgentLoop:
                     and not ctx.is_private
                     and len(user_msg_clean) <= 4
                 )
-                if force_tool_first and tool_calls_made == 0 and not intentional_silence:
+                if (
+                    force_tool_first
+                    and tool_calls_made == 0
+                    and not intentional_silence
+                ):
                     _log.info(
                         "agent_force_tool_first | trace=%s | step=%d | text=%s",
                         ctx.trace_id,
                         step_idx,
                         clip_text(ctx.message_text, 120),
                     )
-                    steps.append({"step": step_idx, "tool": "policy_guard", "error": "tool_required_before_final"})
+                    steps.append(
+                        {
+                            "step": step_idx,
+                            "tool": "policy_guard",
+                            "error": "tool_required_before_final",
+                        }
+                    )
                     messages.append({"role": "assistant", "content": response_text})
                     messages.append(
                         {
@@ -958,7 +1164,9 @@ class AgentLoop:
                     if recovered_tool == "final_answer":
                         recovered_text = ""
                         if isinstance(recovered_args, dict):
-                            recovered_text = normalize_text(str(recovered_args.get("text", "")))
+                            recovered_text = normalize_text(
+                                str(recovered_args.get("text", ""))
+                            )
                         if recovered_text:
                             _log.info(
                                 "agent_final_answer_embedded_final_unwrapped | trace=%s | step=%d",
@@ -969,10 +1177,14 @@ class AgentLoop:
                     elif recovered_tool and self.tool_registry.has_tool(recovered_tool):
                         _log.warning(
                             "agent_final_answer_embedded_tool_recovered | trace=%s | step=%d | tool=%s",
-                            ctx.trace_id, step_idx, recovered_tool,
+                            ctx.trace_id,
+                            step_idx,
+                            recovered_tool,
                         )
                         tool_name = recovered_tool
-                        tool_args = recovered_args if isinstance(recovered_args, dict) else {}
+                        tool_args = (
+                            recovered_args if isinstance(recovered_args, dict) else {}
+                        )
                     else:
                         text = _pl.get_message(
                             "tool_payload_leaked",
@@ -988,19 +1200,33 @@ class AgentLoop:
                         "tool_payload_leaked",
                         "检测到模型输出了工具调用格式，我已自动拦截。",
                     )
-                if tool_name == "final_answer" and not text and not image_url and not video_url and not audio_file:
+                if (
+                    tool_name == "final_answer"
+                    and not text
+                    and not image_url
+                    and not video_url
+                    and not audio_file
+                ):
                     # bot 用 think 推理后决定不回复 → 保持空文本（intentional silence）
                     # 其他情况（没 think 过就空 final_answer）→ AI 生成兜底
                     if not intentional_silence:
                         text = self._last_success_display(steps)
                         if not text:
-                            text = await self._ai_fallback_reply(ctx, "处理完了但没有拿到有效结果")
+                            text = await self._ai_fallback_reply(
+                                ctx, "处理完了但没有拿到有效结果"
+                            )
                         if not text:
                             text = _pl.get_message("no_result", "")
-                steps.append({"step": step_idx, "tool": "final_answer", "result": "done"})
+                steps.append(
+                    {"step": step_idx, "tool": "final_answer", "result": "done"}
+                )
                 if tool_name == "final_answer":
-                    user_media_refs = self._extract_media_refs_from_segments(ctx.raw_segments)
-                    reply_media_refs = self._extract_media_refs_from_segments(ctx.reply_media_segments)
+                    user_media_refs = self._extract_media_refs_from_segments(
+                        ctx.raw_segments
+                    )
+                    reply_media_refs = self._extract_media_refs_from_segments(
+                        ctx.reply_media_segments
+                    )
                     _log.info(
                         "agent_final_answer_media_source | trace=%s | step=%d | image=%s | image_count=%d | video=%s | user_media=%d | reply_media=%d",
                         ctx.trace_id,
@@ -1014,19 +1240,34 @@ class AgentLoop:
                     # 去重：如果工具已经发送了媒体（副作用），final_answer 不再重复携带
                     if tool_sent_media:
                         if image_url and normalize_text(image_url) in tool_sent_media:
-                            _log.info("agent_dedup_media | trace=%s | stripped image_url (already sent by tool)", ctx.trace_id)
+                            _log.info(
+                                "agent_dedup_media | trace=%s | stripped image_url (already sent by tool)",
+                                ctx.trace_id,
+                            )
                             image_url = ""
-                        image_urls = [u for u in image_urls if normalize_text(u) not in tool_sent_media]
+                        image_urls = [
+                            u
+                            for u in image_urls
+                            if normalize_text(u) not in tool_sent_media
+                        ]
                         if video_url and normalize_text(video_url) in tool_sent_media:
-                            _log.info("agent_dedup_media | trace=%s | stripped video_url (already sent by tool)", ctx.trace_id)
+                            _log.info(
+                                "agent_dedup_media | trace=%s | stripped video_url (already sent by tool)",
+                                ctx.trace_id,
+                            )
                             video_url = ""
                     return AgentResult(
                         reply_text=text,
                         image_url=image_url,
-                        image_urls=image_urls if image_urls else ([image_url] if image_url else []),
+                        image_urls=(
+                            image_urls
+                            if image_urls
+                            else ([image_url] if image_url else [])
+                        ),
                         video_url=video_url,
                         audio_file=audio_file,
-                        action="reply", reason="agent_final_answer",
+                        action="reply",
+                        reason="agent_final_answer",
                         tool_calls_made=tool_calls_made,
                         total_time_ms=self._elapsed(t0),
                         steps=steps,
@@ -1050,7 +1291,8 @@ class AgentLoop:
                             "连续思考次数过多，没有执行有效工具",
                         )
                         return AgentResult(
-                            reply_text=fallback_text or "我不绕圈了：你再说得具体一点，我直接执行。",
+                            reply_text=fallback_text
+                            or "我不绕圈了：你再说得具体一点，我直接执行。",
                             action="reply",
                             reason="agent_think_loop_break",
                             tool_calls_made=tool_calls_made,
@@ -1075,12 +1317,31 @@ class AgentLoop:
                     )
                     continue
                 thought = str(tool_args.get("thought", ""))
-                steps.append({"step": step_idx, "tool": "think", "thought": clip_text(thought, 200)})
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": "think",
+                        "thought": clip_text(thought, 200),
+                    }
+                )
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": json.dumps(
-                    {"tool_result": {"tool": "think", "ok": True, "display": _pl.get_message("think_done", "思考完成，请继续")}},
-                    ensure_ascii=False,
-                )})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_result": {
+                                    "tool": "think",
+                                    "ok": True,
+                                    "display": _pl.get_message(
+                                        "think_done", "思考完成，请继续"
+                                    ),
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
                 continue
             else:
                 consecutive_think_count = 0
@@ -1088,44 +1349,100 @@ class AgentLoop:
             # 安全检查: 三级权限
             perm_level = self._resolve_permission_level(ctx)
             if tool_name in self._super_admin_tools and perm_level != "super_admin":
-                steps.append({"step": step_idx, "tool": tool_name, "blocked": "need_super_admin"})
+                steps.append(
+                    {"step": step_idx, "tool": tool_name, "blocked": "need_super_admin"}
+                )
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": json.dumps(
-                    {"tool_result": {"tool": tool_name, "ok": False, "error": "权限不足，该操作仅超级管理员可执行"}},
-                    ensure_ascii=False,
-                )})
-                continue
-            if tool_name in self._group_admin_tools and perm_level not in ("super_admin", "group_admin"):
-                steps.append({"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"})
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": json.dumps(
-                    {"tool_result": {"tool": tool_name, "ok": False, "error": "权限不足，该操作需要群管理员或超级管理员权限"}},
-                    ensure_ascii=False,
-                )})
-                continue
-            if tool_name in self._group_admin_tools and not self._is_explicit_bot_addressed(ctx):
-                steps.append({"step": step_idx, "tool": tool_name, "blocked": "explicit_bot_address_required"})
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": json.dumps(
+                messages.append(
                     {
-                        "tool_result": {
-                            "tool": tool_name,
-                            "ok": False,
-                            "error": "执行群管理操作前，需要明确点名机器人（@我或直接叫YUKI）",
-                        }
-                    },
-                    ensure_ascii=False,
-                )})
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_result": {
+                                    "tool": tool_name,
+                                    "ok": False,
+                                    "error": "权限不足，该操作仅超级管理员可执行",
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                continue
+            if tool_name in self._group_admin_tools and perm_level not in (
+                "super_admin",
+                "group_admin",
+            ):
+                steps.append(
+                    {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
+                )
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_result": {
+                                    "tool": tool_name,
+                                    "ok": False,
+                                    "error": "权限不足，该操作需要群管理员或超级管理员权限",
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
+                continue
+            if (
+                tool_name in self._group_admin_tools
+                and not self._is_explicit_bot_addressed(ctx)
+            ):
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": tool_name,
+                        "blocked": "explicit_bot_address_required",
+                    }
+                )
+                messages.append({"role": "assistant", "content": response_text})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_result": {
+                                    "tool": tool_name,
+                                    "ok": False,
+                                    "error": "执行群管理操作前，需要明确点名机器人（@我或直接叫YUKI）",
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
                 continue
 
             # 检查工具是否存在
             if not self.tool_registry.has_tool(tool_name):
-                steps.append({"step": step_idx, "tool": tool_name, "error": "unknown_tool"})
+                steps.append(
+                    {"step": step_idx, "tool": tool_name, "error": "unknown_tool"}
+                )
                 messages.append({"role": "assistant", "content": response_text})
-                messages.append({"role": "user", "content": json.dumps(
-                    {"tool_result": {"tool": tool_name, "ok": False, "error": f"工具 {tool_name} 不存在，请检查工具名"}},
-                    ensure_ascii=False,
-                )})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "tool_result": {
+                                    "tool": tool_name,
+                                    "ok": False,
+                                    "error": f"工具 {tool_name} 不存在，请检查工具名",
+                                }
+                            },
+                            ensure_ascii=False,
+                        ),
+                    }
+                )
                 continue
 
             high_risk_guard_reply = self._guard_high_risk_tool_call(
@@ -1154,7 +1471,9 @@ class AgentLoop:
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
             tool_signature = f"{tool_name}|{self._build_args_signature(tool_args)}"
             if self.repeat_tool_guard_enable:
-                repeated_tool_counts[tool_signature] = repeated_tool_counts.get(tool_signature, 0) + 1
+                repeated_tool_counts[tool_signature] = (
+                    repeated_tool_counts.get(tool_signature, 0) + 1
+                )
                 repeat_count = repeated_tool_counts[tool_signature]
                 if repeat_count > self.max_same_tool_call:
                     steps.append(
@@ -1182,7 +1501,9 @@ class AgentLoop:
                         }
                     )
                     if repeat_count >= self.max_same_tool_call + 2:
-                        return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "repeated_tool_call")
+                        return await self._build_fallback_result(
+                            ctx, steps, tool_calls_made, t0, "repeated_tool_call"
+                        )
                     continue
 
             ext_sig = ""
@@ -1219,7 +1540,9 @@ class AgentLoop:
             tool_context = self._build_tool_context(ctx, perm_level)
             remaining_for_tool = deadline_ts - time.monotonic()
             if remaining_for_tool <= 3:
-                return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "total_timeout")
+                return await self._build_fallback_result(
+                    ctx, steps, tool_calls_made, t0, "total_timeout"
+                )
             tool_timeout = min(
                 self._resolve_tool_timeout_seconds(tool_name, has_media),
                 max(4.0, remaining_for_tool - 1.0),
@@ -1242,7 +1565,9 @@ class AgentLoop:
             result_tool_name = tool_name
 
             if not result.ok:
-                fallback = self._fallback_tool_on_failure(tool_name, tool_args, result.error)
+                fallback = self._fallback_tool_on_failure(
+                    tool_name, tool_args, result.error
+                )
                 if fallback:
                     fb_tool_name, fb_tool_args = fallback
                     _log.info(
@@ -1255,14 +1580,18 @@ class AgentLoop:
                     )
                     remaining_for_fallback = deadline_ts - time.monotonic()
                     if remaining_for_fallback <= 3:
-                        return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "total_timeout")
+                        return await self._build_fallback_result(
+                            ctx, steps, tool_calls_made, t0, "total_timeout"
+                        )
                     fb_timeout = min(
                         self._resolve_tool_timeout_seconds(fb_tool_name, has_media),
                         max(4.0, remaining_for_fallback - 1.0),
                     )
                     try:
                         fb_result = await asyncio.wait_for(
-                            self.tool_registry.call(fb_tool_name, fb_tool_args, tool_context),
+                            self.tool_registry.call(
+                                fb_tool_name, fb_tool_args, tool_context
+                            ),
                             timeout=fb_timeout,
                         )
                     except asyncio.TimeoutError:
@@ -1315,7 +1644,11 @@ class AgentLoop:
 
             _log.info(
                 "agent_tool_result | trace=%s | step=%d | tool=%s | ok=%s | display=%s",
-                ctx.trace_id, step_idx, result_tool_name, result.ok, clip_text(result.display, 100),
+                ctx.trace_id,
+                step_idx,
+                result_tool_name,
+                result.ok,
+                clip_text(result.display, 100),
             )
 
             # 把工具结果喂回 LLM
@@ -1332,7 +1665,12 @@ class AgentLoop:
                 tool_result_msg["tool_result"]["data"] = compact_data
 
             messages.append({"role": "assistant", "content": response_text})
-            messages.append({"role": "user", "content": json.dumps(tool_result_msg, ensure_ascii=False)})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": json.dumps(tool_result_msg, ensure_ascii=False),
+                }
+            )
 
         # 达到 max_steps，用最后的信息兜底
         _log.warning(
@@ -1341,7 +1679,9 @@ class AgentLoop:
             self.max_steps,
             successful_external_fact_tools,
         )
-        return await self._build_fallback_result(ctx, steps, tool_calls_made, t0, "max_steps_reached")
+        return await self._build_fallback_result(
+            ctx, steps, tool_calls_made, t0, "max_steps_reached"
+        )
 
     # ── 系统提示词构建 ──
 
@@ -1359,7 +1699,9 @@ class AgentLoop:
             if faces:
                 hint_parts.append(f"\n\n可用 QQ 经典表情 ({face_count} 个): {faces}")
         if emoji_count > 0:
-            hint_parts.append(f"\n可用自定义表情包: {emoji_count} 个 (使用 send_emoji 工具，兼容别名 send_sticker)")
+            hint_parts.append(
+                f"\n可用自定义表情包: {emoji_count} 个 (使用 send_emoji 工具，兼容别名 send_sticker)"
+            )
         return "".join(hint_parts) if hint_parts else ""
 
     def _build_system_prompt(self, ctx: AgentContext) -> str:
@@ -1378,7 +1720,8 @@ class AgentLoop:
         # 智能工具过滤: 根据用户意图选择相关工具子集
         perm_level = self._resolve_permission_level(ctx)
         selected_tools = self.tool_registry.select_tools_for_intent(
-            ctx.message_text, perm_level,
+            ctx.message_text,
+            perm_level,
         )
         tool_docs = self.tool_registry.get_schemas_for_prompt_filtered(selected_tools)
         total_tools = self.tool_registry.tool_count
@@ -1400,11 +1743,17 @@ class AgentLoop:
 
         context_parts = []
         if ctx.memory_context:
-            context_parts.append("最近对话:\n" + "\n".join(f"- {m}" for m in ctx.memory_context[-8:]))
+            context_parts.append(
+                "最近对话:\n" + "\n".join(f"- {m}" for m in ctx.memory_context[-8:])
+            )
         if ctx.related_memories:
-            context_parts.append("相关记忆:\n" + "\n".join(f"- {m}" for m in ctx.related_memories[:5]))
+            context_parts.append(
+                "相关记忆:\n" + "\n".join(f"- {m}" for m in ctx.related_memories[:5])
+            )
         if ctx.user_profile_summary:
-            context_parts.append(f"用户画像: {clip_text(ctx.user_profile_summary, 300)}")
+            context_parts.append(
+                f"用户画像: {clip_text(ctx.user_profile_summary, 300)}"
+            )
         if ctx.preferred_name:
             context_parts.append(f"用户偏好称呼: {ctx.preferred_name}")
         if ctx.recent_speakers:
@@ -1413,7 +1762,11 @@ class AgentLoop:
                 user_label = normalize_text(name)
                 if not user_label:
                     user_label = f"用户{uid[-4:]}" if uid else "某人"
-                tail = f" 最近说: {clip_text(normalize_text(preview), 60)}" if normalize_text(preview) else ""
+                tail = (
+                    f" 最近说: {clip_text(normalize_text(preview), 60)}"
+                    if normalize_text(preview)
+                    else ""
+                )
                 speaker_rows.append(f"- {user_label}(QQ:{uid}){tail}")
             if speaker_rows:
                 context_parts.append("最近活跃用户:\n" + "\n".join(speaker_rows))
@@ -1433,8 +1786,12 @@ class AgentLoop:
             if normalize_text(state_text):
                 context_parts.append(f"会话线程状态: {state_text}")
         if ctx.user_directives:
-            context_parts.append("用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[:5]))
-        context_block = "\n\n".join(context_parts) if context_parts else "(无额外上下文)"
+            context_parts.append(
+                "用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[:5])
+            )
+        context_block = (
+            "\n\n".join(context_parts) if context_parts else "(无额外上下文)"
+        )
 
         prompt = (
             f"## 身份\n{identity_text}\n\n"
@@ -1450,7 +1807,11 @@ class AgentLoop:
         if normalize_text(tool_priority_text):
             prompt += f"## 工具优先级（必须遵守）\n{tool_priority_text}\n\n"
         if selected_tool_hints:
-            prompt += "## 工具细粒度提示（按本轮可用工具）\n" + "\n".join(selected_tool_hints) + "\n\n"
+            prompt += (
+                "## 工具细粒度提示（按本轮可用工具）\n"
+                + "\n".join(selected_tool_hints)
+                + "\n\n"
+            )
         prompt += (
             "## 执行预算（硬约束）\n"
             f"- 本轮最多 {self.max_steps} 步，优先选择成功率最高的路径，不要重复同类搜索。\n"
@@ -1466,13 +1827,19 @@ class AgentLoop:
             f"{context_rules_text}"
         )
         # 插件注入的规则
-        plugin_rules = self.tool_registry.get_prompt_hints_text("rules", tool_names=selected_tools)
+        plugin_rules = self.tool_registry.get_prompt_hints_text(
+            "rules", tool_names=selected_tools
+        )
         if plugin_rules:
             prompt += f"{plugin_rules}\n"
-        plugin_tools_guidance = self.tool_registry.get_prompt_hints_text("tools_guidance", tool_names=selected_tools)
+        plugin_tools_guidance = self.tool_registry.get_prompt_hints_text(
+            "tools_guidance", tool_names=selected_tools
+        )
         if plugin_tools_guidance:
             prompt += f"## 工具使用指南（插件）\n{plugin_tools_guidance}\n\n"
-        plugin_context = self.tool_registry.get_prompt_hints_text("context", tool_names=selected_tools)
+        plugin_context = self.tool_registry.get_prompt_hints_text(
+            "context", tool_names=selected_tools
+        )
         if plugin_context:
             prompt += f"## 插件上下文\n{plugin_context}\n\n"
         # 动态上下文提供者
@@ -1488,12 +1855,16 @@ class AgentLoop:
         if policy_tool_guidance:
             prompt += f"## 工具注入规则（配置）\n{policy_tool_guidance}\n\n"
 
-        agent_cfg = self.config.get("agent", {}) if isinstance(self.config, dict) else {}
+        agent_cfg = (
+            self.config.get("agent", {}) if isinstance(self.config, dict) else {}
+        )
         if isinstance(agent_cfg, dict):
             runtime_rules = normalize_text(str(agent_cfg.get("runtime_rules", "")))
             if runtime_rules:
                 prompt += f"## 运行时规则（配置）\n{runtime_rules}\n\n"
-            preferred_name_prompt = normalize_text(str(agent_cfg.get("preferred_name_prompt", "")))
+            preferred_name_prompt = normalize_text(
+                str(agent_cfg.get("preferred_name_prompt", ""))
+            )
             if preferred_name_prompt and normalize_text(ctx.preferred_name):
                 prompt += (
                     "## 用户偏好规则（配置）\n"
@@ -1531,7 +1902,9 @@ class AgentLoop:
         v_hint = _verbosity_hints.get(ctx.verbosity, "")
         if v_hint:
             prompt += f"## 输出详略度\n{v_hint}\n\n"
-        output_style_instruction = clip_text(normalize_text(ctx.output_style_instruction), 400)
+        output_style_instruction = clip_text(
+            normalize_text(ctx.output_style_instruction), 400
+        )
         if output_style_instruction:
             prompt += f"## 输出风格附加要求（配置）\n{output_style_instruction}\n\n"
 
@@ -1550,6 +1923,7 @@ class AgentLoop:
     @staticmethod
     def _render_runtime_tpl(template_text: str, values: dict[str, Any]) -> str:
         """安全渲染模板：缺失占位符不抛错，保留原样。"""
+
         class _SafeMap(dict):
             def __missing__(self, key: str) -> str:  # type: ignore[override]
                 return "{" + key + "}"
@@ -1572,7 +1946,9 @@ class AgentLoop:
     @staticmethod
     def _clip_json_for_prompt(payload: Any, max_chars: int = 1100) -> str:
         try:
-            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
+            text = json.dumps(
+                payload, ensure_ascii=False, separators=(",", ":"), default=str
+            )
         except Exception:
             text = normalize_text(str(payload))
         return clip_text(normalize_text(text), max_chars)
@@ -1601,7 +1977,9 @@ class AgentLoop:
             "group_name": payload.get("group_name", ""),
             "user_id": payload.get("user_id", ""),
             "to_me": bool(payload.get("to_me", False)),
-            "raw_message": clip_text(normalize_text(str(payload.get("raw_message", ""))), 220),
+            "raw_message": clip_text(
+                normalize_text(str(payload.get("raw_message", ""))), 220
+            ),
         }
         sender_info = {
             "user_id": sender.get("user_id", ""),
@@ -1615,9 +1993,22 @@ class AgentLoop:
         if raw:
             raw_anchor: dict[str, Any] = {}
             for key in (
-                "id", "msgId", "msgSeq", "msgRandom", "chatType", "msgType", "subMsgType",
-                "sendType", "msgTime", "senderUid", "senderUin", "peerUid", "peerUin",
-                "peerName", "sendNickName", "sendMemberName",
+                "id",
+                "msgId",
+                "msgSeq",
+                "msgRandom",
+                "chatType",
+                "msgType",
+                "subMsgType",
+                "sendType",
+                "msgTime",
+                "senderUid",
+                "senderUin",
+                "peerUid",
+                "peerUin",
+                "peerName",
+                "sendNickName",
+                "sendMemberName",
             ):
                 value = raw.get(key, "")
                 if value not in ("", None):
@@ -1684,34 +2075,60 @@ class AgentLoop:
         if reply_mid or reply_uid or reply_text:
             is_reply_to_bot = bool(reply_uid and reply_uid == str(ctx.bot_id))
             anchor_lines = [
-                self._runtime_tpl(runtime_templates, "reply_anchor_header", "[引用锚点]"),
+                self._runtime_tpl(
+                    runtime_templates, "reply_anchor_header", "[引用锚点]"
+                ),
                 self._render_runtime_tpl(
-                    self._runtime_tpl(runtime_templates, "reply_anchor_line_message_id", "reply_to_message_id={reply_to_message_id}"),
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "reply_anchor_line_message_id",
+                        "reply_to_message_id={reply_to_message_id}",
+                    ),
                     {"reply_to_message_id": reply_mid or "-"},
                 ),
                 self._render_runtime_tpl(
-                    self._runtime_tpl(runtime_templates, "reply_anchor_line_user_id", "reply_to_user_id={reply_to_user_id}"),
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "reply_anchor_line_user_id",
+                        "reply_to_user_id={reply_to_user_id}",
+                    ),
                     {"reply_to_user_id": reply_uid or "-"},
                 ),
                 self._render_runtime_tpl(
-                    self._runtime_tpl(runtime_templates, "reply_anchor_line_user_name", "reply_to_user_name={reply_to_user_name}"),
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "reply_anchor_line_user_name",
+                        "reply_to_user_name={reply_to_user_name}",
+                    ),
                     {"reply_to_user_name": reply_name or "-"},
                 ),
                 self._render_runtime_tpl(
-                    self._runtime_tpl(runtime_templates, "reply_anchor_line_is_reply_to_bot", "is_reply_to_bot={is_reply_to_bot}"),
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "reply_anchor_line_is_reply_to_bot",
+                        "is_reply_to_bot={is_reply_to_bot}",
+                    ),
                     {"is_reply_to_bot": "true" if is_reply_to_bot else "false"},
                 ),
             ]
             if reply_text:
                 line = self._render_runtime_tpl(
-                    self._runtime_tpl(runtime_templates, "reply_anchor_line_text", "reply_to_text={reply_to_text}"),
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "reply_anchor_line_text",
+                        "reply_to_text={reply_to_text}",
+                    ),
                     {"reply_to_text": clip_text(reply_text, 240)},
                 )
                 if normalize_text(line):
                     anchor_lines.append(line)
             if ctx.reply_media_summary:
                 line = self._render_runtime_tpl(
-                    self._runtime_tpl(runtime_templates, "reply_anchor_line_media", "reply_to_media={reply_to_media}"),
+                    self._runtime_tpl(
+                        runtime_templates,
+                        "reply_anchor_line_media",
+                        "reply_to_media={reply_to_media}",
+                    ),
                     {"reply_to_media": ", ".join(ctx.reply_media_summary[:5])},
                 )
                 if normalize_text(line):
@@ -1721,7 +2138,11 @@ class AgentLoop:
                 parts.append("\n".join(anchor_lines))
 
         if normalize_text(ctx.reply_to_text):
-            reply_from = normalize_text(ctx.reply_to_user_name) or normalize_text(ctx.reply_to_user_id) or "未知用户"
+            reply_from = (
+                normalize_text(ctx.reply_to_user_name)
+                or normalize_text(ctx.reply_to_user_id)
+                or "未知用户"
+            )
             is_reply_to_bot = reply_uid == str(ctx.bot_id)
             if is_reply_to_bot:
                 line = self._render_runtime_tpl(
@@ -1730,7 +2151,11 @@ class AgentLoop:
                         "reply_context_to_bot",
                         "[用户在回复bot之前的消息 | bot原文: {reply_to_text}]",
                     ),
-                    {"reply_to_text": clip_text(normalize_text(ctx.reply_to_text), 220)},
+                    {
+                        "reply_to_text": clip_text(
+                            normalize_text(ctx.reply_to_text), 220
+                        )
+                    },
                 )
             else:
                 line = self._render_runtime_tpl(
@@ -1742,7 +2167,9 @@ class AgentLoop:
                     {
                         "reply_from": reply_from,
                         "reply_to_user_id": reply_uid or "-",
-                        "reply_to_text": clip_text(normalize_text(ctx.reply_to_text), 220),
+                        "reply_to_text": clip_text(
+                            normalize_text(ctx.reply_to_text), 220
+                        ),
                     },
                 )
             if normalize_text(line):
@@ -1751,10 +2178,16 @@ class AgentLoop:
         if ctx.media_summary:
             image_count = sum(1 for m in ctx.media_summary if m.startswith("image:"))
             video_count = sum(1 for m in ctx.media_summary if m.startswith("video:"))
-            voice_count = sum(1 for m in ctx.media_summary if m.startswith("record") or m.startswith("audio"))
+            voice_count = sum(
+                1
+                for m in ctx.media_summary
+                if m.startswith("record") or m.startswith("audio")
+            )
             media_desc = ", ".join(ctx.media_summary[:5])
             media_line = self._render_runtime_tpl(
-                self._runtime_tpl(runtime_templates, "attached_media_line", "[附带媒体: {media_desc}]"),
+                self._runtime_tpl(
+                    runtime_templates, "attached_media_line", "[附带媒体: {media_desc}]"
+                ),
                 {
                     "media_desc": media_desc,
                     "image_count": image_count,
@@ -1780,7 +2213,7 @@ class AgentLoop:
                     self._runtime_tpl(
                         runtime_templates,
                         "hint_user_video",
-                        "[提示: 用户发了视频；如果是在问内容、解析链接或要总结视频，优先用 parse_video / analyze_video]",
+                        "[提示: 用户直接发了视频文件；内容理解优先 analyze_local_video，切片/抽音频/封面/关键帧优先 split_video]",
                     ),
                     {"video_count": video_count},
                 )
@@ -1811,12 +2244,17 @@ class AgentLoop:
         # 检测用户消息中的链接
         first_url = self._extract_first_url(ctx.message_text)
         if first_url:
-            if "b23.tv" in first_url or "bilibili.com" in first_url or "douyin.com" in first_url or "kuaishou.com" in first_url:
+            if (
+                "b23.tv" in first_url
+                or "bilibili.com" in first_url
+                or "douyin.com" in first_url
+                or "kuaishou.com" in first_url
+            ):
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
                         runtime_templates,
                         "hint_video_url",
-                        "[检测到视频链接 {url}，用 parse_video 解析]",
+                        "[检测到视频链接 {url}；拿可发送直链优先 parse_video，要分析内容优先 analyze_video]",
                     ),
                     {"url": first_url},
                 )
@@ -1834,11 +2272,23 @@ class AgentLoop:
                 if normalize_text(line):
                     parts.append(line)
         if ctx.reply_media_summary:
-            reply_image_count = sum(1 for m in ctx.reply_media_summary if m.startswith("image:"))
-            reply_video_count = sum(1 for m in ctx.reply_media_summary if m.startswith("video:"))
-            reply_voice_count = sum(1 for m in ctx.reply_media_summary if m.startswith("record") or m.startswith("audio"))
+            reply_image_count = sum(
+                1 for m in ctx.reply_media_summary if m.startswith("image:")
+            )
+            reply_video_count = sum(
+                1 for m in ctx.reply_media_summary if m.startswith("video:")
+            )
+            reply_voice_count = sum(
+                1
+                for m in ctx.reply_media_summary
+                if m.startswith("record") or m.startswith("audio")
+            )
             reply_media_line = self._render_runtime_tpl(
-                self._runtime_tpl(runtime_templates, "reply_media_line", "[引用消息中的媒体: {reply_media_desc}]"),
+                self._runtime_tpl(
+                    runtime_templates,
+                    "reply_media_line",
+                    "[引用消息中的媒体: {reply_media_desc}]",
+                ),
                 {
                     "reply_media_desc": ", ".join(ctx.reply_media_summary[:5]),
                     "reply_image_count": reply_image_count,
@@ -1875,7 +2325,7 @@ class AgentLoop:
                     self._runtime_tpl(
                         runtime_templates,
                         "hint_reply_video",
-                        "[提示: 引用消息里有视频；如果用户在问这条引用内容，优先 parse_video / analyze_video，并以引用视频为目标]",
+                        "[提示: 引用消息里有视频；内容理解优先 analyze_local_video，切片/抽音频/封面/关键帧优先 split_video，并以引用视频为目标]",
                     ),
                     {"reply_video_count": reply_video_count},
                 )
@@ -1907,9 +2357,14 @@ class AgentLoop:
 
     @staticmethod
     def _has_animated_image_summary(rows: list[str] | None) -> bool:
-        return any(normalize_text(str(item)).lower().startswith("image:animated:") for item in (rows or []))
+        return any(
+            normalize_text(str(item)).lower().startswith("image:animated:")
+            for item in (rows or [])
+        )
 
-    def _normalize_tool_args(self, tool_name: str, args: dict[str, Any], ctx: AgentContext) -> dict[str, Any]:
+    def _normalize_tool_args(
+        self, tool_name: str, args: dict[str, Any], ctx: AgentContext
+    ) -> dict[str, Any]:
         """对常见工具进行缺参兜底，减少 args={} 造成的空调用。"""
         fixed = dict(args or {})
         text = normalize_text(ctx.message_text)
@@ -1940,7 +2395,9 @@ class AgentLoop:
             if not mode:
                 _set_if_empty("mode", self._infer_search_mode(contextual_query or text))
         elif tool_name in {"lookup_wiki"}:
-            _set_if_empty("keyword", self._infer_lookup_keyword(contextual_query or text))
+            _set_if_empty(
+                "keyword", self._infer_lookup_keyword(contextual_query or text)
+            )
         elif tool_name == "split_video":
             _set_if_empty("url", recent_video_url or candidate_url)
             inferred_mode = self._infer_split_video_mode(contextual_query or text)
@@ -1960,7 +2417,13 @@ class AgentLoop:
                 frame_hint = self._infer_frame_count_hint(contextual_query or text)
                 if frame_hint > 0:
                     _set_if_empty("max_frames", frame_hint)
-        elif tool_name in {"parse_video", "analyze_video", "fetch_webpage", "download_file", "smart_download"}:
+        elif tool_name in {
+            "parse_video",
+            "analyze_video",
+            "fetch_webpage",
+            "download_file",
+            "smart_download",
+        }:
             if tool_name in {"parse_video", "analyze_video"}:
                 _set_if_empty("url", recent_video_url or candidate_url)
             else:
@@ -1978,7 +2441,12 @@ class AgentLoop:
             _set_if_empty("query", contextual_query or text)
         elif tool_name == "search_web_media":
             _set_if_empty("query", contextual_query or text)
-            _set_if_empty("media_type", self._infer_media_type(contextual_query or text))
+            _set_if_empty(
+                "media_type", self._infer_media_type(contextual_query or text)
+            )
+        elif tool_name == "analyze_local_video":
+            _set_if_empty("url", recent_video_url or candidate_url)
+            _set_if_empty("question", text)
         elif tool_name == "analyze_image":
             _set_if_empty("question", text)
             _set_if_empty("allow_recent_fallback", True)
@@ -1988,7 +2456,9 @@ class AgentLoop:
                 fixed["recent_only_when_unique"] = False
         elif tool_name == "search_download_resources":
             _set_if_empty("query", contextual_query or text)
-            _set_if_empty("file_type", self._infer_resource_file_type(contextual_query or text))
+            _set_if_empty(
+                "file_type", self._infer_resource_file_type(contextual_query or text)
+            )
         elif tool_name == "cli_invoke":
             _set_if_empty("prompt", text)
         elif tool_name == "get_user_info":
@@ -2012,13 +2482,21 @@ class AgentLoop:
         elif tool_name == "get_qq_avatar":
             if qq_id:
                 _set_if_empty("qq", str(qq_id))
-        elif tool_name in {"get_qzone_profile", "get_qzone_moods", "get_qzone_albums", "analyze_qzone", "get_qzone_photos"}:
+        elif tool_name in {
+            "get_qzone_profile",
+            "get_qzone_moods",
+            "get_qzone_albums",
+            "analyze_qzone",
+            "get_qzone_photos",
+        }:
             if qq_id:
                 _set_if_empty("qq_number", str(qq_id))
         elif tool_name in {"send_emoji", "send_sticker"}:
             _set_if_empty("query", self._infer_emoji_query(contextual_query or text))
         elif tool_name in {"generate_image", "generate_image_enhanced"}:
-            _set_if_empty("prompt", self._infer_image_generation_prompt(contextual_query or text))
+            _set_if_empty(
+                "prompt", self._infer_image_generation_prompt(contextual_query or text)
+            )
 
         return fixed
 
@@ -2104,12 +2582,23 @@ class AgentLoop:
             return False
         if re.search(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)", target):
             return True
-        return any(host in target for host in ("bilibili.com/video/", "b23.tv/", "douyin.com/", "kuaishou.com/", "acfun.cn/v/ac"))
+        return any(
+            host in target
+            for host in (
+                "bilibili.com/video/",
+                "b23.tv/",
+                "douyin.com/",
+                "kuaishou.com/",
+                "acfun.cn/v/ac",
+            )
+        )
 
     @classmethod
     def _extract_recent_media_url(cls, ctx: AgentContext, media_type: str) -> str:
         wanted = normalize_text(media_type).lower()
-        summary_rows = list(ctx.reply_media_summary or []) + list(ctx.media_summary or [])
+        summary_rows = list(ctx.reply_media_summary or []) + list(
+            ctx.media_summary or []
+        )
         for row in summary_rows:
             text = normalize_text(row)
             if not text:
@@ -2118,7 +2607,9 @@ class AgentLoop:
                 continue
             if wanted == "image" and not text.startswith("image:"):
                 continue
-            if wanted == "audio" and not (text.startswith("audio:") or text.startswith("record:")):
+            if wanted == "audio" and not (
+                text.startswith("audio:") or text.startswith("record:")
+            ):
                 continue
             url = cls._extract_first_url(text)
             if url:
@@ -2161,7 +2652,10 @@ class AgentLoop:
         return any(re.search(pattern, t) for pattern in patterns)
 
     def _extract_recent_url(self, ctx: AgentContext) -> str:
-        for direct_text in (normalize_text(ctx.reply_to_text), normalize_text(ctx.message_text)):
+        for direct_text in (
+            normalize_text(ctx.reply_to_text),
+            normalize_text(ctx.message_text),
+        ):
             url = self._extract_first_url(direct_text)
             if url:
                 return url
@@ -2212,7 +2706,11 @@ class AgentLoop:
 
         # 2) 其次是 reply 目标（引用了谁）
         reply_uid = normalize_text(str(ctx.reply_to_user_id))
-        if reply_uid and reply_uid != str(ctx.bot_id) and re.fullmatch(r"[1-9]\d{5,11}", reply_uid):
+        if (
+            reply_uid
+            and reply_uid != str(ctx.bot_id)
+            and re.fullmatch(r"[1-9]\d{5,11}", reply_uid)
+        ):
             return int(reply_uid)
 
         # 3) 最后才回退到正文数字（避免截断数字抢占）
@@ -2230,26 +2728,8 @@ class AgentLoop:
         t = normalize_text(text)
         if not t:
             return ""
-        for token in (
-            "是谁",
-            "是什么",
-            "有谁",
-            "请问",
-            "介绍一下",
-            "介绍下",
-            "科普一下",
-            "给我",
-            "帮我",
-            "查一下",
-            "查下",
-            "搜一下",
-            "搜索",
-            "照片",
-            "图片",
-            "gif",
-            "GIF",
-        ):
-            t = t.replace(token, " ")
+        t = re.sub(r"^(?i:/(?:lookup|wiki))\s*", "", t)
+        t = re.sub(r"^(?i:keyword)\s*=\s*", "", t)
         t = re.sub(r"[，。,.!?！？:：;；\[\]()（）\"'`]+", " ", t)
         t = re.sub(r"\s+", " ", t).strip()
         return t[:80]
@@ -2257,15 +2737,19 @@ class AgentLoop:
     @staticmethod
     def _infer_search_mode(text: str) -> str:
         t = normalize_text(text).lower()
+        plain = re.sub(r"\s+", "", t)
+        if "mode=image" in plain:
+            return "image"
+        if "mode=video" in plain:
+            return "video"
         if re.search(r"(?:^|\s)/image(?:\s|$)", t):
             return "image"
         if re.search(r"(?:^|\s)/(?:video|vid)(?:\s|$)", t):
             return "video"
-        if re.search(r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$", t):
-            return "video"
-        if any(k in t for k in ("gif", "动图", "图片", "照片", "壁纸", "头像", "表情包")):
-            return "image"
-        if any(k in t for k in ("视频", "mv", "短片", "片段", "剪辑", "video")):
+        if re.search(
+            r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$",
+            t,
+        ):
             return "video"
         return "text"
 
@@ -2300,12 +2784,6 @@ class AgentLoop:
         for cue, ft in mapping:
             if cue in plain:
                 return ft
-        if any(cue in t for cue in ("安卓", "android", "手机端", "手机版", "移动端", "arm64-v8a", "armeabi")):
-            return "apk"
-        if any(cue in t for cue in ("windows", "win", "pc", "电脑", "桌面端", "x64", "x86", "amd64")):
-            return "exe"
-        if any(cue in t for cue in ("mac", "macos", "darwin")):
-            return "dmg"
         return ""
 
     @staticmethod
@@ -2320,7 +2798,10 @@ class AgentLoop:
             return "cover"
         if "mode=frames" in plain or "mode=frame" in plain:
             return "frames"
-        if "mode=clip" in plain or re.search(r"\b\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\s*-\s*\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\b", t):
+        if "mode=clip" in plain or re.search(
+            r"\b\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\s*-\s*\d+(?:\.\d+)?\s*(?:s|sec|seconds?)\b",
+            t,
+        ):
             return "clip"
         return ""
 
@@ -2375,9 +2856,13 @@ class AgentLoop:
         t = normalize_text(text)
         if not t:
             return 0
-        m = re.search(r"(?:max_frames|frame_count)\s*=\s*(\d{1,2})", t, flags=re.IGNORECASE)
+        m = re.search(
+            r"(?:max_frames|frame_count)\s*=\s*(\d{1,2})", t, flags=re.IGNORECASE
+        )
         if not m:
-            m = re.search(r"(\d{1,2})\s*(?:screenshots?|frames?)", t, flags=re.IGNORECASE)
+            m = re.search(
+                r"(\d{1,2})\s*(?:screenshots?|frames?)", t, flags=re.IGNORECASE
+            )
         if not m:
             m = re.search(r"(\d{1,2})\s*(?:张|幀|帧)", t, flags=re.IGNORECASE)
         if not m:
@@ -2425,18 +2910,12 @@ class AgentLoop:
             return True
         if len(t) <= 16 and re.fullmatch(r"[?？!！,，.。~\-\s]*", t):
             return True
-        starters = (
-            "so", "so?", "so？", "所以", "所以呢", "所以说", "然后", "然后呢", "那呢", "然后我要", "那我要",
-        )
-        return any(t.startswith(s) for s in starters)
+        return False
 
     @staticmethod
     def _strip_continuation_prefix(text: str) -> str:
         t = normalize_text(text)
         t = re.sub(r"^(?i:/(?:next|continue))\s*[?？:：,，]?\s*", "", t)
-        t = re.sub(r"^(?i:so)\s*[?？:：,，]?\s*", "", t)
-        t = re.sub(r"^(所以(?:呢|说)?|然后(?:呢)?|那(?:然后|么)?呢?)\s*[?？:：,，]?\s*", "", t)
-        t = re.sub(r"^(我要|我想要|我想|给我|来个|来一个|帮我)\s*", "", t)
         t = normalize_text(t)
         return t
 
@@ -2481,10 +2960,14 @@ class AgentLoop:
         return clip_text(text, 100)
 
     @staticmethod
-    def _fallback_tool_on_failure(tool_name: str, args: dict[str, Any], error: str = "") -> tuple[str, dict[str, Any]] | None:
+    def _fallback_tool_on_failure(
+        tool_name: str, args: dict[str, Any], error: str = ""
+    ) -> tuple[str, dict[str, Any]] | None:
         query = normalize_text(str(args.get("query", "")))
         err = normalize_text(error).lower()
-        if tool_name in {"smart_download", "download_file"} and err.startswith("download_untrusted_source"):
+        if tool_name in {"smart_download", "download_file"} and err.startswith(
+            "download_untrusted_source"
+        ):
             if query:
                 return "web_search", {"query": query, "mode": "text"}
             url = normalize_text(str(args.get("url", "")))
@@ -2497,7 +2980,9 @@ class AgentLoop:
             "download_path_missing",
             "download_failed",
         }:
-            file_type = normalize_text(str(args.get("prefer_ext", ""))).lower().strip(".")
+            file_type = (
+                normalize_text(str(args.get("prefer_ext", ""))).lower().strip(".")
+            )
             if not file_type and query:
                 file_type = AgentLoop._infer_resource_file_type(query)
             fallback_query = query
@@ -2514,7 +2999,9 @@ class AgentLoop:
         if tool_name == "search_download_resources":
             return "web_search", {"query": f"{query} 官网 下载", "mode": "text"}
         if tool_name == "search_web_media":
-            media_type = normalize_text(str(args.get("media_type", "image"))).lower() or "image"
+            media_type = (
+                normalize_text(str(args.get("media_type", "image"))).lower() or "image"
+            )
             if media_type == "video":
                 return "web_search", {"query": query, "mode": "video"}
             if media_type == "gif":
@@ -2526,6 +3013,7 @@ class AgentLoop:
         heavy_tools = {
             "parse_video",
             "analyze_video",
+            "analyze_local_video",
             "split_video",
             "fetch_webpage",
             "download_file",
@@ -2546,29 +3034,47 @@ class AgentLoop:
             return float(self.tool_timeout_seconds_media)
         return float(self.tool_timeout_seconds)
 
-    def estimate_total_timeout_seconds(self, ctx: AgentContext, has_media: bool) -> float:
+    def estimate_total_timeout_seconds(
+        self, ctx: AgentContext, has_media: bool
+    ) -> float:
         """公开给外层编排器使用的超时预算估算。"""
         return self._resolve_total_timeout_seconds(ctx, has_media)
 
-    def _resolve_total_timeout_seconds(self, ctx: AgentContext, has_media: bool) -> float:
+    def _resolve_total_timeout_seconds(
+        self, ctx: AgentContext, has_media: bool
+    ) -> float:
         per_step_timeout = 35 if has_media else 30
         total_timeout = float(max(12, self.max_steps * per_step_timeout))
         if self.total_timeout_seconds > 0:
             total_timeout = min(total_timeout, float(self.total_timeout_seconds))
 
-        queue_cfg = self.config.get("queue", {}) if isinstance(self.config, dict) else {}
+        queue_cfg = (
+            self.config.get("queue", {}) if isinstance(self.config, dict) else {}
+        )
         if isinstance(queue_cfg, dict):
             queue_timeout = self._to_safe_int(queue_cfg.get("process_timeout_seconds"))
             text = normalize_text(ctx.message_text).lower()
-            video_override = self._to_safe_int(queue_cfg.get("video_process_timeout_seconds"))
-            download_override = self._to_safe_int(queue_cfg.get("download_process_timeout_seconds"))
-            if any(token in text for token in ("下载", "安装包", ".exe", ".apk", ".zip", "网盘")):
+            video_override = self._to_safe_int(
+                queue_cfg.get("video_process_timeout_seconds")
+            )
+            download_override = self._to_safe_int(
+                queue_cfg.get("download_process_timeout_seconds")
+            )
+            if any(
+                token in text
+                for token in ("下载", "安装包", ".exe", ".apk", ".zip", "网盘")
+            ):
                 queue_timeout = max(queue_timeout, download_override)
-            elif has_media or any(token in text for token in ("视频", "解析", "bilibili", "抖音", "快手", "acfun", "bv")):
+            elif has_media or any(
+                token in text
+                for token in ("视频", "解析", "bilibili", "抖音", "快手", "acfun", "bv")
+            ):
                 queue_timeout = max(queue_timeout, video_override)
 
             if queue_timeout > 0:
-                queue_budget = max(15, queue_timeout - self.queue_timeout_margin_seconds)
+                queue_budget = max(
+                    15, queue_timeout - self.queue_timeout_margin_seconds
+                )
                 total_timeout = min(total_timeout, float(queue_budget))
 
         return max(12.0, total_timeout)
@@ -2577,7 +3083,16 @@ class AgentLoop:
     def _build_external_fact_signature(tool_name: str, args: dict[str, Any]) -> str:
         if not isinstance(args, dict):
             return ""
-        fields = ["query", "url", "repo", "instruction", "schema_desc", "mode", "keyword", "media_type"]
+        fields = [
+            "query",
+            "url",
+            "repo",
+            "instruction",
+            "schema_desc",
+            "mode",
+            "keyword",
+            "media_type",
+        ]
         parts = [tool_name]
         for key in fields:
             value = normalize_text(str(args.get(key, ""))).lower()
@@ -2591,9 +3106,24 @@ class AgentLoop:
         if not t:
             return "随机"
         lower = t.lower()
-        if any(cue in lower for cue in ("刚学", "刚刚学", "刚才学", "最近学", "刚学的", "刚刚学的", "刚刚那个", "刚才那个")):
+        if any(
+            cue in lower
+            for cue in (
+                "刚学",
+                "刚刚学",
+                "刚才学",
+                "最近学",
+                "刚学的",
+                "刚刚学的",
+                "刚刚那个",
+                "刚才那个",
+            )
+        ):
             return "最近"
-        if any(cue in lower for cue in ("随机", "随便", "来个", "来一张", "来张", "发个", "发一张")):
+        if any(
+            cue in lower
+            for cue in ("随机", "随便", "来个", "来一张", "来张", "发个", "发一张")
+        ):
             return "随机"
         cleaned = re.sub(
             r"(请|請|麻烦|麻煩|帮我|幫我|给我|給我|把|发表情包|發表情包|表情包|表情|emoji|emote|动图|動圖|gif|贴纸|貼紙|发|發|来|來|一张|一張|一个|一個|一下|吧|呀|啊|嘛|呢)",
@@ -2624,52 +3154,25 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        cues = (
-            "发我安装包",
-            "直接发我",
-            "丢给我",
-            "上传群文件",
-            "给我下载",
-            "帮我下载",
-            "安装包",
-            "apk",
-            "exe",
-            "zip",
+        plain = re.sub(r"\s+", "", t)
+        explicit_tokens = (
+            "/upload",
+            "upload=1",
+            "send_file=1",
+            "send=group_file",
+            "group_file=1",
         )
-        return any(cue in t for cue in cues)
+        return any(token in plain for token in explicit_tokens)
 
     @staticmethod
     def _looks_like_download_file_request(text: str) -> bool:
         t = normalize_text(text).lower()
         if not t:
             return False
-        explicit_file = any(
-            cue in t
-            for cue in (
-                "安装包",
-                "资源包",
-                "客户端",
-                ".apk",
-                ".exe",
-                ".msi",
-                ".zip",
-                ".7z",
-                ".rar",
-                "apk",
-                "exe",
-                "msi",
-                "电脑版",
-                "电脑板",
-                "pc版",
-                "pc端",
-                "windows",
-                "安卓",
-                "android",
-            )
-        )
-        if explicit_file:
+        plain = re.sub(r"\s+", "", t)
+        if any(token in plain for token in ("/download", "download=1", "prefer_ext=")):
             return True
-        return "下载" in t and any(cue in t for cue in ("游戏", "软件", "客户端", "安装", "发我", "上传"))
+        return bool(re.search(r"\.(apk|exe|msi|zip|7z|rar|ipa|dmg)(?:\?|#|$)", t))
 
     def _rewrite_download_tool_if_needed(
         self,
@@ -2692,9 +3195,9 @@ class AgentLoop:
             or self._extract_first_url(normalize_text(ctx.reply_to_text))
             or self._extract_recent_url(ctx)
         )
-        contextual_query = self._rebuild_query_with_context(normalize_text(ctx.message_text), ctx) or normalize_text(
-            ctx.message_text
-        )
+        contextual_query = self._rebuild_query_with_context(
+            normalize_text(ctx.message_text), ctx
+        ) or normalize_text(ctx.message_text)
         inferred_ext = self._infer_resource_file_type(contextual_query)
 
         if candidate_url:
@@ -2785,7 +3288,9 @@ class AgentLoop:
             "二次元",
             "anime",
         )
-        return any(verb in t for verb in request_verbs) and any(cue in t for cue in subject_cues)
+        return any(verb in t for verb in request_verbs) and any(
+            cue in t for cue in subject_cues
+        )
 
     @staticmethod
     def _infer_image_generation_prompt(text: str) -> str:
@@ -2846,49 +3351,55 @@ class AgentLoop:
         if self._select_forced_media_tool(ctx):
             return True
 
-        # 任何外链默认工具优先（解析/抓取/校验）
-        if re.search(r"https?://", text):
+        if ctx.media_summary or ctx.reply_media_summary:
             return True
 
-        # 明确媒体分析请求
-        if (ctx.media_summary or ctx.reply_media_summary) and (
-            self._looks_like_image_question(text)
-            or "视频" in text
-            or "截图" in text
-            or "图里" in text
-            or "图片" in text
-            or "解析" in text
-            or "识别" in text
-            or "分析" in text
-        ):
+        # 任何外链默认工具优先（解析/抓取/校验）
+        if re.search(r"https?://", text):
             return True
 
         # 明确搜索/查证请求（需要外部信息）
         if any(
             k in text
             for k in (
-                "搜索", "查一下", "查查", "帮我查", "联网", "最新", "新闻", "资料",
-                "安装包", "资源包", "下载链接", "下载地址", "网盘", "gif", "动图",
-                "分割视频", "切片", "提取音频", "导出音频", "封面", "关键帧",
+                "搜索",
+                "查一下",
+                "查查",
+                "帮我查",
+                "联网",
+                "最新",
+                "新闻",
+                "资料",
+                "安装包",
+                "资源包",
+                "下载链接",
+                "下载地址",
+                "网盘",
             )
         ):
             return True
 
         # 目标人物/QQ 资料分析：用户给了 QQ 号、@某人或引用了某人的消息，默认先走工具。
-        target_entity_exists = bool(self._extract_candidate_qq_id(ctx)) or bool(ctx.at_other_user_ids) or bool(
-            normalize_text(str(ctx.reply_to_user_id))
+        target_entity_exists = (
+            bool(self._extract_candidate_qq_id(ctx))
+            or bool(ctx.at_other_user_ids)
+            or bool(normalize_text(str(ctx.reply_to_user_id)))
         )
         if target_entity_exists and self._looks_like_profile_analysis_request(text):
             return True
 
         # 视频解析/下载类请求
-        if any(k in text for k in ("解析", "下载")) and any(v in text for v in ("视频", "链接", "bv", "av")):
+        if any(k in text for k in ("解析", "下载")) and any(
+            v in text for v in ("视频", "链接", "bv", "av")
+        ):
             return True
 
         return False
 
     @staticmethod
-    def _has_segment_type(segments: list[dict[str, Any]] | None, wanted: set[str]) -> bool:
+    def _has_segment_type(
+        segments: list[dict[str, Any]] | None, wanted: set[str]
+    ) -> bool:
         for seg in segments or []:
             if not isinstance(seg, dict):
                 continue
@@ -2900,7 +3411,9 @@ class AgentLoop:
     def _has_image_media(self, ctx: AgentContext) -> bool:
         return (
             any(item.startswith("image:") for item in (ctx.media_summary or []))
-            or any(item.startswith("image:") for item in (ctx.reply_media_summary or []))
+            or any(
+                item.startswith("image:") for item in (ctx.reply_media_summary or [])
+            )
             or self._text_has_image_hint(ctx.message_text)
             or self._text_has_image_hint(ctx.reply_to_text)
             or self._has_segment_type(ctx.raw_segments, {"image"})
@@ -2910,7 +3423,9 @@ class AgentLoop:
     def _has_video_media(self, ctx: AgentContext) -> bool:
         return (
             any(item.startswith("video:") for item in (ctx.media_summary or []))
-            or any(item.startswith("video:") for item in (ctx.reply_media_summary or []))
+            or any(
+                item.startswith("video:") for item in (ctx.reply_media_summary or [])
+            )
             or self._has_segment_type(ctx.raw_segments, {"video"})
             or self._has_segment_type(ctx.reply_media_segments, {"video"})
         )
@@ -2999,9 +3514,15 @@ class AgentLoop:
         if self._looks_like_generic_media_question(text):
             return True
         reference_cues = tuple(
-            normalize_text(cue).lower() for cue in _pl.get_list("image_reference_cues") if normalize_text(cue)
+            normalize_text(cue).lower()
+            for cue in _pl.get_list("image_reference_cues")
+            if normalize_text(cue)
         )
-        if ("?" in text or "？" in text) and reference_cues and any(cue in text for cue in reference_cues):
+        if (
+            ("?" in text or "？" in text)
+            and reference_cues
+            and any(cue in text for cue in reference_cues)
+        ):
             return True
         return False
 
@@ -3011,21 +3532,54 @@ class AgentLoop:
             return False
         if self._looks_like_generic_media_question(text):
             return True
-        video_cues = (
-            "视频",
-            "影片",
-            "录像",
-            "錄像",
-            "画面",
-            "畫面",
-            "内容",
-            "內容",
-            "解析",
-            "分析",
-            "总结",
-            "總結",
-        )
-        return any(cue in text for cue in video_cues)
+        return not text
+
+    def _select_forced_video_tool(
+        self, ctx: AgentContext
+    ) -> tuple[str, dict[str, Any]] | None:
+        if not self._has_video_media(ctx):
+            return None
+
+        text = normalize_text(ctx.message_text)
+        contextual_text = self._rebuild_query_with_context(text, ctx) or text
+        video_url = self._extract_recent_media_url(ctx, "video")
+        mode = self._infer_split_video_mode(contextual_text)
+        time_hints = self._infer_video_time_hints(contextual_text)
+        frame_hint = self._infer_frame_count_hint(contextual_text)
+
+        if not mode:
+            if frame_hint > 0:
+                mode = "frames"
+            elif time_hints.get("start") is not None and time_hints.get("end") is not None:
+                mode = "clip"
+            elif time_hints.get("point") is not None:
+                mode = "cover"
+
+        if mode:
+            forced_args: dict[str, Any] = {"mode": mode}
+            if video_url:
+                forced_args["url"] = video_url
+            if mode in {"clip", "audio"}:
+                if time_hints.get("start") is not None:
+                    forced_args["start_seconds"] = time_hints["start"]
+                if time_hints.get("end") is not None:
+                    forced_args["end_seconds"] = time_hints["end"]
+            elif mode == "cover":
+                if time_hints.get("point") is not None:
+                    forced_args["frame_time_seconds"] = time_hints["point"]
+            elif mode == "frames" and frame_hint > 0:
+                forced_args["max_frames"] = frame_hint
+            return "split_video", forced_args
+
+        if self._should_force_local_video_tool_first(ctx):
+            forced_args = {}
+            if video_url:
+                forced_args["url"] = video_url
+            if text:
+                forced_args["question"] = text
+            return "analyze_local_video", forced_args
+
+        return None
 
     def _should_force_voice_tool_first(self, ctx: AgentContext) -> bool:
         text = normalize_text(ctx.message_text).lower()
@@ -3049,7 +3603,9 @@ class AgentLoop:
         )
         return any(cue in text for cue in voice_cues)
 
-    def _select_forced_media_tool(self, ctx: AgentContext) -> tuple[str, dict[str, Any]] | None:
+    def _select_forced_media_tool(
+        self, ctx: AgentContext
+    ) -> tuple[str, dict[str, Any]] | None:
         if self._looks_like_image_generation_request(ctx.message_text):
             prompt = self._infer_image_generation_prompt(ctx.message_text)
             tool_name = ""
@@ -3075,12 +3631,9 @@ class AgentLoop:
                 forced_args["question"] = question
             return "analyze_image", forced_args
 
-        if self._should_force_local_video_tool_first(ctx):
-            forced_args: dict[str, Any] = {}
-            video_url = self._extract_recent_media_url(ctx, "video")
-            if video_url:
-                forced_args["url"] = video_url
-            return "analyze_local_video", forced_args
+        forced_video_tool = self._select_forced_video_tool(ctx)
+        if forced_video_tool:
+            return forced_video_tool
 
         if self._should_force_voice_tool_first(ctx):
             forced_args: dict[str, Any] = {}
@@ -3095,16 +3648,43 @@ class AgentLoop:
     def _looks_like_image_question(text: str) -> bool:
         """判断文本是否在对图片提问。"""
         t = (text or "").lower()
-        cues = [normalize_text(cue).lower() for cue in _pl.get_list("image_question_cues") if normalize_text(cue)]
+        cues = [
+            normalize_text(cue).lower()
+            for cue in _pl.get_list("image_question_cues")
+            if normalize_text(cue)
+        ]
         if not cues:
             cues = [
-                "图里", "图中", "这图", "这张图", "看图", "图片", "照片", "截图", "动图", "gif",
-                "这是什么图", "图上", "图里的", "识图", "看不懂图",
+                "图里",
+                "图中",
+                "这图",
+                "这张图",
+                "看图",
+                "图片",
+                "照片",
+                "截图",
+                "动图",
+                "gif",
+                "这是什么图",
+                "图上",
+                "图里的",
+                "识图",
+                "看不懂图",
             ]
         if any(c in t for c in cues):
             return True
         # 弱兜底：出现“图像词 + 提问词”时也视为图片提问。
-        ask_words = ("是谁", "是什么", "谁", "啥", "怎么", "哪", "有没有", "在干嘛", "干什么")
+        ask_words = (
+            "是谁",
+            "是什么",
+            "谁",
+            "啥",
+            "怎么",
+            "哪",
+            "有没有",
+            "在干嘛",
+            "干什么",
+        )
         image_words = ("图", "图片", "照片", "截图", "动图", "gif")
         return any(a in t for a in ask_words) and any(w in t for w in image_words)
 
@@ -3142,14 +3722,18 @@ class AgentLoop:
             "describe",
             "ocr",
         )
-        return any(cue in content for cue in scope_cues) and any(cue in content for cue in action_cues)
+        return any(cue in content for cue in scope_cues) and any(
+            cue in content for cue in action_cues
+        )
 
     def _parse_llm_output(self, text: str) -> dict[str, Any] | None:
         """解析 LLM 输出为 tool_call dict，失败返回 None。"""
         clean = text.strip()
 
         # 先剥离 <thinking>...</thinking> 块（LLM 可能在 tool call 前输出思考）
-        clean = re.sub(r"<thinking>.*?</thinking>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(
+            r"<thinking>.*?</thinking>", "", clean, flags=re.DOTALL | re.IGNORECASE
+        )
         clean = re.sub(r"</?thinking>", "", clean, flags=re.IGNORECASE)
         # 剥离 <tool_call>...</tool_call> 包裹（保留内部 JSON）
         clean = re.sub(r"</?tool_call>", "", clean, flags=re.IGNORECASE)
@@ -3157,7 +3741,8 @@ class AgentLoop:
         # 兼容 <tool_use> tool_name {"arg":"val"} </tool_use> 格式
         tool_use_match = re.search(
             r"<tool_use>\s*(\w+)\s*(\{.*?\})\s*</tool_use>",
-            clean, flags=re.DOTALL | re.IGNORECASE,
+            clean,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         if tool_use_match:
             tool_name = tool_use_match.group(1).strip()
@@ -3173,7 +3758,8 @@ class AgentLoop:
         # 兼容 [tool_use: tool_name] key: value 格式
         bracket_match = re.search(
             r"\[tool_use:\s*(\w+)\]\s*(.*)",
-            clean, flags=re.DOTALL | re.IGNORECASE,
+            clean,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         if bracket_match:
             tool_name = bracket_match.group(1).strip()
@@ -3188,7 +3774,8 @@ class AgentLoop:
         # 兼容 [tool_call(tool_name, key="value")] 格式
         call_match = re.search(
             r"\[tool_call\(\s*(\w+)\s*,\s*(.*?)\)\]",
-            clean, flags=re.DOTALL | re.IGNORECASE,
+            clean,
+            flags=re.DOTALL | re.IGNORECASE,
         )
         if call_match:
             tool_name = call_match.group(1).strip()
@@ -3208,7 +3795,10 @@ class AgentLoop:
                 return data
             # 兼容 OpenAI function calling 格式: {"name": "tool", "arguments": {...}}
             if isinstance(data, dict) and "name" in data:
-                return {"tool": data["name"], "args": data.get("arguments", data.get("args", {}))}
+                return {
+                    "tool": data["name"],
+                    "args": data.get("arguments", data.get("args", {})),
+                }
         except (json.JSONDecodeError, ValueError):
             pass
 
@@ -3219,12 +3809,14 @@ class AgentLoop:
         elif clean.startswith("{"):
             end = self._find_json_end(clean)
             if end is not None and end < len(clean) - 1:
-                first_json = clean[:end + 1]
+                first_json = clean[: end + 1]
                 try:
                     data = json.loads(first_json)
                     norm = self._normalize_tool_call(data)
                     if norm:
-                        _log.debug("parse_multi_json | picked first of concatenated objects")
+                        _log.debug(
+                            "parse_multi_json | picked first of concatenated objects"
+                        )
                         return norm
                 except (json.JSONDecodeError, ValueError):
                     pass
@@ -3248,7 +3840,7 @@ class AgentLoop:
         first_brace = clean.find("{")
         last_brace = clean.rfind("}")
         if first_brace >= 0 and last_brace > first_brace:
-            candidate = clean[first_brace:last_brace + 1]
+            candidate = clean[first_brace : last_brace + 1]
             try:
                 data = json.loads(candidate)
                 norm = self._normalize_tool_call(data)
@@ -3269,7 +3861,10 @@ class AgentLoop:
                 if recovered:
                     return recovered
                 _log.warning("agent_parse_fail_json_like | content=%s", clean[:200])
-                return {"tool": "think", "args": {"thought": "我的上一次输出格式有误，让我重新组织回复"}}
+                return {
+                    "tool": "think",
+                    "args": {"thought": "我的上一次输出格式有误，让我重新组织回复"},
+                }
             if not clean.startswith("{"):
                 return {"tool": "final_answer", "args": {"text": clean}}
 
@@ -3284,7 +3879,10 @@ class AgentLoop:
             return data
         # OpenAI function calling 格式: {"name": "tool", "arguments": {...}}
         if "name" in data:
-            return {"tool": data["name"], "args": data.get("arguments", data.get("args", {}))}
+            return {
+                "tool": data["name"],
+                "args": data.get("arguments", data.get("args", {})),
+            }
         return None
 
     @staticmethod
@@ -3297,7 +3895,7 @@ class AgentLoop:
             if escape:
                 escape = False
                 continue
-            if ch == '\\' and in_string:
+            if ch == "\\" and in_string:
                 escape = True
                 continue
             if ch == '"' and not escape:
@@ -3305,9 +3903,9 @@ class AgentLoop:
                 continue
             if in_string:
                 continue
-            if ch == '{':
+            if ch == "{":
                 depth += 1
-            elif ch == '}':
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
                     return i
@@ -3337,7 +3935,9 @@ class AgentLoop:
         try:
             candidate = str(json.loads(f'"{candidate}"'))
         except Exception:
-            candidate = candidate.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t")
+            candidate = (
+                candidate.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t")
+            )
 
         return normalize_text(candidate)
 
@@ -3388,7 +3988,9 @@ class AgentLoop:
 
         return None
 
-    def _compact_data(self, data: dict[str, Any], max_items: int = 20) -> dict[str, Any]:
+    def _compact_data(
+        self, data: dict[str, Any], max_items: int = 20
+    ) -> dict[str, Any]:
         """压缩工具返回数据，避免 token 爆炸。"""
         result = {}
         for key, value in data.items():
@@ -3413,7 +4015,9 @@ class AgentLoop:
         return ""
 
     @staticmethod
-    def _last_success_audio_file(steps: list[dict[str, Any]], prefer_non_silk: bool = False) -> str:
+    def _last_success_audio_file(
+        steps: list[dict[str, Any]], prefer_non_silk: bool = False
+    ) -> str:
         for step in reversed(steps):
             if not bool(step.get("ok")):
                 continue
@@ -3435,7 +4039,9 @@ class AgentLoop:
             return None
 
         candidates = [clean]
-        for block in re.findall(r"```(?:json)?\s*(.*?)```", clean, flags=re.DOTALL | re.IGNORECASE):
+        for block in re.findall(
+            r"```(?:json)?\s*(.*?)```", clean, flags=re.DOTALL | re.IGNORECASE
+        ):
             block_clean = normalize_text(block)
             if block_clean:
                 candidates.append(block_clean)
@@ -3453,10 +4059,14 @@ class AgentLoop:
             first_brace = candidate.find("{")
             last_brace = candidate.rfind("}")
             if first_brace >= 0 and last_brace > first_brace:
-                parsed = self._parse_embedded_tool_payload(candidate[first_brace:last_brace + 1])
+                parsed = self._parse_embedded_tool_payload(
+                    candidate[first_brace : last_brace + 1]
+                )
                 if parsed:
                     return parsed
-                recovered = self._try_recover_tool_call(candidate[first_brace:last_brace + 1])
+                recovered = self._try_recover_tool_call(
+                    candidate[first_brace : last_brace + 1]
+                )
                 if recovered:
                     return recovered
         return None
@@ -3467,13 +4077,18 @@ class AgentLoop:
         content = normalize_text(text)
         if not content:
             return False
-        if re.search(r"</?\s*(function_calls?|invoke|parameter)\b", content, flags=re.IGNORECASE):
+        if re.search(
+            r"</?\s*(function_calls?|invoke|parameter)\b", content, flags=re.IGNORECASE
+        ):
             return True
         patterns = (
             r"```(?:json)?\s*\{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"[a-zA-Z0-9_.-]+\")(?:[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*?(?:```|$)",
             r"^\{\s*\"(?:name|tool)\"\s*:\s*\"[a-zA-Z0-9_.-]+\"(?=[\s\S]*?\"(?:args|arguments|tool_arguments)\"\s*:)[\s\S]*$",
         )
-        return any(re.search(pattern, content, flags=re.DOTALL | re.IGNORECASE) for pattern in patterns)
+        return any(
+            re.search(pattern, content, flags=re.DOTALL | re.IGNORECASE)
+            for pattern in patterns
+        )
 
     @staticmethod
     def _normalize_embedded_tool_name(name: str) -> str:
@@ -3535,15 +4150,25 @@ class AgentLoop:
             first = tool_uses[0]
             if isinstance(first, dict):
                 name = first.get("tool_name") or first.get("name") or first.get("tool")
-                args = first.get("tool_arguments", first.get("arguments", first.get("args", {})))
+                args = first.get(
+                    "tool_arguments", first.get("arguments", first.get("args", {}))
+                )
                 if isinstance(name, str) and name.strip():
-                    return {"tool": name.strip(), "args": args if isinstance(args, dict) else {}}
+                    return {
+                        "tool": name.strip(),
+                        "args": args if isinstance(args, dict) else {},
+                    }
 
         # 兼容 {"tool_name":"...","tool_arguments":{...}}
         name = data.get("tool_name") or data.get("name") or data.get("tool")
         if isinstance(name, str) and name.strip():
-            args = data.get("tool_arguments", data.get("arguments", data.get("args", {})))
-            return {"tool": name.strip(), "args": args if isinstance(args, dict) else {}}
+            args = data.get(
+                "tool_arguments", data.get("arguments", data.get("args", {}))
+            )
+            return {
+                "tool": name.strip(),
+                "args": args if isinstance(args, dict) else {},
+            }
 
         return None
 
@@ -3569,7 +4194,8 @@ class AgentLoop:
             if display:
                 return AgentResult(
                     reply_text=display,
-                    action="reply", reason=f"agent_fallback_{reason}",
+                    action="reply",
+                    reason=f"agent_fallback_{reason}",
                     tool_calls_made=tool_calls_made,
                     total_time_ms=self._elapsed(t0),
                     steps=steps,
@@ -3581,14 +4207,17 @@ class AgentLoop:
             if isinstance(step, dict) and step.get("tool") and step.get("ok") is False
         ]
         fail_hint = ", ".join(failed_tools[:4]) if failed_tools else reason
-        ai_reply = await self._ai_fallback_reply(ctx, f"处理过程中失败({fail_hint})，没拿到最终结果")
+        ai_reply = await self._ai_fallback_reply(
+            ctx, f"处理过程中失败({fail_hint})，没拿到最终结果"
+        )
         fallback_text = ai_reply or _pl.get_message(
             "no_result",
             "我这边工具刚刚没跑通，你换个说法或稍后再试，我继续处理。",
         )
         return AgentResult(
             reply_text=fallback_text,
-            action="reply", reason=f"agent_fallback_{reason}",
+            action="reply",
+            reason=f"agent_fallback_{reason}",
             tool_calls_made=tool_calls_made,
             total_time_ms=self._elapsed(t0),
             steps=steps,
@@ -3652,7 +4281,9 @@ class AgentLoop:
             path = parsed.path or ""
             query = parsed.query or ""
             # 去掉 fragment；query 保留，避免同路径不同资源被误合并。
-            return f"{parsed.scheme.lower()}://{host}{path}" + (f"?{query}" if query else "")
+            return f"{parsed.scheme.lower()}://{host}{path}" + (
+                f"?{query}" if query else ""
+            )
         except Exception:
             return ""
 
@@ -3676,7 +4307,12 @@ class AgentLoop:
             for key, value in payload.items():
                 key_norm = normalize_text(str(key)).lower()
                 if isinstance(value, str):
-                    if "url" in key_norm or key_norm in {"source", "link", "image", "video"}:
+                    if "url" in key_norm or key_norm in {
+                        "source",
+                        "link",
+                        "image",
+                        "video",
+                    }:
                         norm = cls._normalize_media_url(value)
                         if norm:
                             out.add(norm)
@@ -3697,12 +4333,16 @@ class AgentLoop:
             if norm:
                 out.add(norm)
 
-    def _collect_known_media_urls(self, steps: list[dict[str, Any]], ctx: AgentContext) -> set[str]:
+    def _collect_known_media_urls(
+        self, steps: list[dict[str, Any]], ctx: AgentContext
+    ) -> set[str]:
         known: set[str] = set()
         for raw_text in (ctx.message_text, ctx.reply_to_text):
             if not raw_text:
                 continue
-            for found in re.findall(r"https?://[^\s<>\"]+", raw_text, flags=re.IGNORECASE):
+            for found in re.findall(
+                r"https?://[^\s<>\"]+", raw_text, flags=re.IGNORECASE
+            ):
                 norm = self._normalize_media_url(found)
                 if norm:
                     known.add(norm)
@@ -3729,7 +4369,10 @@ class AgentLoop:
             for key, value in payload.items():
                 key_norm = normalize_text(str(key)).lower()
                 if isinstance(value, str):
-                    if any(token in key_norm for token in ("path", "file", "url", "image", "video")):
+                    if any(
+                        token in key_norm
+                        for token in ("path", "file", "url", "image", "video")
+                    ):
                         local = cls._normalize_local_media_path(value)
                         if local:
                             out.add(local)
@@ -3765,7 +4408,9 @@ class AgentLoop:
                     refs.append(value)
         return refs
 
-    def _collect_known_local_media_paths(self, steps: list[dict[str, Any]], ctx: AgentContext) -> set[str]:
+    def _collect_known_local_media_paths(
+        self, steps: list[dict[str, Any]], ctx: AgentContext
+    ) -> set[str]:
         known: set[str] = set()
         for step in steps:
             if not isinstance(step, dict):
@@ -3773,9 +4418,9 @@ class AgentLoop:
             step_data = step.get("data", {})
             if isinstance(step_data, dict) and step_data:
                 self._collect_local_paths_from_payload(step_data, known)
-        for item in self._extract_media_refs_from_segments(ctx.raw_segments) + self._extract_media_refs_from_segments(
-            ctx.reply_media_segments
-        ):
+        for item in self._extract_media_refs_from_segments(
+            ctx.raw_segments
+        ) + self._extract_media_refs_from_segments(ctx.reply_media_segments):
             local = self._normalize_local_media_path(item)
             if local:
                 known.add(local)
@@ -3810,7 +4455,11 @@ class AgentLoop:
                 "必须使用简体中文，不要输出英文段落。"
                 "禁止说自己是 IDE 助手或说无法扮演当前角色。"
             )
-            memory_lines = [f"- {clip_text(normalize_text(item), 80)}" for item in ctx.memory_context[-5:] if normalize_text(item)]
+            memory_lines = [
+                f"- {clip_text(normalize_text(item), 80)}"
+                for item in ctx.memory_context[-5:]
+                if normalize_text(item)
+            ]
             memory_block = "\n".join(memory_lines) if memory_lines else "(无)"
             user_msg = (
                 f"用户说：{clip_text(ctx.message_text, 200)}\n"
@@ -3822,8 +4471,13 @@ class AgentLoop:
             )
             raw = await asyncio.wait_for(
                 self.model_client.chat_text_with_retry(
-                    [{"role": "system", "content": system}, {"role": "user", "content": user_msg}],
-                    max_tokens=100, retries=1, backoff=0.5,
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    max_tokens=100,
+                    retries=1,
+                    backoff=0.5,
                 ),
                 timeout=8,
             )

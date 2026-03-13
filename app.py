@@ -1341,8 +1341,8 @@ def register_handlers(engine: YukikoEngine) -> None:
             "multi_reply_enable": bool(bot_cfg_rt.get("multi_reply_enable", True)),
             "multi_reply_max_chunks": max(1, _as_int(bot_cfg_rt.get("multi_reply_max_chunks", 4), 4)),
             "multi_reply_max_lines": max(1, _as_int(bot_cfg_rt.get("multi_reply_max_lines", 1), 1)),
-            "multi_reply_max_chars": max(80, _as_int(bot_cfg_rt.get("multi_reply_max_chars", 160), 160)),
-            "multi_reply_chat_max_chars": max(60, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chars", 120), 120)),
+            "multi_reply_max_chars": max(160, _as_int(bot_cfg_rt.get("multi_reply_max_chars", 520), 520)),
+            "multi_reply_chat_max_chars": max(120, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chars", 320), 320)),
             "multi_reply_chat_max_chunks": max(1, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chunks", 6), 6)),
             "multi_reply_interval_ms": max(0, _as_int(bot_cfg_rt.get("multi_reply_interval_ms", 260), 260)),
             "multi_image_max_count": max(1, _as_int(bot_cfg_rt.get("multi_image_max_count", 9), 9)),
@@ -2067,8 +2067,8 @@ def register_handlers(engine: YukikoEngine) -> None:
                     chunk_max_chars = multi_reply_max_chars
                     chunk_max_count = multi_reply_max_chunks
                     if action == "reply":
-                        # 日常聊天默认更积极分段，避免“AI 一大段”
-                        chunk_max_lines = min(chunk_max_lines, 1)
+                        # 日常聊天仍可分段，但不要切得过碎。
+                        chunk_max_lines = min(chunk_max_lines, 2)
                         chunk_max_chars = min(chunk_max_chars, multi_reply_chat_max_chars)
                         chunk_max_count = max(chunk_max_count, multi_reply_chat_max_chunks)
                     if action == "search":

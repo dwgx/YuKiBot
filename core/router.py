@@ -43,7 +43,6 @@ class RouterInput:
     followup_candidate: bool = False
     listen_probe: bool = False
     risk_level: str = "safe"
-    learned_keywords: list[str] = field(default_factory=list)
     runtime_group_context: list[str] = field(default_factory=list)
 
 
@@ -73,14 +72,27 @@ class RouterEngine:
         self.mode = str(routing_cfg.get("mode", "ai_full")).strip() or "ai_full"
         self.min_confidence = float(routing_cfg.get("min_confidence", 0.58))
         self.max_tool_hops = max(1, int(routing_cfg.get("max_tool_hops", 1)))
-        self.failover_mode = str(routing_cfg.get("failover_mode", "mention_or_private_only")).strip()
-        self.trust_ai_fully = bool(routing_cfg.get("trust_ai_fully", True))  # 默认完全信任 AI
-        self.followup_fast_path_enable = bool(routing_cfg.get("followup_fast_path_enable", False))  # 禁用快速路径
+        self.failover_mode = str(
+            routing_cfg.get("failover_mode", "mention_or_private_only")
+        ).strip()
+        self.trust_ai_fully = bool(
+            routing_cfg.get("trust_ai_fully", True)
+        )  # 默认完全信任 AI
+        self.followup_fast_path_enable = bool(
+            routing_cfg.get("followup_fast_path_enable", False)
+        )  # 禁用快速路径
         self.passive_multimodal_followup_min_confidence = max(
             0.0,
-            min(1.0, float(routing_cfg.get("passive_multimodal_followup_min_confidence", 0.72))),
+            min(
+                1.0,
+                float(
+                    routing_cfg.get("passive_multimodal_followup_min_confidence", 0.72)
+                ),
+            ),
         )
-        self.multi_user_dialogue_min_users = max(2, int(routing_cfg.get("multi_user_dialogue_min_users", 2)))
+        self.multi_user_dialogue_min_users = max(
+            2, int(routing_cfg.get("multi_user_dialogue_min_users", 2))
+        )
         output_cfg = config.get("output", {}) if isinstance(config, dict) else {}
         self.token_saving = bool(output_cfg.get("token_saving", False))
         self.allow_actions = {
@@ -154,7 +166,11 @@ class RouterEngine:
         if self.mode != "ai_full":
             return fallback
         if not self.model_client.enabled:
-            if payload.mentioned or payload.is_private or self._looks_like_bot_address(payload.text):
+            if (
+                payload.mentioned
+                or payload.is_private
+                or self._looks_like_bot_address(payload.text)
+            ):
                 return RouterDecision(
                     should_handle=True,
                     action="reply",
@@ -204,7 +220,9 @@ class RouterEngine:
             "reply_to_text": clip_text(payload.reply_to_text, 400),
             "recent_messages": payload.recent_messages[-recent_limit:],
             "recent_bot_replies": payload.recent_bot_replies[-2:],
-            "user_profile_summary": "" if self.token_saving else payload.user_profile_summary,
+            "user_profile_summary": (
+                "" if self.token_saving else payload.user_profile_summary
+            ),
             "thread_state": {} if self.token_saving else payload.thread_state,
             "queue_depth": payload.queue_depth,
             "busy_messages": payload.busy_messages,
@@ -214,7 +232,6 @@ class RouterEngine:
             "followup_candidate": payload.followup_candidate,
             "listen_probe": payload.listen_probe,
             "risk_level": payload.risk_level,
-            "learned_keywords": payload.learned_keywords[:12],
             "runtime_group_context": payload.runtime_group_context[-10:],
             "raw_segments": payload.raw_segments,
             "media_summary": payload.media_summary[:8],
@@ -236,7 +253,12 @@ class RouterEngine:
         t0 = time.monotonic()
         data = await self.model_client.chat_json(messages)
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        self._log.info("router_llm | trace=%s | elapsed=%dms | raw=%s", payload.trace_id, elapsed_ms, repr(data)[:300])
+        self._log.info(
+            "router_llm | trace=%s | elapsed=%dms | raw=%s",
+            payload.trace_id,
+            elapsed_ms,
+            repr(data)[:300],
+        )
 
         if not isinstance(data, dict):
             self._log.warning(
@@ -247,7 +269,9 @@ class RouterEngine:
             )
             return fallback
 
-        decision = self._parse_decision(data, fallback, plugin_schema, method_schema, payload)
+        decision = self._parse_decision(
+            data, fallback, plugin_schema, method_schema, payload
+        )
         self._log.info(
             "router_decision | trace=%s | action=%s | confidence=%.2f | reason=%s | style=%s",
             payload.trace_id,
@@ -280,17 +304,23 @@ class RouterEngine:
     ) -> RouterDecision:
         allowed_styles = {"short", "casual", "serious", "long"}
         plugin_names = {str(item.get("name", "")) for item in plugin_schema}
-        method_names = {normalize_text(str(item.get("name", "")).lower()) for item in method_schema}
+        method_names = {
+            normalize_text(str(item.get("name", "")).lower()) for item in method_schema
+        }
 
         action = str(data.get("action", fallback.action)).strip()
         if action not in self.allow_actions:
             action = fallback.action
 
-        should_handle = self._safe_bool(data.get("should_handle"), fallback.should_handle)
+        should_handle = self._safe_bool(
+            data.get("should_handle"), fallback.should_handle
+        )
         if action == "ignore":
             should_handle = False
 
-        reason = normalize_text(str(data.get("reason", fallback.reason))) or fallback.reason
+        reason = (
+            normalize_text(str(data.get("reason", fallback.reason))) or fallback.reason
+        )
         reason_code = normalize_text(str(data.get("reason_code", ""))).lower()
         if not reason_code:
             reason_code = self._build_reason_code(action=action, reason=reason)
@@ -324,7 +354,14 @@ class RouterEngine:
                         passthrough = {
                             k: v
                             for k, v in normalized_args.items()
-                            if k not in {"query", "mode", "method", "method_args", "platform"}
+                            if k
+                            not in {
+                                "query",
+                                "mode",
+                                "method",
+                                "method_args",
+                                "platform",
+                            }
                         }
                         if passthrough:
                             method_args = passthrough
@@ -337,12 +374,19 @@ class RouterEngine:
         method_name_raw = normalize_text(str(tool_args.get("method", "")))
         method_name = self._canonicalize_method_name(method_name_raw)
         if method_name and action != "search":
-            self._log.debug("router_override | method_force_search | method=%s | was=%s", method_name, action)
+            self._log.debug(
+                "router_override | method_force_search | method=%s | was=%s",
+                method_name,
+                action,
+            )
             action = "search"
             should_handle = True
         if method_name:
             # 仅允许约定的兼容方法名称格式。
-            if not re.match(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$", method_name) or method_name not in method_names:
+            if (
+                not re.match(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+$", method_name)
+                or method_name not in method_names
+            ):
                 tool_args.pop("method", None)
                 tool_args.pop("method_args", None)
             else:
@@ -357,10 +401,14 @@ class RouterEngine:
             target_user_id = ""
 
         user_text = payload.text
-        has_image_media = any(item.startswith("image:") for item in payload.media_summary)
+        has_image_media = any(
+            item.startswith("image:") for item in payload.media_summary
+        )
         media_user_text = self._extract_multimodal_user_text(user_text)
         has_inline_multimodal_text = bool(media_user_text)
-        followup_multimodal_window = bool(payload.followup_candidate or payload.active_session)
+        followup_multimodal_window = bool(
+            payload.followup_candidate or payload.active_session
+        )
         passive_multimodal_addressed = (
             payload.mentioned
             or payload.is_private
@@ -412,8 +460,14 @@ class RouterEngine:
                 reply_style="short",
             )
 
-        if passive_multimodal_followup_allowed and action in {"ignore", "reply", "search"}:
-            self._log.debug("router_override | passive_multimodal_followup | was=%s", action)
+        if passive_multimodal_followup_allowed and action in {
+            "ignore",
+            "reply",
+            "search",
+        }:
+            self._log.debug(
+                "router_override | passive_multimodal_followup | was=%s", action
+            )
             action = "search"
             should_handle = True
             tool_args = dict(tool_args)
@@ -429,7 +483,9 @@ class RouterEngine:
             and not self._contains_explicit_adult_intent(media_user_text)
             and action in {"ignore", "reply", "search"}
         ):
-            self._log.debug("router_override | media_instruction_force_search | was=%s", action)
+            self._log.debug(
+                "router_override | media_instruction_force_search | was=%s", action
+            )
             action = "search"
             should_handle = True
             tool_args = dict(tool_args)
@@ -441,7 +497,12 @@ class RouterEngine:
 
         # 关键词覆盖路径已移除：路由结果完全以模型判定为准。
 
-        if payload.at_other_user_only and not payload.mentioned and should_handle and action != "ignore":
+        if (
+            payload.at_other_user_only
+            and not payload.mentioned
+            and should_handle
+            and action != "ignore"
+        ):
             if not self._looks_like_bot_address(user_text):
                 return RouterDecision(
                     should_handle=False,
@@ -477,8 +538,12 @@ class RouterEngine:
         if not (payload.followup_candidate or payload.active_session):
             return None
 
-        has_image_media = any(item.startswith("image:") for item in payload.media_summary)
-        media_user_text = normalize_text(self._extract_multimodal_user_text(payload.text))
+        has_image_media = any(
+            item.startswith("image:") for item in payload.media_summary
+        )
+        media_user_text = normalize_text(
+            self._extract_multimodal_user_text(payload.text)
+        )
         has_inline_multimodal_text = bool(media_user_text)
         fast_path_allowed = (
             payload.mentioned
@@ -486,8 +551,13 @@ class RouterEngine:
             or self._looks_like_bot_address(payload.text)
             or has_inline_multimodal_text
         )
-        if has_image_media and fast_path_allowed and (
-            has_inline_multimodal_text or self._is_passive_multimodal_event(payload.text)
+        if (
+            has_image_media
+            and fast_path_allowed
+            and (
+                has_inline_multimodal_text
+                or self._is_passive_multimodal_event(payload.text)
+            )
         ):
             query = media_user_text or "继续分析这张图"
             return RouterDecision(
@@ -497,7 +567,11 @@ class RouterEngine:
                 reason_code="followup_multimodal_fast_path",
                 confidence=0.9,
                 reply_style="casual",
-                tool_args={"method": "media.analyze_image", "method_args": {}, "query": query},
+                tool_args={
+                    "method": "media.analyze_image",
+                    "method_args": {},
+                    "query": query,
+                },
             )
         return None
 
@@ -545,7 +619,9 @@ class RouterEngine:
             or content.startswith("用户发送多模态消息：")
             or content.startswith("用户@了你并发送多模态消息：")
             or content.lower().startswith("user sent multimodal message:")
-            or content.lower().startswith("user mentioned bot and sent multimodal message:")
+            or content.lower().startswith(
+                "user mentioned bot and sent multimodal message:"
+            )
         )
 
     @staticmethod
@@ -553,8 +629,12 @@ class RouterEngine:
         content = normalize_text(text)
         if not content:
             return ""
-        content = re.sub(r"\bMULTIMODAL_EVENT(?:_AT)?\b", " ", content, flags=re.IGNORECASE)
-        content = content.replace("用户发送多模态消息：", " ").replace("用户@了你并发送多模态消息：", " ")
+        content = re.sub(
+            r"\bMULTIMODAL_EVENT(?:_AT)?\b", " ", content, flags=re.IGNORECASE
+        )
+        content = content.replace("用户发送多模态消息：", " ").replace(
+            "用户@了你并发送多模态消息：", " "
+        )
         content = content.replace("user sent multimodal message:", " ").replace(
             "user mentioned bot and sent multimodal message:",
             " ",
@@ -565,7 +645,12 @@ class RouterEngine:
             content,
             flags=re.IGNORECASE,
         )
-        content = re.sub(r"\b(?:image|video|record|audio|forward)\s*:\s*\S+", " ", content, flags=re.IGNORECASE)
+        content = re.sub(
+            r"\b(?:image|video|record|audio|forward)\s*:\s*\S+",
+            " ",
+            content,
+            flags=re.IGNORECASE,
+        )
         content = re.sub(r"\s+", " ", content).strip()
         parts = content.split()
         while parts and not re.search(r"[A-Za-z0-9\u4e00-\u9fff]", parts[0]):

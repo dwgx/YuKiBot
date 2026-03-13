@@ -4367,15 +4367,15 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
         ToolSchema(
             name="analyze_local_video",
             description=(
-                "深度分析本地视频内容: 提取关键帧画面描述 + 音频转文字。\n"
-                "自动从当前消息或引用消息中提取视频文件。\n"
-                "使用场景: 用户发了视频文件并问'这视频讲了什么'、'分析这个视频'时使用。\n"
-                "与 analyze_video 的区别: 此工具处理用户直接发送的视频文件，analyze_video 处理视频链接。"
+                "深度分析用户直接发送或引用的视频内容：关键帧、字幕/转写、画面摘要、结构化结论。\n"
+                "自动从当前消息或引用消息中提取视频文件，优先用于视频内容理解/总结/解说。\n"
+                "与 analyze_video 的区别：此工具处理用户直接发送的视频文件或引用视频，analyze_video 处理视频链接。"
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "url": {"type": "string", "description": "视频文件URL（可选，不传则从消息中自动提取）"},
+                    "question": {"type": "string", "description": "用户想重点了解的内容（可选）"},
                 },
                 "required": [],
             },
@@ -5417,117 +5417,102 @@ async def _handle_split_video(args: dict[str, Any], context: dict[str, Any]) -> 
 # ── 本地视频内容分析 handler ──
 
 async def _handle_analyze_local_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    """处理本地视频文件的深度内容分析（关键帧 + 音频转文字）。"""
-    from pathlib import Path as _Path
-
-    explicit_url = normalize_text(str(args.get("url", "")))
-    raw_segments = context.get("raw_segments", [])
-    reply_media_segments = context.get("reply_media_segments", [])
+    """处理本地/引用视频的深度内容分析，统一复用共享 VideoAnalyzer 链路。"""
     tool_executor = context.get("tool_executor")
-
-    # 收集视频 URL
-    video_url = explicit_url
-    if not video_url:
-        for segs in (raw_segments, reply_media_segments):
-            for seg in (segs or []):
-                if not isinstance(seg, dict):
-                    continue
-                seg_type = normalize_text(str(seg.get("type", ""))).lower()
-                if seg_type != "video":
-                    continue
-                data = seg.get("data", {}) or {}
-                url = normalize_text(str(data.get("url", "")))
-                if url:
-                    video_url = url
-                    break
-            if video_url:
-                break
-
-    if not video_url:
+    if not tool_executor:
         return ToolCallResult(
             ok=False,
-            error="video_not_found",
-            display="没有找到视频。请发送视频或回复一条视频消息再试。",
+            error="video_analyzer_unavailable",
+            display="视频分析模块未初始化",
         )
+
+    explicit_url = normalize_text(str(args.get("url", "")))
+    message_text = normalize_text(str(context.get("message_text", "")))
+    conversation_id = str(context.get("conversation_id", ""))
+    raw_segments = context.get("raw_segments", [])
+    reply_media_segments = context.get("reply_media_segments", [])
+
+    merged_segments: list[dict[str, Any]] = []
+    for segs in (raw_segments, reply_media_segments):
+        if isinstance(segs, list):
+            merged_segments.extend(item for item in segs if isinstance(item, dict))
+
+    method_args: dict[str, Any] = {}
+    if explicit_url:
+        method_args["url"] = explicit_url
 
     try:
-        from utils.media import (
-            download_file, extract_audio, extract_keyframes,
-            transcribe_audio, run_ffprobe_json, get_media_info,
+        result = await tool_executor._method_video_analyze(
+            method_name="analyze_local_video",
+            method_args=method_args,
+            query=message_text or explicit_url,
+            message_text=message_text,
+            raw_segments=merged_segments,
+            conversation_id=conversation_id,
         )
-
-        cache_dir = _Path("storage/cache/videos")
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        import hashlib
-        fname = hashlib.md5(video_url.encode()).hexdigest()
-        video_path = cache_dir / f"{fname}.mp4"
-
-        # 下载视频
-        if not video_path.is_file():
-            ok = await download_file(video_url, video_path, timeout=50.0, max_size_mb=64.0)
-            if not ok:
-                return ToolCallResult(ok=False, error="video_download_failed", display="视频下载失败（可能超过64MB限制）")
-
-        # 获取视频信息
-        probe = await run_ffprobe_json(video_path)
-        info = get_media_info(probe)
-        duration = info.get("duration", 0)
-
-        results: dict[str, Any] = {"duration": duration, "info": info}
-        display_parts: list[str] = []
-        if duration > 0:
-            display_parts.append(f"时长: {int(duration)}秒")
-
-        # 提取关键帧
-        keyframe_dir = cache_dir / "keyframes" / fname
-        frames = await extract_keyframes(video_path, keyframe_dir, max_frames=6)
-        results["keyframe_count"] = len(frames)
-
-        # 用 Vision API 分析关键帧
-        frame_descriptions: list[str] = []
-        if frames and tool_executor and hasattr(tool_executor, "_method_media_analyze_image"):
-            for i, frame_path in enumerate(frames[:4]):
-                try:
-                    img_result = await tool_executor._method_media_analyze_image(
-                        method_name="analyze_image",
-                        method_args={"url": f"file://{frame_path}"},
-                        query="简要描述这个视频画面的内容",
-                        message_text="",
-                        raw_segments=[],
-                        conversation_id="",
-                    )
-                    if img_result.ok:
-                        desc = str((img_result.payload or {}).get("analysis", ""))
-                        if desc:
-                            frame_descriptions.append(f"画面{i+1}: {clip_text(desc, 100)}")
-                except Exception:
-                    pass
-        if frame_descriptions:
-            results["frame_descriptions"] = frame_descriptions
-            display_parts.append("关键帧分析:\n" + "\n".join(frame_descriptions))
-
-        # 提取音频并转录
-        if info.get("has_audio"):
-            wav_path = await extract_audio(video_path)
-            if wav_path:
-                transcript = await transcribe_audio(wav_path, language="zh", timeout=180.0)
-                if transcript:
-                    results["transcript"] = transcript
-                    display_parts.append(f"音频内容: {clip_text(transcript, 400)}")
-
-        if not display_parts:
-            display_parts.append("视频分析完成，但未能提取有效内容")
-
-        return ToolCallResult(
-            ok=True,
-            data=results,
-            display="\n".join(display_parts),
-        )
-    except ImportError as exc:
-        return ToolCallResult(ok=False, error=f"missing_dependency: {exc}", display=f"缺少依赖: {exc}")
     except Exception as exc:
         _log.warning("analyze_local_video_error | %s", exc)
-        return ToolCallResult(ok=False, error=f"video_analysis_error: {exc}", display=f"视频分析失败: {exc}")
+        return ToolCallResult(
+            ok=False,
+            error=f"video_analysis_error: {exc}",
+            display=f"视频分析失败: {exc}",
+        )
+
+    payload = result.payload or {}
+    text = str(payload.get("text", ""))
+    video_url = str(payload.get("video_url", "")) or explicit_url
+    analysis_context = str(payload.get("analysis_context", text))
+    image_url = str(payload.get("image_url", ""))
+    image_urls = [
+        normalize_text(str(item))
+        for item in (payload.get("image_urls", []) or [])
+        if normalize_text(str(item))
+    ]
+    duration = 0
+    title = ""
+
+    for line in analysis_context.split("\n"):
+        if line.startswith("时长:"):
+            try:
+                parts = line.split(":", 1)[1].strip().split(":")
+                if len(parts) == 3:
+                    duration = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                elif len(parts) == 2:
+                    duration = int(parts[0]) * 60 + int(parts[1])
+            except (ValueError, IndexError):
+                pass
+        elif line.startswith("标题:"):
+            title = line.split(":", 1)[1].strip()
+
+    safety = _estimate_qq_safety(
+        url=video_url or explicit_url or "local-video",
+        title=title or text,
+        duration=duration,
+        platform="local",
+    )
+
+    if result.ok:
+        display_parts = [clip_text(text or analysis_context or "视频分析完成", 500)]
+        display_parts.append(f"安全度: {safety['level']} - {safety.get('suggestion', '')}")
+        data: dict[str, Any] = {
+            "text": text or analysis_context,
+            "qq_safety": safety,
+            "platform": "local",
+        }
+        if video_url:
+            data["video_url"] = video_url
+        if image_url:
+            data["image_url"] = image_url
+        if image_urls:
+            data["image_urls"] = image_urls
+        return ToolCallResult(ok=True, data=data, display="\n".join(display_parts))
+
+    error_text = result.error or "分析失败"
+    return ToolCallResult(
+        ok=False,
+        error=error_text,
+        display=text or f"视频分析失败: {error_text}",
+    )
 
 def _register_admin_tools(registry: AgentToolRegistry) -> None:
     """注册管理指令工具，让 Agent 可以执行 /yuki 系列命令。"""

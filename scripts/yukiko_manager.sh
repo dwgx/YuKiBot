@@ -111,7 +111,9 @@ Commands:
 Uninstall options:
   --service-name NAME               Service name (default: ${DEFAULT_SERVICE_NAME})
   --purge-runtime                   Remove .venv, webui/node_modules, webui/dist
+  --purge-state                     Remove storage/cache, __pycache__, .pytest_cache
   --purge-env                       Remove .env and .env.prod
+  --purge-all                       Shortcut for --purge-runtime --purge-state --purge-env
   --keep-cli                        Keep /usr/local/bin/yukiko
   --yes                             No confirmation prompt
 
@@ -126,6 +128,7 @@ Examples:
   yukiko logs --lines 200
   yukiko set-port --port 8088 --host 0.0.0.0
   yukiko uninstall --purge-runtime --purge-env --yes
+  yukiko uninstall --purge-all --yes
 EOF
 }
 
@@ -548,6 +551,7 @@ cmd_set_port() {
 cmd_uninstall() {
   local service_name="$DEFAULT_SERVICE_NAME"
   local purge_runtime=0
+  local purge_state=0
   local purge_env=0
   local remove_cli=1
   local assume_yes=0
@@ -563,7 +567,17 @@ cmd_uninstall() {
         purge_runtime=1
         shift
         ;;
+      --purge-state)
+        purge_state=1
+        shift
+        ;;
       --purge-env)
+        purge_env=1
+        shift
+        ;;
+      --purge-all)
+        purge_runtime=1
+        purge_state=1
         purge_env=1
         shift
         ;;
@@ -587,6 +601,9 @@ cmd_uninstall() {
     echo "- service: $service_name (stop/disable/remove)"
     if [[ "$purge_runtime" -eq 1 ]]; then
       echo "- purge runtime: .venv, webui/node_modules, webui/dist"
+    fi
+    if [[ "$purge_state" -eq 1 ]]; then
+      echo "- purge state: storage/cache, __pycache__, .pytest_cache"
     fi
     if [[ "$purge_env" -eq 1 ]]; then
       echo "- purge env: .env, .env.prod"
@@ -619,6 +636,11 @@ cmd_uninstall() {
   if [[ "$purge_runtime" -eq 1 ]]; then
     rm -rf "$ROOT_DIR/.venv" "$ROOT_DIR/webui/node_modules" "$ROOT_DIR/webui/dist"
     info "Runtime artifacts removed."
+  fi
+
+  if [[ "$purge_state" -eq 1 ]]; then
+    rm -rf "$ROOT_DIR/storage/cache" "$ROOT_DIR/__pycache__" "$ROOT_DIR/.pytest_cache"
+    info "Local state/cache artifacts removed."
   fi
 
   if [[ "$purge_env" -eq 1 ]]; then
