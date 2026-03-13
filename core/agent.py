@@ -571,8 +571,8 @@ class AgentLoop:
         """执行 Agent 循环，返回最终结果。"""
         t0 = time.monotonic()
         steps: list[dict[str, Any]] = []
+        forced_media_tool = self._select_forced_media_tool(ctx)
         force_tool_first = self._should_force_tool_first(ctx)
-        force_image_tool_first = self._should_force_image_tool_first(ctx)
 
         system_prompt = self._build_system_prompt(ctx)
         messages: list[dict[str, str]] = [
@@ -698,22 +698,17 @@ class AgentLoop:
                 tool_args = {}
             tool_name, tool_args = self._rewrite_download_tool_if_needed(tool_name, tool_args, ctx)
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
-            if force_image_tool_first and tool_calls_made == 0 and tool_name not in {"analyze_image", "think"}:
+            if forced_media_tool and tool_calls_made == 0 and tool_name not in {forced_media_tool[0], "think"}:
+                forced_name, forced_args = forced_media_tool
                 _log.info(
-                    "agent_force_image_tool_first | trace=%s | step=%d | from=%s",
+                    "agent_force_media_tool_first | trace=%s | step=%d | from=%s | to=%s",
                     ctx.trace_id,
                     step_idx,
                     tool_name or "unknown",
+                    forced_name,
                 )
-                forced_args: dict[str, Any] = {}
-                first_url = self._extract_first_url(ctx.message_text)
-                if first_url and self._looks_like_image_url(first_url):
-                    forced_args["url"] = first_url
-                question = normalize_text(ctx.message_text)
-                if question:
-                    forced_args["question"] = question
-                tool_name = "analyze_image"
-                tool_args = forced_args
+                tool_name = forced_name
+                tool_args = dict(forced_args)
             missing_args = self._missing_required_tool_args(tool_name, tool_args)
 
             _log.info(
@@ -2714,6 +2709,9 @@ class AgentLoop:
         if not text and not ctx.media_summary and not ctx.reply_media_summary:
             return False
 
+        if self._select_forced_media_tool(ctx):
+            return True
+
         # 任何外链默认工具优先（解析/抓取/校验）
         if re.search(r"https?://", text):
             return True
@@ -2755,27 +2753,116 @@ class AgentLoop:
 
         return False
 
-    def _should_force_image_tool_first(self, ctx: AgentContext) -> bool:
-        text = normalize_text(ctx.message_text).lower()
-        has_image = (
+    @staticmethod
+    def _has_segment_type(segments: list[dict[str, Any]] | None, wanted: set[str]) -> bool:
+        for seg in segments or []:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            if seg_type in wanted:
+                return True
+        return False
+
+    def _has_image_media(self, ctx: AgentContext) -> bool:
+        return (
             any(item.startswith("image:") for item in (ctx.media_summary or []))
             or any(item.startswith("image:") for item in (ctx.reply_media_summary or []))
             or self._text_has_image_hint(ctx.message_text)
             or self._text_has_image_hint(ctx.reply_to_text)
-            or any(
-                normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
-                for seg in (ctx.raw_segments or [])
-                if isinstance(seg, dict)
-            )
-            or any(
-                normalize_text(str((seg or {}).get("type", ""))).lower() == "image"
-                for seg in (ctx.reply_media_segments or [])
-                if isinstance(seg, dict)
-            )
+            or self._has_segment_type(ctx.raw_segments, {"image"})
+            or self._has_segment_type(ctx.reply_media_segments, {"image"})
         )
-        if not has_image:
+
+    def _has_video_media(self, ctx: AgentContext) -> bool:
+        return (
+            any(item.startswith("video:") for item in (ctx.media_summary or []))
+            or any(item.startswith("video:") for item in (ctx.reply_media_summary or []))
+            or self._has_segment_type(ctx.raw_segments, {"video"})
+            or self._has_segment_type(ctx.reply_media_segments, {"video"})
+        )
+
+    def _has_voice_media(self, ctx: AgentContext) -> bool:
+        return (
+            any(
+                item.startswith(prefix)
+                for item in (ctx.media_summary or [])
+                for prefix in ("audio:", "record:")
+            )
+            or any(
+                item.startswith(prefix)
+                for item in (ctx.reply_media_summary or [])
+                for prefix in ("audio:", "record:")
+            )
+            or self._has_segment_type(ctx.raw_segments, {"audio", "record"})
+            or self._has_segment_type(ctx.reply_media_segments, {"audio", "record"})
+        )
+
+    @staticmethod
+    def _looks_like_generic_media_question(text: str) -> bool:
+        t = normalize_text(text).lower()
+        if not t:
+            return True
+        direct_cues = (
+            "这是什么",
+            "這是什麼",
+            "這是什麽",
+            "这是啥",
+            "這是啥",
+            "啥意思",
+            "什么意思",
+            "什麼意思",
+            "什麽意思",
+            "看下",
+            "看一下",
+            "看看",
+            "帮我看",
+            "幫我看",
+            "解释一下",
+            "解釋一下",
+            "说说",
+            "說說",
+            "讲了什么",
+            "講了什麼",
+            "说了什么",
+            "說了什麼",
+            "写了什么",
+            "寫了什麼",
+            "读一下",
+            "讀一下",
+            "内容是什么",
+            "內容是什麼",
+        )
+        if any(cue in t for cue in direct_cues):
+            return True
+        ask_tokens = (
+            "什么",
+            "什麼",
+            "啥",
+            "谁",
+            "誰",
+            "哪",
+            "怎么",
+            "怎麼",
+            "意思",
+            "内容",
+            "內容",
+            "看",
+            "读",
+            "讀",
+            "讲",
+            "講",
+            "写",
+            "寫",
+        )
+        return len(t) <= 12 and any(token in t for token in ask_tokens)
+
+    def _should_force_image_tool_first(self, ctx: AgentContext) -> bool:
+        text = normalize_text(ctx.message_text).lower()
+        if not self._has_image_media(ctx):
             return False
         if self._looks_like_image_question(text):
+            return True
+        if self._looks_like_generic_media_question(text):
             return True
         reference_cues = tuple(
             normalize_text(cue).lower() for cue in _pl.get_list("image_reference_cues") if normalize_text(cue)
@@ -2783,6 +2870,77 @@ class AgentLoop:
         if ("?" in text or "？" in text) and reference_cues and any(cue in text for cue in reference_cues):
             return True
         return False
+
+    def _should_force_local_video_tool_first(self, ctx: AgentContext) -> bool:
+        text = normalize_text(ctx.message_text).lower()
+        if not self._has_video_media(ctx):
+            return False
+        if self._looks_like_generic_media_question(text):
+            return True
+        video_cues = (
+            "视频",
+            "影片",
+            "录像",
+            "錄像",
+            "画面",
+            "畫面",
+            "内容",
+            "內容",
+            "解析",
+            "分析",
+            "总结",
+            "總結",
+        )
+        return any(cue in text for cue in video_cues)
+
+    def _should_force_voice_tool_first(self, ctx: AgentContext) -> bool:
+        text = normalize_text(ctx.message_text).lower()
+        if not self._has_voice_media(ctx):
+            return False
+        if self._looks_like_generic_media_question(text):
+            return True
+        voice_cues = (
+            "语音",
+            "語音",
+            "录音",
+            "錄音",
+            "音频",
+            "音頻",
+            "转文字",
+            "轉文字",
+            "听不清",
+            "聽不清",
+            "内容",
+            "內容",
+        )
+        return any(cue in text for cue in voice_cues)
+
+    def _select_forced_media_tool(self, ctx: AgentContext) -> tuple[str, dict[str, Any]] | None:
+        if self._should_force_image_tool_first(ctx):
+            forced_args: dict[str, Any] = {}
+            first_url = self._extract_first_url(ctx.message_text)
+            if first_url and self._looks_like_image_url(first_url):
+                forced_args["url"] = first_url
+            question = normalize_text(ctx.message_text)
+            if question:
+                forced_args["question"] = question
+            return "analyze_image", forced_args
+
+        if self._should_force_local_video_tool_first(ctx):
+            forced_args: dict[str, Any] = {}
+            video_url = self._extract_recent_media_url(ctx, "video")
+            if video_url:
+                forced_args["url"] = video_url
+            return "analyze_local_video", forced_args
+
+        if self._should_force_voice_tool_first(ctx):
+            forced_args: dict[str, Any] = {}
+            voice_url = self._extract_recent_media_url(ctx, "audio")
+            if voice_url:
+                forced_args["url"] = voice_url
+            return "analyze_voice", forced_args
+
+        return None
 
     @staticmethod
     def _looks_like_image_question(text: str) -> bool:

@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import unittest
 
-from core.agent import AgentLoop
+from core.agent import AgentContext, AgentLoop
 from core.engine import YukikoEngine
 
 
 class ToolCallLeakRegressionTests(unittest.TestCase):
+    @staticmethod
+    def _make_ctx(**overrides) -> AgentContext:
+        base = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="",
+        )
+        for key, value in overrides.items():
+            setattr(base, key, value)
+        return base
+
     def test_agent_recovers_truncated_named_final_answer_payload(self) -> None:
         loop = AgentLoop.__new__(AgentLoop)
         loop.fallback_on_parse_error = True
@@ -59,6 +75,57 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         loop = AgentLoop.__new__(AgentLoop)
         url = "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123"
         self.assertTrue(loop._looks_like_image_url(url))
+
+    def test_agent_forces_image_tool_for_short_image_question(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        ctx = self._make_ctx(
+            message_text="MULTIMODAL_EVENT_AT user mentioned bot and sent multimodal message: image:https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123\n這是什麽",
+            raw_segments=[
+                {
+                    "type": "image",
+                    "data": {"url": "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123"},
+                }
+            ],
+        )
+        forced = loop._select_forced_media_tool(ctx)
+        self.assertIsNotNone(forced)
+        assert forced is not None
+        self.assertEqual(forced[0], "analyze_image")
+        self.assertEqual(
+            forced[1].get("url"),
+            "https://multimedia.nt.qq.com.cn/download?appid=1407&fileid=abc123",
+        )
+        self.assertIn("這是什麽", forced[1].get("question", ""))
+
+    def test_agent_forces_local_video_tool_for_short_question(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        ctx = self._make_ctx(
+            message_text="这是什么",
+            raw_segments=[
+                {
+                    "type": "video",
+                    "data": {"url": "https://example.com/demo.mp4"},
+                }
+            ],
+            media_summary=["video:https://example.com/demo.mp4"],
+        )
+        forced = loop._select_forced_media_tool(ctx)
+        self.assertEqual(forced, ("analyze_local_video", {"url": "https://example.com/demo.mp4"}))
+
+    def test_agent_forces_voice_tool_for_short_question(self) -> None:
+        loop = AgentLoop.__new__(AgentLoop)
+        ctx = self._make_ctx(
+            message_text="说了什么",
+            raw_segments=[
+                {
+                    "type": "record",
+                    "data": {"url": "https://example.com/demo.mp3"},
+                }
+            ],
+            media_summary=["record:https://example.com/demo.mp3"],
+        )
+        forced = loop._select_forced_media_tool(ctx)
+        self.assertEqual(forced, ("analyze_voice", {"url": "https://example.com/demo.mp3"}))
 
 
 if __name__ == "__main__":
