@@ -2471,6 +2471,24 @@ def register_handlers(engine: YukikoEngine) -> None:
     @request_router.handle()
     async def handle_request(bot: Bot, event: Event) -> None:
         _log_qq_generic_event(kind="qq_request", event=event, bot_id=str(bot.self_id))
+        # 自动同意好友请求
+        payload = _event_to_dict(event)
+        request_type = normalize_text(str(payload.get("request_type", ""))).lower()
+        if request_type == "friend":
+            flag = str(payload.get("flag", "")).strip()
+            user_id = str(payload.get("user_id", "")).strip()
+            if flag:
+                try:
+                    await bot.set_friend_add_request(flag=flag, approve=True)
+                    _log.info(
+                        "auto_accept_friend | bot=%s | user=%s | flag=%s",
+                        bot.self_id, user_id, flag[:40],
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "auto_accept_friend_failed | bot=%s | user=%s | error=%s",
+                        bot.self_id, user_id, str(exc)[:120],
+                    )
 
     @meta_router.handle()
     async def handle_meta(bot: Bot, event: Event) -> None:

@@ -1206,6 +1206,13 @@ class YukikoEngine:
 
         self.min_reply_chars = max(8, int(bot_config.get("min_reply_chars", 16)))
 
+        # 多段发送总字数预算，供 _limit_reply_text 使用（避免在分段前就截断）
+        _mr_max_chars = max(160, int(bot_config.get("multi_reply_max_chars", 520)))
+        _mr_max_chunks = max(1, int(bot_config.get("multi_reply_max_chunks", 6)))
+        self._multi_reply_total_budget = _mr_max_chars * _mr_max_chunks if bool(
+            bot_config.get("multi_reply_enable", True)
+        ) else 0
+
         kaomoji_raw = bot_config.get("kaomoji_allowlist", ["QWQ", "AWA"])
 
         if not isinstance(kaomoji_raw, list):
@@ -4601,9 +4608,8 @@ class YukikoEngine:
             for seg in all_segments
         ) or bool(self._extract_first_video_url_from_text(text_norm))
 
-        image_reference = bool(
-            re.search(r"(这张图|历史图片|图里|图中|截图|照片)", text_norm)
-        )
+        # 不再用中文关键词判定图像引用，仅依赖结构化信号（raw_segments / URL）
+        image_reference = False
 
         if action in {"ignore"}:
 
@@ -4621,7 +4627,7 @@ class YukikoEngine:
         if action == "reply" and (
             (
                 self._looks_like_image_analyze_intent(text_norm)
-                and (has_image_signal or image_reference)
+                and has_image_signal
             )
             or (self._looks_like_video_resolve_intent(text_norm) and has_video_signal)
             or (
@@ -7375,12 +7381,17 @@ class YukikoEngine:
             return text
 
         limit = self.max_reply_chars_proactive if proactive else self.max_reply_chars
+        # 多段发送时，总字数预算应为 per-chunk × chunks，不在此处硬截。
+        # 这里只做粗粒度上限保护，实际分段由 chat_splitter 处理。
+        multi_budget = getattr(self, "_multi_reply_total_budget", 0)
+        if multi_budget > 0:
+            limit = max(limit, multi_budget)
         if reply_style == "short":
-            limit = min(limit, 160)
+            limit = min(limit, max(160, multi_budget))
         elif reply_style == "casual":
-            limit = min(limit, 260)
+            limit = min(limit, max(520, multi_budget))
         elif reply_style == "serious":
-            limit = min(limit, 420)
+            limit = min(limit, max(680, multi_budget))
         elif reply_style == "long":
             limit = int(limit * 1.8)
 

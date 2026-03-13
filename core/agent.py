@@ -196,6 +196,7 @@ class AgentLoop:
         self.high_risk_confirm_cues: tuple[str, ...] = ()
         self.high_risk_cancel_cues: tuple[str, ...] = ()
         self.search_followup_resend_media_cues: tuple[str, ...] = ()
+        self.tool_args_log_max_chars = 600
 
         # 安全: 需要管理员权限的工具 (与 AgentToolRegistry 保持同步)
         self._super_admin_tools = {
@@ -302,6 +303,9 @@ class AgentLoop:
         ]
         self.search_followup_resend_media_cues = tuple(dict.fromkeys(resend_media_cues))
 
+        self.tool_args_log_max_chars = max(
+            200, int(agent_cfg.get("tool_args_log_max_chars", 600))
+        )
         admin_cfg = (
             self.config.get("admin", {}) if isinstance(self.config, dict) else {}
         )
@@ -473,6 +477,16 @@ class AgentLoop:
         except Exception:
             return str(args or {})
 
+    def _truncate_tool_args_for_log(self, tool_args: dict[str, Any]) -> str:
+        """将 tool_args 序列化并截断用于日志，默认 600 字符。"""
+        limit = getattr(self, "tool_args_log_max_chars", 600)
+        try:
+            raw = json.dumps(tool_args, ensure_ascii=False)
+        except Exception:
+            raw = str(tool_args)
+        if len(raw) <= limit:
+            return raw
+        return raw[:limit] + f"... [truncated={len(raw)}]"
     def _build_tool_context(
         self, ctx: AgentContext, permission_level: str
     ) -> dict[str, Any]:
@@ -646,25 +660,35 @@ class AgentLoop:
 
         self._cleanup_pending_high_risk(force=False)
         key = self._pending_high_risk_key(ctx)
-        current_args_sig = self._build_args_signature(tool_args)
         pending = self._pending_high_risk_actions.get(key)
         msg_text = normalize_text(ctx.message_text)
 
         if pending and self._is_cancellation_text(msg_text, pending):
             self._pending_high_risk_actions.pop(key, None)
+            _log.info("confirm_cancelled | trace=%s | tool=%s", ctx.trace_id, tool_name)
             return "已取消上一条高风险操作，不会执行。"
 
         if pending:
             pending_tool = normalize_text(str(pending.get("tool_name", "")))
-            pending_sig = normalize_text(str(pending.get("args_sig", "")))
             if (
                 self._is_confirmation_text(msg_text, pending)
                 and pending_tool == tool_name
-                and pending_sig == current_args_sig
             ):
+                # 确认命中：同 tool_name 即放行，用 pending 保存的 tool_args 覆盖当前参数（防漂移）
+                saved_args = pending.get("saved_tool_args")
                 self._pending_high_risk_actions.pop(key, None)
+                if saved_args is not None:
+                    tool_args.clear()
+                    tool_args.update(saved_args)
+                    _log.info(
+                        "confirm_args_overridden | trace=%s | tool=%s",
+                        ctx.trace_id,
+                        tool_name,
+                    )
+                _log.info("confirm_matched | trace=%s | tool=%s", ctx.trace_id, tool_name)
                 return ""
-            if pending_tool == tool_name and pending_sig == current_args_sig:
+            if pending_tool == tool_name:
+                # 同工具但未确认 → 重新提示
                 return (
                     normalize_text(str(pending.get("prompt", "")))
                     or self._build_high_risk_confirm_prompt(tool_name, tool_args)[0]
@@ -675,9 +699,12 @@ class AgentLoop:
         prompt, confirm_token, cancel_token = self._build_high_risk_confirm_prompt(
             tool_name, tool_args
         )
+        import copy
+
         self._pending_high_risk_actions[key] = {
             "tool_name": tool_name,
-            "args_sig": current_args_sig,
+            "args_sig": self._build_args_signature(tool_args),
+            "saved_tool_args": copy.deepcopy(tool_args),
             "created_at": time.time(),
             "expires_at": time.time() + self.high_risk_pending_ttl_seconds,
             "prompt": prompt,
@@ -904,7 +931,7 @@ class AgentLoop:
                 ctx.trace_id,
                 step_idx,
                 tool_name,
-                json.dumps(tool_args, ensure_ascii=False)[:200],
+                self._truncate_tool_args_for_log(tool_args),
             )
 
             if missing_args:
@@ -1256,6 +1283,31 @@ class AgentLoop:
                                 ctx.trace_id,
                             )
                             video_url = ""
+                    # 表情包/贴纸工具已完成时，final_answer 默认清空媒体（仅保留文字确认）
+                    _STICKER_LIKE_TOOLS = {
+                        "learn_sticker", "correct_sticker",
+                        "send_emoji", "send_sticker", "send_face",
+                    }
+                    sticker_tool_used = any(
+                        s.get("tool") in _STICKER_LIKE_TOOLS and s.get("result")
+                        for s in steps
+                    )
+                    if sticker_tool_used and (image_url or image_urls or video_url or audio_file):
+                        # 仅当用户明确要求"预览/发出来看看"时才保留
+                        user_wants_preview = any(
+                            kw in normalize_text(ctx.message_text)
+                            for kw in ("预览", "发出来看看", "看看效果", "/preview")
+                        )
+                        if not user_wants_preview:
+                            _log.info(
+                                "agent_strip_sticker_media | trace=%s | step=%d | stripped media from final_answer after sticker tool",
+                                ctx.trace_id,
+                                step_idx,
+                            )
+                            image_url = ""
+                            image_urls = []
+                            video_url = ""
+                            audio_file = ""
                     return AgentResult(
                         reply_text=text,
                         image_url=image_url,
@@ -3646,47 +3698,16 @@ class AgentLoop:
 
     @staticmethod
     def _looks_like_image_question(text: str) -> bool:
-        """判断文本是否在对图片提问。"""
+        """Weak check: does the text ask about an image?
+
+        Chinese keyword matching removed. Only explicit control tokens accepted.
+        Image pipeline is driven by raw_segments / URL structural signals.
+        """
         t = (text or "").lower()
-        cues = [
-            normalize_text(cue).lower()
-            for cue in _pl.get_list("image_question_cues")
-            if normalize_text(cue)
-        ]
-        if not cues:
-            cues = [
-                "图里",
-                "图中",
-                "这图",
-                "这张图",
-                "看图",
-                "图片",
-                "照片",
-                "截图",
-                "动图",
-                "gif",
-                "这是什么图",
-                "图上",
-                "图里的",
-                "识图",
-                "看不懂图",
-            ]
-        if any(c in t for c in cues):
+        # Only accept explicit control tokens
+        if any(tok in t for tok in ("/analyze", "mode=analyze", "ocr=true")):
             return True
-        # 弱兜底：出现“图像词 + 提问词”时也视为图片提问。
-        ask_words = (
-            "是谁",
-            "是什么",
-            "谁",
-            "啥",
-            "怎么",
-            "哪",
-            "有没有",
-            "在干嘛",
-            "干什么",
-        )
-        image_words = ("图", "图片", "照片", "截图", "动图", "gif")
-        return any(a in t for a in ask_words) and any(w in t for w in image_words)
+        return False
 
     @staticmethod
     def _looks_like_all_images_request(text: str) -> bool:

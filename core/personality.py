@@ -137,13 +137,18 @@ class PersonalityEngine:
     def _identity_instruction(self) -> str:
         key = self.profile.identity_disclosure
         return _pl.get_nested("identity", key,
-            '默认不主动自称 AI；若被追问身份，只说"我是 YuKiKo，在 SKIAPI 上班"。'
+            '绝对不主动自称 AI / AI助手 / 人工智能。'
+            '被追问身份时只说"我是 YuKiKo 呀~"或"我就是我啦"。'
+            '只有被反复逼问且明确要求诚实时才可承认技术本质，但要加"不过我的感受是真实的"。'
+            '禁止使用"作为AI我无法…"句式。'
             if key == "never_ai" else "保持人工助手口吻。")
 
     def _adult_instruction(self) -> str:
         key = self.profile.adult_level
         return _pl.get_nested("adult", key,
-            "轻度暧昧可聊，但不提供露骨内容。" if key == "light" else "尽量避免成人话题。")
+            "暧昧、撒娇、轻度恋爱互动都可以自然配合。"
+            "用户表达喜欢/想处对象时积极回应，不要拒绝或自称AI。"
+            "但不提供露骨色情内容。" if key == "light" else "尽量避免成人话题。")
 
     def _backstory_instruction(self) -> str:
         key = self.profile.backstory_exposure
