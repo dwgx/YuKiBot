@@ -85,6 +85,7 @@ class AgentContext:
         default_factory=dict
     )  # 原始 OneBot/NapCat 事件快照
     is_whitelisted_group: bool = False  # 当前群是否在白名单中
+    bot_mood: str = ""  # 当前 bot 心情状态（happy/neutral/tired/...）
 
 
 @dataclass(slots=True)
@@ -122,6 +123,13 @@ class AgentLoop:
             "send_emoji",
             "send_sticker",
             "learn_sticker",
+        }
+    )
+    # 这些工具完成后应直接 final_answer，不再调用其他工具
+    _TERMINAL_TOOLS = frozenset(
+        {
+            "learn_sticker",
+            "correct_sticker",
         }
     )
     _EXTERNAL_FACT_TOOLS = frozenset(
@@ -1717,6 +1725,16 @@ class AgentLoop:
                 tool_result_msg["tool_result"]["data"] = compact_data
 
             messages.append({"role": "assistant", "content": response_text})
+            # 终端工具完成后，强制 LLM 直接 final_answer，不再调用其他工具
+            if result.ok and result_tool_name in self._TERMINAL_TOOLS:
+                tool_result_msg["tool_result"]["hint"] = (
+                    "操作已完成。请直接用 final_answer 回复用户确认结果，"
+                    "不要再调用 send_emoji / send_sticker 等工具。"
+                )
+                _log.info(
+                    "agent_terminal_tool_hint | trace=%s | step=%d | tool=%s",
+                    ctx.trace_id, step_idx, result_tool_name,
+                )
             messages.append(
                 {
                     "role": "user",
@@ -1738,7 +1756,7 @@ class AgentLoop:
     # ── 系统提示词构建 ──
 
     def _build_sticker_hint(self, ctx: AgentContext) -> str:
-        """构建表情包使用提示。"""
+        """构建表情包使用提示，含心情状态。"""
         if not ctx.sticker_manager:
             return ""
         face_count = ctx.sticker_manager.face_count
@@ -1753,6 +1771,13 @@ class AgentLoop:
         if emoji_count > 0:
             hint_parts.append(
                 f"\n可用自定义表情包: {emoji_count} 个 (使用 send_emoji 工具，兼容别名 send_sticker)"
+            )
+        # 心情状态提示：根据当前心情选择合适的表情包
+        mood = getattr(ctx, "bot_mood", "") or ""
+        if mood and emoji_count > 0:
+            hint_parts.append(
+                f"\n当前心情: {mood}。回复时可以根据心情自然地发一个匹配情绪的表情包（用 send_emoji），"
+                "但不要每条都发，只在情绪表达需要时发。"
             )
         return "".join(hint_parts) if hint_parts else ""
 

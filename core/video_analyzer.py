@@ -308,6 +308,17 @@ class VideoAnalyzer:
                     except Exception:
                         pass
 
+        # Step 4: 尝试从本地视频提取内嵌字幕（ffmpeg）
+        if has_local and self._ffmpeg_available and not result.subtitle_text:
+            try:
+                extracted_sub = await self._extract_embedded_subtitles(result.local_video_path)
+                if extracted_sub:
+                    result.subtitle_text = extracted_sub[:8000]
+                    result.subtitle_source = "ffmpeg_embedded"
+                    result.subtitle_lang = "auto"
+            except Exception as exc:
+                _log.debug("subtitle_extract_fail | err=%s", str(exc)[:120])
+
         return result
 
     # ── Step 1: yt-dlp 元数据填充 ──
@@ -937,6 +948,64 @@ class VideoAnalyzer:
             return int(float(stdout.decode().strip()))
         except Exception:
             return 0
+
+    # ── Step 4: 从本地视频提取内嵌字幕 ──
+
+    async def _extract_embedded_subtitles(self, video_path: str) -> str:
+        """用 ffmpeg 提取视频内嵌字幕流（SRT/ASS/text），超时 10s。"""
+        try:
+            # 先用 ffprobe 检查是否有字幕流
+            probe_proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet",
+                "-select_streams", "s",
+                "-show_entries", "stream=index,codec_name",
+                "-of", "csv=p=0",
+                video_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            probe_out, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=8)
+            probe_text = probe_out.decode("utf-8", errors="replace").strip()
+            if not probe_text:
+                return ""
+
+            # 提取第一条字幕流为 SRT 格式
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-y",
+                "-i", video_path,
+                "-map", "0:s:0",
+                "-f", "srt",
+                "pipe:1",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            raw_srt = out.decode("utf-8", errors="replace").strip()
+            if not raw_srt:
+                return ""
+
+            # 解析 SRT：只提取文本行，去掉时间码和序号
+            import re as _re
+            lines = []
+            for line in raw_srt.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                if _re.match(r"^\d+$", line):
+                    continue
+                if _re.match(r"\d{2}:\d{2}:\d{2}", line):
+                    continue
+                # 去掉 ASS/SRT 标签
+                clean = _re.sub(r"<[^>]+>", "", line)
+                clean = _re.sub(r"\{[^}]+\}", "", clean)
+                clean = clean.strip()
+                if clean and clean not in lines[-1:]:
+                    lines.append(clean)
+
+            return "\n".join(lines[:200])
+        except (asyncio.TimeoutError, Exception) as exc:
+            _log.debug("subtitle_extract_error | err=%s", str(exc)[:120])
+            return ""
 
     # ── Step 3b: Vision API 分析关键帧 ──
 

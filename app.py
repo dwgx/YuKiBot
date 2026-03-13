@@ -2489,6 +2489,24 @@ def register_handlers(engine: YukikoEngine) -> None:
                         "auto_accept_friend_failed | bot=%s | user=%s | error=%s",
                         bot.self_id, user_id, str(exc)[:120],
                     )
+        # 自动同意加群邀请（invite 类型）
+        if request_type == "group":
+            flag = str(payload.get("flag", "")).strip()
+            sub_type = normalize_text(str(payload.get("sub_type", ""))).lower()
+            group_id = str(payload.get("group_id", "")).strip()
+            user_id = str(payload.get("user_id", "")).strip()
+            if flag and sub_type == "invite":
+                try:
+                    await bot.set_group_add_request(flag=flag, sub_type="invite", approve=True)
+                    _log.info(
+                        "auto_accept_group_invite | bot=%s | group=%s | inviter=%s",
+                        bot.self_id, group_id, user_id,
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "auto_accept_group_invite_failed | bot=%s | group=%s | error=%s",
+                        bot.self_id, group_id, str(exc)[:120],
+                    )
 
     @meta_router.handle()
     async def handle_meta(bot: Bot, event: Event) -> None:

@@ -4521,7 +4521,7 @@ class ToolExecutor:
     def _pick_gif_keyframe_indexes(frame_count: int) -> list[int]:
         if frame_count <= 1:
             return [0]
-        target_frames = min(4, frame_count)
+        target_frames = min(6, frame_count)
         last = frame_count - 1
         picks = [
             int(round(last * idx / max(1, target_frames - 1)))
@@ -4564,7 +4564,7 @@ class ToolExecutor:
         if not frames:
             return ""
 
-        target_h = max(120, min(520, max(frame.height for frame in frames)))
+        target_h = max(180, min(640, max(frame.height for frame in frames)))
         resized = []
         for frame in frames:
             src_h = max(1, int(frame.height))
@@ -4573,8 +4573,8 @@ class ToolExecutor:
             )
             resized.append(frame.resize((width, target_h)))
 
-        gap = 10
-        cols = 2 if len(resized) > 1 else 1
+        gap = 8
+        cols = min(3, len(resized)) if len(resized) > 2 else (2 if len(resized) > 1 else 1)
         rows = max(1, (len(resized) + cols - 1) // cols)
         cell_w = max(frame.width for frame in resized)
         cell_h = max(frame.height for frame in resized)

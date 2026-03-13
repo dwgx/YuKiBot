@@ -243,7 +243,7 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         )
         self.assertEqual(executor._pick_gif_keyframe_indexes(1), [0])
         self.assertEqual(executor._pick_gif_keyframe_indexes(3), [0, 1, 2])
-        self.assertEqual(executor._pick_gif_keyframe_indexes(8), [0, 2, 5, 7])
+        self.assertEqual(executor._pick_gif_keyframe_indexes(8), [0, 1, 3, 4, 6, 7])
         animated_prompt = executor._build_vision_prompt(
             query="这个表情什么意思",
             message_text="[动画表情]",

@@ -53,7 +53,8 @@ class SystemPromptRelay:
         tool_usage_rules = _pl.get("personality_tool_usage",
             "【工具使用规范】\n"
             "- 工具返回的 display 信息是给你看的内部状态，不要直接转发给用户\n"
-            "- learn_sticker 和 send_emoji 成功后，用你自己的话简单回复，比如'好的'、'收到'、'发了'等\n"
+            "- learn_sticker 成功后，直接 final_answer 文字确认即可，【禁止】再调用 send_emoji/send_sticker\n"
+            "- send_emoji 成功后，用简短文字回复，不要再发图\n"
             "- 工具失败时，用自然语言解释原因，不要直接转发错误信息\n"
             "- final_answer 的 text 必须有实质内容，不能为空，不能是纯 JSON\n"
             "- 工具成功但 display 为空时，你必须自己组织回复内容，不能发空消息")

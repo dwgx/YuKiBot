@@ -3435,6 +3435,11 @@ class YukikoEngine:
                     else False
                 ),
                 stream_callback=self._get_stream_callback(message.conversation_id),
+                bot_mood=(
+                    self.affinity.mood.current
+                    if hasattr(self, "affinity") and hasattr(self.affinity, "mood")
+                    else ""
+                ),
             )
 
             # 含媒体或"文本里明确是媒体重任务"时，放宽超时预算
