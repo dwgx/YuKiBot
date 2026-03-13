@@ -22,8 +22,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from core.cookie_auth import (
-    extract_browser_cookies_multi_strategy,
-    bilibili_qr_login_terminal,
+    bilibili_qr_login,
+    extract_browser_cookies_with_source,
+    get_cookie_runtime_capabilities,
 )
 
 logging.basicConfig(
@@ -41,6 +42,7 @@ SUPPORTED_SITES = {
     "zhihu": [".zhihu.com", "zhihu.com"],
     "weibo": [".weibo.com", "weibo.com"],
 }
+SUPPORTED_BROWSERS = ("edge", "chrome", "firefox")
 
 
 def format_cookies_for_display(cookies: dict[str, str]) -> str:
@@ -70,6 +72,7 @@ async def get_cookies_for_site(
     site: str,
     browser: str | None = None,
     use_qr: bool = False,
+    auto_close: bool = False,
 ) -> dict[str, str]:
     """获取指定网站的 Cookie"""
     _log.info(f"正在获取 {site} 的 Cookie...")
@@ -78,33 +81,89 @@ async def get_cookies_for_site(
     if site == "bilibili" and use_qr:
         _log.info("使用 B站扫码登录...")
         try:
-            result = await bilibili_qr_login_terminal()
-            if result and result.get("ok"):
-                cookies = result.get("cookies", {})
+            cookies = await bilibili_qr_login()
+            if cookies:
                 _log.info(f"✓ B站扫码登录成功，获取到 {len(cookies)} 个 Cookie")
                 return cookies
-            else:
-                _log.warning(f"B站扫码登录失败: {result.get('message', '未知错误')}")
-                return {}
+            _log.warning("B站扫码登录失败")
+            return {}
         except Exception as e:
             _log.error(f"B站扫码登录异常: {e}")
             return {}
 
     # 从浏览器提取 Cookie
     domains = SUPPORTED_SITES.get(site, [site])
+    browser_candidates = _pick_browser_candidates(browser)
     try:
-        cookies = await extract_browser_cookies_multi_strategy(
-            domains=domains,
-            browser=browser,
+        for browser_name in browser_candidates:
+            cookies = _extract_site_cookies(
+                site=site,
+                domains=domains,
+                browser=browser_name,
+                auto_close=auto_close,
+            )
+            if cookies:
+                _log.info(
+                    f"✓ 成功从 {browser_name} 提取 {site} Cookie，共 {len(cookies)} 个"
+                )
+                return cookies
+
+        _log.warning(
+            "未能从浏览器提取 %s Cookie，已尝试: %s",
+            site,
+            ", ".join(browser_candidates),
         )
-        if cookies:
-            _log.info(f"✓ 成功从浏览器提取 {site} Cookie，共 {len(cookies)} 个")
-        else:
-            _log.warning(f"未能从浏览器提取 {site} Cookie")
-        return cookies
+        return {}
     except Exception as e:
         _log.error(f"提取 {site} Cookie 失败: {e}")
         return {}
+
+
+def _pick_browser_candidates(preferred: str | None) -> list[str]:
+    if preferred:
+        return [preferred]
+
+    caps = get_cookie_runtime_capabilities()
+    browser_info = caps.get("browsers", {}) if isinstance(caps, dict) else {}
+    recommended = str(browser_info.get("recommended", "") or "").strip().lower()
+    installed = browser_info.get("installed", []) if isinstance(browser_info, dict) else []
+
+    candidates: list[str] = []
+    for name in [recommended, *installed, *SUPPORTED_BROWSERS]:
+        normalized = str(name or "").strip().lower()
+        if normalized in SUPPORTED_BROWSERS and normalized not in candidates:
+            candidates.append(normalized)
+    return candidates or list(SUPPORTED_BROWSERS)
+
+
+def _extract_site_cookies(
+    *,
+    site: str,
+    domains: list[str],
+    browser: str,
+    auto_close: bool,
+) -> dict[str, str]:
+    merged: dict[str, str] = {}
+    domain_sources: list[str] = []
+
+    for domain in domains:
+        cookies, source = extract_browser_cookies_with_source(
+            browser=browser,
+            domain=domain,
+            auto_close=auto_close,
+        )
+        if cookies:
+            merged.update(cookies)
+        domain_sources.append(f"{domain}:{source}")
+
+    _log.info(
+        "浏览器提取结果 | site=%s | browser=%s | domains=%s | cookies=%d",
+        site,
+        browser,
+        ", ".join(domain_sources),
+        len(merged),
+    )
+    return merged
 
 
 async def main_async() -> None:
@@ -144,6 +203,11 @@ async def main_async() -> None:
         action="store_true",
         help="仅显示 Cookie，不保存到文件",
     )
+    parser.add_argument(
+        "--auto-close",
+        action="store_true",
+        help="必要时关闭浏览器再提取 Cookie",
+    )
 
     args = parser.parse_args()
 
@@ -158,6 +222,7 @@ async def main_async() -> None:
             site=site,
             browser=args.browser,
             use_qr=(args.qr and site == "bilibili"),
+            auto_close=args.auto_close,
         )
         results[site] = cookies
 

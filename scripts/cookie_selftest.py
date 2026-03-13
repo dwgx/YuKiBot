@@ -64,6 +64,7 @@ async def _verify_douyin_with_tool(url: str, cookie: str) -> tuple[bool, str]:
         "tool_interface": {
             "enable": True,
             "browser_enable": True,
+            "auto_method_enable": True,
             "github_enable": True,
         },
     }
