@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 
 
@@ -4079,6 +4079,12 @@ class YukikoEngine:
 
 
                 trigger=trigger,
+                explicit_bot_addressed=explicit_bot_addressed,
+
+                thread_state=thread_state,
+
+                runtime_group_context=runtime_group_context,
+
 
 
                 memory_context=memory_context,
@@ -5744,6 +5750,12 @@ class YukikoEngine:
 
 
         trigger: Any,
+        explicit_bot_addressed: bool,
+
+        thread_state: dict[str, Any] | None,
+
+        runtime_group_context: list[str] | None,
+
 
 
         memory_context: list[str],

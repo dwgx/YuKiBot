@@ -41,6 +41,7 @@ class ToolSchema:
     description: str
     parameters: dict[str, Any] = field(default_factory=dict)
     category: str = "general"  # general / napcat / search / media / admin
+    group: str = ""  # backward-compat metadata only; not used for local intent routing
 
 
 @dataclass(slots=True)
