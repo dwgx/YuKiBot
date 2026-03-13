@@ -360,30 +360,116 @@ print_napcat_manual_hint() {
   warn "  curl -o napcat.sh $NAPCAT_INSTALLER_URL && bash napcat.sh"
 }
 
+detect_napcat_custom_tree() {
+  local -a candidate_roots=(
+    "/root"
+    "/opt"
+    "/usr/local"
+    "${HOME:-}"
+    "$ROOT_DIR/.."
+  )
+
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    local sudo_home
+    sudo_home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    if [[ -n "$sudo_home" ]]; then
+      candidate_roots+=("$sudo_home")
+    fi
+  fi
+
+  local root
+  for root in "${candidate_roots[@]}"; do
+    [[ -n "$root" && -d "$root" ]] || continue
+
+    if find "$root" -maxdepth 9 -type f -path "*/opt/QQ/resources/app/app_launcher/napcat/napcat.mjs" 2>/dev/null | grep -q .; then
+      echo "custom_tree"
+      return
+    fi
+
+    if find "$root" -maxdepth 4 -type f \( -path "*/Nap[Cc]at*/opt/QQ/qq" -o -path "*/napcat*/opt/QQ/qq" \) 2>/dev/null | grep -q .; then
+      echo "custom_tree"
+      return
+    fi
+  done
+}
+
+detect_napcat_process() {
+  command_exists pgrep || return 1
+
+  if pgrep -fa napcat >/dev/null 2>&1; then
+    echo "process"
+    return 0
+  fi
+
+  if pgrep -fa "QQ/qq" 2>/dev/null | grep -Eiq '/[^ ]*napcat[^ ]*/opt/QQ/qq'; then
+    echo "qq_process"
+    return 0
+  fi
+
+  return 1
+}
+
 detect_napcat() {
+  local custom_tree
+
   # Check common NapCat install locations
   if command_exists napcat; then
     echo "binary"
     return
   fi
+
+  # Check for NapCat Shell installation (most common)
   if [[ -f /opt/QQ/resources/app/app_launcher/napcat/napcat.mjs ]]; then
     echo "shell"
     return
   fi
+
+  # Check for NapCat in current project directory (Windows-style structure)
+  if [[ -d "$ROOT_DIR/../NapCat.Shell.Windows.Node" ]]; then
+    echo "local"
+    return
+  fi
+
+  custom_tree="$(detect_napcat_custom_tree || true)"
+  if [[ -n "$custom_tree" ]]; then
+    echo "$custom_tree"
+    return
+  fi
+
+  # Check for any NapCat directory in parent
+  if find "$ROOT_DIR/.." -maxdepth 1 -type d -iname "*napcat*" 2>/dev/null | grep -q .; then
+    echo "local"
+    return
+  fi
+
+  # Check systemd service
   if command_exists systemctl; then
     if systemctl is-active --quiet napcat 2>/dev/null || systemctl is-enabled --quiet napcat 2>/dev/null; then
       echo "systemd"
       return
     fi
   fi
+
+  # Check docker
   if command_exists docker && docker ps -a 2>/dev/null | grep -qi napcat; then
     echo "docker"
     return
   fi
-  if command_exists pgrep && pgrep -fa napcat >/dev/null 2>&1; then
-    echo "process"
+
+  # Check running process
+  local process_match
+  process_match="$(detect_napcat_process || true)"
+  if [[ -n "$process_match" ]]; then
+    echo "$process_match"
     return
   fi
+
+  # Check for node_modules with napcat
+  if [[ -d "$ROOT_DIR/../NapCat.Shell.Windows.Node/napcat/node_modules" ]]; then
+    echo "local"
+    return
+  fi
+
   echo ""
 }
 
