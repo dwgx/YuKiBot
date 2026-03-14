@@ -698,6 +698,41 @@ class StickerManager:
         img_data: bytes | None = None
         last_err: str = ""
         source_hint = "url"
+        min_effective_bytes = 100
+
+        def _accept_image_bytes(data: bytes | None, source: str) -> bool:
+            nonlocal img_data, source_hint, last_err
+            if data is None:
+                return False
+            if len(data) < min_effective_bytes:
+                last_err = f"{source}:payload_too_small:{len(data)}"
+                return False
+            img_data = data
+            source_hint = source
+            last_err = ""
+            return True
+
+        def _decode_inline_image(value: str) -> tuple[bytes | None, str]:
+            raw = str(value or "").strip()
+            if not raw:
+                return None, "empty_url"
+            payload = ""
+            if raw.startswith("data:image") and ";base64," in raw:
+                payload = raw.split(";base64,", 1)[1].strip()
+            elif raw.startswith("base64://"):
+                payload = raw[len("base64://") :].strip()
+            else:
+                return None, "not_inline_image"
+            if not payload:
+                return None, "inline_payload_empty"
+            try:
+                return base64.b64decode(payload, validate=True), ""
+            except Exception:
+                try:
+                    padded = payload + ("=" * (-len(payload) % 4))
+                    return base64.b64decode(padded), ""
+                except Exception as exc:
+                    return None, f"inline_decode:{exc}"
 
         def _extract_api_data(result: Any) -> dict[str, Any]:
             if not isinstance(result, dict):
@@ -763,8 +798,22 @@ class StickerManager:
                         await _aio.sleep(1.0 * (_attempt + 1))
             return None, err
 
-        # 1.1 先尝试直接下载 URL
-        img_data, last_err = await _download_via_http(image_url)
+        image_url_value = str(image_url or "").strip()
+        inline_like_input = image_url_value.startswith("data:image") or image_url_value.startswith("base64://")
+
+        # 1.0 先解析 data:image/base64:// 内联图片
+        inline_data, inline_err = _decode_inline_image(image_url_value)
+        if inline_data is not None:
+            _accept_image_bytes(inline_data, "inline")
+        elif inline_err not in {"empty_url", "not_inline_image"}:
+            last_err = inline_err
+
+        # 1.1 再尝试直接下载 URL
+        if img_data is None and image_url_value and not inline_like_input:
+            direct_data, direct_err = await _download_via_http(image_url_value)
+            if not _accept_image_bytes(direct_data, "url"):
+                if direct_data is None:
+                    last_err = direct_err
 
         # 1.2 URL 失败时，尝试 get_image(file=...) 读取本地缓存文件
         if img_data is None and api_call and image_file:
@@ -784,37 +833,42 @@ class StickerManager:
             if get_image_result is not None:
                 payload = _extract_api_data(get_image_result)
                 for key in ("file", "file_path", "path", "local_path", "filename"):
-                    img_data, last_err = _read_local_file(payload.get(key))
-                    if img_data is not None:
-                        source_hint = f"get_image:{key}"
+                    candidate_data, read_err = _read_local_file(payload.get(key))
+                    if _accept_image_bytes(candidate_data, f"get_image:{key}"):
                         break
+                    if candidate_data is None and read_err:
+                        last_err = read_err
                 if img_data is None:
                     for key in ("url", "download_url", "src"):
                         candidate = str(payload.get(key, "")).strip()
                         if not candidate:
                             continue
-                        img_data, last_err = await _download_via_http(candidate)
-                        if img_data is not None:
-                            source_hint = f"get_image:{key}"
+                        candidate_data, download_err = await _download_via_http(candidate)
+                        if _accept_image_bytes(candidate_data, f"get_image:{key}"):
                             break
+                        if candidate_data is None:
+                            last_err = download_err
             elif get_image_err:
                 last_err = f"get_image:{get_image_err}"
 
         # 1.3 再兜底 download_file(url=...)
-        if img_data is None and api_call and image_url:
+        if img_data is None and api_call and image_url_value and not inline_like_input:
             try:
-                dl_result = await api_call("download_file", url=image_url, thread_count=1)
+                dl_result = await api_call("download_file", url=image_url_value, thread_count=1)
                 payload = _extract_api_data(dl_result)
                 for key in ("file", "file_path", "path", "local_path", "filename"):
-                    img_data, last_err = _read_local_file(payload.get(key))
-                    if img_data is not None:
-                        source_hint = f"download_file:{key}"
+                    candidate_data, read_err = _read_local_file(payload.get(key))
+                    if _accept_image_bytes(candidate_data, f"download_file:{key}"):
                         break
+                    if candidate_data is None and read_err:
+                        last_err = read_err
             except Exception as exc:
                 last_err = f"download_file:{exc}"
 
         if img_data is None:
             hint = "QQ 图片链接可能已失效"
+            if "payload_too_small" in last_err:
+                hint = "拿到的是占位图或缩略图，建议回复原图后再学习"
             if str(image_sub_type).strip() == "1":
                 hint = "QQ 动画表情链接受限，建议改发静态图或原图文件"
             _log.warning(
@@ -831,8 +885,8 @@ class StickerManager:
             source_hint,
             len(img_data),
         )
-        if len(img_data) < 100:
-            return False, "图片太小，跳过"
+        if len(img_data) < min_effective_bytes:
+            return False, "图片内容异常小，疑似占位资源，请发送原图后再试"
         if len(img_data) > 5 * 1024 * 1024:
             return False, "图片超过5MB，太大了"
 

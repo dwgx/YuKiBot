@@ -1701,6 +1701,15 @@ class YukikoEngine:
                         self.trigger.delegate_undirected_to_ai,
                     )
                 )
+                self.trigger.delegate_undirected_min_signal = max(
+                    0.0,
+                    float(
+                        trigger_cfg.get(
+                            "delegate_undirected_min_signal",
+                            getattr(self.trigger, "delegate_undirected_min_signal", 1.0),
+                        )
+                    ),
+                )
 
         # 热重载时刷新自动学习配置。
 

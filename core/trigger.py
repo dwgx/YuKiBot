@@ -138,6 +138,9 @@ class TriggerEngine:
         self.delegate_undirected_to_ai = bool(
             trigger_config.get("delegate_undirected_to_ai", False)
         )
+        self.delegate_undirected_min_signal = max(
+            0.0, float(trigger_config.get("delegate_undirected_min_signal", 1.0))
+        )
 
         self.overload_enable = bool(trigger_config.get("overload_enable", True))
 
@@ -407,7 +410,12 @@ class TriggerEngine:
                 priority=20,
             )
 
-        if self.delegate_undirected_to_ai:
+        delegate_signal = self._explicit_request_signal(payload.text)
+
+        if (
+            self.delegate_undirected_to_ai
+            and delegate_signal >= self.delegate_undirected_min_signal
+        ):
 
             return TriggerResult(
                 # 仅作为候选进入 AI 评估，不直接放行回复。
