@@ -489,6 +489,7 @@ export default function ConfigPage() {
   const [envDrafts, setEnvDrafts] = useState<EnvDraftMap>({});
   const [envSaving, setEnvSaving] = useState(false);
   const [envSaveResult, setEnvSaveResult] = useState<EnvUpdateResponse | null>(null);
+  const [envPanelOpen, setEnvPanelOpen] = useState(false);
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, string>>({});
   const [numberDrafts, setNumberDrafts] = useState<Record<string, string>>({});
   const [listDrafts, setListDrafts] = useState<Record<string, string>>({});
@@ -979,6 +980,19 @@ export default function ConfigPage() {
       </div>
 
       <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
+        <CardHeader className="flex items-center justify-between gap-3">
+          <div className="font-semibold">{active.label}</div>
+          <div className="flex items-center gap-2">
+            <Button size="sm" variant="flat" startContent={<ChevronLeft size={14} />} isDisabled={activeIndex <= 0} onPress={() => setActiveSection(SECTIONS[Math.max(0, activeIndex - 1)].key)}>上一段</Button>
+            <Button size="sm" variant="flat" endContent={<ChevronRight size={14} />} isDisabled={activeIndex >= SECTIONS.length - 1} onPress={() => setActiveSection(SECTIONS[Math.min(SECTIONS.length - 1, activeIndex + 1)].key)}>下一段</Button>
+          </div>
+        </CardHeader>
+        <CardBody>
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">{active.fields.map(renderField)}</div>
+        </CardBody>
+      </Card>
+
+      <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
         <CardHeader className="flex flex-wrap items-center justify-between gap-3">
           <div className="space-y-1">
             <div className="font-semibold">环境变量与 NapCat 连接</div>
@@ -990,39 +1004,39 @@ export default function ConfigPage() {
             {envSaveResult && !envSaveResult.restart_required && !envSaveResult.reauth_required && (
               <Chip size="sm" variant="flat" color="success">已热更新</Chip>
             )}
-            <Button color="secondary" startContent={<Save size={16} />} isLoading={envSaving} onPress={handleEnvSave}>
-              保存 .env
+            <Button variant="flat" onPress={() => setEnvPanelOpen((prev) => !prev)}>
+              {envPanelOpen ? "收起环境变量" : "展开环境变量"}
             </Button>
+            {envPanelOpen && (
+              <Button color="secondary" startContent={<Save size={16} />} isLoading={envSaving} onPress={handleEnvSave}>
+                保存 .env
+              </Button>
+            )}
           </div>
         </CardHeader>
         <CardBody className="space-y-4">
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-            {envEntries.map(renderEnvField)}
-          </div>
-          {envSaveResult && (
-            <div className="rounded-2xl border border-default-400/25 bg-content2/35 p-4 text-sm text-default-600">
-              <div>{envSaveResult.message}</div>
-              {envSaveResult.changed_keys.length > 0 && (
-                <div className="mt-2 text-xs text-default-500">已更新: {envSaveResult.changed_keys.join(", ")}</div>
+          {!envPanelOpen ? (
+            <p className="text-sm text-default-500">
+              环境变量编辑默认折叠，避免影响配置分区切换体验。点击「展开环境变量」即可编辑并热更新。
+            </p>
+          ) : (
+            <>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                {envEntries.map(renderEnvField)}
+              </div>
+              {envSaveResult && (
+                <div className="rounded-2xl border border-default-400/25 bg-content2/35 p-4 text-sm text-default-600">
+                  <div>{envSaveResult.message}</div>
+                  {envSaveResult.changed_keys.length > 0 && (
+                    <div className="mt-2 text-xs text-default-500">已更新: {envSaveResult.changed_keys.join(", ")}</div>
+                  )}
+                  {envSaveResult.reload_message && (
+                    <div className="mt-2 text-xs text-default-500">{envSaveResult.reload_message}</div>
+                  )}
+                </div>
               )}
-              {envSaveResult.reload_message && (
-                <div className="mt-2 text-xs text-default-500">{envSaveResult.reload_message}</div>
-              )}
-            </div>
+            </>
           )}
-        </CardBody>
-      </Card>
-
-      <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
-        <CardHeader className="flex items-center justify-between gap-3">
-          <div className="font-semibold">{active.label}</div>
-          <div className="flex items-center gap-2">
-            <Button size="sm" variant="flat" startContent={<ChevronLeft size={14} />} isDisabled={activeIndex <= 0} onPress={() => setActiveSection(SECTIONS[Math.max(0, activeIndex - 1)].key)}>上一段</Button>
-            <Button size="sm" variant="flat" endContent={<ChevronRight size={14} />} isDisabled={activeIndex >= SECTIONS.length - 1} onPress={() => setActiveSection(SECTIONS[Math.min(SECTIONS.length - 1, activeIndex + 1)].key)}>下一段</Button>
-          </div>
-        </CardHeader>
-        <CardBody>
-          <div className="grid grid-cols-2 gap-4">{active.fields.map(renderField)}</div>
         </CardBody>
       </Card>
 
