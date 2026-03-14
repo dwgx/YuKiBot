@@ -11,7 +11,7 @@ NAPCAT_GUIDE_URL="https://napneko.github.io/guide/boot/Shell"
 
 NON_INTERACTIVE=0
 AUTO_INSTALL_SERVICE=1
-AUTO_OPEN_FIREWALL=0
+AUTO_OPEN_FIREWALL=1
 SKIP_WEBUI_BUILD=0
 SKIP_CLI_INSTALL=0
 SKIP_NAPCAT=0
@@ -43,8 +43,8 @@ Options:
   --service-name <name>     systemd service name (default: yukiko)
   --service                 Enable systemd install (default)
   --no-service              Skip systemd install
-  --open-firewall           Try opening selected port in firewall
-  --no-firewall             Do not touch firewall (default)
+  --open-firewall           Try opening selected port in firewall (default)
+  --no-firewall             Do not touch firewall
   --skip-webui-build        Skip npm build step
   --skip-cli-install        Skip installing /usr/local/bin/yukiko
   --skip-napcat             Skip NapCat detection and install
@@ -655,7 +655,7 @@ main() {
   current_onebot_access_token="$(get_env_value ONEBOT_ACCESS_TOKEN)"
 
   local host_default port_default token_default onebot_access_token_default
-  host_default="${current_host:-0.0.0.0}"
+  host_default="0.0.0.0"
   port_default="${current_port:-8081}"
   token_default="${current_token:-$(random_token)}"
   onebot_access_token_default="${current_onebot_access_token:-$(random_token)}"
@@ -696,7 +696,7 @@ main() {
       install_service=0
     fi
 
-    if ask_yes_no "Open firewall port ${port}/tcp automatically?" "no"; then
+    if ask_yes_no "Open firewall port ${port}/tcp automatically?" "yes"; then
       open_firewall=1
     else
       open_firewall=0
