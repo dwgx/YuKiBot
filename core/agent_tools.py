@@ -6104,8 +6104,90 @@ async def _handle_think(args: dict[str, Any], context: dict[str, Any]) -> ToolCa
 
 # ── Sticker / Face tools ──
 
+_STICKER_SEND_CUES = (
+    "发个表情",
+    "发一个表情",
+    "发表情",
+    "发送表情",
+    "来个表情",
+    "来一个表情",
+    "用表情",
+    "回个表情",
+    "发张表情包",
+    "来张表情包",
+    "发出来看看",
+    "看看效果",
+    "预览",
+    "把刚学的发",
+)
+
+_STICKER_MANAGEMENT_CUES = (
+    "学习表情",
+    "学这个表情",
+    "添加表情",
+    "收录表情",
+    "记住这个表情",
+    "表情包库",
+    "表情库",
+    "meme更新",
+    "更新了吗",
+    "学会了吗",
+    "学到了吗",
+    "描述不对",
+    "识别错",
+    "纠正表情",
+    "改这个表情",
+    "最近学的",
+    "刚学的是什么",
+)
+
+
+def _looks_like_explicit_sticker_send_message(text: str) -> bool:
+    content = normalize_text(text).lower()
+    if not content:
+        return False
+    if any(cue in content for cue in _STICKER_SEND_CUES):
+        return True
+    return bool(
+        re.search(r"(发|来|回|用).{0,8}(表情|表情包|emoji|sticker)", content)
+        or re.search(r"(表情|表情包).{0,8}(发|来|回|看)", content)
+    )
+
+
+def _looks_like_sticker_management_message(text: str) -> bool:
+    content = normalize_text(text).lower()
+    if not content:
+        return False
+    if any(cue in content for cue in _STICKER_MANAGEMENT_CUES):
+        return True
+    if "表情" not in content and "meme" not in content and "emoji" not in content:
+        return False
+    return bool(
+        re.search(r"(学习|添加|收录|记住|纠正|修改|更新|识别|描述|标签|分类).{0,8}(表情|表情包)", content)
+        or re.search(r"(表情|表情包).{0,8}(学习|添加|收录|纠正|更新|描述|标签|分类)", content)
+    )
+
+
+def _should_block_sticker_send_for_management_turn(context: dict[str, Any]) -> bool:
+    message_text = normalize_text(
+        str(context.get("original_message_text", "") or context.get("message_text", ""))
+    )
+    if not message_text:
+        return False
+    return (
+        _looks_like_sticker_management_message(message_text)
+        and not _looks_like_explicit_sticker_send_message(message_text)
+    )
+
+
 async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """Send a classic QQ face by emotion/description query."""
+    if _should_block_sticker_send_for_management_turn(context):
+        return ToolCallResult(
+            ok=False,
+            data={},
+            display="当前是在学习或查询表情包状态，不应直接发送表情",
+        )
     query = str(args.get("query", "")).strip()
     if not query:
         return ToolCallResult(ok=False, data={}, display="缺少 query 参数")
@@ -6145,6 +6227,12 @@ async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> To
 
 async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """Send a local emoji image. Supports keyword search or random."""
+    if _should_block_sticker_send_for_management_turn(context):
+        return ToolCallResult(
+            ok=False,
+            data={},
+            display="当前是在学习或查询表情包状态，不应直接发送表情包",
+        )
     query = normalize_text(str(args.get("query", ""))).strip()
     if not query:
         query = normalize_text(str(args.get("keyword", ""))).strip()

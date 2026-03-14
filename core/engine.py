@@ -7739,6 +7739,8 @@ class YukikoEngine:
         {
             "send_face",
             "send_emoji",
+            "learn_sticker",
+            "correct_sticker",
             "send_group_message",
             "send_private_message",
             "send_group_forward_msg",
@@ -7767,6 +7769,9 @@ class YukikoEngine:
         for step in agent_result.steps:
 
             tool = step.get("tool", "")
+            step_data = step.get("data", {})
+            if not isinstance(step_data, dict):
+                step_data = {}
 
             if tool in self._SIDE_EFFECT_TOOLS:
 
@@ -7775,9 +7780,33 @@ class YukikoEngine:
                 display = str(step.get("display", result_text)).strip()
 
                 if tool in ("send_face", "send_emoji"):
+                    sticker_desc = (
+                        normalize_text(str(step_data.get("desc", "")))
+                        or normalize_text(str(step_data.get("key", "")))
+                        or display
+                    )
 
                     parts.append(
-                        f"[发送了表情包] {display}" if display else "[发送了表情包]"
+                        f"[发送了表情包] {sticker_desc}"
+                        if sticker_desc
+                        else "[发送了表情包]"
+                    )
+
+                elif tool in ("learn_sticker", "correct_sticker"):
+
+                    sticker_desc = (
+                        normalize_text(str(step_data.get("description", "")))
+                        or normalize_text(str(step_data.get("desc", "")))
+                        or normalize_text(str(step_data.get("key", "")))
+                        or display
+                    )
+
+                    action_label = "学习了表情包" if tool == "learn_sticker" else "修正了表情包"
+
+                    parts.append(
+                        f"[{action_label}] {sticker_desc}"
+                        if sticker_desc
+                        else f"[{action_label}]"
                     )
 
                 elif tool == "generate_image":

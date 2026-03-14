@@ -1493,13 +1493,11 @@ def register_handlers(engine: YukikoEngine) -> None:
         mentioned = _is_mentioned(bot, event, at_targets=at_targets) or (
             reply_to_user_id and str(reply_to_user_id) == str(bot.self_id)
         )
-        at_other_user_ids = [item for item in at_targets if item not in {"all", str(bot.self_id)}]
-        if reply_to_user_id and str(reply_to_user_id) != str(bot.self_id):
-            at_other_user_ids.append(str(reply_to_user_id))
-        at_other_user_ids = list(dict.fromkeys(at_other_user_ids))
-        at_other_user_only = (
-            (bool(at_targets) and not mentioned)
-            or (bool(reply_to_user_id) and str(reply_to_user_id) != str(bot.self_id))
+        at_other_user_ids, at_other_user_only = _resolve_other_user_targets(
+            bot_id=str(bot.self_id),
+            at_targets=at_targets,
+            reply_to_user_id=reply_to_user_id,
+            mentioned=mentioned,
         )
         has_media = _has_media_segments(raw_segments)
         text = raw_text
@@ -2789,6 +2787,37 @@ def _extract_reply_message_id(event: MessageEvent) -> str:
         if match:
             return str(match.group(1))
     return ""
+
+
+def _resolve_other_user_targets(
+    *,
+    bot_id: str,
+    at_targets: list[str],
+    reply_to_user_id: str,
+    mentioned: bool,
+) -> tuple[list[str], bool]:
+    """Separate real @targets from reply anchors.
+
+    Replying to another user is a distinct signal from explicitly @-mentioning
+    that user. Mixing the two makes downstream context think the sender is
+    currently talking to the quoted user, which can skew multi-user reasoning.
+    """
+
+    safe_bot_id = normalize_text(str(bot_id))
+    at_other_user_ids = [
+        item
+        for item in at_targets
+        if item not in {"all", safe_bot_id}
+    ]
+    at_other_user_ids = list(dict.fromkeys(at_other_user_ids))
+    at_other_user_only = (
+        (bool(at_targets) and not mentioned)
+        or (
+            bool(reply_to_user_id)
+            and normalize_text(str(reply_to_user_id)) != safe_bot_id
+        )
+    )
+    return at_other_user_ids, at_other_user_only
 
 
 def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict[str, Any]]]:

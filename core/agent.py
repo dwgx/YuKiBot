@@ -1772,12 +1772,49 @@ class AgentLoop:
             hint_parts.append(
                 f"\n可用自定义表情包: {emoji_count} 个 (使用 send_emoji 工具，兼容别名 send_sticker)"
             )
-        # 心情状态提示：根据当前心情选择合适的表情包
+            latest_parts: list[str] = []
+            latest_for_user = None
+            if hasattr(ctx.sticker_manager, "last_learned_emoji"):
+                latest_for_user = ctx.sticker_manager.last_learned_emoji(
+                    source_user=ctx.user_id
+                )
+                latest_global = ctx.sticker_manager.last_learned_emoji()
+            else:
+                latest_global = None
+
+            def _render_latest(prefix: str, payload: Any) -> str:
+                if not payload or not isinstance(payload, tuple) or len(payload) < 2:
+                    return ""
+                key, emoji = payload[0], payload[1]
+                desc = normalize_text(str(getattr(emoji, "description", ""))) or str(key).split("/")[-1]
+                category = normalize_text(str(getattr(emoji, "category", "")))
+                tags = getattr(emoji, "tags", []) or []
+                tag_text = ",".join(
+                    normalize_text(str(item)) for item in tags[:3] if normalize_text(str(item))
+                )
+                parts = [f"{prefix}: {desc}"]
+                if category:
+                    parts.append(f"分类={category}")
+                if tag_text:
+                    parts.append(f"标签={tag_text}")
+                return " | ".join(parts)
+
+            latest_user_line = _render_latest("当前用户最近学到的表情包", latest_for_user)
+            if latest_user_line:
+                latest_parts.append(latest_user_line)
+            latest_global_line = _render_latest("全局最近学到的表情包", latest_global)
+            if latest_global_line and latest_global_line not in latest_parts:
+                latest_parts.append(latest_global_line)
+            if latest_parts:
+                hint_parts.append("\n" + "\n".join(latest_parts))
         mood = getattr(ctx, "bot_mood", "") or ""
         if mood and emoji_count > 0:
+            hint_parts.append(f"\n当前心情: {mood}。")
+        if emoji_count > 0 or face_count > 0:
             hint_parts.append(
-                f"\n当前心情: {mood}。回复时可以根据心情自然地发一个匹配情绪的表情包（用 send_emoji），"
-                "但不要每条都发，只在情绪表达需要时发。"
+                "\n规则: 只有用户明确要求发送/预览表情时，才调用 send_emoji/send_face。"
+                "如果用户是在学习表情包、纠正描述、查询表情包库、问“学会了吗/更新了吗/刚学的是什么”，"
+                "优先回答状态或使用 list_emojis / correct_sticker，不要自己顺手发一张表情。"
             )
         return "".join(hint_parts) if hint_parts else ""
 
@@ -2128,7 +2165,13 @@ class AgentLoop:
         """构建用户消息。"""
         runtime_templates = _pl.get_dict("agent_runtime")
         rebuilt_query = self._rebuild_query_with_context(ctx.message_text, ctx)
-        parts = [ctx.message_text]
+        speaker_name = normalize_text(ctx.user_name) or (
+            f"用户{str(ctx.user_id)[-4:]}" if normalize_text(str(ctx.user_id)) else "当前用户"
+        )
+        speaker_line = f"[当前说话人: {speaker_name}(QQ:{ctx.user_id})]"
+        if normalize_text(ctx.sender_role):
+            speaker_line = f"{speaker_line[:-1]} | role={normalize_text(ctx.sender_role)}]"
+        parts = [speaker_line, ctx.message_text]
         if rebuilt_query and rebuilt_query != normalize_text(ctx.message_text):
             parts.append(f"[语境补全: {rebuilt_query}]")
 
@@ -3343,31 +3386,17 @@ class AgentLoop:
         )
         if any(cue in t for cue in direct_cues):
             return True
-        request_verbs = ("生成", "画", "畫", "绘", "繪", "做", "整", "出")
-        subject_cues = (
-            "图",
-            "圖",
-            "图片",
-            "圖片",
-            "照片",
-            "头像",
-            "頭像",
-            "壁纸",
-            "壁紙",
-            "插画",
-            "插畫",
-            "立绘",
-            "立繪",
-            "封面",
-            "表情包",
-            "猫娘",
-            "貓娘",
-            "二次元",
-            "anime",
+        subject_pattern = (
+            r"(?:图|圖|图片|圖片|照片|头像|頭像|壁纸|壁紙|插画|插畫|立绘|立繪|封面|表情包|猫娘|貓娘|二次元|anime)"
         )
-        return any(verb in t for verb in request_verbs) and any(
-            cue in t for cue in subject_cues
+        generation_patterns = (
+            rf"(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|替我|帮忙|幫忙|来|來)?"
+            rf"(?:生成|做|整)(?:一张|一張|个|個|张|張)?[^\n。！？!?]{{0,24}}{subject_pattern}",
+            rf"(?:^|[\s，,。.!?：:])(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|替我|帮忙|幫忙|来|來|想|要)?"
+            rf"(?:画|畫|绘|繪)(?:一张|一張|个|個|张|張|幅|一下)?[^\n。！？!?]{{0,24}}{subject_pattern}",
+            rf"{subject_pattern}[^\n。！？!?]{{0,10}}(?:生成|做|整)",
         )
+        return any(re.search(pattern, t) for pattern in generation_patterns)
 
     @staticmethod
     def _infer_image_generation_prompt(text: str) -> str:
