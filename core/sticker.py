@@ -28,6 +28,8 @@ from utils.text import normalize_text
 _log = logging.getLogger("yukiko.sticker")
 
 _QQ_DATA_ROOTS = [
+    Path(os.path.expanduser("~/.config/QQ")),
+    Path(os.path.expanduser("~/.local/share/QQ")),
     Path(os.path.expanduser("~/OneDrive/Documents/Tencent Files")),
     Path(os.path.expanduser("~/Documents/Tencent Files")),
 ]

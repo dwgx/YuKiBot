@@ -4,6 +4,9 @@ from __future__ import annotations
 import asyncio
 
 
+import copy
+
+
 import contextlib
 
 
@@ -797,7 +800,7 @@ class YukikoEngine:
         self.safety = SafetyEngine(self.config.get("safety", {}))
 
         self.trigger = TriggerEngine(
-            trigger_config=self.config.get("trigger", {}),
+            trigger_config=self._build_effective_trigger_config(),
             bot_config=self.config.get("bot", {}),
         )
 
@@ -1119,6 +1122,54 @@ class YukikoEngine:
                 self.logger.warning("trend_fetch_error | %s", e)
 
             await asyncio.sleep(interval)
+
+    def _build_effective_trigger_config(self) -> dict[str, Any]:
+        """Derive runtime trigger flags from control policy + explicit trigger config."""
+        cfg = self.config if isinstance(self.config, dict) else {}
+        trigger_cfg = (
+            copy.deepcopy(cfg.get("trigger", {}))
+            if isinstance(cfg.get("trigger"), dict)
+            else {}
+        )
+        bot_cfg = cfg.get("bot", {}) if isinstance(cfg.get("bot"), dict) else {}
+        control_cfg = (
+            cfg.get("control", {}) if isinstance(cfg.get("control"), dict) else {}
+        )
+
+        allow_non_to_me_defined = "allow_non_to_me" in bot_cfg
+        ai_listen_defined = "ai_listen_enable" in trigger_cfg
+        delegate_defined = "delegate_undirected_to_ai" in trigger_cfg
+
+        allow_non_to_me = bool(bot_cfg.get("allow_non_to_me", False))
+        ai_listen_enable = bool(trigger_cfg.get("ai_listen_enable", False))
+        delegate_undirected = bool(
+            trigger_cfg.get("delegate_undirected_to_ai", False)
+        )
+        policy = (
+            normalize_text(str(control_cfg.get("undirected_policy", "mention_only")))
+            .lower()
+            or "mention_only"
+        )
+
+        if policy in {"off", "disabled", "mention_only", "directed_only"}:
+            allow_non_to_me = False
+            ai_listen_enable = False
+            delegate_undirected = False
+        elif policy == "high_confidence_only":
+            if not allow_non_to_me_defined:
+                allow_non_to_me = True
+            if not ai_listen_defined:
+                ai_listen_enable = True
+            if not delegate_defined:
+                delegate_undirected = False
+
+        if not allow_non_to_me:
+            ai_listen_enable = False
+            delegate_undirected = False
+
+        trigger_cfg["ai_listen_enable"] = ai_listen_enable
+        trigger_cfg["delegate_undirected_to_ai"] = delegate_undirected
+        return trigger_cfg
 
     def _init_from_config(self) -> None:
         """从 config 读取阈值/参数，热重载时也会调用。"""
@@ -1565,7 +1616,7 @@ class YukikoEngine:
 
         if hasattr(self, "trigger"):
 
-            trigger_cfg = self.config.get("trigger", {})
+            trigger_cfg = self._build_effective_trigger_config()
 
             if isinstance(trigger_cfg, dict):
 
@@ -1656,7 +1707,7 @@ class YukikoEngine:
                 )
 
                 self.trigger = TriggerEngine(
-                    trigger_config=self.config.get("trigger", {}),
+                    trigger_config=self._build_effective_trigger_config(),
                     bot_config=self.config.get("bot", {}),
                 )
 

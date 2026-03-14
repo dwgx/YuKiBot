@@ -795,7 +795,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             if not ai_listen_defined:
                 ai_listen_enable_flag = allow_non_to_me_flag
             if not delegate_undirected_defined:
-                delegate_undirected_flag = ai_listen_enable_flag
+                delegate_undirected_flag = False
 
         if not allow_non_to_me_flag:
             ai_listen_enable_flag = False
@@ -1342,6 +1342,16 @@ def register_handlers(engine: YukikoEngine) -> None:
             "multi_reply_max_chunks": max(1, _as_int(bot_cfg_rt.get("multi_reply_max_chunks", 4), 4)),
             "multi_reply_max_lines": max(1, _as_int(bot_cfg_rt.get("multi_reply_max_lines", 1), 1)),
             "multi_reply_max_chars": max(160, _as_int(bot_cfg_rt.get("multi_reply_max_chars", 520), 520)),
+            "multi_reply_chat_max_lines": max(
+                1,
+                _as_int(
+                    bot_cfg_rt.get(
+                        "multi_reply_chat_max_lines",
+                        bot_cfg_rt.get("multi_reply_max_lines", 4),
+                    ),
+                    _as_int(bot_cfg_rt.get("multi_reply_max_lines", 4), 4),
+                ),
+            ),
             "multi_reply_chat_max_chars": max(120, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chars", 320), 320)),
             "multi_reply_chat_max_chunks": max(1, _as_int(bot_cfg_rt.get("multi_reply_chat_max_chunks", 6), 6)),
             "multi_reply_interval_ms": max(0, _as_int(bot_cfg_rt.get("multi_reply_interval_ms", 260), 260)),
@@ -1727,6 +1737,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             multi_reply_max_chunks = int(send_opts["multi_reply_max_chunks"])
             multi_reply_max_lines = int(send_opts["multi_reply_max_lines"])
             multi_reply_max_chars = int(send_opts["multi_reply_max_chars"])
+            multi_reply_chat_max_lines = int(send_opts["multi_reply_chat_max_lines"])
             multi_reply_chat_max_chars = int(send_opts["multi_reply_chat_max_chars"])
             multi_reply_chat_max_chunks = int(send_opts["multi_reply_chat_max_chunks"])
             multi_reply_interval_ms = int(send_opts["multi_reply_interval_ms"])
@@ -2065,10 +2076,9 @@ def register_handlers(engine: YukikoEngine) -> None:
                     chunk_max_chars = multi_reply_max_chars
                     chunk_max_count = multi_reply_max_chunks
                     if action == "reply":
-                        # 日常聊天仍可分段，但不要切得过碎。
-                        chunk_max_lines = min(chunk_max_lines, 2)
-                        chunk_max_chars = min(chunk_max_chars, multi_reply_chat_max_chars)
-                        chunk_max_count = max(chunk_max_count, multi_reply_chat_max_chunks)
+                        chunk_max_lines = multi_reply_chat_max_lines
+                        chunk_max_chars = multi_reply_chat_max_chars
+                        chunk_max_count = multi_reply_chat_max_chunks
                     if action == "search":
                         chunk_max_lines = max(chunk_max_lines, 4)
                         chunk_max_chars = max(chunk_max_chars, 260)

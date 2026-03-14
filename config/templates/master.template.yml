@@ -1,7 +1,7 @@
 config:
   control:
     chat_mode: balanced
-    undirected_policy: high_confidence_only
+    undirected_policy: mention_only
     knowledge_learning: aggressive
     memory_recall_level: light
     emoji_level: medium
@@ -58,7 +58,7 @@ config:
     allow_markdown: true
     allow_search: true
     allow_image: true
-    allow_non_to_me: true
+    allow_non_to_me: false
     private_chat_mode: false
     private_chat_whitelist: []
     max_reply_chars: 520
@@ -67,6 +67,7 @@ config:
     multi_reply_max_chunks: 6
     multi_reply_max_lines: 4
     multi_reply_max_chars: 520
+    multi_reply_chat_max_lines: 4
     multi_reply_chat_max_chars: 320
     multi_reply_chat_max_chunks: 8
     multi_reply_interval_ms: 450
@@ -193,10 +194,11 @@ config:
     whitelist_groups: []
     non_whitelist_mode: silent
   trigger:
-    ai_listen_enable: true
+    ai_listen_enable: false
     delegate_undirected_to_ai: false
-    ai_listen_min_messages: 3
-    ai_listen_min_score: 1.5
+    ai_listen_min_messages: 5
+    ai_listen_min_unique_users: 2
+    ai_listen_min_score: 2.4
     followup_reply_window_seconds: 30
     followup_max_turns: 3
   routing:

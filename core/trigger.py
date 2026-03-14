@@ -109,9 +109,9 @@ class TriggerEngine:
             seconds=max(15, int(trigger_config.get("busy_window_seconds", 60)))
         )
 
-        # 默认开启轻度“旁听探测”，配合后续 self_check 高阈值，减少误接话同时保留自然接话能力。
+        # 默认不做全局旁听；由 control.undirected_policy 或显式 trigger 配置开启。
 
-        self.ai_listen_enable = bool(trigger_config.get("ai_listen_enable", True))
+        self.ai_listen_enable = bool(trigger_config.get("ai_listen_enable", False))
 
         self.ai_listen_interval = timedelta(
             seconds=max(15, int(trigger_config.get("ai_listen_interval_seconds", 45)))
@@ -136,7 +136,7 @@ class TriggerEngine:
         )
 
         self.delegate_undirected_to_ai = bool(
-            trigger_config.get("delegate_undirected_to_ai", True)
+            trigger_config.get("delegate_undirected_to_ai", False)
         )
 
         self.overload_enable = bool(trigger_config.get("overload_enable", True))
