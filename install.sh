@@ -15,6 +15,7 @@ AUTO_OPEN_FIREWALL=1
 SKIP_WEBUI_BUILD=0
 SKIP_CLI_INSTALL=0
 SKIP_NAPCAT=0
+FAST_DEPLOY=0
 
 HOST_INPUT=""
 PORT_INPUT=""
@@ -48,12 +49,14 @@ Options:
   --skip-webui-build        Skip npm build step
   --skip-cli-install        Skip installing /usr/local/bin/yukiko
   --skip-napcat             Skip NapCat detection and install
+  --fast                    Fast deploy: skip webui build + skip NapCat auto-install
   --non-interactive         Use defaults and CLI arguments, no prompts
   -h, --help                Show this help
 
 Examples:
   bash install.sh
   bash install.sh --host 0.0.0.0 --port 18081 --open-firewall
+  bash install.sh --fast --non-interactive --port 8081
   bash install.sh --non-interactive --port 9000 --no-service
 EOF
 }
@@ -120,7 +123,11 @@ install_system_packages() {
   info "Installing system dependencies..."
   case "$pm" in
     apt)
-      run_root apt-get update
+      if [[ "$FAST_DEPLOY" -eq 1 ]]; then
+        warn "Fast mode enabled: skip apt-get update."
+      else
+        run_root apt-get update
+      fi
       run_root apt-get install -y \
         python3 python3-venv python3-pip curl git ca-certificates ffmpeg nodejs npm
       ;;
@@ -616,6 +623,12 @@ parse_args() {
         SKIP_NAPCAT=1
         shift
         ;;
+      --fast)
+        FAST_DEPLOY=1
+        SKIP_WEBUI_BUILD=1
+        SKIP_NAPCAT=1
+        shift
+        ;;
       --non-interactive)
         NON_INTERACTIVE=1
         shift
@@ -717,7 +730,11 @@ main() {
   local pm
   pm="$(detect_pkg_manager)"
   install_system_packages "$pm"
-  ensure_node_18_plus "$pm"
+  if [[ "$SKIP_WEBUI_BUILD" -eq 0 ]]; then
+    ensure_node_18_plus "$pm"
+  else
+    warn "Node.js version check skipped because WebUI build is disabled."
+  fi
   bootstrap_python
   build_webui
   install_napcat

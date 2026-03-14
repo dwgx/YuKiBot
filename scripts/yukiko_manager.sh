@@ -11,6 +11,7 @@ NAPCAT_GUIDE_URL="https://napneko.github.io/guide/boot/Shell"
 DEFAULT_HEALTH_PATH="/api/webui/health"
 DEFAULT_SERVICE_WAIT_SECONDS=40
 DEFAULT_HEALTH_WAIT_SECONDS=35
+DEFAULT_BACKUP_DIR="$ROOT_DIR/backups"
 
 info() { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -271,6 +272,92 @@ wait_webui_health() {
   done
 }
 
+create_backup_archive() {
+  local output_dir="$1"
+  local prefix="$2"
+  local ts archive_name archive_path
+  ts="$(date +%Y%m%d_%H%M%S)"
+  archive_name="${prefix}_${ts}.tar.gz"
+  archive_path="${output_dir%/}/$archive_name"
+
+  mkdir -p "$output_dir"
+
+  local -a include_paths=()
+  [[ -f "$ROOT_DIR/.env" ]] && include_paths+=(".env")
+  [[ -f "$ROOT_DIR/.env.prod" ]] && include_paths+=(".env.prod")
+  [[ -d "$ROOT_DIR/config" ]] && include_paths+=("config")
+  [[ -d "$ROOT_DIR/plugins/config" ]] && include_paths+=("plugins/config")
+  [[ -d "$ROOT_DIR/storage" ]] && include_paths+=("storage")
+
+  if [[ "${#include_paths[@]}" -eq 0 ]]; then
+    return 1
+  fi
+
+  (
+    cd "$ROOT_DIR"
+    tar -czf "$archive_path" "${include_paths[@]}"
+  )
+  printf '%s' "$archive_path"
+}
+
+restore_backup_archive() {
+  local archive_file="$1"
+  if [[ ! -f "$archive_file" ]]; then
+    return 1
+  fi
+  (
+    cd "$ROOT_DIR"
+    tar -xzf "$archive_file"
+  )
+}
+
+infer_update_tasks_from_diff() {
+  local from_commit="$1"
+  local to_commit="$2"
+  local changed
+  changed="$(git -C "$ROOT_DIR" diff --name-only "${from_commit}..${to_commit}" || true)"
+
+  local needs_python=0
+  local needs_webui=0
+
+  if printf '%s\n' "$changed" | grep -Eiq '(^|/)requirements(\.txt|/)|(^|/)pyproject\.toml$|(^|/)poetry\.lock$|(^|/)Pipfile(\.lock)?$'; then
+    needs_python=1
+  fi
+
+  if printf '%s\n' "$changed" | grep -Eiq '^webui/'; then
+    needs_webui=1
+  fi
+
+  printf 'needs_python=%s needs_webui=%s\n' "$needs_python" "$needs_webui"
+}
+
+rollback_update() {
+  local rollback_commit="$1"
+  local service_name="$2"
+
+  warn "Attempting rollback to commit: $rollback_commit"
+  if ! git -C "$ROOT_DIR" reset --hard "$rollback_commit"; then
+    error "Rollback failed: unable to reset to $rollback_commit"
+    return 1
+  fi
+
+  if command_exists systemctl; then
+    local svc_path
+    svc_path="$(service_path "$service_name")"
+    if run_root_nonfatal test -f "$svc_path"; then
+      if run_root_nonfatal systemctl restart "$service_name"; then
+        info "Service restarted after rollback: $service_name"
+      else
+        warn "Rollback succeeded but service restart failed: $service_name"
+      fi
+    fi
+  fi
+
+  wait_webui_health "$DEFAULT_HEALTH_WAIT_SECONDS" || true
+  warn "Rollback completed."
+  return 0
+}
+
 cmd_napcat_status() {
   local method_only=0
   local quiet=0
@@ -316,6 +403,272 @@ cmd_napcat_status() {
     warn "Guide: $NAPCAT_GUIDE_URL"
   fi
   return 1
+}
+
+cmd_doctor() {
+  local service_name="$DEFAULT_SERVICE_NAME"
+  local timeout_seconds=8
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --service-name)
+        service_name="${2:-}"
+        shift 2
+        ;;
+      --timeout-seconds)
+        timeout_seconds="${2:-}"
+        shift 2
+        ;;
+      *)
+        error "Unknown option for doctor: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ ! "$timeout_seconds" =~ ^[0-9]+$ ]] || (( timeout_seconds < 2 || timeout_seconds > 120 )); then
+    error "--timeout-seconds must be between 2 and 120"
+    exit 1
+  fi
+
+  local pass_count=0
+  local warn_count=0
+  local fail_count=0
+  local napcat_method=""
+  local host port health_host webui_token onebot_token
+
+  host="$(get_env_value HOST)"
+  port="$(get_env_value PORT)"
+  webui_token="$(get_env_value WEBUI_TOKEN)"
+  onebot_token="$(get_env_value ONEBOT_ACCESS_TOKEN)"
+  host="${host:-0.0.0.0}"
+  port="${port:-8081}"
+  health_host="$(normalize_health_host "$host")"
+
+  if [[ -f "$ENV_FILE" ]]; then
+    info "[doctor][PASS] .env exists: $ENV_FILE"
+    pass_count=$((pass_count + 1))
+  else
+    error "[doctor][FAIL] .env not found: $ENV_FILE"
+    fail_count=$((fail_count + 1))
+  fi
+
+  if validate_port "$port"; then
+    info "[doctor][PASS] PORT valid: $port"
+    pass_count=$((pass_count + 1))
+  else
+    error "[doctor][FAIL] PORT invalid: $port"
+    fail_count=$((fail_count + 1))
+  fi
+
+  if [[ -n "$webui_token" ]]; then
+    info "[doctor][PASS] WEBUI_TOKEN configured"
+    pass_count=$((pass_count + 1))
+  else
+    error "[doctor][FAIL] WEBUI_TOKEN is empty"
+    fail_count=$((fail_count + 1))
+  fi
+
+  if [[ -n "$onebot_token" ]]; then
+    info "[doctor][PASS] ONEBOT_ACCESS_TOKEN configured"
+    pass_count=$((pass_count + 1))
+  else
+    error "[doctor][FAIL] ONEBOT_ACCESS_TOKEN is empty"
+    fail_count=$((fail_count + 1))
+  fi
+
+  if command_exists ffmpeg; then
+    info "[doctor][PASS] ffmpeg available"
+    pass_count=$((pass_count + 1))
+  else
+    warn "[doctor][WARN] ffmpeg not found"
+    warn_count=$((warn_count + 1))
+  fi
+
+  napcat_method="$(detect_napcat)"
+  if [[ -n "$napcat_method" ]]; then
+    info "[doctor][PASS] NapCat detected: $napcat_method"
+    pass_count=$((pass_count + 1))
+  else
+    warn "[doctor][WARN] NapCat not detected"
+    warn_count=$((warn_count + 1))
+  fi
+
+  if command_exists systemctl; then
+    local svc_path
+    svc_path="$(service_path "$service_name")"
+    if run_root_nonfatal test -f "$svc_path"; then
+      if run_root_nonfatal systemctl is-active --quiet "$service_name"; then
+        info "[doctor][PASS] service active: $service_name"
+        pass_count=$((pass_count + 1))
+      else
+        warn "[doctor][WARN] service not active: $service_name"
+        warn_count=$((warn_count + 1))
+      fi
+    else
+      warn "[doctor][WARN] service file not found: $svc_path"
+      warn_count=$((warn_count + 1))
+    fi
+  else
+    warn "[doctor][WARN] systemctl not available"
+    warn_count=$((warn_count + 1))
+  fi
+
+  if command_exists curl; then
+    local health_url napcat_url
+    health_url="http://${health_host}:${port}${DEFAULT_HEALTH_PATH}"
+    if curl -fsS --connect-timeout 2 --max-time "$timeout_seconds" "$health_url" >/dev/null 2>&1; then
+      info "[doctor][PASS] WebUI health reachable: $health_url"
+      pass_count=$((pass_count + 1))
+    else
+      warn "[doctor][WARN] WebUI health failed: $health_url"
+      warn_count=$((warn_count + 1))
+    fi
+
+    if [[ -n "$webui_token" ]]; then
+      napcat_url="http://${health_host}:${port}/api/webui/napcat/status"
+      if curl -fsS --connect-timeout 2 --max-time "$timeout_seconds" -H "Authorization: Bearer $webui_token" "$napcat_url" >/dev/null 2>&1; then
+        info "[doctor][PASS] NapCat diagnostics API reachable"
+        pass_count=$((pass_count + 1))
+      else
+        warn "[doctor][WARN] NapCat diagnostics API failed (check WEBUI_TOKEN / service)"
+        warn_count=$((warn_count + 1))
+      fi
+    fi
+  else
+    warn "[doctor][WARN] curl not available; skip HTTP diagnostics"
+    warn_count=$((warn_count + 1))
+  fi
+
+  echo "[doctor] summary: pass=${pass_count} warn=${warn_count} fail=${fail_count}"
+  if (( fail_count > 0 )); then
+    return 1
+  fi
+  return 0
+}
+
+cmd_backup() {
+  local output_dir="$DEFAULT_BACKUP_DIR"
+  local name_prefix="yukiko_backup"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --output-dir)
+        output_dir="${2:-}"
+        shift 2
+        ;;
+      --name)
+        name_prefix="${2:-}"
+        shift 2
+        ;;
+      *)
+        error "Unknown option for backup: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$output_dir" || -z "$name_prefix" ]]; then
+    error "backup requires non-empty --output-dir and --name"
+    exit 1
+  fi
+
+  local archive_path
+  archive_path="$(create_backup_archive "$output_dir" "$name_prefix" || true)"
+  if [[ -z "$archive_path" ]]; then
+    error "Backup failed: no files available to archive."
+    exit 1
+  fi
+  info "Backup created: $archive_path"
+}
+
+cmd_restore() {
+  local backup_file=""
+  local service_name="$DEFAULT_SERVICE_NAME"
+  local restart_service=1
+  local assume_yes=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file)
+        backup_file="${2:-}"
+        shift 2
+        ;;
+      --service-name)
+        service_name="${2:-}"
+        shift 2
+        ;;
+      --no-restart)
+        restart_service=0
+        shift
+        ;;
+      --yes)
+        assume_yes=1
+        shift
+        ;;
+      *)
+        error "Unknown option for restore: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  if [[ -z "$backup_file" ]]; then
+    error "restore requires --file <backup.tar.gz>"
+    exit 1
+  fi
+  if [[ ! -f "$backup_file" ]]; then
+    error "Backup file not found: $backup_file"
+    exit 1
+  fi
+
+  if [[ "$assume_yes" -eq 0 ]]; then
+    echo "About to restore backup archive:"
+    echo "- file: $backup_file"
+    echo "- target: $ROOT_DIR"
+    echo "- restart service: $([[ "$restart_service" -eq 1 ]] && echo yes || echo no)"
+    read -r -p "Continue restore? [yes/no]: " confirm
+    if [[ "${confirm,,}" != "yes" ]]; then
+      warn "Restore cancelled."
+      exit 0
+    fi
+  fi
+
+  local pre_backup
+  pre_backup="$(create_backup_archive "$DEFAULT_BACKUP_DIR" "pre_restore" || true)"
+  if [[ -n "$pre_backup" ]]; then
+    info "Created safety backup before restore: $pre_backup"
+  else
+    warn "Unable to create pre-restore backup, continuing."
+  fi
+
+  if command_exists systemctl; then
+    local svc_path
+    svc_path="$(service_path "$service_name")"
+    if run_root_nonfatal test -f "$svc_path"; then
+      run_root_nonfatal systemctl stop "$service_name" || true
+    fi
+  fi
+
+  if ! restore_backup_archive "$backup_file"; then
+    error "Restore failed while extracting archive: $backup_file"
+    exit 1
+  fi
+  info "Restore completed: $backup_file"
+
+  if [[ "$restart_service" -eq 1 ]] && command_exists systemctl; then
+    local svc_path
+    svc_path="$(service_path "$service_name")"
+    if run_root_nonfatal test -f "$svc_path"; then
+      if run_root_nonfatal systemctl restart "$service_name"; then
+        info "Service restarted after restore: $service_name"
+        wait_service_active "$service_name" "$DEFAULT_SERVICE_WAIT_SECONDS" || true
+        wait_webui_health "$DEFAULT_HEALTH_WAIT_SECONDS" || true
+      else
+        warn "Service restart failed after restore: $service_name"
+      fi
+    fi
+  fi
 }
 
 uninstall_napcat() {
@@ -427,6 +780,9 @@ Commands:
   register [--service-name NAME] [--user USER] [--enable-now|--no-enable-now]
                                     Register systemd service
   unregister [--service-name NAME]  Stop/disable and remove service file
+  doctor [options]                  Deployment health diagnostics
+  backup [options]                  Backup env/config/storage
+  restore --file FILE [options]     Restore backup archive
   napcat-status [--method-only|--quiet]
                                     Detect NapCat installation status
   set-port --port N [--host H]      Update HOST/PORT in .env
@@ -442,12 +798,42 @@ Uninstall options:
   --keep-napcat                     Keep NapCat (skip NapCat uninstall)
   --yes                             No confirmation prompt
 
+Doctor options:
+  --service-name NAME               Service name (default: ${DEFAULT_SERVICE_NAME})
+  --timeout-seconds N               Health-check timeout (default: 8)
+
+Backup options:
+  --output-dir DIR                  Backup output dir (default: ${DEFAULT_BACKUP_DIR})
+  --name PREFIX                     Backup filename prefix (default: yukiko_backup)
+
+Restore options:
+  --file FILE                       Backup tar.gz file path (required)
+  --service-name NAME               Service name (default: ${DEFAULT_SERVICE_NAME})
+  --no-restart                      Do not restart service after restore
+  --yes                             No confirmation prompt
+
+Update options:
+  --check-only                      Show update status only
+  --allow-dirty                     Allow updating with dirty worktree
+  --fast                            Skip optional dependency/build steps
+  --force-python                    Force Python dependency sync
+  --force-webui                     Force WebUI build
+  --auto-rollback                   Enable rollback when health checks fail (default)
+  --no-auto-rollback                Disable automatic rollback
+  --hot-reload                      Restart service after update (default)
+  --no-hot-reload                   Do not restart service
+
 Examples:
   yukiko --help
   yukiko install --host 0.0.0.0 --port 18081
   yukiko update --check-only
+  yukiko update --fast
+  yukiko update --no-auto-rollback
   yukiko update --no-hot-reload
   yukiko update --restart
+  yukiko doctor
+  yukiko backup
+  yukiko restore --file backups/yukiko_backup_20260101_120000.tar.gz --yes
   yukiko register --service-name yukiko --user \$USER
   yukiko start
   yukiko logs --lines 200
@@ -466,6 +852,10 @@ cmd_update() {
   local build_webui=1
   local allow_dirty=0
   local hot_reload=1
+  local fast_mode=0
+  local auto_rollback=1
+  local force_python=0
+  local force_webui=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -491,6 +881,26 @@ cmd_update() {
         ;;
       --allow-dirty)
         allow_dirty=1
+        shift
+        ;;
+      --fast)
+        fast_mode=1
+        shift
+        ;;
+      --auto-rollback)
+        auto_rollback=1
+        shift
+        ;;
+      --no-auto-rollback)
+        auto_rollback=0
+        shift
+        ;;
+      --force-python)
+        force_python=1
+        shift
+        ;;
+      --force-webui)
+        force_webui=1
         shift
         ;;
       --hot-reload)
@@ -559,14 +969,45 @@ cmd_update() {
     exit 1
   fi
 
+  local pre_update_commit post_update_commit did_pull=0
+  local changed_hints=""
+  pre_update_commit="$(git -C "$ROOT_DIR" rev-parse HEAD)"
   if [[ "$behind" -gt 0 ]]; then
     info "Pulling latest commits (ff-only)..."
     git -C "$ROOT_DIR" pull --ff-only
+    did_pull=1
   else
     info "Already up to date with $upstream."
   fi
+  post_update_commit="$(git -C "$ROOT_DIR" rev-parse HEAD)"
 
+  if [[ "$did_pull" -eq 1 ]]; then
+    changed_hints="$(infer_update_tasks_from_diff "$pre_update_commit" "$post_update_commit")"
+    info "Changed hints: ${changed_hints:-none}"
+  fi
+
+  local need_python=0
+  local need_webui=0
   if [[ "$install_python" -eq 1 ]]; then
+    if [[ "$force_python" -eq 1 ]]; then
+      need_python=1
+    elif [[ "$fast_mode" -eq 1 ]]; then
+      need_python=0
+    elif [[ "$did_pull" -eq 1 && "$changed_hints" == *"needs_python=1"* ]]; then
+      need_python=1
+    fi
+  fi
+  if [[ "$build_webui" -eq 1 ]]; then
+    if [[ "$force_webui" -eq 1 ]]; then
+      need_webui=1
+    elif [[ "$fast_mode" -eq 1 ]]; then
+      need_webui=0
+    elif [[ "$did_pull" -eq 1 && "$changed_hints" == *"needs_webui=1"* ]]; then
+      need_webui=1
+    fi
+  fi
+
+  if [[ "$need_python" -eq 1 ]]; then
     local py_cmd=""
     if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
       py_cmd="$ROOT_DIR/.venv/bin/python"
@@ -577,13 +1018,15 @@ cmd_update() {
     fi
     if [[ -n "$py_cmd" ]]; then
       info "Installing Python dependencies..."
-      "$py_cmd" -m pip install -r "$ROOT_DIR/requirements.txt"
+      "$py_cmd" -m pip install --disable-pip-version-check -r "$ROOT_DIR/requirements.txt"
     else
       warn "No python executable found, skipped Python dependency sync."
     fi
+  else
+    info "Python dependency sync skipped (no dependency changes detected)."
   fi
 
-  if [[ "$build_webui" -eq 1 ]]; then
+  if [[ "$need_webui" -eq 1 ]]; then
     if [[ -f "$ROOT_DIR/webui/package.json" ]]; then
       if command_exists npm; then
         info "Building WebUI..."
@@ -600,12 +1043,20 @@ cmd_update() {
         warn "npm not found, skipped WebUI build."
       fi
     fi
+  else
+    info "WebUI build skipped (no webui changes detected)."
   fi
 
   local hot_reload_done=0
   local service_ready=0
   local health_ok=0
+  local reload_expected=0
+  local svc_path=""
+  if [[ -n "$service_name" ]]; then
+    svc_path="$(service_path "$service_name")"
+  fi
   if [[ "$restart_service" -eq 1 ]]; then
+    reload_expected=1
     if [[ -z "$service_name" ]]; then
       error "Service name cannot be empty."
       exit 1
@@ -619,9 +1070,8 @@ cmd_update() {
     elif ! command_exists systemctl; then
       warn "systemctl not found, skipped automatic hot reload."
     else
-      local svc_path
-      svc_path="$(service_path "$service_name")"
       if run_root_nonfatal test -f "$svc_path"; then
+        reload_expected=1
         info "Hot reloading service via systemd restart: $service_name"
         if run_root_nonfatal systemctl restart "$service_name"; then
           info "Hot reload completed: service restarted."
@@ -645,6 +1095,14 @@ cmd_update() {
 
     if wait_webui_health "$DEFAULT_HEALTH_WAIT_SECONDS"; then
       health_ok=1
+    fi
+  fi
+
+  if [[ "$did_pull" -eq 1 && "$auto_rollback" -eq 1 && "$reload_expected" -eq 1 ]]; then
+    if [[ "$hot_reload_done" -ne 1 || "$service_ready" -ne 1 || "$health_ok" -ne 1 ]]; then
+      warn "Readiness checks failed after update. Auto rollback is enabled."
+      rollback_update "$pre_update_commit" "$service_name" || true
+      return 1
     fi
   fi
 
@@ -1043,6 +1501,15 @@ main() {
       ;;
     unregister)
       cmd_unregister "$@"
+      ;;
+    doctor)
+      cmd_doctor "$@"
+      ;;
+    backup)
+      cmd_backup "$@"
+      ;;
+    restore)
+      cmd_restore "$@"
       ;;
     napcat-status)
       cmd_napcat_status "$@"

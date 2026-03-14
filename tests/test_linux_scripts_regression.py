@@ -8,7 +8,16 @@ class LinuxScriptsRegressionTests(unittest.TestCase):
     def test_manager_script_contains_napcat_status_and_cleanup_flow(self) -> None:
         text = Path("scripts/yukiko_manager.sh").read_text(encoding="utf-8")
         self.assertIn("cmd_napcat_status()", text)
+        self.assertIn("cmd_doctor()", text)
+        self.assertIn("cmd_backup()", text)
+        self.assertIn("cmd_restore()", text)
         self.assertIn("napcat-status [--method-only|--quiet]", text)
+        self.assertIn("doctor [options]", text)
+        self.assertIn("backup [options]", text)
+        self.assertIn("restore --file FILE [options]", text)
+        self.assertIn("--fast", text)
+        self.assertIn("--no-auto-rollback", text)
+        self.assertIn("rollback_update", text)
         self.assertIn("--keep-napcat", text)
         self.assertIn("uninstall_napcat()", text)
         self.assertIn("wait_webui_health()", text)
@@ -17,6 +26,7 @@ class LinuxScriptsRegressionTests(unittest.TestCase):
     def test_install_script_contains_onebot_access_token_and_extended_detection(self) -> None:
         text = Path("install.sh").read_text(encoding="utf-8")
         self.assertIn("--onebot-access-token", text)
+        self.assertIn("--fast", text)
         self.assertIn("ONEBOT_ACCESS_TOKEN_INPUT", text)
         self.assertIn('upsert_env "ONEBOT_ACCESS_TOKEN"', text)
         self.assertIn("/opt/QQ/resources/app/napcat/napcat.mjs", text)
@@ -25,4 +35,3 @@ class LinuxScriptsRegressionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

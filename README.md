@@ -225,6 +225,11 @@ ANTHROPIC_API_KEY=                         # Claude（按需）
 ```bash
 yukiko status              # 查看服务状态
 yukiko logs --lines 200    # 查看最近日志
+yukiko doctor              # 部署健康自检
+yukiko napcat-status       # NapCat 安装检测
+yukiko backup              # 备份 env/config/storage
+yukiko restore --file <backup.tar.gz> --yes
+yukiko update --fast       # 快速更新（按变更决定是否装依赖/构建）
 yukiko restart             # 重启服务
 yukiko stop                # 停止服务
 yukiko start               # 启动服务
@@ -314,6 +319,7 @@ YuKiKo/
 | [English Guide](docs/en/GUIDE.md) | Deployment & configuration |
 | [English Architecture](docs/en/ARCHITECTURE.md) | Internal design notes |
 | [繁體中文指南](docs/zh-TW/GUIDE.md) | 部署與設定 |
+| [NapCat/Linux/WebUI 更新說明](docs/zh-TW/NAPCAT_LINUX_WEBUI_UPDATE.md) | NapCat 深度整合、運維命令、部署加速 |
 | [插件开发指南](docs/PLUGIN_GUIDE.md) | 插件配置与开发 |
 
 ## 📄 License
