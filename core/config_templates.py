@@ -262,6 +262,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
         "trigger": {
             "ai_listen_enable": False,
             "delegate_undirected_to_ai": False,
+            "delegate_undirected_min_signal": 1.0,
             "ai_listen_min_messages": 5,
             "ai_listen_min_unique_users": 2,
             "ai_listen_min_score": 2.4,

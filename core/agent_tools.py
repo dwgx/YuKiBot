@@ -5256,89 +5256,145 @@ async def _handle_analyze_image(args: dict[str, Any], context: dict[str, Any]) -
 
 async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """处理语音转文字请求。"""
-    import tempfile
     from pathlib import Path as _Path
+    import hashlib
 
     explicit_url = normalize_text(str(args.get("url", "")))
     raw_segments = context.get("raw_segments", [])
     reply_media_segments = context.get("reply_media_segments", [])
     api_call = context.get("api_call")
 
-    # 收集所有语音 URL
-    voice_url = explicit_url
-    voice_file_id = ""
-    if not voice_url:
-        for segs in (raw_segments, reply_media_segments):
-            for seg in (segs or []):
-                if not isinstance(seg, dict):
-                    continue
-                seg_type = normalize_text(str(seg.get("type", ""))).lower()
-                if seg_type not in ("record", "audio"):
-                    continue
-                data = seg.get("data", {}) or {}
-                url = normalize_text(str(data.get("url", "")))
-                fid = normalize_text(str(data.get("file", "") or data.get("file_id", "")))
-                if url:
-                    voice_url = url
-                    break
-                if fid:
-                    voice_file_id = fid
-                    break
-            if voice_url or voice_file_id:
-                break
+    url_candidates: list[str] = []
+    file_id_candidates: list[str] = []
+    seen_urls: set[str] = set()
+    seen_file_ids: set[str] = set()
 
-    if not voice_url and not voice_file_id:
+    def _append_voice_url(value: Any) -> None:
+        url = normalize_text(str(value))
+        if not url or url in seen_urls:
+            return
+        seen_urls.add(url)
+        url_candidates.append(url)
+
+    def _append_voice_file_id(value: Any) -> None:
+        file_id = normalize_text(str(value))
+        if not file_id or file_id in seen_file_ids:
+            return
+        seen_file_ids.add(file_id)
+        file_id_candidates.append(file_id)
+
+    if explicit_url:
+        _append_voice_url(explicit_url)
+
+    for segs in (raw_segments, reply_media_segments):
+        for seg in (segs or []):
+            if not isinstance(seg, dict):
+                continue
+            seg_type = normalize_text(str(seg.get("type", ""))).lower()
+            if seg_type not in ("record", "audio"):
+                continue
+            data = seg.get("data", {}) or {}
+            if not isinstance(data, dict):
+                continue
+            _append_voice_url(data.get("url", ""))
+            _append_voice_file_id(data.get("file", "") or data.get("file_id", ""))
+
+    if not url_candidates and not file_id_candidates:
         return ToolCallResult(
             ok=False,
             error="voice_not_found",
             display="没有找到语音消息。请发送语音或回复一条语音消息再试。",
         )
 
-    # 尝试通过 NapCat API 获取语音文件
-    if not voice_url and voice_file_id and api_call:
-        try:
-            result = await call_napcat_api(api_call, "get_record", file=voice_file_id, out_format="mp3")
-            if isinstance(result, dict):
-                # 某些实现直接返回转录文本
-                text = str(result.get("text", "")).strip()
-                if text:
-                    return ToolCallResult(ok=True, data={"text": text, "source": "napcat_stt"}, display=f"语音内容: {text}")
-                voice_url = str(result.get("url", "") or result.get("file", "")).strip()
-        except Exception as exc:
-            _log.warning("voice_get_record_error | %s", exc)
+    # 尝试通过 NapCat API 用 file_id 反查完整可下载地址。
+    if callable(api_call):
+        for voice_file_id in file_id_candidates:
+            try:
+                result = await call_napcat_api(
+                    api_call,
+                    "get_record",
+                    file=voice_file_id,
+                    out_format="mp3",
+                )
+            except Exception as exc:
+                _log.warning("voice_get_record_error | file=%s | %s", voice_file_id, exc)
+                continue
+            if not isinstance(result, dict):
+                continue
 
-    if not voice_url:
+            # 某些实现直接返回转录文本
+            text = str(result.get("text", "")).strip()
+            if text:
+                return ToolCallResult(
+                    ok=True,
+                    data={"text": text, "source": "napcat_stt"},
+                    display=f"语音内容: {text}",
+                )
+
+            _append_voice_url(result.get("url", "") or result.get("file", ""))
+
+    if not url_candidates:
         return ToolCallResult(ok=False, error="voice_url_unavailable", display="无法获取语音文件地址")
 
-    # 下载语音文件
     try:
         from utils.media import download_file, extract_audio, transcribe_audio
 
         cache_dir = _Path("storage/cache/voice")
         cache_dir.mkdir(parents=True, exist_ok=True)
-        import hashlib
-        fname = hashlib.md5(voice_url.encode()).hexdigest()
-        voice_path = cache_dir / f"{fname}.mp3"
 
-        if not voice_path.is_file():
-            ok = await download_file(voice_url, voice_path, timeout=20.0)
-            if not ok:
-                return ToolCallResult(ok=False, error="voice_download_failed", display="语音文件下载失败")
+        had_download = False
+        had_empty_transcript = False
 
-        # 转换为 WAV
-        wav_path = await extract_audio(voice_path, voice_path.with_suffix(".wav"))
-        if not wav_path:
-            wav_path = str(voice_path)  # 尝试直接用 mp3
+        for voice_url in url_candidates:
+            fname = hashlib.md5(voice_url.encode()).hexdigest()
+            voice_path = cache_dir / f"{fname}.mp3"
 
-        # Whisper 转录
-        text = await transcribe_audio(wav_path, language="zh")
-        if not text:
-            return ToolCallResult(ok=False, error="whisper_transcribe_empty", display="语音转录结果为空，可能是静音或无法识别")
+            if not (voice_path.is_file() and voice_path.stat().st_size > 0):
+                downloaded = False
+                if re.match(r"^https?://", voice_url, flags=re.IGNORECASE):
+                    downloaded = await download_file(voice_url, voice_path, timeout=20.0)
+                else:
+                    local_path = _Path(voice_url).expanduser()
+                    if local_path.is_file():
+                        try:
+                            shutil.copyfile(local_path, voice_path)
+                            downloaded = voice_path.is_file() and voice_path.stat().st_size > 0
+                        except Exception as exc:
+                            _log.warning(
+                                "voice_local_copy_error | src=%s | %s", local_path, exc
+                            )
+                if not downloaded:
+                    continue
 
+            had_download = True
+
+            wav_path = await extract_audio(voice_path, voice_path.with_suffix(".wav"))
+            if not wav_path:
+                wav_path = str(voice_path)  # 尝试直接用 mp3
+
+            text = await transcribe_audio(wav_path, language="zh")
+            if text:
+                return ToolCallResult(
+                    ok=True,
+                    data={"text": text, "source": "whisper"},
+                    display=f"语音内容: {text}",
+                )
+            had_empty_transcript = True
+
+        if had_empty_transcript:
+            return ToolCallResult(
+                ok=False,
+                error="whisper_transcribe_empty",
+                display="语音转录结果为空，可能是静音或无法识别",
+            )
+        if not had_download:
+            return ToolCallResult(
+                ok=False, error="voice_download_failed", display="语音文件下载失败"
+            )
         return ToolCallResult(
-            ok=True,
-            data={"text": text, "source": "whisper"},
-            display=f"语音内容: {text}",
+            ok=False,
+            error="voice_prepare_failed",
+            display="语音准备失败",
         )
     except ImportError:
         return ToolCallResult(ok=False, error="whisper_not_installed", display="语音转录功能需要安装 openai-whisper: pip install openai-whisper")
