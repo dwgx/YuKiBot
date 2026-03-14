@@ -44,6 +44,9 @@ class CompatContextInput:
     user_profile_summary: str = ""
     affinity_summary: str = ""
     bot_mood: str = ""
+    relationship_summary: str = ""
+    humanization_summary: str = ""
+    kaomoji_summary: str = ""
 
 
 def build_affinity_summary(affinity_engine: Any, user_id: str) -> str:
@@ -95,6 +98,18 @@ def build_context_compat_block(payload: CompatContextInput) -> str:
     if affinity_summary:
         rows.append(affinity_summary)
 
+    relationship_summary = normalize_text(payload.relationship_summary)
+    if relationship_summary:
+        rows.append(f"关系策略: {clip_text(relationship_summary, 220)}")
+
+    humanization_summary = normalize_text(payload.humanization_summary)
+    if humanization_summary:
+        rows.append(f"拟人参数: {clip_text(humanization_summary, 220)}")
+
+    kaomoji_summary = normalize_text(payload.kaomoji_summary)
+    if kaomoji_summary:
+        rows.append(kaomoji_summary)
+
     profile_summary = normalize_text(payload.user_profile_summary)
     if profile_summary:
         rows.append(f"当前用户画像摘要: {clip_text(profile_summary, 180)}")
@@ -123,7 +138,8 @@ def build_context_compat_block(payload: CompatContextInput) -> str:
     rows.append(
         "关系兼容层规则: 把群里每个人都当成独立、持续存在的真实个体；"
         "先回应当前说话人的情绪和诉求；允许关系自然延续和升温，但只能基于真实对话证据；"
-        "不要把其他成员的画像、偏好、记忆、情绪或结论套到当前用户身上，也不要编造不存在的共同经历。"
+        "不要把其他成员的画像、偏好、记忆、情绪或结论套到当前用户身上，也不要编造不存在的共同经历；"
+        "家庭/结婚等承诺类关系必须谨慎递进，未达条件时不要直接答应。"
     )
 
     return "【群聊关系兼容层】\n" + "\n".join(f"- {row}" for row in rows if normalize_text(row))

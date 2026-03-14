@@ -85,6 +85,20 @@ _CANDIDATE_STOP_CUES = (
     "懂吗",
     "知道吗",
 )
+_QUESTION_NAME_CUES = frozenset(
+    {
+        "什么",
+        "啥",
+        "谁",
+        "叫什么",
+        "叫啥",
+        "啥名",
+        "什么名",
+        "什么名字",
+        "啥名字",
+        "哪位",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,7 +140,14 @@ def _clean_candidate(raw: str) -> str:
     candidate = strip_invisible_format_chars(normalize_text(candidate))
     if not candidate or len(candidate) > 24:
         return ""
+    lowered = candidate.lower()
+    if lowered in _QUESTION_NAME_CUES:
+        return ""
     if any(cue in candidate for cue in _CANDIDATE_STOP_CUES):
+        return ""
+    if any(cue in lowered for cue in ("什么", "啥", "谁")):
+        return ""
+    if candidate.endswith(("吗", "嘛", "呢")):
         return ""
     if re.search(r"[，,。.!！?？:：;；/\\]", candidate):
         return ""
@@ -136,6 +157,8 @@ def _clean_candidate(raw: str) -> str:
 def extract_explicit_preferred_name(text: str) -> str:
     content = strip_invisible_format_chars(normalize_text(text))
     if not content:
+        return ""
+    if "?" in content or "？" in content:
         return ""
     for pattern in _PREFERRED_NAME_SENTENCE_PATTERNS:
         match = pattern.match(content)

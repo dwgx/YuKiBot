@@ -40,6 +40,11 @@ _FUZZY_COMMAND_MAP: dict[str, str] = {
     "debug": "debug", "调试": "debug",
     "定海神针": "clear_screen", "刷屏": "clear_screen", "清屏": "clear_screen",
     "学习表情包": "learn_sticker", "表情包": "sticker_status", "扫描表情包": "scan_sticker",
+    "忽略用户": "ignore_user", "别理他": "ignore_user", "不理他": "ignore_user",
+    "恢复用户": "unignore_user", "取消忽略": "unignore_user", "解除忽略": "unignore_user",
+    "忽略列表": "ignore_list",
+    "高风险确认": "high_risk_confirm", "风险确认": "high_risk_confirm", "二次确认": "high_risk_confirm",
+    "免确认": "high_risk_confirm", "不用确认": "high_risk_confirm", "直接执行": "high_risk_confirm",
     "更新": "update", "升级": "update", "update": "update", "upgrade": "update", "远程更新": "update",
 }
 
@@ -107,9 +112,22 @@ class AdminEngine:
         "表情包": "sticker_status",
         "表情包状态": "sticker_status",
         "扫描表情包": "scan_sticker",
+        "忽略用户": "ignore_user",
+        "ignore": "ignore_user",
+        "恢复用户": "unignore_user",
+        "解除忽略": "unignore_user",
+        "unignore": "unignore_user",
+        "忽略列表": "ignore_list",
+        "ignored": "ignore_list",
+        "高风险确认": "high_risk_confirm",
+        "风险确认": "high_risk_confirm",
+        "二次确认": "high_risk_confirm",
+        "high_risk_confirm": "high_risk_confirm",
+        "risk_confirm": "high_risk_confirm",
     }
 
     _PUBLIC = {"help", "help_detail", "plugins"}
+    _GROUP_ADMIN_ACTIONS = {"ignore_user", "unignore_user", "ignore_list", "high_risk_confirm"}
 
     def __init__(self, config: dict[str, Any], storage_dir: Path):
         self.config = config if isinstance(config, dict) else {}
@@ -142,6 +160,19 @@ class AdminEngine:
                 pass
         self._load_white()
 
+        self._ignore_path = self.storage_dir / "ignored_users.json"
+        self._ignored_global: set[str] = set()
+        self._ignored_group: dict[int, set[str]] = {}
+        self._ignore_policy = normalize_text(str(admin_cfg.get("ignore_policy", "silent"))).lower() or "silent"
+        if self._ignore_policy not in {"silent", "soft", "ai_review"}:
+            self._ignore_policy = "silent"
+        self._load_ignore()
+
+        self._policy_path = self.storage_dir / "runtime_policies.json"
+        self._high_risk_confirm_global: bool | None = None
+        self._high_risk_confirm_group: dict[int, bool] = {}
+        self._load_runtime_policy()
+
     @property
     def enabled(self) -> bool:
         return self._enabled
@@ -160,6 +191,15 @@ class AdminEngine:
             return True
         return str(user_id).strip() in self._super_users
 
+    def is_group_admin_user(self, user_id: str, group_id: int = 0, sender_role: str = "") -> bool:
+        if self.is_super_admin(user_id):
+            return True
+        role = normalize_text(sender_role).lower()
+        gid = int(group_id or 0)
+        if gid <= 0 or role not in {"owner", "admin"}:
+            return False
+        return self.is_group_whitelisted(gid)
+
     def is_group_whitelisted(self, group_id: int | str) -> bool:
         if not self.enabled:
             return True
@@ -173,14 +213,152 @@ class AdminEngine:
             return False
         return gid in self._white
 
+    @property
+    def ignore_policy(self) -> str:
+        return self._ignore_policy
+
+    def is_user_ignored(self, user_id: str, group_id: int = 0) -> bool:
+        uid = normalize_text(str(user_id))
+        if not uid:
+            return False
+        if uid in self._ignored_global:
+            return True
+        if int(group_id or 0) > 0 and uid in self._ignored_group.get(int(group_id), set()):
+            return True
+        return False
+
+    def list_ignored_users(self, group_id: int = 0) -> dict[str, Any]:
+        gid = int(group_id or 0)
+        group_items = sorted(self._ignored_group.get(gid, set())) if gid > 0 else []
+        global_items = sorted(self._ignored_global)
+        return {
+            "policy": self._ignore_policy,
+            "group_id": gid,
+            "group_users": group_items,
+            "global_users": global_items,
+            "group_count": len(group_items),
+            "global_count": len(global_items),
+        }
+
+    def add_ignored_user(self, user_id: str, group_id: int = 0, scope: str = "group") -> tuple[bool, str]:
+        uid = normalize_text(str(user_id))
+        if not uid:
+            return False, "目标用户不能为空"
+        scope_value = normalize_text(scope).lower() or "group"
+        gid = int(group_id or 0)
+        if scope_value in {"global", "all", "全局"}:
+            self._ignored_global.add(uid)
+            self._save_ignore()
+            return True, f"已忽略用户 {uid}（全局）"
+        if gid <= 0:
+            return False, "群聊内默认按本群忽略；私聊请使用全局 scope"
+        bucket = self._ignored_group.setdefault(gid, set())
+        bucket.add(uid)
+        self._save_ignore()
+        return True, f"已忽略用户 {uid}（本群 {gid}）"
+
+    def remove_ignored_user(self, user_id: str, group_id: int = 0, scope: str = "group") -> tuple[bool, str]:
+        uid = normalize_text(str(user_id))
+        if not uid:
+            return False, "目标用户不能为空"
+        scope_value = normalize_text(scope).lower() or "group"
+        gid = int(group_id or 0)
+        changed = False
+        if scope_value in {"global", "all", "全局"}:
+            if uid in self._ignored_global:
+                self._ignored_global.discard(uid)
+                changed = True
+        else:
+            if gid > 0 and uid in self._ignored_group.get(gid, set()):
+                self._ignored_group[gid].discard(uid)
+                if not self._ignored_group[gid]:
+                    self._ignored_group.pop(gid, None)
+                changed = True
+            elif uid in self._ignored_global:
+                # 兜底：群聊解封时允许自动解除全局忽略，避免误操作后难恢复。
+                self._ignored_global.discard(uid)
+                changed = True
+                scope_value = "global"
+        if changed:
+            self._save_ignore()
+            if scope_value in {"global", "all", "全局"}:
+                return True, f"已恢复用户 {uid}（全局）"
+            return True, f"已恢复用户 {uid}（本群 {gid}）"
+        return False, f"用户 {uid} 不在忽略列表"
+
     def increment_message_count(self) -> None:
         self._count += 1
+
+    def get_high_risk_confirmation_policy(
+        self,
+        *,
+        group_id: int = 0,
+        default_required: bool = True,
+    ) -> dict[str, Any]:
+        gid = int(group_id or 0)
+        if gid > 0 and gid in self._high_risk_confirm_group:
+            required = bool(self._high_risk_confirm_group.get(gid, True))
+            return {
+                "high_risk_confirmation_required": required,
+                "source": "group",
+                "group_id": gid,
+                "overridden": True,
+            }
+        if self._high_risk_confirm_global is not None:
+            required = bool(self._high_risk_confirm_global)
+            return {
+                "high_risk_confirmation_required": required,
+                "source": "global",
+                "group_id": gid,
+                "overridden": True,
+            }
+        return {
+            "high_risk_confirmation_required": bool(default_required),
+            "source": "default",
+            "group_id": gid,
+            "overridden": False,
+        }
+
+    def set_high_risk_confirmation_policy(
+        self,
+        *,
+        required: bool | None,
+        scope: str = "group",
+        group_id: int = 0,
+    ) -> tuple[bool, str, dict[str, Any]]:
+        scope_value = normalize_text(scope).lower() or "group"
+        gid = int(group_id or 0)
+        payload: dict[str, Any] = {"scope": scope_value, "group_id": gid}
+        if scope_value in {"global", "all", "全局"}:
+            self._high_risk_confirm_global = None if required is None else bool(required)
+            self._save_runtime_policy()
+            if required is None:
+                payload["high_risk_confirmation_required"] = None
+                return True, "已恢复全局高风险确认默认策略", payload
+            payload["high_risk_confirmation_required"] = bool(required)
+            if required:
+                return True, "已开启全局高风险二次确认", payload
+            return True, "已关闭全局高风险二次确认", payload
+        if gid <= 0:
+            return False, "群聊内默认按本群设置；私聊请使用 global scope", payload
+        if required is None:
+            self._high_risk_confirm_group.pop(gid, None)
+            self._save_runtime_policy()
+            payload["high_risk_confirmation_required"] = None
+            return True, f"已恢复本群 {gid} 的高风险确认默认策略", payload
+        self._high_risk_confirm_group[gid] = bool(required)
+        self._save_runtime_policy()
+        payload["high_risk_confirmation_required"] = bool(required)
+        if required:
+            return True, f"已开启本群 {gid} 的高风险二次确认", payload
+        return True, f"已关闭本群 {gid} 的高风险二次确认", payload
 
     async def handle_command(
         self,
         text: str,
         user_id: str,
         group_id: int,
+        sender_role: str = "",
         engine: Any = None,
         api_call: Any = None,
     ) -> str | None:
@@ -194,7 +372,7 @@ class AdminEngine:
         if first in self._TOP:
             action = self._TOP[first]
             arg = parts[1].strip() if len(parts) > 1 else ""
-            return await self._dispatch(action, arg, user_id, group_id, engine, api_call)
+            return await self._dispatch(action, arg, user_id, group_id, sender_role, engine, api_call)
 
         if first in {"/yuki", "/yuki帮助"}:
             sub = normalize_text(parts[1]).lower() if len(parts) > 1 else "help"
@@ -211,7 +389,7 @@ class AdminEngine:
                     return f"未知命令「{sub}」，你是不是想用:\n" + "\n".join(f"  /yuki {s}" for s in suggestions)
                 return "未知子命令 发送 /yuki help 查看用法"
             arg = parts[2].strip() if len(parts) > 2 else ""
-            return await self._dispatch(action, arg, user_id, group_id, engine, api_call)
+            return await self._dispatch(action, arg, user_id, group_id, sender_role, engine, api_call)
         return None
 
     def _fuzzy_match_command(self, text: str) -> str | None:
@@ -246,9 +424,25 @@ class AdminEngine:
         matches = get_close_matches(t, candidates, n=3, cutoff=0.4)
         return matches
 
-    async def _dispatch(self, action: str, arg: str, user_id: str, group_id: int, engine: Any, api_call: Any) -> str | None:
-        if action not in self._PUBLIC and not self.is_super_admin(user_id):
-            return "权限不足 仅超级管理员可使用此指令"
+    async def _dispatch(
+        self,
+        action: str,
+        arg: str,
+        user_id: str,
+        group_id: int,
+        sender_role: str,
+        engine: Any,
+        api_call: Any,
+    ) -> str | None:
+        if action not in self._PUBLIC:
+            if self.is_super_admin(user_id):
+                pass
+            elif action in self._GROUP_ADMIN_ACTIONS and self.is_group_admin_user(user_id, group_id, sender_role):
+                pass
+            else:
+                if action in self._GROUP_ADMIN_ACTIONS:
+                    return "权限不足，此指令需要本群管理员/群主或超级管理员权限"
+                return "权限不足 仅超级管理员可使用此指令"
         handler = getattr(self, f"_act_{action}", None)
         if handler is None:
             return "命令暂未实现"
@@ -264,6 +458,8 @@ class AdminEngine:
             "戳 / 骰子 / 猜拳\n"
             "音乐卡片 / json / 定海神针\n"
             "表情包 / 学习表情包 / 扫描表情包\n"
+            "忽略用户 / 恢复用户 / 忽略列表\n"
+            "高风险确认\n"
             "---------------------\n"
             "/yuki help_detail 查看详细参数"
         )
@@ -285,6 +481,10 @@ class AdminEngine:
             "  /yuki 加白          add current group\n"
             "  /yuki 拉黑          remove current group\n"
             "  /yuki 白名单        list all groups\n"
+            "  /yuki 忽略列表      list ignored users\n"
+            "  /yuki 忽略用户 <QQ> [group|global]\n"
+            "  /yuki 恢复用户 <QQ> [group|global]\n"
+            "  /yuki 高风险确认 [on|off|default] [group|global]\n"
             "---------------------\n"
             "Safety & Behavior\n"
             "  /yuki 尺度 <0-3>    0=off 1=loose 2=standard 3=strict\n"
@@ -299,6 +499,9 @@ class AdminEngine:
             "  /yuki 收藏表情      custom face status\n"
             "  /yuki 拉取收藏表情 [n]  fetch n custom faces (default 48)\n"
             "  /yuki 学习收藏表情 [n]  learn n custom faces via LLM\n"
+            "  /yuki 高风险确认 off group   disable confirm for this group\n"
+            "  /yuki 高风险确认 on group    enable confirm for this group\n"
+            "  /yuki 高风险确认 default     reset current scope to default\n"
             "---------------------\n"
             "Interactive\n"
             "  /yuki 戳 <QQ>       poke user\n"
@@ -408,6 +611,7 @@ class AdminEngine:
             f"  运行时长  {uptime_str}",
             f"  消息计数  {self._count}",
             f"  白名单群  {len(self._white)} 个",
+            f"  忽略用户  群内{sum(len(x) for x in self._ignored_group.values())} / 全局{len(self._ignored_global)}",
         ]
         if engine is not None:
             if getattr(engine, "safety", None) is not None:
@@ -615,6 +819,124 @@ class AdminEngine:
         if not self._white:
             return "白名单为空"
         return "白名单群\n" + "\n".join(f"- {x}" for x in sorted(self._white))
+
+    @staticmethod
+    def _parse_ignore_action_arg(arg: str, *, default_scope: str = "group") -> tuple[str, str]:
+        raw = normalize_text(arg)
+        if not raw:
+            return "", default_scope
+        parts = [normalize_text(item) for item in raw.split() if normalize_text(item)]
+        if not parts:
+            return "", default_scope
+        user_id = parts[0]
+        scope = default_scope
+        for token in parts[1:]:
+            lowered = token.lower()
+            if lowered in {"global", "all", "全局"}:
+                scope = "global"
+                break
+            if lowered in {"group", "本群"}:
+                scope = "group"
+                break
+        return user_id, scope
+
+    async def _act_ignore_user(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        user_id = normalize_text(str(kwargs.get("user_id", "")))
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        default_scope = "group" if gid > 0 else "global"
+        target_user_id, scope = self._parse_ignore_action_arg(arg, default_scope=default_scope)
+        if not target_user_id:
+            return "用法: /yuki 忽略用户 <QQ号> [group|global]"
+        if scope == "global" and not self.is_super_admin(user_id):
+            return "权限不足，只有超级管理员可以设置全局忽略"
+        ok, message = self.add_ignored_user(target_user_id, group_id=gid, scope=scope)
+        return message if ok else f"忽略失败: {message}"
+
+    async def _act_unignore_user(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        user_id = normalize_text(str(kwargs.get("user_id", "")))
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        default_scope = "group" if gid > 0 else "global"
+        target_user_id, scope = self._parse_ignore_action_arg(arg, default_scope=default_scope)
+        if not target_user_id:
+            return "用法: /yuki 恢复用户 <QQ号> [group|global]"
+        if scope == "global" and not self.is_super_admin(user_id):
+            return "权限不足，只有超级管理员可以解除全局忽略"
+        ok, message = self.remove_ignored_user(target_user_id, group_id=gid, scope=scope)
+        return message if ok else f"恢复失败: {message}"
+
+    async def _act_ignore_list(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        info = self.list_ignored_users(group_id=gid)
+        rows = [
+            f"忽略策略: {info.get('policy', 'silent')}",
+            f"全局忽略({info.get('global_count', 0)}):",
+        ]
+        global_users = info.get("global_users", [])
+        if isinstance(global_users, list) and global_users:
+            rows.extend([f"- {item}" for item in global_users[:60]])
+        else:
+            rows.append("- (空)")
+        if gid > 0:
+            rows.append(f"本群忽略({info.get('group_count', 0)}):")
+            group_users = info.get("group_users", [])
+            if isinstance(group_users, list) and group_users:
+                rows.extend([f"- {item}" for item in group_users[:60]])
+            else:
+                rows.append("- (空)")
+        return "\n".join(rows)
+
+    @staticmethod
+    def _parse_high_risk_confirm_arg(arg: str, *, default_scope: str = "group") -> tuple[bool | None, str]:
+        content = normalize_text(arg).lower()
+        if not content:
+            return None, default_scope
+        parts = [item for item in content.split() if item]
+        required: bool | None = None
+        scope = default_scope
+        for token in parts:
+            if token in {"on", "enable", "enabled", "true", "1", "需要确认", "开启", "打开", "恢复确认"}:
+                required = True
+                continue
+            if token in {"off", "disable", "disabled", "false", "0", "免确认", "不用确认", "不需要确认", "关闭", "直接执行"}:
+                required = False
+                continue
+            if token in {"default", "reset", "恢复默认", "默认"}:
+                required = None
+                continue
+            if token in {"global", "all", "全局"}:
+                scope = "global"
+                continue
+            if token in {"group", "本群"}:
+                scope = "group"
+                continue
+        return required, scope
+
+    async def _act_high_risk_confirm(self, **kwargs: Any) -> str:
+        gid = int(kwargs.get("group_id", 0) or 0)
+        user_id = normalize_text(str(kwargs.get("user_id", "")))
+        arg = normalize_text(str(kwargs.get("arg", "")))
+        default_scope = "group" if gid > 0 else "global"
+        if not arg:
+            policy = self.get_high_risk_confirmation_policy(group_id=gid)
+            required = bool(policy.get("high_risk_confirmation_required", True))
+            source = normalize_text(str(policy.get("source", "default"))) or "default"
+            state = "开启" if required else "关闭"
+            if source == "group" and gid > 0:
+                return f"当前本群高风险二次确认：{state}"
+            if source == "global":
+                return f"当前全局高风险二次确认：{state}"
+            return f"当前高风险二次确认沿用默认策略：{'开启' if required else '关闭'}"
+        required, scope = self._parse_high_risk_confirm_arg(arg, default_scope=default_scope)
+        if scope == "global" and not self.is_super_admin(user_id):
+            return "权限不足，只有超级管理员可以修改全局高风险确认策略"
+        ok, message, _payload = self.set_high_risk_confirmation_policy(
+            required=required,
+            scope=scope,
+            group_id=gid,
+        )
+        return message if ok else f"设置失败: {message}"
 
     async def _act_group_info(self, **kwargs: Any) -> str:
         gid = int(kwargs.get("group_id", 0) or 0)
@@ -1106,6 +1428,92 @@ class AdminEngine:
             self._white_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
             _log.debug("save_whitelist_fail | %s", exc)
+
+    def _load_ignore(self) -> None:
+        if not self._ignore_path.exists():
+            return
+        try:
+            data = json.loads(self._ignore_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _log.debug("load_ignore_fail | %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        ignore_policy = normalize_text(str(data.get("ignore_policy", ""))).lower()
+        if ignore_policy in {"silent", "soft", "ai_review"}:
+            self._ignore_policy = ignore_policy
+        global_rows = data.get("global", [])
+        if isinstance(global_rows, list):
+            for item in global_rows:
+                uid = normalize_text(str(item))
+                if uid:
+                    self._ignored_global.add(uid)
+        groups = data.get("groups", {})
+        if isinstance(groups, dict):
+            for raw_gid, rows in groups.items():
+                try:
+                    gid = int(raw_gid)
+                except Exception:
+                    continue
+                if gid <= 0 or not isinstance(rows, list):
+                    continue
+                bucket = self._ignored_group.setdefault(gid, set())
+                for item in rows:
+                    uid = normalize_text(str(item))
+                    if uid:
+                        bucket.add(uid)
+
+    def _save_ignore(self) -> None:
+        payload = {
+            "global": sorted(self._ignored_global),
+            "groups": {
+                str(gid): sorted(users)
+                for gid, users in sorted(self._ignored_group.items(), key=lambda pair: pair[0])
+                if users
+            },
+            "ignore_policy": self._ignore_policy,
+        }
+        try:
+            self._ignore_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _log.debug("save_ignore_fail | %s", exc)
+
+    def _load_runtime_policy(self) -> None:
+        if not self._policy_path.exists():
+            return
+        try:
+            data = json.loads(self._policy_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _log.debug("load_runtime_policy_fail | %s", exc)
+            return
+        if not isinstance(data, dict):
+            return
+        global_value = data.get("high_risk_confirmation_global")
+        if isinstance(global_value, bool):
+            self._high_risk_confirm_global = global_value
+        groups = data.get("high_risk_confirmation_groups", {})
+        if isinstance(groups, dict):
+            for raw_gid, raw_required in groups.items():
+                try:
+                    gid = int(raw_gid)
+                except Exception:
+                    continue
+                if gid <= 0 or not isinstance(raw_required, bool):
+                    continue
+                self._high_risk_confirm_group[gid] = raw_required
+
+    def _save_runtime_policy(self) -> None:
+        payload = {
+            "high_risk_confirmation_global": self._high_risk_confirm_global,
+            "high_risk_confirmation_groups": {
+                str(gid): required
+                for gid, required in sorted(self._high_risk_confirm_group.items(), key=lambda pair: pair[0])
+            },
+        }
+        try:
+            self._policy_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            _log.debug("save_runtime_policy_fail | %s", exc)
 
     # ── 表情包管理 ──
 

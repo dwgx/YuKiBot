@@ -57,6 +57,8 @@ class EmojiInfo:
     learned: bool = False
     registered: bool = False   # 是否有真实描述 (区分 hash 假学习)
     manual_override: bool = False  # 手动注册表覆盖
+    native_segment_type: str = ""
+    native_segment_data: dict[str, Any] = field(default_factory=dict)
 
 
 # ── Emotion → face_id mapping for classic QQ faces ──
@@ -234,6 +236,8 @@ class StickerManager:
         category: str = "",
         tags: list[str] | None = None,
         registered: bool = True,
+        native_segment_type: str = "",
+        native_segment_data: dict[str, Any] | None = None,
     ) -> str:
         user_dir = self._add_dir / str(user_id)
         user_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +252,10 @@ class StickerManager:
         filepath.write_bytes(img_data)
 
         key = f"add/{user_id}/{filename}"
+        normalized_native_type, normalized_native_data = self._normalize_native_segment(
+            native_segment_type,
+            native_segment_data,
+        )
         self._emojis[key] = EmojiInfo(
             file_path=key,
             description=description,
@@ -257,6 +265,8 @@ class StickerManager:
             source=str(user_id),
             learned=True,
             registered=bool(registered),
+            native_segment_type=normalized_native_type,
+            native_segment_data=normalized_native_data,
         )
         source_user = str(user_id or "").strip()
         if source_user:
@@ -264,6 +274,104 @@ class StickerManager:
         self._last_learned_global = key
         self._save_knowledge()
         return key
+
+    @staticmethod
+    def _normalize_native_segment(
+        segment_type: str,
+        segment_data: dict[str, Any] | None,
+    ) -> tuple[str, dict[str, Any]]:
+        seg_type = normalize_text(str(segment_type)).lower()
+        if seg_type not in {"face", "mface"}:
+            return "", {}
+        raw_data = segment_data if isinstance(segment_data, dict) else {}
+        cleaned: dict[str, Any] = {}
+        for raw_key, raw_value in raw_data.items():
+            key = str(raw_key or "").strip()
+            if not key or raw_value is None:
+                continue
+            if isinstance(raw_value, str):
+                value = raw_value.strip()
+                if not value:
+                    continue
+                cleaned[key] = value
+                continue
+            cleaned[key] = raw_value
+
+        if seg_type == "face":
+            face_id = cleaned.get("id", raw_data.get("id"))
+            if face_id is None:
+                face_id = cleaned.get("face_id", raw_data.get("face_id"))
+            try:
+                return "face", {"id": str(int(face_id))}
+            except (TypeError, ValueError):
+                return "", {}
+
+        alias_map = {
+            "package_id": "emoji_package_id",
+            "packageId": "emoji_package_id",
+            "id": "emoji_id",
+        }
+        for source_key, target_key in alias_map.items():
+            if source_key in cleaned and target_key not in cleaned:
+                cleaned[target_key] = cleaned[source_key]
+        if not cleaned:
+            return "", {}
+        if not any(key in cleaned for key in ("emoji_package_id", "emoji_id", "key", "summary")):
+            return "", {}
+        return "mface", cleaned
+
+    def _semantic_face_segment_for_emoji(
+        self,
+        emoji: EmojiInfo,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        terms: list[str] = []
+        for value in [*emoji.emotions, *emoji.tags, emoji.category, emoji.description]:
+            token = normalize_text(str(value))
+            if not token or token in terms:
+                continue
+            terms.append(token)
+        for term in terms:
+            faces = self.find_face(term)
+            if not faces:
+                continue
+            face = faces[0]
+            return self.get_face_segment(face.face_id), {
+                "face_id": face.face_id,
+                "face_desc": face.desc,
+                "fallback": "semantic_face",
+                "matched_term": term,
+            }
+        return None, {}
+
+    def get_preferred_emoji_segment(
+        self,
+        key: str,
+    ) -> tuple[dict[str, Any] | None, str, dict[str, Any]]:
+        e = self._emojis.get(key)
+        if not e:
+            return None, "", {}
+
+        native_type, native_data = self._normalize_native_segment(
+            e.native_segment_type,
+            e.native_segment_data,
+        )
+        if native_type and native_data:
+            return {
+                "type": native_type,
+                "data": native_data,
+            }, native_type, {
+                "native_segment_type": native_type,
+                "fallback": "native",
+            }
+
+        face_segment, face_meta = self._semantic_face_segment_for_emoji(e)
+        if face_segment:
+            return face_segment, "face", face_meta
+
+        image_segment = self.get_emoji_segment(key)
+        if image_segment:
+            return image_segment, "image", {"fallback": "image"}
+        return None, "", {}
 
     # ── Registry (手动注册表) ──
 
@@ -576,6 +684,8 @@ class StickerManager:
         image_file: str = "",
         image_sub_type: str = "",
         api_call: Any | None = None,
+        native_segment_type: str = "",
+        native_segment_data: dict[str, Any] | None = None,
     ) -> tuple[bool, str]:
         """用户在群里教学表情包: 下载图片 -> LLM审核+描述 -> 存入 add/<qq号>/。
 
@@ -785,6 +895,8 @@ class StickerManager:
                         category="其他",
                         tags=["待补全"],
                         registered=False,
+                        native_segment_type=native_segment_type,
+                        native_segment_data=native_segment_data,
                     )
                     _log.info("learn_chat_fallback_saved | user=%s | key=%s", user_id, key)
                     return True, "已收下这张表情，描述待补全（稍后自动补全）"
@@ -798,6 +910,8 @@ class StickerManager:
                 category="其他",
                 tags=["待补全"],
                 registered=False,
+                native_segment_type=native_segment_type,
+                native_segment_data=native_segment_data,
             )
             _log.info("learn_chat_fallback_saved | user=%s | key=%s | reason=llm_error", user_id, key)
             return True, "已收下这张表情，描述待补全（模型暂时不稳定）"
@@ -829,6 +943,8 @@ class StickerManager:
             category=category,
             tags=tags if isinstance(tags, list) else [],
             registered=True,
+            native_segment_type=native_segment_type,
+            native_segment_data=native_segment_data,
         )
         _log.info("learn_chat_ok | user=%s key=%s desc=%s", user_id, key, desc)
         # 返回空 display，让 Agent 根据 ok=True 自己组织回复
@@ -1039,6 +1155,8 @@ class StickerManager:
                     learned=info.get("learned", False),
                     registered=info.get("registered", not is_hash),
                     manual_override=info.get("manual_override", False),
+                    native_segment_type=info.get("native_segment_type", ""),
+                    native_segment_data=info.get("native_segment_data", {}),
                 )
             _log.info("knowledge_loaded | emojis=%d learned=%d registered=%d",
                         len(self._emojis), self.learned_count, self.registered_count)
@@ -1050,11 +1168,15 @@ class StickerManager:
 
     def _save_knowledge(self) -> None:
         data: dict[str, Any] = {
-            "version": 4,
+            "version": 5,
             "last_scan": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "emojis": {},
         }
         for key, e in self._emojis.items():
+            native_type, native_data = self._normalize_native_segment(
+                e.native_segment_type,
+                e.native_segment_data,
+            )
             data["emojis"][key] = {
                 "file_path": self._normalize_knowledge_file_path(key=key, raw_path=e.file_path),
                 "description": e.description,
@@ -1065,6 +1187,8 @@ class StickerManager:
                 "learned": e.learned,
                 "registered": e.registered,
                 "manual_override": e.manual_override,
+                "native_segment_type": native_type,
+                "native_segment_data": native_data,
             }
         try:
             self._knowledge_path.write_text(

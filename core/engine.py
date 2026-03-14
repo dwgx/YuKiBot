@@ -1289,6 +1289,72 @@ class YukikoEngine:
 
         self.default_kaomoji = self.kaomoji_allowlist[0]
 
+        self.kaomoji_enable = bool(bot_config.get("kaomoji_enable", True))
+
+        self.relationship_progressive_enable = bool(
+            bot_config.get("relationship_progressive_enable", True)
+        )
+        self.relationship_hard_boundary_enabled = bool(
+            bot_config.get("relationship_hard_boundary_enabled", True)
+        )
+        self.relationship_commitment_min_level = max(
+            1,
+            min(10, int(bot_config.get("relationship_commitment_min_level", 8))),
+        )
+        self.relationship_commitment_min_interactions = max(
+            1, int(bot_config.get("relationship_commitment_min_interactions", 30))
+        )
+        self.relationship_commitment_private_only = bool(
+            bot_config.get("relationship_commitment_private_only", True)
+        )
+        self.relationship_boundary_reply_template = (
+            normalize_text(
+                str(
+                    bot_config.get(
+                        "relationship_boundary_reply_template",
+                        "这件事我会认真对待，但我们先多相处一段时间，再决定要不要走到家庭或结婚这一步，好吗？",
+                    )
+                )
+            )
+            or "这件事我会认真对待，但我们先多相处一段时间，再决定要不要走到家庭或结婚这一步，好吗？"
+        )
+        self.relationship_commitment_terms = tuple(
+            dict.fromkeys(
+                normalize_text(str(item))
+                for item in (
+                    bot_config.get("relationship_commitment_terms")
+                    if isinstance(bot_config.get("relationship_commitment_terms"), list)
+                    else [
+                        "结婚",
+                        "嫁给",
+                        "娶我",
+                        "老婆",
+                        "老公",
+                        "对象",
+                        "恋人",
+                        "家庭",
+                        "家人",
+                        "主人",
+                    ]
+                )
+                if normalize_text(str(item))
+            )
+        )
+
+        humanization_raw = bot_config.get("humanization_profile", {})
+        if not isinstance(humanization_raw, dict):
+            humanization_raw = {}
+        self.humanization_profile = {
+            "warmth": self._clamp_unit_float(humanization_raw.get("warmth", 0.78)),
+            "initiative": self._clamp_unit_float(humanization_raw.get("initiative", 0.58)),
+            "empathy": self._clamp_unit_float(humanization_raw.get("empathy", 0.86)),
+            "jealousy": self._clamp_unit_float(humanization_raw.get("jealousy", 0.22)),
+            "vulnerability": self._clamp_unit_float(humanization_raw.get("vulnerability", 0.55)),
+            "humor": self._clamp_unit_float(humanization_raw.get("humor", 0.62)),
+            "tsundere": self._clamp_unit_float(humanization_raw.get("tsundere", 0.36)),
+            "intimacy_pace": self._clamp_unit_float(humanization_raw.get("intimacy_pace", 0.42)),
+        }
+
         routing_cfg = self.config.get("routing", {})
 
         self.router_timeout_seconds = max(
@@ -2445,6 +2511,22 @@ class YukikoEngine:
             else []
         )
 
+        runtime_admin_policy = (
+            self.admin.get_high_risk_confirmation_policy(
+                group_id=message.group_id,
+                default_required=bool(getattr(self.agent, "high_risk_default_require_confirmation", True)),
+            )
+            if hasattr(self, "admin")
+            else {
+                "high_risk_confirmation_required": bool(
+                    getattr(self.agent, "high_risk_default_require_confirmation", True)
+                ),
+                "source": "default",
+                "group_id": int(message.group_id or 0),
+                "overridden": False,
+            }
+        )
+
         thread_state = (
             self.memory.get_thread_state(message.conversation_id)
             if allow_memory
@@ -2487,6 +2569,9 @@ class YukikoEngine:
                     if hasattr(self, "affinity") and hasattr(self.affinity, "mood")
                     else ""
                 ),
+                relationship_summary=self._build_relationship_prompt_hint(message),
+                humanization_summary=self._build_humanization_prompt_hint(),
+                kaomoji_summary=self._build_kaomoji_prompt_hint(),
             )
         )
 
@@ -2621,6 +2706,7 @@ class YukikoEngine:
                     compat_context=compat_context,
                     user_policies=user_policies,
                     user_directives=user_directives,
+                    runtime_admin_policy=runtime_admin_policy,
                     at_other_user_names=at_other_user_names,
                 )
 
@@ -3301,6 +3387,12 @@ class YukikoEngine:
 
         reply_text = self._enforce_identity_claim(reply_text)
 
+        reply_text = self._apply_relationship_commitment_guard(
+            reply_text=reply_text,
+            user_text=text,
+            message=message,
+        )
+
         reply_text = self._apply_tone_guard(reply_text)
 
         reply_text = self.safety.filter_output(reply_text)
@@ -3438,6 +3530,7 @@ class YukikoEngine:
         compat_context: str,
         user_policies: dict[str, Any] | None = None,
         user_directives: list[str] | None = None,
+        runtime_admin_policy: dict[str, Any] | None = None,
         at_other_user_names: dict[str, str] | None = None,
     ) -> EngineResponse | None:
         """尝试走 Agent 循环处理消息。成功返回 EngineResponse，失败返回 None 回退旧管线。"""
@@ -3462,6 +3555,7 @@ class YukikoEngine:
                     text=text,
                     user_id=user_id,
                     group_id=group_id,
+                    sender_role=message.sender_role or "",
                     engine=_engine_ref,
                     api_call=message.api_call,
                 )
@@ -3520,6 +3614,7 @@ class YukikoEngine:
                 user_directives=user_directives or [],
                 thread_state=thread_state if isinstance(thread_state, dict) else {},
                 runtime_group_context=runtime_group_context or [],
+                runtime_admin_policy=runtime_admin_policy or {},
                 media_summary=media_summary,
                 reply_media_summary=reply_media_summary,
                 at_other_user_ids=message.at_other_user_ids or [],
@@ -3771,6 +3866,14 @@ class YukikoEngine:
 
                         ai_fix = self._sanitize_reply_output(ai_fix, action="reply")
 
+                        ai_fix = self._enforce_identity_claim(ai_fix)
+
+                        ai_fix = self._apply_relationship_commitment_guard(
+                            reply_text=ai_fix,
+                            user_text=text,
+                            message=message,
+                        )
+
                         ai_fix = self._apply_tone_guard(ai_fix)
 
                         ai_fix = self.safety.filter_output(ai_fix)
@@ -3817,6 +3920,12 @@ class YukikoEngine:
             )
 
             reply_text = self._enforce_identity_claim(reply_text)
+
+            reply_text = self._apply_relationship_commitment_guard(
+                reply_text=reply_text,
+                user_text=text,
+                message=message,
+            )
 
             reply_text = self._apply_tone_guard(reply_text)
 
@@ -6819,7 +6928,7 @@ class YukikoEngine:
 
             return
 
-        line = f"{message.user_name or message.user_id}: {clip_text(content, 88)}"
+        line = f"{message.user_name or message.user_id}(QQ:{message.user_id}): {clip_text(content, 88)}"
 
         cache = self._runtime_group_chat_cache[message.conversation_id]
 
@@ -7143,6 +7252,302 @@ class YukikoEngine:
             return self._apply_privacy_output_guard(fallback, action=action)
 
     @staticmethod
+    def _clamp_unit_float(value: Any, default: float = 0.5) -> float:
+
+        try:
+
+            numeric = float(value)
+
+        except (TypeError, ValueError):
+
+            numeric = float(default)
+
+        return max(0.0, min(1.0, numeric))
+
+    def _get_affinity_snapshot(self, user_id: str) -> tuple[int, int]:
+
+        uid = normalize_text(user_id)
+
+        if not uid or not hasattr(self, "affinity"):
+
+            return 1, 0
+
+        try:
+
+            user = self.affinity.get_user(uid)
+
+        except Exception:
+
+            return 1, 0
+
+        level = max(1, min(10, int(getattr(user, "level", 1) or 1)))
+
+        interactions = max(0, int(getattr(user, "total_interactions", 0) or 0))
+
+        return level, interactions
+
+    @staticmethod
+    def _relationship_stage_label(level: int) -> str:
+
+        if level >= 9:
+
+            return "深度羁绊"
+
+        if level >= 8:
+
+            return "亲密伴侣候选"
+
+        if level >= 6:
+
+            return "稳定亲密"
+
+        if level >= 4:
+
+            return "熟络朋友"
+
+        return "初识磨合"
+
+    def _build_relationship_prompt_hint(self, message: EngineMessage) -> str:
+
+        if not self.relationship_progressive_enable:
+
+            return "关系递进策略: 关闭（允许按当前语境自然互动）"
+
+        level, interactions = self._get_affinity_snapshot(message.user_id)
+
+        stage = self._relationship_stage_label(level)
+
+        ready, reason = self._relationship_commitment_ready(message)
+
+        threshold = (
+            f"承诺关系门槛: Lv.{self.relationship_commitment_min_level}+ 且累计互动>="
+            f"{self.relationship_commitment_min_interactions}次"
+        )
+
+        if self.relationship_commitment_private_only:
+
+            threshold += "，且优先私聊确认"
+
+        if ready:
+
+            return (
+                f"当前关系阶段: {stage}（Lv.{level} / 互动{interactions}次）。"
+                f"{threshold}；已达标，可在用户明确提出时谨慎确认。"
+            )
+
+        reason_map = {
+            "level": f"当前等级不足（Lv.{level}）",
+            "interactions": f"互动次数不足（{interactions}次）",
+            "private_only": "当前在群聊场景",
+        }
+
+        reason_text = reason_map.get(reason, "条件不足")
+
+        return (
+            f"当前关系阶段: {stage}（Lv.{level} / 互动{interactions}次）。"
+            f"{threshold}；{reason_text}，仅可温暖互动，不要直接答应家庭/结婚等承诺关系。"
+        )
+
+    def _build_humanization_prompt_hint(self) -> str:
+
+        profile = self.humanization_profile if isinstance(
+            getattr(self, "humanization_profile", {}),
+            dict,
+        ) else {}
+
+        if not profile:
+
+            return ""
+
+        keys = (
+            ("warmth", "温度"),
+            ("initiative", "主动性"),
+            ("empathy", "共情"),
+            ("jealousy", "占有欲"),
+            ("vulnerability", "脆弱表达"),
+            ("humor", "幽默"),
+            ("tsundere", "傲娇"),
+            ("intimacy_pace", "亲密推进速度"),
+        )
+
+        rows: list[str] = []
+
+        for key, label in keys:
+
+            value = self._clamp_unit_float(profile.get(key, 0.0))
+
+            rows.append(f"{label}={value:.2f}")
+
+        return " / ".join(rows)
+
+    def _build_kaomoji_prompt_hint(self) -> str:
+
+        if not self.kaomoji_enable:
+
+            return "颜文字开关: 关闭（禁止输出 QWQ/AWA 等颜文字）"
+
+        allowlist = [
+            normalize_text(str(item))
+            for item in self.kaomoji_allowlist
+            if normalize_text(str(item))
+        ]
+
+        if not allowlist:
+
+            return "颜文字开关: 开启（当前白名单为空）"
+
+        return f"颜文字开关: 开启（允许: {','.join(allowlist)}）"
+
+    def _is_relationship_commitment_request(self, text: str) -> bool:
+
+        content = normalize_text(text).lower()
+
+        if not content:
+
+            return False
+
+        explain_cues = (
+            "什么意思",
+            "是什么",
+            "怎么理解",
+            "定义",
+            "解释一下",
+            "为什么",
+        )
+
+        if any(cue in content for cue in explain_cues):
+
+            return False
+
+        proposal_cues = (
+            "和我",
+            "跟我",
+            "嫁给我",
+            "娶我",
+            "做我",
+            "当我",
+            "在一起",
+            "你愿意",
+            "愿不愿意",
+            "可不可以",
+            "行不行",
+            "要不要",
+            "好不好",
+            "好吗",
+            "我们",
+        )
+
+        has_proposal_cue = any(cue in content for cue in proposal_cues)
+
+        for token in self.relationship_commitment_terms:
+
+            normalized = normalize_text(token).lower()
+
+            if normalized and normalized in content and has_proposal_cue:
+
+                return True
+
+        for token in ("marry", "marriage", "wedding", "wife", "husband", "family"):
+
+            if token in content and (
+                "with me" in content
+                or "be my" in content
+                or "will you" in content
+                or "can we" in content
+            ):
+
+                return True
+
+        return False
+
+    def _relationship_commitment_ready(
+        self,
+        message: EngineMessage,
+    ) -> tuple[bool, str]:
+
+        if not self.relationship_progressive_enable:
+
+            return True, "disabled"
+
+        level, interactions = self._get_affinity_snapshot(message.user_id)
+
+        if level < self.relationship_commitment_min_level:
+
+            return False, "level"
+
+        if interactions < self.relationship_commitment_min_interactions:
+
+            return False, "interactions"
+
+        if self.relationship_commitment_private_only and not bool(message.is_private):
+
+            return False, "private_only"
+
+        return True, "ready"
+
+    def _apply_relationship_commitment_guard(
+        self,
+        *,
+        reply_text: str,
+        user_text: str,
+        message: EngineMessage,
+    ) -> str:
+
+        content = normalize_text(reply_text)
+
+        if not content:
+
+            return ""
+
+        if not self.relationship_hard_boundary_enabled:
+
+            return content
+
+        if not self._is_relationship_commitment_request(user_text):
+
+            return content
+
+        ready, reason = self._relationship_commitment_ready(message)
+
+        if ready:
+
+            return content
+
+        self.logger.info(
+            "relationship_commitment_guard_block | trace=%s | user=%s | reason=%s",
+            getattr(message, "trace_id", ""),
+            getattr(message, "user_id", ""),
+            reason,
+        )
+
+        return self.relationship_boundary_reply_template
+
+    @staticmethod
+    def _strip_known_kaomoji_tokens(text: str) -> str:
+
+        content = str(text or "")
+
+        if not content:
+
+            return ""
+
+        known = ("QWQ", "AWA", "OwO", "UwU", "QAQ", ">_<", "TAT", "XD")
+
+        for token in known:
+
+            if re.fullmatch(r"[A-Za-z0-9_]+", token):
+
+                pattern = rf"(?<![A-Za-z0-9_]){re.escape(token)}(?![A-Za-z0-9_])"
+
+            else:
+
+                pattern = re.escape(token)
+
+            content = re.sub(pattern, " ", content, flags=re.IGNORECASE)
+
+        return normalize_text(content)
+
+    @staticmethod
     def _mask_numeric_id(value: str) -> str:
 
         raw = normalize_text(value)
@@ -7295,11 +7700,19 @@ class YukikoEngine:
 
     def _apply_tone_guard(self, text: str) -> str:
 
-        content = replace_emoji_with_kaomoji(text, kaomoji=self.default_kaomoji)
+        content = str(text or "")
 
-        content = normalize_kaomoji_style(content, default=self.default_kaomoji)
+        if self.kaomoji_enable:
 
-        content = self._enforce_kaomoji_allowlist(content)
+            content = replace_emoji_with_kaomoji(content, kaomoji=self.default_kaomoji)
+
+            content = normalize_kaomoji_style(content, default=self.default_kaomoji)
+
+            content = self._enforce_kaomoji_allowlist(content)
+
+        else:
+
+            content = self._strip_known_kaomoji_tokens(content)
 
         content = re.sub(r"\n{3,}", "\n\n", content)
 

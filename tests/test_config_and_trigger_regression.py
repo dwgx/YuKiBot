@@ -15,6 +15,8 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
         self.assertFalse(defaults["bot"]["allow_non_to_me"])
         self.assertFalse(defaults["trigger"]["ai_listen_enable"])
         self.assertFalse(defaults["trigger"]["delegate_undirected_to_ai"])
+        self.assertTrue(defaults["bot"]["relationship_progressive_enable"])
+        self.assertTrue(defaults["bot"]["kaomoji_enable"])
 
     def test_trigger_engine_does_not_delegate_undirected_by_default(self) -> None:
         trigger = TriggerEngine(trigger_config={}, bot_config={"name": "YuKiKo"})

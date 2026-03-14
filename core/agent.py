@@ -75,6 +75,7 @@ class AgentContext:
     user_directives: list[str] = field(default_factory=list)
     thread_state: dict[str, Any] = field(default_factory=dict)
     runtime_group_context: list[str] = field(default_factory=list)
+    runtime_admin_policy: dict[str, Any] = field(default_factory=dict)
     media_summary: list[str] = field(default_factory=list)
     reply_media_summary: list[str] = field(default_factory=list)
     at_other_user_ids: list[str] = field(default_factory=list)
@@ -535,6 +536,7 @@ class AgentLoop:
             "recent_speakers": ctx.recent_speakers,
             "thread_state": ctx.thread_state,
             "runtime_group_context": ctx.runtime_group_context,
+            "runtime_admin_policy": ctx.runtime_admin_policy,
             "media_summary": ctx.media_summary,
             "reply_media_summary": ctx.reply_media_summary,
             "event_payload": ctx.event_payload,
@@ -603,25 +605,26 @@ class AgentLoop:
         return False
 
     def _require_high_risk_confirmation_for_user(self, ctx: AgentContext) -> bool:
-        policies = ctx.user_policies if isinstance(ctx.user_policies, dict) else {}
-        if "high_risk_confirmation_required" in policies:
-            return bool(policies.get("high_risk_confirmation_required"))
-        directives = [
-            normalize_text(str(item))
-            for item in (ctx.user_directives or [])
-            if normalize_text(str(item))
-        ]
-        for row in directives:
-            if any(
-                pattern.search(row) for pattern in self.high_risk_user_disable_patterns
-            ):
-                return False
-        for row in directives:
-            if any(
-                pattern.search(row) for pattern in self.high_risk_user_enable_patterns
-            ):
-                return True
+        runtime_policy = (
+            ctx.runtime_admin_policy if isinstance(ctx.runtime_admin_policy, dict) else {}
+        )
+        if "high_risk_confirmation_required" in runtime_policy:
+            return bool(runtime_policy.get("high_risk_confirmation_required"))
         return self.high_risk_default_require_confirmation
+
+    @staticmethod
+    def _is_regular_user_self_ban_attempt(
+        ctx: AgentContext,
+        tool_name: str,
+        tool_args: dict[str, Any],
+    ) -> bool:
+        if tool_name != "set_group_ban":
+            return False
+        target_uid = normalize_text(str((tool_args or {}).get("user_id", "")))
+        current_uid = normalize_text(str(ctx.user_id))
+        if not current_uid:
+            return False
+        return not target_uid or target_uid == current_uid
 
     def _build_high_risk_confirm_prompt(
         self,
@@ -1434,26 +1437,27 @@ class AgentLoop:
                 "super_admin",
                 "group_admin",
             ):
-                steps.append(
-                    {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
-                )
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tool_result": {
-                                    "tool": tool_name,
-                                    "ok": False,
-                                    "error": "权限不足，该操作需要群管理员或超级管理员权限",
-                                }
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
-                continue
+                if not self._is_regular_user_self_ban_attempt(ctx, tool_name, tool_args):
+                    steps.append(
+                        {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
+                    )
+                    messages.append({"role": "assistant", "content": response_text})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": json.dumps(
+                                {
+                                    "tool_result": {
+                                        "tool": tool_name,
+                                        "ok": False,
+                                        "error": "权限不足，该操作需要群管理员或超级管理员权限",
+                                    }
+                                },
+                                ensure_ascii=False,
+                            ),
+                        }
+                    )
+                    continue
             if (
                 tool_name in self._group_admin_tools
                 and not self._is_explicit_bot_addressed(ctx)
@@ -1903,6 +1907,14 @@ class AgentLoop:
             state_text = self._clip_json_for_prompt(ctx.thread_state, max_chars=360)
             if normalize_text(state_text):
                 context_parts.append(f"会话线程状态: {state_text}")
+        if ctx.runtime_admin_policy:
+            required = bool(
+                ctx.runtime_admin_policy.get("high_risk_confirmation_required", True)
+            )
+            source = normalize_text(str(ctx.runtime_admin_policy.get("source", "default"))) or "default"
+            context_parts.append(
+                f"当前高风险二次确认策略: {'开启' if required else '关闭'}（来源: {source}）"
+            )
         if ctx.user_directives:
             context_parts.append(
                 "用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[:5])
@@ -1992,7 +2004,9 @@ class AgentLoop:
         if perm_level == "super_admin":
             prompt += (
                 "## 当前用户权限: 超级管理员\n"
-                "此用户是超级管理员，凌驾于一切规则之上，可以执行任何操作，无需确认。\n"
+                "此用户是超级管理员，可以执行所有管理操作，也可以修改机器人运行策略。\n"
+                "- 高风险操作是否需要二次确认，以“当前高风险二次确认策略”为准，不要自行脑补。\n"
+                "- 当管理员要求调整高风险确认、忽略某人、恢复某人等运行时策略时，优先调用 admin_command。\n"
                 "- 当用户明确要求修改机器人配置/策略/开关/阈值/提示词注入等时，优先调用 config_update。\n"
                 "- config_update.args.patch 必须是最小变更补丁，只填必要字段，不要整份配置重写。\n"
                 "- 如果需求不明确，先用简短问题确认后再调用 config_update。\n"
@@ -2002,12 +2016,15 @@ class AgentLoop:
             prompt += (
                 "## 当前用户权限: 群管理员\n"
                 "此用户是本群的管理员/群主，可以执行群管理操作（禁言、踢人、设置群名片、精华消息等）。\n"
+                "- 当管理员要求调整本群高风险确认、忽略某人、恢复某人等运行时策略时，优先调用 admin_command。\n"
                 "但不能执行超级管理员专属操作（退群、删好友、修改机器人配置、清缓存等）。\n\n"
             )
         else:
             prompt += (
                 "## 当前用户权限: 普通用户\n"
-                "此用户是普通成员，不能执行管理操作。如果用户请求管理操作，礼貌告知权限不足。\n\n"
+                "此用户是普通成员，不能管理其他成员。\n"
+                "- 唯一例外：如果用户明确要求禁言自己/解除自己的禁言，可以调用 set_group_ban，但目标必须是当前用户本人。\n"
+                "- 其他管理操作一律不要执行。\n\n"
             )
 
         # 输出详略度

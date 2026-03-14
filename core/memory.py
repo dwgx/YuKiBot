@@ -224,6 +224,17 @@ class MemoryEngine:
                 profile["keywords"] = cleaned
                 self._user_profiles[user_id] = profile
                 dirty = True
+            policies = profile.get("agent_policies", {})
+            if isinstance(policies, dict):
+                removed = False
+                for key in ("high_risk_confirmation_required", "high_risk_confirmation_updated_at"):
+                    if key in policies:
+                        policies.pop(key, None)
+                        removed = True
+                if removed:
+                    profile["agent_policies"] = policies
+                    self._user_profiles[user_id] = profile
+                    dirty = True
         if dirty:
             self._save_user_profiles()
 
@@ -831,10 +842,8 @@ class MemoryEngine:
         agent_policies = profile.get("agent_policies", {})
         if not isinstance(agent_policies, dict):
             agent_policies = {}
-        detected_high_risk_confirm = self._extract_high_risk_confirm_policy(text) if self.heuristic_rules_enable else None
-        if detected_high_risk_confirm is not None:
-            agent_policies["high_risk_confirmation_required"] = bool(detected_high_risk_confirm)
-            agent_policies["high_risk_confirmation_updated_at"] = ts.isoformat()
+        agent_policies.pop("high_risk_confirmation_required", None)
+        agent_policies.pop("high_risk_confirmation_updated_at", None)
         agent_directives = profile.get("agent_directives", [])
         if not isinstance(agent_directives, list):
             agent_directives = []
@@ -946,15 +955,6 @@ class MemoryEngine:
         return ""
 
     def _extract_high_risk_confirm_policy(self, text: str) -> bool | None:
-        content = normalize_text(text)
-        if not content:
-            return None
-        for pattern in self.high_risk_confirm_disable_patterns:
-            if pattern.search(content):
-                return False
-        for pattern in self.high_risk_confirm_enable_patterns:
-            if pattern.search(content):
-                return True
         return None
 
     def _extract_agent_directive(self, text: str) -> str:
@@ -1263,7 +1263,10 @@ class MemoryEngine:
         policies = profile.get("agent_policies", {})
         if not isinstance(policies, dict):
             return {}
-        return dict(policies)
+        safe_policies = dict(policies)
+        safe_policies.pop("high_risk_confirmation_required", None)
+        safe_policies.pop("high_risk_confirmation_updated_at", None)
+        return safe_policies
 
     def get_agent_directives(self, user_id: str) -> list[str]:
         profile = self._user_profiles.get(str(user_id), {})

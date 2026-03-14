@@ -14,6 +14,7 @@ import { Button, Card, CardBody, CardHeader, Chip, Input, Spinner, Textarea } fr
 import { BrainCircuit, ChevronDown, ChevronUp, Copy, ImagePlus, MessageSquare, Minus, Pause, Play, Plus, Quote, RefreshCw, SendHorizontal, SmilePlus, Sparkles, Square, Star, Trash2, UserRound, X } from "lucide-react";
 import { AnimatePresence, motion, useDragControls } from "framer-motion";
 import { api, ChatAgentStateItem, ChatConversationItem, ChatHistoryPermission, ChatMessageItem } from "../api/client";
+import "../styles/stapxs-chat.css";
 
 function fmtTs(ts: number): string {
   if (!ts || Number.isNaN(ts)) return "-";
@@ -34,6 +35,18 @@ function hasImageSegment(msg: ChatMessageItem | null): boolean {
     return true;
   }
   return String(msg.text || "").includes("[image]");
+}
+
+function resolveQQAvatar(userId: string, size = 100): string {
+  const id = String(userId || "").trim();
+  if (!/^\d{5,}$/.test(id)) return "";
+  return `https://q1.qlogo.cn/g?b=qq&nk=${encodeURIComponent(id)}&s=${encodeURIComponent(String(size))}`;
+}
+
+function avatarInitial(label: string): string {
+  const text = String(label || "").trim().replace(/\s+/g, "");
+  if (!text) return "?";
+  return Array.from(text)[0]?.toUpperCase() || "?";
 }
 
 const CONTEXT_EASTER_EGGS = [
@@ -1456,8 +1469,8 @@ export default function ChatPage() {
   }, [retargetConversation, retargeting, thinkingDraft]);
 
   return (
-    <section className="h-[calc(100vh-96px)] min-h-0 flex flex-col gap-2 overflow-hidden">
-      <div className="flex items-center justify-between gap-1.5">
+    <section className="stapxs-chat-shell h-[calc(100vh-96px)] min-h-0 flex flex-col gap-2 overflow-hidden">
+      <div className="stapxs-chat-toolbar flex items-center justify-between gap-1.5">
         <div className="flex items-center gap-2">
           <MessageSquare size={18} />
           <h2 className="text-lg font-semibold">聊天控制台</h2>
@@ -1499,8 +1512,8 @@ export default function ChatPage() {
         </div>
       )}
 
-      <div className="grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-2 flex-1 min-h-0">
-        <Card className="h-full overflow-hidden">
+      <div className="stapxs-chat-grid grid grid-cols-1 lg:grid-cols-[300px_minmax(0,1fr)] gap-2 flex-1 min-h-0">
+        <Card className="stapxs-conv-card h-full overflow-hidden">
           <CardHeader className="pb-2">
             <div className="flex items-center justify-between w-full">
               <span className="text-sm font-semibold">会话列表</span>
@@ -1514,30 +1527,39 @@ export default function ChatPage() {
               classNames={INPUT_CLASSES}
             />
           </CardHeader>
-          <CardBody className="pt-1 overflow-auto space-y-2">
+          <CardBody className="stapxs-conv-list pt-1 overflow-auto">
             {filteredConversations.map((item) => {
               const active = selectedId === item.conversation_id;
+              const title = item.peer_name || item.peer_id || "未知会话";
+              const avatarUrl = resolveQQAvatar(item.peer_id, 100);
               return (
                 <button
                   type="button"
                   key={item.conversation_id}
-                  className={`w-full text-left rounded-lg border px-3 py-2 transition ${
-                    active
-                      ? "border-primary/70 bg-primary/10"
-                      : "border-default-300/40 bg-content2/35 hover:bg-content2/55"
-                  }`}
+                  className={`stapxs-conv-item ${active ? "is-active" : ""}`}
                   onClick={() => setSelectedId(item.conversation_id)}
                 >
-                  <div className="flex items-center justify-between gap-2">
-                    <div className="truncate font-medium">
-                      {item.chat_type === "group" ? "群聊" : "私聊"} · {item.peer_name}
+                  <div className="stapxs-conv-item-main">
+                    <span className="stapxs-avatar size-sm">
+                      {avatarUrl ? (
+                        <img src={avatarUrl} alt={`${title} avatar`} loading="lazy" />
+                      ) : (
+                        <span className="stapxs-avatar-fallback">{avatarInitial(title)}</span>
+                      )}
+                    </span>
+                    <div className="stapxs-conv-meta">
+                      <div className="stapxs-conv-title-row">
+                        <div className="stapxs-conv-title">
+                          {item.chat_type === "group" ? "群聊" : "私聊"} · {title}
+                        </div>
+                        <span className="stapxs-conv-time">{fmtTs(item.last_time)}</span>
+                      </div>
+                      <div className="stapxs-conv-preview">{clip(item.last_message, 80) || "暂无预览"}</div>
                     </div>
                     {item.unread_count > 0 && (
                       <Chip size="sm" color="danger" variant="flat">{item.unread_count}</Chip>
                     )}
                   </div>
-                  <div className="mt-1 text-xs text-default-500 truncate">{clip(item.last_message, 80) || "暂无预览"}</div>
-                  <div className="mt-1 text-[11px] text-default-400">{fmtTs(item.last_time)}</div>
                 </button>
               );
             })}
@@ -1549,7 +1571,7 @@ export default function ChatPage() {
         </Card>
 
         <div className="grid grid-rows-[auto_minmax(0,1fr)_auto] gap-2 h-full min-h-0">
-          <Card>
+          <Card className="stapxs-status-card">
             <CardBody className="py-3">
               <div className="flex flex-wrap items-center gap-2 justify-between">
                 <div className="min-w-0">
@@ -1604,50 +1626,80 @@ export default function ChatPage() {
             </CardBody>
           </Card>
 
-          <Card className="h-full min-h-0 overflow-hidden relative">
+          <Card className="stapxs-msg-card h-full min-h-0 overflow-hidden relative">
             <CardBody
               ref={messagesScrollRef}
-              className="min-h-0 overflow-auto space-y-1.5"
+              className="stapxs-msg-scroll min-h-0 overflow-auto"
               onScroll={onMessagesScroll}
             >
               {loadingHistory && <Spinner size="sm" />}
               {!loadingHistory && messages.length === 0 && (
                 <p className="text-default-400 text-sm">暂无聊天记录</p>
               )}
-              {messages.map((msg) => (
-                <div key={`${msg.message_id}-${msg.seq}-${msg.timestamp}`} className={`flex ${msg.is_self ? "justify-end" : "justify-start"}`}>
-                  <div
-                    className={`max-w-[82%] rounded-lg px-3 py-2 ${
-                      msg.is_recalled
-                        ? "border border-warning/35 bg-warning/10 text-default-700"
-                        : msg.is_self
-                          ? "bg-primary/15 border border-primary/30"
-                          : "bg-content2/45 border border-default-300/30"
-                    }`}
-                    onContextMenu={(evt) => openMessageMenu(evt, msg)}
-                    title="右键可操作：复制 / 引用 / 设精华 / 移除精华 / 添加表情包 / 撤回"
-                  >
-                    <div className="mb-1 flex flex-wrap items-center gap-1.5 text-xs text-default-500">
-                      <span className="inline-flex items-center gap-1">
-                        <UserRound size={12} />
-                        <span>{msg.sender_name || msg.sender_id || "未知"}</span>
+              {messages.map((msg) => {
+                const msgAvatarUrl = resolveQQAvatar(msg.sender_id, 100);
+                const msgDisplayName = msg.sender_name || msg.sender_id || "未知";
+                return (
+                  <div key={`${msg.message_id}-${msg.seq}-${msg.timestamp}`} className={`stapxs-msg-row ${msg.is_self ? "is-self" : ""}`}>
+                    {!msg.is_self && (
+                      <span className="stapxs-avatar size-xs">
+                        {msgAvatarUrl ? (
+                          <img
+                            src={msgAvatarUrl}
+                            alt={`${msgDisplayName} avatar`}
+                            loading="lazy"
+                          />
+                        ) : (
+                          <span className="stapxs-avatar-fallback">{avatarInitial(msgDisplayName || "U")}</span>
+                        )}
                       </span>
-                      <span>·</span>
-                      <span>{fmtTs(msg.timestamp)}</span>
-                      {msg.is_essence && <Chip size="sm" variant="flat" color="warning">精华</Chip>}
-                      {msg.is_recalled && <Chip size="sm" variant="flat" color="warning">此消息已撤回</Chip>}
-                    </div>
-                    <div className="text-sm whitespace-pre-wrap break-words">
-                      {msg.text || "[空消息]"}
-                    </div>
-                    {msg.is_recalled && (
-                      <div className="mt-2 text-[11px] text-warning-700/90">
-                        此消息已撤回，保留原文仅用于对话追踪。
+                    )}
+                    <div
+                      className={`stapxs-msg-bubble ${
+                        msg.is_recalled
+                          ? "is-recalled"
+                          : msg.is_self
+                            ? "is-self"
+                            : ""
+                      }`}
+                      onContextMenu={(evt) => openMessageMenu(evt, msg)}
+                      title="右键可操作：复制 / 引用 / 设精华 / 移除精华 / 添加表情包 / 撤回"
+                    >
+                      <div className="stapxs-msg-header">
+                        <span className="inline-flex items-center gap-1">
+                          <UserRound size={12} />
+                          <span>{msgDisplayName}</span>
+                        </span>
+                        <span>·</span>
+                        <span>{fmtTs(msg.timestamp)}</span>
+                        {msg.is_essence && <Chip size="sm" variant="flat" color="warning">精华</Chip>}
+                        {msg.is_recalled && <Chip size="sm" variant="flat" color="warning">此消息已撤回</Chip>}
                       </div>
+                      <div className="stapxs-msg-text">
+                        {msg.text || "[空消息]"}
+                      </div>
+                      {msg.is_recalled && (
+                        <div className="mt-2 text-[11px] text-warning-700/90">
+                          此消息已撤回，保留原文仅用于对话追踪。
+                        </div>
+                      )}
+                    </div>
+                    {msg.is_self && (
+                      <span className="stapxs-avatar size-xs">
+                        {msgAvatarUrl ? (
+                          <img
+                            src={msgAvatarUrl}
+                            alt={`${msgDisplayName} avatar`}
+                            loading="lazy"
+                          />
+                        ) : (
+                          <span className="stapxs-avatar-fallback">{avatarInitial(msgDisplayName || "Y")}</span>
+                        )}
+                      </span>
                     )}
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </CardBody>
             {showScrollToBottom && (
               <div className="pointer-events-none absolute bottom-3 right-3 z-30">
@@ -1919,10 +1971,10 @@ export default function ChatPage() {
             </AnimatePresence>
           </Card>
 
-          <Card className="border border-primary/15 bg-content1">
+          <Card className="stapxs-composer-card border border-primary/15 bg-content1">
             <CardBody className="space-y-2.5">
               {replyToMessage && (
-                <div className="rounded-lg border border-primary/35 bg-primary/10 px-3 py-2 flex items-start justify-between gap-3">
+                <div className="stapxs-reply-bar rounded-lg border border-primary/35 bg-primary/10 px-3 py-2 flex items-start justify-between gap-3">
                   <div className="text-xs min-w-0">
                     <p className="text-primary font-medium">正在引用消息</p>
                     <p className="text-default-600 truncate">
@@ -1940,7 +1992,7 @@ export default function ChatPage() {
                 </div>
               )}
               {selected && (
-                <div className={`rounded-lg border px-3 py-2 text-xs ${
+                <div className={`stapxs-mode-bar rounded-lg border px-3 py-2 text-xs ${
                   thinkingActive
                     ? "border-warning/35 bg-warning/10 text-warning-700"
                     : "border-primary/30 bg-primary/10 text-primary-700"
@@ -1966,7 +2018,7 @@ export default function ChatPage() {
                 isDisabled={!selected || sending}
                 classNames={INPUT_CLASSES}
               />
-              <div className="flex items-center gap-2">
+              <div className="stapxs-input-row flex items-center gap-2">
                 <Button
                   color="primary"
                   startContent={<SendHorizontal size={14} />}
@@ -1983,21 +2035,23 @@ export default function ChatPage() {
                 >
                   交给AI
                 </Button>
-                <Input
-                  className="flex-1"
-                  placeholder="图片 URL（http/https）"
-                  value={imageUrl}
-                  onValueChange={(v) => {
-                    setImageUrl(v);
-                    if (v.trim()) {
-                      setImageBase64("");
-                      setImageFileName("");
-                      setImagePreviewUrl("");
-                    }
-                  }}
-                  isDisabled={!selected || sending}
-                  classNames={INPUT_CLASSES}
-                />
+                <div className="stapxs-input-grow">
+                  <Input
+                    className="flex-1"
+                    placeholder="图片 URL（http/https）"
+                    value={imageUrl}
+                    onValueChange={(v) => {
+                      setImageUrl(v);
+                      if (v.trim()) {
+                        setImageBase64("");
+                        setImageFileName("");
+                        setImagePreviewUrl("");
+                      }
+                    }}
+                    isDisabled={!selected || sending}
+                    classNames={INPUT_CLASSES}
+                  />
+                </div>
                 <Button
                   variant="flat"
                   startContent={<ImagePlus size={14} />}
@@ -2017,7 +2071,7 @@ export default function ChatPage() {
                 </Button>
               </div>
               {pendingImageSrc && (
-                <div className="inline-flex max-w-full items-center gap-2 self-start rounded-full border border-default-300/40 bg-content2/55 px-2.5 py-1.5">
+                <div className="stapxs-pending-image inline-flex max-w-full items-center gap-2 self-start rounded-full border border-default-300/40 bg-content2/55 px-2.5 py-1.5">
                   <div className="flex min-w-0 items-center gap-2">
                     <img
                       src={pendingImageSrc}
@@ -2047,7 +2101,7 @@ export default function ChatPage() {
       {contextMenu.open && contextMenu.message && (
         <div
           data-chat-context-menu="1"
-          className="fixed z-[70] w-[220px] rounded-xl border border-default-400/45 bg-content1/95 backdrop-blur p-1 shadow-xl"
+          className="stapxs-context-menu fixed z-[70] w-[220px] rounded-xl border border-default-400/45 bg-content1/95 backdrop-blur p-1 shadow-xl"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           {contextEgg && (
@@ -2058,7 +2112,7 @@ export default function ChatPage() {
           )}
           <button
             type="button"
-            className="w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2"
+            className="stapxs-context-item w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2"
             onClick={copyMessageText}
           >
             <Copy size={14} />
@@ -2066,7 +2120,7 @@ export default function ChatPage() {
           </button>
           <button
             type="button"
-            className="w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2"
+            className="stapxs-context-item w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2"
             onClick={useQuoteMessage}
             disabled={!contextMenu.message?.message_id}
           >
@@ -2075,7 +2129,7 @@ export default function ChatPage() {
           </button>
           <button
             type="button"
-            className="w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2 disabled:opacity-45"
+            className="stapxs-context-item w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2 disabled:opacity-45"
             onClick={addMessageToSticker}
             disabled={sending || !hasImageSegment(contextMenu.message)}
           >
@@ -2087,7 +2141,7 @@ export default function ChatPage() {
               {!contextMessageIsEssence && (
                 <button
                   type="button"
-                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2 disabled:opacity-45"
+                  className="stapxs-context-item w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2 disabled:opacity-45"
                   onClick={setEssenceMessage}
                   disabled={sending || !contextMenu.message?.message_id}
                 >
@@ -2098,7 +2152,7 @@ export default function ChatPage() {
               {contextMessageIsEssence && (
                 <button
                   type="button"
-                  className="w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2 disabled:opacity-45"
+                  className="stapxs-context-item w-full text-left px-3 py-2 rounded-lg hover:bg-content2/70 text-sm flex items-center gap-2 disabled:opacity-45"
                   onClick={removeEssenceMessage}
                   disabled={sending || !contextMenu.message?.message_id}
                 >
@@ -2113,7 +2167,7 @@ export default function ChatPage() {
               <div className="my-1 h-px bg-default-300/45" />
               <button
                 type="button"
-                className="w-full text-left px-3 py-2 rounded-lg hover:bg-danger/15 text-sm flex items-center gap-2 text-danger disabled:opacity-45"
+                className="stapxs-context-item danger w-full text-left px-3 py-2 rounded-lg hover:bg-danger/15 text-sm flex items-center gap-2 text-danger disabled:opacity-45"
                 onClick={recallMessage}
                 disabled={sending || !contextMenu.message?.message_id || Boolean(contextMenu.message?.is_recalled)}
               >

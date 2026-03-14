@@ -930,28 +930,6 @@ def register_handlers(engine: YukikoEngine) -> None:
                     action = ""
         return normalize_text(str(action or "")).lower()
 
-    _SELF_NAME_PATTERNS = (
-        re.compile(r"(?:^|[\s，,。.!！？?])(?:以后|今后|之后|从现在开始)?(?:请)?(?:就)?(?:叫我|喊我|称呼我)(?:做|为|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
-        re.compile(r"(?:^|[\s，,。.!！？?])我(?:的名字|叫)\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
-    )
-    _CROSS_NAME_PATTERNS = (
-        re.compile(r"(?:^|[\s，,。.!！？?])(?:以后|今后|之后|从现在开始)(?:请)?(?:就)?(?:叫他|叫她|叫ta|叫TA|叫这个人|叫这位|称呼他|称呼她|称呼ta|称呼TA)(?:做|为|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
-        re.compile(r"(?:^|[\s，,。.!！？?])(?:给|帮)?(?:他|她|ta|TA|这位|这个人)(?:改名|改称呼)(?:叫|成)?\s*([^\s，,。.!！？?]{1,24})", re.IGNORECASE),
-    )
-
-    def _extract_name_by_patterns(text: str, patterns: tuple[re.Pattern[str], ...]) -> str:
-        raw = normalize_text(text)
-        if not raw:
-            return ""
-        for pattern in patterns:
-            matched = pattern.search(raw)
-            if not matched:
-                continue
-            candidate = normalize_text(matched.group(1))
-            if candidate:
-                return candidate
-        return ""
-
     def _is_group_admin_sender(*, user_id: str, group_id: int, sender_role: str) -> bool:
         if engine.admin.is_super_admin(user_id):
             return True
@@ -1549,99 +1527,34 @@ def register_handlers(engine: YukikoEngine) -> None:
         if not text:
             return
 
-        queue_cfg_rt = engine.config.get("queue", {}) if isinstance(engine.config, dict) else {}
-        if not isinstance(queue_cfg_rt, dict):
-            queue_cfg_rt = {}
-        # 群聊默认按“用户”隔离会话，避免多人上下文互串；同时允许不同用户并行处理。
-        if is_group_message and bool(queue_cfg_rt.get("group_isolate_by_user", True)):
-            group_id = int(getattr(event, "group_id", 0) or 0)
-            user_id = str(event.get_user_id())
-            if group_id > 0 and user_id:
-                scoped_conversation = f"group:{group_id}:user:{user_id}"
-                if scoped_conversation != conversation_id:
-                    _log.debug(
-                        "conversation_scope_user | base=%s | scoped=%s | mentioned=%s | to_me=%s",
-                        conversation_id,
-                        scoped_conversation,
-                        mentioned,
-                        bool(getattr(event, "to_me", False)),
-                    )
-                conversation_id = scoped_conversation
-
-        # 昵称记忆治理：
-        # - “叫我XX”自动更新本人偏好称呼；
-        # - 群聊里“叫他/她XX”仅超级管理员或本群管理员可改，避免跨用户串改。
-        memory = getattr(engine, "memory", None)
-        if memory is not None and hasattr(memory, "set_preferred_name"):
-            sender_uid = str(event.get_user_id())
-            sender_name = _extract_user_name(event)
-            sender_role = _extract_sender_role(event)
-            has_question_mark = ("?" in text) or ("？" in text)
-            self_name_candidate = "" if has_question_mark else _extract_name_by_patterns(text, _SELF_NAME_PATTERNS)
-            cross_name_candidate = "" if has_question_mark else _extract_name_by_patterns(text, _CROSS_NAME_PATTERNS)
-            cross_target_uid = ""
-            if at_other_user_ids:
-                cross_target_uid = normalize_text(str(at_other_user_ids[0]))
-            elif reply_to_user_id and str(reply_to_user_id) != str(bot.self_id):
-                cross_target_uid = normalize_text(str(reply_to_user_id))
-
-            # 自己改自己：允许直接生效
-            if self_name_candidate:
-                ok, message, payload = memory.set_preferred_name(
-                    target_user_id=sender_uid,
-                    preferred_name=self_name_candidate,
-                    actor=f"{sender_name}({sender_uid})",
-                    conversation_id=conversation_id,
-                    note="用户主动设置称呼",
-                    reason="self_preferred_name_request",
-                )
-                if ok:
-                    preferred = normalize_text(str((payload or {}).get("preferred_name", ""))) or self_name_candidate
-                    await _safe_send(
-                        bot=bot,
-                        event=event,
-                        message=Message(f"记住了，以后我会叫你“{preferred}”。"),
-                    )
-                    return
-                await _safe_send(bot=bot, event=event, message=Message(f"这个称呼我没法保存：{message}"))
-                return
-
-            # 改别人：必须是超级管理员，或白名单群里的 owner/admin
-            if cross_name_candidate and cross_target_uid and cross_target_uid != sender_uid:
-                is_allowed = _is_group_admin_sender(
-                    user_id=sender_uid,
-                    group_id=event_group_id,
-                    sender_role=sender_role,
-                )
-                if not is_allowed:
-                    await _safe_send(
-                        bot=bot,
-                        event=event,
-                        message=Message("跨用户改称呼需要群管理员或超级管理员权限。"),
-                    )
-                    return
-                ok, message, payload = memory.set_preferred_name(
-                    target_user_id=cross_target_uid,
-                    preferred_name=cross_name_candidate,
-                    actor=f"{sender_name}({sender_uid})",
-                    conversation_id=conversation_id,
-                    note="管理员跨用户设置称呼",
-                    reason="admin_cross_user_preferred_name_request",
-                )
-                if ok:
-                    target_name = normalize_text(str((payload or {}).get("display_name", ""))) or f"用户{cross_target_uid[-4:]}"
-                    preferred = normalize_text(str((payload or {}).get("preferred_name", ""))) or cross_name_candidate
-                    await _safe_send(
-                        bot=bot,
-                        event=event,
-                        message=Message(f"已记录：以后称呼 {target_name} 为“{preferred}”。"),
-                    )
-                    return
-                await _safe_send(bot=bot, event=event, message=Message(f"称呼更新失败：{message}"))
-                return
+        sender_uid = str(event.get_user_id())
+        sender_role = _extract_sender_role(event)
 
         async def api_call(api: str, **kwargs: Any) -> Any:
             return await call_napcat_bot_api(bot, api, **kwargs)
+
+        ignored = engine.admin.is_user_ignored(sender_uid, event_group_id)
+        allow_admin_recovery = engine.admin.is_admin_command(text) and _is_group_admin_sender(
+            user_id=sender_uid,
+            group_id=event_group_id,
+            sender_role=sender_role,
+        )
+        if ignored and not allow_admin_recovery:
+            ignore_policy = normalize_text(getattr(engine.admin, "ignore_policy", "silent")).lower() or "silent"
+            _log.info(
+                "ignored_user_blocked | conv=%s | group=%s | user=%s | policy=%s",
+                conversation_id,
+                event_group_id,
+                sender_uid,
+                ignore_policy,
+            )
+            if ignore_policy == "soft":
+                await _safe_send(
+                    bot=bot,
+                    event=event,
+                    message=Message("当前不会处理你的消息。"),
+                )
+            return
 
         # ── 管理员指令拦截 ──
         if engine.admin.is_admin_command(text):
@@ -1669,14 +1582,19 @@ def register_handlers(engine: YukikoEngine) -> None:
                 )
             admin_reply = await engine.admin.handle_command(
                 text=text,
-                user_id=str(event.get_user_id()),
+                user_id=sender_uid,
                 group_id=event_group_id,
+                sender_role=sender_role,
                 engine=engine,
                 api_call=api_call,
             )
             if admin_reply:
                 await _safe_send(bot=bot, event=event, message=Message(admin_reply))
             return
+
+        queue_cfg_rt = engine.config.get("queue", {}) if isinstance(engine.config, dict) else {}
+        if not isinstance(queue_cfg_rt, dict):
+            queue_cfg_rt = {}
 
         seq = dispatcher.next_seq(conversation_id)
         trace_id = _build_trace_id(conversation_id=conversation_id, seq=seq)
@@ -1757,6 +1675,16 @@ def register_handlers(engine: YukikoEngine) -> None:
             voice_send_split_max_segments = int(send_opts["voice_send_split_max_segments"])
             voice_send_music_force_full = bool(send_opts["voice_send_music_force_full"])
             voice_send_music_disable_split = bool(send_opts["voice_send_music_disable_split"])
+            latest_ctx = _latest_queue_task_ctx.get(payload.conversation_id, {})
+            latest_trace = normalize_text(str(latest_ctx.get("trace_id", ""))) if isinstance(latest_ctx, dict) else ""
+            if latest_trace and latest_trace != payload.trace_id:
+                _log.info(
+                    "send_skip_stale_trace | trace=%s | latest=%s | conversation=%s",
+                    payload.trace_id,
+                    latest_trace,
+                    payload.conversation_id,
+                )
+                return
             if getattr(result, "action", "") == "ignore":
                 _log.info(
                     "send_skip_ignore | trace=%s | conversation=%s | reason=%s | mentioned=%s | private=%s | text=%s",
@@ -2726,8 +2654,29 @@ def _looks_like_sticker_learning_request(
 
 
 def _looks_like_cancel_previous_request(text: str) -> bool:
-    _ = text
-    return False
+    content = normalize_text(text).lower()
+    if not content:
+        return False
+    explicit_cues = (
+        "打断",
+        "停止上一个",
+        "取消上一个",
+        "先别回刚才",
+        "忽略上一条",
+        "中断",
+        "插一句",
+        "更正",
+        "纠正",
+        "我说的是",
+        "不是这个",
+        "不是那个",
+        "刚才说错",
+        "重新回答",
+        "按我这条",
+    )
+    if any(cue in content for cue in explicit_cues):
+        return True
+    return bool(re.search(r"^(?:不是|更正|纠正|重新说|重新答|我指的是)", content))
 
 
 def _extract_at_targets(event: MessageEvent) -> list[str]:

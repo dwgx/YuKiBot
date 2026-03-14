@@ -287,6 +287,8 @@ class AgentToolRegistry:
         is_group_admin = level in {"group_admin", "super_admin"}
         if name in self._SUPER_ADMIN_TOOLS and not is_super:
             return False
+        if name == "set_group_ban":
+            return True
         if name in self._GROUP_ADMIN_TOOLS and not is_group_admin:
             return False
         return True
@@ -520,7 +522,7 @@ class AgentToolRegistry:
             )
             return ToolCallResult(ok=False, error="permission_denied:need_super_admin")
 
-        if name in self._GROUP_ADMIN_TOOLS and not is_group_admin:
+        if name in self._GROUP_ADMIN_TOOLS and not is_group_admin and name != "set_group_ban":
             _log.warning(
                 "tool_permission_denied | tool=%s | actor=%s | level=%s | need=group_admin",
                 name,
@@ -751,15 +753,15 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
     registry.register(
         ToolSchema(
             name="set_group_ban",
-            description="对群成员禁言（需要管理员权限）。\n使用场景: 用户说'禁言XX'、'把XX禁言10分钟'、'解除禁言'时使用。\nduration=0 为解除禁言，单位是秒(如600=10分钟, 3600=1小时)",
+            description="对群成员禁言。\n使用场景: 用户说'禁言XX'、'把XX禁言10分钟'、'解除禁言'时使用。\n普通用户只能对自己执行自助禁言/解除禁言；管理员可对其他成员操作。\nduration=0 为解除禁言，单位是秒(如600=10分钟, 3600=1小时)。若 user_id 留空，必须能从 @、回复或群聊共享上下文唯一解析。",
             parameters={
                 "type": "object",
                 "properties": {
                     "group_id": {"type": "integer", "description": "群号"},
-                    "user_id": {"type": "integer", "description": "用户QQ号"},
+                    "user_id": {"type": "integer", "description": "目标用户QQ号；可选，留空时仅在目标能唯一解析时允许"},
                     "duration": {"type": "integer", "description": "禁言时长（秒），0=解除禁言"},
                 },
-                "required": ["group_id", "user_id", "duration"],
+                "required": ["duration"],
             },
             category="napcat",
         ),
@@ -1433,16 +1435,346 @@ async def _handle_recall_recent_messages(args: dict[str, Any], context: dict[str
     )
 
 
+def _normalize_target_from_context(value: Any) -> str:
+    text = normalize_text(str(value))
+    return text if _QQ_ID_SAFE_PATTERN.fullmatch(text) else ""
+
+
+def _message_contains_explicit_user_id(message_text: str, user_id: str) -> bool:
+    content = normalize_text(message_text)
+    uid = normalize_text(user_id)
+    if not content or not uid:
+        return False
+    return bool(re.search(rf"(?<!\d){re.escape(uid)}(?!\d)", content))
+
+
+_BAN_REFERENCE_GENERIC_TOKENS = frozenset(
+    {
+        "禁言",
+        "解除禁言",
+        "取消禁言",
+        "解禁",
+        "30天",
+        "30",
+        "分钟",
+        "小时",
+        "天",
+        "秒",
+        "那个",
+        "这个",
+        "那位",
+        "这位",
+        "那个人",
+        "这个人",
+        "刚刚",
+        "刚才",
+        "之前",
+        "前面",
+        "一直",
+        "老是",
+        "总是",
+        "的人",
+        "那个人",
+    }
+)
+_BAN_REFERENCE_DEMONSTRATIVE_CUES = ("那个", "这位", "这个", "刚刚", "刚才", "前面", "一直", "老是", "总是")
+
+
+def _collect_shared_ban_candidates(context: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    candidates: dict[str, dict[str, Any]] = {}
+
+    def _touch(uid: str, *, name: str = "", text: str = "") -> None:
+        key = _normalize_target_from_context(uid)
+        if not key:
+            return
+        bucket = candidates.setdefault(key, {"uid": key, "names": set(), "texts": []})
+        clean_name = normalize_text(name)
+        clean_text = normalize_text(text)
+        if clean_name:
+            bucket["names"].add(clean_name)
+        if clean_text:
+            texts = bucket["texts"]
+            if clean_text not in texts:
+                texts.append(clean_text)
+
+    recent_speakers = context.get("recent_speakers", [])
+    if isinstance(recent_speakers, list):
+        for row in recent_speakers:
+            if not isinstance(row, (list, tuple)) or len(row) < 3:
+                continue
+            uid = _normalize_target_from_context(row[0])
+            if not uid:
+                continue
+            _touch(uid, name=str(row[1]), text=str(row[2]))
+
+    runtime_rows = context.get("runtime_group_context", [])
+    if isinstance(runtime_rows, list):
+        for raw_row in runtime_rows:
+            row = normalize_text(str(raw_row))
+            if not row:
+                continue
+            matched = re.match(r"^(?P<name>.+?)\(QQ:(?P<uid>[1-9]\d{5,11})\):\s*(?P<text>.+)$", row)
+            if not matched:
+                continue
+            _touch(
+                matched.group("uid"),
+                name=matched.group("name"),
+                text=matched.group("text"),
+            )
+    return candidates
+
+
+def _score_shared_ban_candidate(message_text: str, candidate: dict[str, Any]) -> int:
+    content = normalize_text(message_text)
+    if not content:
+        return 0
+    content_lower = content.lower()
+    has_demonstrative = any(cue in content for cue in _BAN_REFERENCE_DEMONSTRATIVE_CUES)
+    ascii_tokens = [token.lower() for token in re.findall(r"[a-zA-Z0-9_]{1,16}", content)]
+    multi_tokens = [
+        token.lower()
+        for token in tokenize(content)
+        if token and token.lower() not in _BAN_REFERENCE_GENERIC_TOKENS
+    ]
+    one_char_ascii_tokens = [token for token in ascii_tokens if len(token) == 1]
+    long_ascii_tokens = [token for token in ascii_tokens if len(token) >= 2]
+
+    score = 0
+    for raw_name in sorted(candidate.get("names", set()), key=len, reverse=True):
+        name = normalize_text(str(raw_name))
+        if not name:
+            continue
+        name_lower = name.lower()
+        if len(name_lower) >= 2 and name_lower in content_lower:
+            score = max(score, 100)
+            continue
+        if len(name_lower) >= 2 and any(
+            token == name_lower or token in name_lower or name_lower in token
+            for token in long_ascii_tokens + multi_tokens
+        ):
+            score = max(score, 72)
+            continue
+        if has_demonstrative and re.fullmatch(r"[a-z0-9_]{2,8}", name_lower):
+            if any(token and token in name_lower for token in one_char_ascii_tokens):
+                score = max(score, 28)
+
+    preview_tokens: set[str] = set()
+    for raw_text in candidate.get("texts", []):
+        preview_tokens.update(
+            token.lower()
+            for token in tokenize(normalize_text(str(raw_text)))
+            if token and token.lower() not in _BAN_REFERENCE_GENERIC_TOKENS
+        )
+    overlap = [token for token in multi_tokens if token in preview_tokens]
+    if overlap:
+        score += min(24, 8 * len(set(overlap)))
+    return score
+
+
+def _infer_unique_ban_target_from_shared_context(context: dict[str, Any]) -> tuple[str, str]:
+    message_text = normalize_text(
+        str(context.get("original_message_text", "") or context.get("message_text", ""))
+    )
+    if not message_text:
+        return "", "shared_context_message_empty"
+    candidates = _collect_shared_ban_candidates(context)
+    if not candidates:
+        return "", "shared_context_empty"
+
+    scored: list[tuple[int, str]] = []
+    for uid, candidate in candidates.items():
+        score = _score_shared_ban_candidate(message_text, candidate)
+        if score > 0:
+            scored.append((score, uid))
+    if not scored:
+        return "", "shared_context_no_match"
+    scored.sort(key=lambda item: item[0], reverse=True)
+    top_score, top_uid = scored[0]
+    if top_score < 20:
+        return "", "shared_context_match_too_weak"
+    if len(scored) > 1:
+        second_score = scored[1][0]
+        if second_score == top_score or top_score - second_score < 8:
+            return "", "shared_context_ambiguous"
+    return top_uid, ""
+
+
+def _resolve_group_ban_target(args: dict[str, Any], context: dict[str, Any]) -> tuple[int | None, str]:
+    raw_target = _safe_user_id(args.get("user_id", 0))
+    target_uid = str(raw_target) if raw_target else ""
+    actor_uid = _normalize_target_from_context(context.get("user_id", ""))
+    bot_id = normalize_text(str(context.get("bot_id", "")))
+    reply_uid = _normalize_target_from_context(context.get("reply_to_user_id", ""))
+    if reply_uid and reply_uid == bot_id:
+        reply_uid = ""
+
+    at_targets: list[str] = []
+    raw_at_targets = context.get("at_other_user_ids", [])
+    if isinstance(raw_at_targets, list):
+        for item in raw_at_targets:
+            uid = _normalize_target_from_context(item)
+            if uid:
+                at_targets.append(uid)
+    explicit_signals = {uid for uid in at_targets if uid}
+    if reply_uid:
+        explicit_signals.add(reply_uid)
+
+    msg_text = normalize_text(
+        str(context.get("original_message_text", "") or context.get("message_text", ""))
+    )
+    text_mentions_target = _message_contains_explicit_user_id(msg_text, target_uid) if target_uid else False
+    shared_context_uid, shared_context_err = _infer_unique_ban_target_from_shared_context(context)
+
+    if explicit_signals:
+        if target_uid:
+            if target_uid not in explicit_signals and not text_mentions_target:
+                if len(explicit_signals) == 1:
+                    target_uid = next(iter(explicit_signals))
+                else:
+                    return None, "target_user_mismatch_with_explicit_context"
+        else:
+            if len(explicit_signals) == 1:
+                target_uid = next(iter(explicit_signals))
+            else:
+                return None, "target_user_ambiguous_explicit_context"
+    elif target_uid and text_mentions_target:
+        pass
+    elif shared_context_uid:
+        target_uid = shared_context_uid
+    elif target_uid and actor_uid and target_uid == actor_uid:
+        pass
+    elif target_uid:
+        return None, "target_user_not_explicit"
+    else:
+        return None, shared_context_err or "missing_or_invalid_user_id"
+
+    try:
+        return int(target_uid), ""
+    except Exception:
+        return None, "target_user_invalid_after_resolve"
+
+
+def _extract_onebot_data(result: Any) -> dict[str, Any]:
+    if isinstance(result, dict):
+        data = result.get("data")
+        if isinstance(data, dict):
+            merged = dict(result)
+            merged.update(data)
+            return merged
+        return result
+    return {}
+
+
+async def _verify_group_ban_applied(
+    api_call: Any,
+    *,
+    group_id: int,
+    user_id: int,
+    duration: int,
+) -> tuple[bool, dict[str, Any]]:
+    if not callable(api_call):
+        return False, {}
+    now = int(time.time())
+    latest_payload: dict[str, Any] = {}
+    for _ in range(5):
+        try:
+            payload_raw = await call_napcat_api(
+                api_call,
+                "get_group_member_info",
+                group_id=group_id,
+                user_id=user_id,
+                no_cache=True,
+            )
+            payload = _extract_onebot_data(payload_raw)
+            latest_payload = payload
+            shut_up_until = int(
+                payload.get("shut_up_timestamp")
+                or payload.get("shut_up_timestamp_sec")
+                or payload.get("ban_until")
+                or 0
+            )
+            now = int(time.time())
+            if duration <= 0:
+                if shut_up_until <= now + 2:
+                    return True, {"shut_up_timestamp": shut_up_until}
+            else:
+                if shut_up_until > now + 5:
+                    return True, {"shut_up_timestamp": shut_up_until}
+        except Exception:
+            pass
+        await asyncio.sleep(0.7)
+    return False, latest_payload
+
+
 async def _handle_set_group_ban(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-    group_id = int(args.get("group_id", 0))
-    user_id = int(args.get("user_id", 0))
+    api_call = context.get("api_call")
+    if not callable(api_call):
+        return ToolCallResult(ok=False, error="no_api_call_available")
+
+    group_id = int(args.get("group_id", 0) or context.get("group_id", 0) or 0)
     duration = int(args.get("duration", 0))
-    if not group_id or not user_id:
-        return ToolCallResult(ok=False, error="missing group_id or user_id")
+    if not group_id:
+        return ToolCallResult(ok=False, error="missing group_id")
+    duration = max(0, min(duration, 30 * 24 * 3600))
+
+    resolved_user_id, resolve_err = _resolve_group_ban_target(args, context)
+    if not resolved_user_id:
+        return ToolCallResult(
+            ok=False,
+            error=f"target_resolve_failed:{resolve_err}",
+            display="禁言目标不明确：需要 @、回复、明确QQ号，或能从群聊共享上下文唯一解析。",
+        )
+
+    permission_level = normalize_text(str(context.get("permission_level", ""))).lower() or "user"
+    actor_uid = _normalize_target_from_context(context.get("user_id", ""))
+    if permission_level not in {"super_admin", "group_admin"}:
+        if not actor_uid or str(resolved_user_id) != actor_uid:
+            return ToolCallResult(
+                ok=False,
+                error="permission_denied:self_ban_only",
+                data={"group_id": group_id, "user_id": resolved_user_id, "duration": duration},
+                display="普通成员只能请求禁言自己或解除自己的禁言。",
+            )
+
+    try:
+        await call_napcat_api(
+            api_call,
+            "set_group_ban",
+            group_id=group_id,
+            user_id=resolved_user_id,
+            duration=duration,
+        )
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=str(exc), display=f"禁言操作失败: {exc}")
+
+    verified, verify_payload = await _verify_group_ban_applied(
+        api_call,
+        group_id=group_id,
+        user_id=resolved_user_id,
+        duration=duration,
+    )
     action = "解除禁言" if duration == 0 else f"禁言 {duration}秒"
-    return await _napcat_api_call(
-        context, "set_group_ban", f"已对 {user_id} {action}",
-        group_id=group_id, user_id=user_id, duration=duration,
+    if not verified:
+        return ToolCallResult(
+            ok=False,
+            error="ban_unverified",
+            data={
+                "group_id": group_id,
+                "user_id": resolved_user_id,
+                "duration": duration,
+                "verify_payload": verify_payload,
+            },
+            display=f"已提交{action}请求，但未拿到可验证回执，请稍后复查。",
+        )
+    return ToolCallResult(
+        ok=True,
+        data={
+            "group_id": group_id,
+            "user_id": resolved_user_id,
+            "duration": duration,
+            "verify_payload": verify_payload,
+        },
+        display=f"已对 {resolved_user_id} {action}（已校验）",
     )
 
 
@@ -5526,6 +5858,9 @@ def _register_admin_tools(registry: AgentToolRegistry) -> None:
                 "- reload: 热重载配置\n"
                 "- ping: 检测存活\n"
                 "- status: 查看运行状态\n"
+                "- high_risk_confirm [on|off|default] [group|global]: 调整高风险确认策略\n"
+                "- ignore_user <QQ> [group|global]: 忽略某个用户\n"
+                "- unignore_user <QQ> [group|global]: 恢复某个用户\n"
                 "- white_add: 加白本群\n"
                 "- white_rm: 拉黑本群\n"
                 "- white_list: 查看白名单\n"
@@ -6181,6 +6516,83 @@ def _should_block_sticker_send_for_management_turn(context: dict[str, Any]) -> b
     )
 
 
+def _extract_message_segments_from_onebot_payload(raw: Any) -> list[dict[str, Any]]:
+    payload = _unwrap_onebot_message_result(raw)
+    message = payload.get("message") if isinstance(payload, dict) else None
+    if not isinstance(message, list):
+        return []
+    return [dict(seg) for seg in message if isinstance(seg, dict)]
+
+
+async def _load_reply_message_segments_for_sticker(context: dict[str, Any]) -> list[dict[str, Any]]:
+    reply_to_message_id = normalize_text(str(context.get("reply_to_message_id", "")))
+    api_call = context.get("api_call")
+    if not reply_to_message_id or not callable(api_call):
+        return []
+    message_ids: list[Any] = [reply_to_message_id]
+    try:
+        message_ids.insert(0, int(reply_to_message_id))
+    except (TypeError, ValueError):
+        pass
+    for message_id in message_ids:
+        try:
+            raw = await call_napcat_api(api_call, "get_msg", message_id=message_id)
+            segments = _extract_message_segments_from_onebot_payload(raw)
+            if segments:
+                return segments
+        except Exception:
+            continue
+    return []
+
+
+def _extract_first_native_sticker_segment(
+    segments: list[dict[str, Any]] | None,
+) -> tuple[str, dict[str, Any]]:
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        if seg_type not in {"mface", "face"}:
+            continue
+        data = seg.get("data", {}) or {}
+        if isinstance(data, dict):
+            return seg_type, dict(data)
+    return "", {}
+
+
+def _extract_first_sticker_media_payload(
+    segments: list[dict[str, Any]] | None,
+) -> tuple[str, str, str]:
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        data = seg.get("data", {}) or {}
+        if seg_type != "image" or not isinstance(data, dict):
+            continue
+        image_url = normalize_text(str(data.get("url", "")))
+        image_file = normalize_text(str(data.get("file", "")))
+        image_sub_type = normalize_text(str(data.get("sub_type", "")))
+        if image_url or image_file:
+            return image_url, image_file, image_sub_type
+
+    for seg in segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        data = seg.get("data", {}) or {}
+        if not isinstance(data, dict):
+            continue
+        if seg_type == "mface":
+            image_url = normalize_text(
+                str(data.get("url", "") or data.get("download_url", "") or data.get("src", ""))
+            )
+            image_file = normalize_text(str(data.get("file", "") or data.get("file_id", "")))
+            if image_url or image_file:
+                return image_url, image_file, ""
+    return "", "", ""
+
+
 async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """Send a classic QQ face by emotion/description query."""
     if _should_block_sticker_send_for_management_turn(context):
@@ -6219,7 +6631,7 @@ async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> To
             return ToolCallResult(ok=False, data={}, display="无法确定发送目标")
         return ToolCallResult(
             ok=True,
-            data={"face_id": face.face_id, "desc": face.desc},
+            data={"face_id": face.face_id, "desc": face.desc, "send_mode": "face"},
             display=f"已发送表情 [{face.desc}] (id={face.face_id})",
         )
     except Exception as e:
@@ -6311,9 +6723,9 @@ async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> T
         key = sticker_mgr.emoji_key(e) or ""
     if not e or not key:
         return ToolCallResult(ok=False, data={}, display="表情包 key 丢失")
-    seg = sticker_mgr.get_emoji_segment(key)
-    if not seg:
-        return ToolCallResult(ok=False, data={}, display="表情包文件不存在")
+    seg, send_mode, send_meta = sticker_mgr.get_preferred_emoji_segment(key)
+    if not seg or not send_mode:
+        return ToolCallResult(ok=False, data={}, display="表情包发送数据不存在")
 
     api_call = context.get("api_call")
     if not api_call:
@@ -6331,9 +6743,12 @@ async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> T
             return ToolCallResult(ok=False, data={}, display="无法确定发送目标")
         desc = e.description or key.split("/")[-1]
         # 返回空 display，让 Agent 根据 ok=True 自己组织回复
+        result_data = {"key": key, "desc": desc, "send_mode": send_mode}
+        if isinstance(send_meta, dict):
+            result_data.update(send_meta)
         return ToolCallResult(
             ok=True,
-            data={"key": key, "desc": desc},
+            data=result_data,
             display="",
         )
     except Exception as e_err:
@@ -6506,25 +6921,32 @@ def _make_learn_sticker_handler(model_client: Any) -> ToolHandler:
         image_url = str(args.get("image_url", "")).strip()
         image_file = str(args.get("image_file", "")).strip()
         image_sub_type = str(args.get("image_sub_type", "")).strip()
+        native_segment_type = normalize_text(str(args.get("native_segment_type", ""))).lower()
+        native_segment_data = args.get("native_segment_data", {})
+        if not isinstance(native_segment_data, dict):
+            native_segment_data = {}
 
         # 优先从当前消息提取，然后从引用消息提取
         raw_segments = context.get("raw_segments") or []
         reply_media_segments = context.get("reply_media_segments") or []
+        reply_message_segments = await _load_reply_message_segments_for_sticker(context)
+
+        if not native_segment_type:
+            for segs in (raw_segments, reply_message_segments, reply_media_segments):
+                native_segment_type, native_segment_data = _extract_first_native_sticker_segment(segs)
+                if native_segment_type:
+                    break
 
         if not image_url or not image_file or not image_sub_type:
-            for segs in (raw_segments, reply_media_segments):
-                for seg in segs:
-                    if isinstance(seg, dict) and seg.get("type") == "image":
-                        data = seg.get("data") or {}
-                        if not image_url:
-                            image_url = str(data.get("url", "")).strip()
-                        if not image_file:
-                            image_file = str(data.get("file", "")).strip()
-                        if not image_sub_type:
-                            image_sub_type = str(data.get("sub_type", "")).strip()
-                        if image_url and image_file and image_sub_type:
-                            break
-                if image_url and image_file and image_sub_type:
+            for segs in (raw_segments, reply_message_segments, reply_media_segments):
+                resolved_url, resolved_file, resolved_sub_type = _extract_first_sticker_media_payload(segs)
+                if not image_url and resolved_url:
+                    image_url = resolved_url
+                if not image_file and resolved_file:
+                    image_file = resolved_file
+                if not image_sub_type and resolved_sub_type:
+                    image_sub_type = resolved_sub_type
+                if image_url or image_file:
                     break
 
         if not image_url and not image_file:
@@ -6542,6 +6964,8 @@ def _make_learn_sticker_handler(model_client: Any) -> ToolHandler:
             user_id=user_id,
             llm_call=_llm_call,
             api_call=context.get("api_call"),
+            native_segment_type=native_segment_type,
+            native_segment_data=native_segment_data,
         )
         return ToolCallResult(ok=ok, data={"learned": ok}, display=msg)
 
@@ -6559,13 +6983,26 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
             tool_names=("correct_sticker",),
         )
     )
+    registry.register_prompt_hint(
+        PromptHint(
+            source="sticker",
+            section="tools_guidance",
+            content=(
+                "对某一条具体消息做表情回应时，优先使用 set_msg_emoji_like。"
+                "send_emoji/send_sticker 只用于独立发送表情，发送顺序是原生 mface -> 原生/语义匹配 face -> image 回退。"
+            ),
+            priority=34,
+            tool_names=("set_msg_emoji_like", "send_emoji", "send_sticker", "send_face"),
+        )
+    )
 
     registry.register(
         ToolSchema(
             name="send_face",
             description=(
-                "发送QQ经典表情。使用场景: 当你想表达情绪时，发送一个QQ原生表情。"
+                "独立发送QQ经典表情。使用场景: 当你想表达情绪时，发送一个QQ原生表情。"
                 "参数query填写情绪关键词如'开心','哭','doge','吃瓜','赞'等。"
+                "如果是要对某条具体消息点表情回应，不要用本工具，改用 set_msg_emoji_like。"
             ),
             parameters={
                 "type": "object",
@@ -6583,10 +7020,11 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
         ToolSchema(
             name="send_emoji",
             description=(
-                "发送本地表情包图片。库里有大量表情包可用。"
+                "独立发送表情包。库里有大量表情包可用，会优先发送原生 mface，其次 face，最后才回退 image。"
                 "query填写情绪关键词匹配，或填'随机'/'random'随机发一张。"
                 "支持按分类搜索(如'搞笑','可爱')，按标签搜索(如'#猫','#无语')。"
                 "如果不确定有什么表情包，直接填'随机'即可。"
+                "如果是要对某条具体消息点表情回应，不要用本工具，改用 set_msg_emoji_like。"
             ),
             parameters={
                 "type": "object",
@@ -6617,7 +7055,8 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
             name="send_sticker",
             description=(
                 "兼容别名：等价于 send_emoji。"
-                "用于发送本地表情包图片，query 可填关键词或'随机'。"
+                "用于独立发送表情包，内部优先 mface，其次 face，最后 image。"
+                "若要对某条具体消息点表情回应，改用 set_msg_emoji_like。"
             ),
             parameters={
                 "type": "object",
@@ -7374,6 +7813,9 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
     category = str(args.get("category", "")).strip()
     if not query:
         return ToolCallResult(ok=False, error="missing query")
+    current_user_id = normalize_text(str(context.get("user_id", "")))
+    current_conversation_id = normalize_text(str(context.get("conversation_id", "")))
+    current_group_id = normalize_text(str(context.get("group_id", "")))
 
     def _build_query_variants(raw_query: str) -> list[str]:
         base = normalize_text(raw_query)
@@ -7455,6 +7897,30 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
 
         return variants[:10]
 
+    def _normalize_entry_tags(entry: Any) -> set[str]:
+        raw_tags = getattr(entry, "tags", [])
+        if isinstance(raw_tags, str):
+            raw_tags = [raw_tags]
+        if not isinstance(raw_tags, list):
+            return set()
+        out: set[str] = set()
+        for raw in raw_tags:
+            text = normalize_text(str(raw)).lower()
+            if text:
+                out.add(text)
+        return out
+
+    def _scope_score(entry: Any) -> int:
+        tags = _normalize_entry_tags(entry)
+        score = 0
+        if current_user_id and f"user:{current_user_id}".lower() in tags:
+            score += 100
+        if current_conversation_id and f"conversation:{current_conversation_id}".lower() in tags:
+            score += 40
+        if current_group_id and f"group:{current_group_id}".lower() in tags:
+            score += 20
+        return score
+
     try:
         query_variants = _build_query_variants(query)
         category_variants: list[str] = [category] if category else [""]
@@ -7481,6 +7947,16 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
             if len(entries) >= 8:
                 break
 
+        if entries:
+            entries = sorted(
+                entries,
+                key=lambda row: (
+                    _scope_score(row),
+                    float(getattr(row, "created_at", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
+
         if not entries:
             return ToolCallResult(
                 ok=True,
@@ -7490,11 +7966,17 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
 
         lines = [f"【知识库搜索: {query}】"]
         result_rows: list[dict[str, Any]] = []
+        scoped_hits = 0
         for e in entries:
             cat_tag = f"[{e.category}]" if e.category else ""
-            lines.append(f"- {cat_tag} {e.title}")
+            scope_score = _scope_score(e)
+            if scope_score >= 100:
+                scoped_hits += 1
+            scope_tag = " (当前用户)" if scope_score >= 100 else ""
+            lines.append(f"- {cat_tag} {e.title}{scope_tag}")
             if e.content:
                 lines.append(f"  {clip_text(e.content, 200)}")
+            tags = [normalize_text(str(item)) for item in (getattr(e, "tags", []) or []) if normalize_text(str(item))]
             result_rows.append(
                 {
                     "id": int(getattr(e, "id", 0) or 0),
@@ -7502,11 +7984,17 @@ async def _handle_search_knowledge(args: dict[str, Any], context: dict[str, Any]
                     "title": normalize_text(str(getattr(e, "title", ""))),
                     "content": normalize_text(str(getattr(e, "content", ""))),
                     "source": normalize_text(str(getattr(e, "source", ""))),
+                    "tags": tags,
                 }
             )
         return ToolCallResult(
             ok=True,
-            data={"count": len(entries), "results": result_rows, "query_variants": query_variants},
+            data={
+                "count": len(entries),
+                "results": result_rows,
+                "query_variants": query_variants,
+                "scoped_hits": scoped_hits,
+            },
             display="\n".join(lines),
         )
     except Exception as e:
@@ -7601,12 +8089,38 @@ async def _handle_learn_knowledge(args: dict[str, Any], context: dict[str, Any])
     if category not in ("fact", "meme", "learned"):
         category = "learned"
 
+    normalized_tags: list[str] = []
+    seen_tags: set[str] = set()
+
+    def _append_tag(raw: str) -> None:
+        tag = normalize_text(str(raw))
+        if not tag:
+            return
+        key = tag.lower()
+        if key in seen_tags:
+            return
+        seen_tags.add(key)
+        normalized_tags.append(tag)
+
+    for item in tags:
+        _append_tag(item)
+    current_user_id = normalize_text(str(context.get("user_id", "")))
+    current_conversation_id = normalize_text(str(context.get("conversation_id", "")))
+    current_group_id = int(context.get("group_id", 0) or 0)
+    if current_user_id:
+        _append_tag(f"user:{current_user_id}")
+    if current_conversation_id:
+        _append_tag(f"conversation:{current_conversation_id}")
+    if current_group_id > 0:
+        _append_tag(f"group:{current_group_id}")
+    normalized_tags = normalized_tags[:20]
+
     try:
         entry_id = kb.add(category=category, title=title, content=content,
-                        source="chat", tags=tags)
+                        source="chat", tags=normalized_tags)
         return ToolCallResult(
             ok=True,
-            data={"id": entry_id, "category": category},
+            data={"id": entry_id, "category": category, "tags": normalized_tags},
             display=f"已学习: [{category}] {title}",
         )
     except Exception as e:
