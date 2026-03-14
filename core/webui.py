@@ -27,10 +27,12 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 import yaml
+from dotenv import dotenv_values, set_key, unset_key
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.requests import Request
 
+from core.napcat_compat import build_napcat_diagnostics, call_napcat_bot_api
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     list_recalled_messages as _list_recalled_messages,
@@ -70,6 +72,8 @@ _SENSITIVE_PATHS = frozenset({
 })
 
 _ROOT_DIR = Path(__file__).resolve().parents[1]
+_ENV_FILE = _ROOT_DIR / ".env"
+_ENV_EXAMPLE_FILE = _ROOT_DIR / ".env.example"
 _PROMPTS_FILE = _ROOT_DIR / "config" / "prompts.yml"
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SQLITE_HEADER = b"SQLite format 3\x00"
@@ -88,6 +92,150 @@ _UPDATE_STAGE_PROGRESS: dict[str, int] = {
     "completed": 100,
     "failed": 100,
 }
+_ENV_EDITABLE_FIELDS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "HOST",
+        "label": "监听地址",
+        "description": "WebUI / OneBot 反向 WS 绑定地址。修改后通常需要重启服务。",
+        "secret": False,
+        "restart_required": True,
+    },
+    {
+        "key": "PORT",
+        "label": "监听端口",
+        "description": "WebUI / OneBot 反向 WS 监听端口。修改后需要重启服务。",
+        "secret": False,
+        "restart_required": True,
+    },
+    {
+        "key": "DRIVER",
+        "label": "NoneBot 驱动",
+        "description": "默认保持 ~fastapi。修改后需要重启服务。",
+        "secret": False,
+        "restart_required": True,
+    },
+    {
+        "key": "ONEBOT_API_TIMEOUT",
+        "label": "OneBot API 超时(秒)",
+        "description": "大文件、视频、上传场景建议适当拉长。修改后建议重启服务。",
+        "secret": False,
+        "restart_required": True,
+    },
+    {
+        "key": "ONEBOT_ACCESS_TOKEN",
+        "label": "OneBot Access Token",
+        "description": "必须与 NapCat OneBot V11 侧 token 保持一致。",
+        "secret": True,
+        "restart_required": True,
+    },
+    {
+        "key": "WEBUI_TOKEN",
+        "label": "WebUI Token",
+        "description": "修改后当前登录会话会失效，需要重新登录。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "SKIAPI_KEY",
+        "label": "SKIAPI Key",
+        "description": "若 config.yml 使用 ${SKIAPI_KEY} 占位符，保存后会自动热重载。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "OPENAI_API_KEY",
+        "label": "OpenAI API Key",
+        "description": "若 config.yml 使用 ${OPENAI_API_KEY} 占位符，保存后会自动热重载。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "DEEPSEEK_API_KEY",
+        "label": "DeepSeek API Key",
+        "description": "若 config.yml 使用 ${DEEPSEEK_API_KEY} 占位符，保存后会自动热重载。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "NEWAPI_API_KEY",
+        "label": "NEWAPI API Key",
+        "description": "聚合网关密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "ANTHROPIC_API_KEY",
+        "label": "Anthropic API Key",
+        "description": "Claude 系列模型密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "GEMINI_API_KEY",
+        "label": "Gemini API Key",
+        "description": "Gemini 系列模型密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "OPENROUTER_API_KEY",
+        "label": "OpenRouter API Key",
+        "description": "OpenRouter 网关密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "XAI_API_KEY",
+        "label": "xAI API Key",
+        "description": "Grok / xAI 密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "QWEN_API_KEY",
+        "label": "Qwen API Key",
+        "description": "通义千问密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "MOONSHOT_API_KEY",
+        "label": "Moonshot API Key",
+        "description": "Moonshot / Kimi 密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "MISTRAL_API_KEY",
+        "label": "Mistral API Key",
+        "description": "Mistral 密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "ZHIPU_API_KEY",
+        "label": "Zhipu API Key",
+        "description": "智谱清言密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+    {
+        "key": "SILICONFLOW_API_KEY",
+        "label": "SiliconFlow API Key",
+        "description": "SiliconFlow 密钥。",
+        "secret": True,
+        "restart_required": False,
+    },
+)
+_ENV_FIELDS_BY_KEY = {str(item["key"]): item for item in _ENV_EDITABLE_FIELDS}
+_ENV_RELOAD_SKIP_KEYS = frozenset({
+    "HOST",
+    "PORT",
+    "DRIVER",
+    "ONEBOT_API_TIMEOUT",
+    "ONEBOT_ACCESS_TOKEN",
+    "WEBUI_TOKEN",
+})
 
 
 def _default_prompts() -> dict:
@@ -132,6 +280,142 @@ def init_webui(engine: Any) -> APIRouter:
     _start_time = time.time()
     _log.info("WebUI API 已初始化")
     return router
+
+
+def _ensure_env_file() -> None:
+    if _ENV_FILE.exists():
+        return
+    if _ENV_EXAMPLE_FILE.exists():
+        shutil.copy2(_ENV_EXAMPLE_FILE, _ENV_FILE)
+        return
+    _ENV_FILE.write_text("", encoding="utf-8")
+
+
+def _read_env_values() -> dict[str, str]:
+    _ensure_env_file()
+    raw = dotenv_values(_ENV_FILE)
+    result: dict[str, str] = {}
+    for key, value in raw.items():
+        safe_key = normalize_text(str(key))
+        if not safe_key:
+            continue
+        result[safe_key] = normalize_text(str(value)) if value is not None else ""
+    return result
+
+
+def _serialize_env_entries() -> list[dict[str, Any]]:
+    raw = _read_env_values()
+    entries: list[dict[str, Any]] = []
+    for item in _ENV_EDITABLE_FIELDS:
+        key = str(item["key"])
+        actual = normalize_text(raw.get(key, ""))
+        secret = bool(item.get("secret", False))
+        entries.append(
+            {
+                "key": key,
+                "label": str(item.get("label", key)),
+                "description": str(item.get("description", "")),
+                "secret": secret,
+                "restart_required": bool(item.get("restart_required", False)),
+                "present": bool(actual),
+                "value": "***" if secret and actual else actual,
+            }
+        )
+    return entries
+
+
+def _normalize_env_update_payload(body: Any) -> dict[str, str]:
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是对象")
+
+    raw_env = body.get("env", body)
+    if isinstance(raw_env, dict):
+        payload = raw_env
+    elif isinstance(raw_env, list):
+        payload = {}
+        for item in raw_env:
+            if not isinstance(item, dict):
+                continue
+            key = normalize_text(str(item.get("key", "")))
+            if not key:
+                continue
+            payload[key] = str(item.get("value", ""))
+    else:
+        raise HTTPException(400, "env 必须是对象或数组")
+
+    normalized: dict[str, str] = {}
+    for raw_key, raw_value in payload.items():
+        key = normalize_text(str(raw_key))
+        if not key:
+            continue
+        if key not in _ENV_FIELDS_BY_KEY:
+            raise HTTPException(400, f"不允许修改环境变量: {key}")
+        normalized[key] = str(raw_value) if raw_value is not None else ""
+    return normalized
+
+
+def _validate_env_value(key: str, value: str) -> str:
+    safe_key = normalize_text(key)
+    text = str(value).strip()
+    if safe_key == "PORT":
+        if not text.isdigit():
+            raise HTTPException(400, "PORT 必须是 1-65535 的数字")
+        port = int(text)
+        if port < 1 or port > 65535:
+            raise HTTPException(400, "PORT 必须是 1-65535")
+        return str(port)
+    if safe_key == "ONEBOT_API_TIMEOUT":
+        if not text.isdigit():
+            raise HTTPException(400, "ONEBOT_API_TIMEOUT 必须是正整数秒数")
+        timeout = int(text)
+        if timeout < 5 or timeout > 3600:
+            raise HTTPException(400, "ONEBOT_API_TIMEOUT 建议在 5-3600 秒之间")
+        return str(timeout)
+    if safe_key in {"HOST", "DRIVER"} and not text:
+        raise HTTPException(400, f"{safe_key} 不能为空")
+    return text
+
+
+async def _apply_env_updates(updates: dict[str, str]) -> dict[str, Any]:
+    env_before = _read_env_values()
+    changed_keys: list[str] = []
+
+    for key, raw_value in updates.items():
+        meta = _ENV_FIELDS_BY_KEY[key]
+        current_value = normalize_text(env_before.get(key, ""))
+        next_value = str(raw_value)
+        if bool(meta.get("secret", False)) and next_value == "***":
+            next_value = current_value
+        next_value = _validate_env_value(key, next_value)
+
+        if next_value == current_value:
+            continue
+
+        if next_value:
+            set_key(str(_ENV_FILE), key, next_value, quote_mode="never")
+            os.environ[key] = next_value
+        else:
+            with contextlib.suppress(Exception):
+                unset_key(str(_ENV_FILE), key)
+            os.environ.pop(key, None)
+        changed_keys.append(key)
+
+    reload_required = any(key not in _ENV_RELOAD_SKIP_KEYS for key in changed_keys)
+    restart_required = any(bool(_ENV_FIELDS_BY_KEY[key].get("restart_required", False)) for key in changed_keys)
+    reauth_required = "WEBUI_TOKEN" in changed_keys
+
+    reload_ok = True
+    reload_message = ""
+    if changed_keys and reload_required and _engine is not None:
+        reload_ok, reload_message = await _reload_engine_config(_engine)
+
+    return {
+        "changed_keys": changed_keys,
+        "restart_required": restart_required,
+        "reauth_required": reauth_required,
+        "reload_ok": reload_ok,
+        "reload_message": reload_message,
+    }
 
 
 def _get_token() -> str:
@@ -1659,6 +1943,49 @@ async def status():
             "multi_conversation_enabled": multi_conversation_enabled,
             "active_conversations": len(runtime_agent_rows),
         },
+        "napcat": {
+            "registered_tools": _count_registered_napcat_tools(),
+            "diagnostics_path": "/api/webui/napcat/status",
+        },
+    }
+
+
+@router.get("/napcat/status", dependencies=[Depends(_check_auth)])
+async def napcat_status(bot_id: str = Query("", description="可选，指定 OneBot bot_id")):
+    return await _collect_napcat_status(bot_id=bot_id)
+
+
+@router.get("/env", dependencies=[Depends(_check_auth)])
+async def get_env_settings():
+    return {
+        "env_file": str(_ENV_FILE),
+        "entries": _serialize_env_entries(),
+    }
+
+
+@router.put("/env", dependencies=[Depends(_check_auth)])
+async def put_env_settings(request: Request):
+    body = await request.json()
+    updates = _normalize_env_update_payload(body)
+    result = await _apply_env_updates(updates)
+    if result["changed_keys"] and not result["reload_ok"]:
+        raise HTTPException(500, result["reload_message"] or "环境变量已写入，但热重载失败")
+    message = "环境变量未变化"
+    if result["changed_keys"]:
+        message = "环境变量已更新"
+        if result["restart_required"]:
+            message += "，部分变更需要重启服务生效"
+        elif result["reload_ok"]:
+            message += "，已完成热重载"
+    return {
+        "ok": True,
+        "message": message,
+        "changed_keys": result["changed_keys"],
+        "restart_required": result["restart_required"],
+        "reauth_required": result["reauth_required"],
+        "reload_ok": result["reload_ok"],
+        "reload_message": result["reload_message"],
+        "entries": _serialize_env_entries(),
     }
 
 
@@ -2340,11 +2667,75 @@ async def _get_onebot_runtime(bot_id: str = "") -> Any:
 async def _onebot_call(api: str, *, bot_id: str = "", **kwargs: Any) -> Any:
     bot = await _get_onebot_runtime(bot_id=bot_id)
     try:
-        payload = await bot.call_api(api, **kwargs)
+        payload = await call_napcat_bot_api(bot, api, **kwargs)
     except Exception as exc:
         tail = clip_text(normalize_text(str(exc)), 220)
         raise HTTPException(502, f"调用 {api} 失败: {tail}") from exc
     return _unwrap_onebot_payload(payload)
+
+
+def _count_registered_napcat_tools() -> int:
+    reg = getattr(_engine, "agent_tool_registry", None)
+    schemas = getattr(reg, "_schemas", {})
+    if not isinstance(schemas, dict):
+        return 0
+    return sum(1 for schema in schemas.values() if getattr(schema, "category", "") == "napcat")
+
+
+async def _collect_napcat_status(bot_id: str = "") -> dict[str, Any]:
+    resolved_bot_id = normalize_text(bot_id)
+    errors: dict[str, str] = {}
+
+    try:
+        bot = await _get_onebot_runtime(bot_id=resolved_bot_id)
+    except HTTPException as exc:
+        diagnostics = build_napcat_diagnostics(
+            status_payload={},
+            version_payload={},
+            bot_id=resolved_bot_id,
+        )
+        diagnostics["availability"] = {
+            "onebot_connected": False,
+            "status_api_ok": False,
+            "version_api_ok": False,
+        }
+        diagnostics["errors"] = {"runtime": normalize_text(str(exc.detail))}
+        diagnostics["integration"] = {
+            "registered_napcat_tools": _count_registered_napcat_tools(),
+            "webui_diagnostics": True,
+        }
+        return diagnostics
+
+    status_payload: Any = {}
+    version_payload: Any = {}
+
+    try:
+        status_payload = _unwrap_onebot_payload(await call_napcat_bot_api(bot, "get_status"))
+    except Exception as exc:
+        errors["get_status"] = clip_text(normalize_text(str(exc)), 220)
+
+    try:
+        version_payload = _unwrap_onebot_payload(await call_napcat_bot_api(bot, "get_version_info"))
+    except Exception as exc:
+        errors["get_version_info"] = clip_text(normalize_text(str(exc)), 220)
+
+    diagnostics = build_napcat_diagnostics(
+        status_payload=status_payload,
+        version_payload=version_payload,
+        bot_self_id=normalize_text(str(getattr(bot, "self_id", ""))),
+        bot_id=resolved_bot_id or normalize_text(str(getattr(bot, "self_id", ""))),
+    )
+    diagnostics["availability"] = {
+        "onebot_connected": True,
+        "status_api_ok": "get_status" not in errors,
+        "version_api_ok": "get_version_info" not in errors,
+    }
+    diagnostics["errors"] = errors
+    diagnostics["integration"] = {
+        "registered_napcat_tools": _count_registered_napcat_tools(),
+        "webui_diagnostics": True,
+    }
+    return diagnostics
 
 
 def _render_message_text(raw_message: Any, segments: Any) -> str:
@@ -3101,7 +3492,7 @@ async def chat_agent_text(request: Request):
     message_id = f"webui-{int(time.time() * 1000)}"
 
     async def runtime_api_call(api: str, **kwargs: Any) -> Any:
-        payload = await bot_runtime.call_api(api, **kwargs)
+        payload = await call_napcat_bot_api(bot_runtime, api, **kwargs)
         return _unwrap_onebot_payload(payload)
 
     try:
@@ -5366,7 +5757,7 @@ async def setup_extract_cookie(request: Request):
     if platform not in _SETUP_COOKIE_PLATFORM_DOMAINS:
         raise HTTPException(400, f"Unknown platform: {platform}")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     domains = _SETUP_COOKIE_PLATFORM_DOMAINS[platform]
 
     try:
@@ -5441,7 +5832,7 @@ async def setup_smart_extract(request: Request):
     _smart_extract_meta = None
     _smart_extract_error = ""
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     async def _do_extract():
         global _smart_extract_result, _smart_extract_meta, _smart_extract_status, _smart_extract_error

@@ -150,6 +150,7 @@ ws://192.168.1.50:8081/onebot/v11/ws
 > ```bash
 > curl -o napcat.sh https://nclatest.znin.net/NapNeko/NapCat-Installer/main/script/install.sh && bash napcat.sh
 > ```
+> 进阶运维与本次更新说明：[`docs/zh-TW/NAPCAT_LINUX_WEBUI_UPDATE.md`](docs/zh-TW/NAPCAT_LINUX_WEBUI_UPDATE.md)
 
 ## ⚙️ 配置说明
 

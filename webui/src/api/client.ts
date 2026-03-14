@@ -114,6 +114,17 @@ class ApiClient {
     });
   }
 
+  getEnvSettings() {
+    return this.request<EnvSettingsResponse>("/env");
+  }
+
+  updateEnvSettings(env: Record<string, string>) {
+    return this.request<EnvUpdateResponse>("/env", {
+      method: "PUT",
+      body: JSON.stringify({ env }),
+    });
+  }
+
   testImageGen(payload: ImageGenTestRequest) {
     return this.request<ImageGenTestResponse>("/image-gen/test", {
       method: "POST",
@@ -480,6 +491,32 @@ export interface SystemUpdateStartResponse {
 
 export interface SystemUpdateTaskResponse {
   task: SystemUpdateTask;
+}
+
+export interface EnvSettingEntry {
+  key: string;
+  label: string;
+  description: string;
+  secret: boolean;
+  restart_required: boolean;
+  present: boolean;
+  value: string;
+}
+
+export interface EnvSettingsResponse {
+  env_file: string;
+  entries: EnvSettingEntry[];
+}
+
+export interface EnvUpdateResponse {
+  ok: boolean;
+  message: string;
+  changed_keys: string[];
+  restart_required: boolean;
+  reauth_required: boolean;
+  reload_ok: boolean;
+  reload_message: string;
+  entries: EnvSettingEntry[];
 }
 
 export interface DbOverviewItem {

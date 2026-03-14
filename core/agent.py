@@ -70,6 +70,7 @@ class AgentContext:
     user_profile_summary: str = ""
     preferred_name: str = ""
     recent_speakers: list[tuple[str, str, str]] = field(default_factory=list)
+    compat_context: str = ""
     user_policies: dict[str, Any] = field(default_factory=dict)
     user_directives: list[str] = field(default_factory=list)
     thread_state: dict[str, Any] = field(default_factory=dict)
@@ -1870,6 +1871,9 @@ class AgentLoop:
             )
         if ctx.preferred_name:
             context_parts.append(f"用户偏好称呼: {ctx.preferred_name}")
+        compat_context = normalize_text(ctx.compat_context)
+        if compat_context:
+            context_parts.append(compat_context)
         if ctx.recent_speakers:
             speaker_rows: list[str] = []
             for uid, name, preview in ctx.recent_speakers[:8]:

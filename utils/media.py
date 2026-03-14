@@ -301,14 +301,14 @@ async def transcribe_audio(
     async with _whisper_lock:
         if _whisper_model is None:
             _log.info("whisper_loading_model | size=%s", model_size)
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             _whisper_model = await loop.run_in_executor(
                 None, lambda: whisper.load_model(model_size)
             )
             _log.info("whisper_model_loaded | size=%s", model_size)
 
     model = _whisper_model
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         result = await asyncio.wait_for(
             loop.run_in_executor(

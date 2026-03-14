@@ -156,40 +156,90 @@ class ModelClient:
                 return fb
         return self.client
 
+    @staticmethod
+    def _supports_method(client: Any, method_name: str) -> bool:
+        return callable(getattr(client, method_name, None))
+
+    @staticmethod
+    def _fallback_supported_error(method_name: str, exc: Exception) -> bool:
+        raw = str(exc or "").strip()
+        msg = raw.lower()
+        if ModelClient._is_fatal_error(exc):
+            return True
+        if "不支持" in raw:
+            return True
+        if any(cue in msg for cue in ("not support", "unsupported", "not implemented")):
+            return True
+        if any(cue in raw for cue in ("缺少密钥", "未配置", "未启用")):
+            return True
+        if any(cue in msg for cue in ("missing key", "api key", "not configured", "disabled")):
+            return True
+        return False
+
+    async def _invoke_with_failover(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        active_provider = self._active_provider
+        active_client = self._get_active_client()
+        if not self._supports_method(active_client, method_name):
+            exc = RuntimeError(f"{active_provider} 不支持 {method_name}")
+            if not self._fallback_providers or not self._fallback_supported_error(method_name, exc):
+                raise exc
+            _log.warning(
+                "provider_fatal | %s | method=%s | %s | trying fallback",
+                active_provider,
+                method_name,
+                exc,
+            )
+        else:
+            try:
+                return await getattr(active_client, method_name)(*args, **kwargs)
+            except Exception as exc:
+                if not self._fallback_providers or not self._fallback_supported_error(method_name, exc):
+                    raise
+                _log.warning(
+                    "provider_fatal | %s | method=%s | %s | trying fallback",
+                    active_provider,
+                    method_name,
+                    exc,
+                )
+
+        for prov in self._fallback_providers:
+            if prov == active_provider:
+                continue
+            client = self._fallback_clients.get(prov)
+            if not client or not self._supports_method(client, method_name):
+                continue
+            try:
+                result = await getattr(client, method_name)(*args, **kwargs)
+                _log.info(
+                    "provider_failover_ok | %s -> %s | method=%s",
+                    active_provider,
+                    prov,
+                    method_name,
+                )
+                self._active_provider = prov
+                return result
+            except Exception as fb_exc:
+                _log.warning(
+                    "fallback_also_failed | %s | method=%s | %s",
+                    prov,
+                    method_name,
+                    fb_exc,
+                )
+
+        raise RuntimeError("所有 provider 均不可用")
+
     async def chat_completion(
         self,
         messages: list[dict[str, str]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
     ) -> dict[str, Any]:
-        # 先用当前活跃 provider
-        try:
-            return await self._get_active_client().chat_completion(
-                messages=messages, response_format=response_format, max_tokens=max_tokens,
-            )
-        except Exception as exc:
-            if not self._is_fatal_error(exc) or not self._fallback_providers:
-                raise
-            _log.warning("provider_fatal | %s | %s | trying fallback", self._active_provider, exc)
-
-        # 降级尝试
-        for prov in self._fallback_providers:
-            if prov == self._active_provider:
-                continue
-            client = self._fallback_clients.get(prov)
-            if not client:
-                continue
-            try:
-                result = await client.chat_completion(
-                    messages=messages, response_format=response_format, max_tokens=max_tokens,
-                )
-                _log.info("provider_failover_ok | %s -> %s", self._active_provider, prov)
-                self._active_provider = prov
-                return result
-            except Exception as fb_exc:
-                _log.warning("fallback_also_failed | %s | %s", prov, fb_exc)
-
-        raise RuntimeError("所有 provider 均不可用")
+        return await self._invoke_with_failover(
+            "chat_completion",
+            messages=messages,
+            response_format=response_format,
+            max_tokens=max_tokens,
+        )
 
     async def chat_text(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> str:
         data = await self.chat_completion(messages=messages, max_tokens=max_tokens)
@@ -227,10 +277,10 @@ class ModelClient:
         raise last_exc  # type: ignore[misc]
 
     async def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
-        return await self._get_active_client().chat_json(messages)
+        return await self._invoke_with_failover("chat_json", messages)
 
     async def generate_image(self, prompt: str, size: str = "1024x1024") -> str | None:
-        return await self._get_active_client().generate_image(prompt=prompt, size=size)
+        return await self._invoke_with_failover("generate_image", prompt=prompt, size=size)
 
     def supports_vision_input(self, model: str | None = None) -> bool:
         """判断当前模型是否支持图片输入（自动启发式，可被配置覆盖）。"""

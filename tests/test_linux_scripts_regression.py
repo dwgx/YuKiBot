@@ -1,0 +1,28 @@
+from __future__ import annotations
+
+import unittest
+from pathlib import Path
+
+
+class LinuxScriptsRegressionTests(unittest.TestCase):
+    def test_manager_script_contains_napcat_status_and_cleanup_flow(self) -> None:
+        text = Path("scripts/yukiko_manager.sh").read_text(encoding="utf-8")
+        self.assertIn("cmd_napcat_status()", text)
+        self.assertIn("napcat-status [--method-only|--quiet]", text)
+        self.assertIn("--keep-napcat", text)
+        self.assertIn("uninstall_napcat()", text)
+        self.assertIn("wait_webui_health()", text)
+        self.assertIn("npm ci --no-audit --no-fund || npm install --no-audit --no-fund", text)
+
+    def test_install_script_contains_onebot_access_token_and_extended_detection(self) -> None:
+        text = Path("install.sh").read_text(encoding="utf-8")
+        self.assertIn("--onebot-access-token", text)
+        self.assertIn("ONEBOT_ACCESS_TOKEN_INPUT", text)
+        self.assertIn('upsert_env "ONEBOT_ACCESS_TOKEN"', text)
+        self.assertIn("/opt/QQ/resources/app/napcat/napcat.mjs", text)
+        self.assertIn("list-unit-files --type=service", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
+

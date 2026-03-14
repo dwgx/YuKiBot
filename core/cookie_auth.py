@@ -215,15 +215,13 @@ async def bilibili_qr_login() -> dict[str, str] | None:
 def bilibili_qr_login_sync() -> dict[str, str] | None:
     """同步包装，供 setup 向导调用。"""
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, bilibili_qr_login())
-                return future.result(timeout=180)
-        return loop.run_until_complete(bilibili_qr_login())
+        asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(bilibili_qr_login())
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        future = pool.submit(asyncio.run, bilibili_qr_login())
+        return future.result(timeout=180)
 
 
 # ═══════════════════════════════════════════════════════════

@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
+from core.napcat_compat import call_napcat_api
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     record_recalled_message as _record_recalled_message,
@@ -1022,7 +1023,7 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
 
 async def _handle_send_group_message(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     api_call = context.get("api_call")
-    if not api_call:
+    if not callable(api_call):
         return ToolCallResult(ok=False, error="no_api_call_available")
     group_id = int(args.get("group_id", 0))
     message = str(args.get("message", ""))
@@ -1031,7 +1032,7 @@ async def _handle_send_group_message(args: dict[str, Any], context: dict[str, An
     if len(message) > 4000:
         message = message[:3997] + "..."
     try:
-        await api_call("send_group_msg", group_id=group_id, message=message)
+        await call_napcat_api(api_call, "send_group_msg", group_id=group_id, message=message)
         return ToolCallResult(ok=True, display=f"已发送群消息到 {group_id}")
     except Exception as exc:
         return ToolCallResult(ok=False, error=str(exc))
@@ -1039,7 +1040,7 @@ async def _handle_send_group_message(args: dict[str, Any], context: dict[str, An
 
 async def _handle_send_private_message(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     api_call = context.get("api_call")
-    if not api_call:
+    if not callable(api_call):
         return ToolCallResult(ok=False, error="no_api_call_available")
     user_id = int(args.get("user_id", 0))
     message = str(args.get("message", ""))
@@ -1048,7 +1049,7 @@ async def _handle_send_private_message(args: dict[str, Any], context: dict[str, 
     if len(message) > 4000:
         message = message[:3997] + "..."
     try:
-        await api_call("send_private_msg", user_id=user_id, message=message)
+        await call_napcat_api(api_call, "send_private_msg", user_id=user_id, message=message)
         return ToolCallResult(ok=True, display=f"已发送私聊消息到 {user_id}")
     except Exception as exc:
         return ToolCallResult(ok=False, error=str(exc))
@@ -1061,10 +1062,10 @@ async def _napcat_api_call(
 ) -> ToolCallResult:
     """通用 NapCat API 调用封装，减少重复代码。"""
     api_call = context.get("api_call")
-    if not api_call:
+    if not callable(api_call):
         return ToolCallResult(ok=False, error="no_api_call_available")
     try:
-        result = await api_call(api, **kwargs)
+        result = await call_napcat_api(api_call, api, **kwargs)
         data = {}
         if isinstance(result, dict):
             data = result
@@ -1228,7 +1229,7 @@ async def _record_recalled_message_from_message_id(
     if not callable(api_call):
         return
     try:
-        raw = await api_call("get_msg", message_id=message_id)
+        raw = await call_napcat_api(api_call, "get_msg", message_id=message_id)
     except Exception:
         return
     item = _unwrap_onebot_message_result(raw)
@@ -1327,7 +1328,7 @@ async def _handle_recall_recent_messages(args: dict[str, Any], context: dict[str
         if next_seq is not None and next_seq > 0:
             kwargs["message_seq"] = next_seq
         try:
-            raw_page = await api_call("get_group_msg_history", **kwargs)
+            raw_page = await call_napcat_api(api_call, "get_group_msg_history", **kwargs)
         except Exception as exc:
             return ToolCallResult(ok=False, error=f"history_fetch_failed:{exc}")
         page_items = _extract_history_messages(raw_page)
@@ -1401,7 +1402,7 @@ async def _handle_recall_recent_messages(args: dict[str, Any], context: dict[str
                 _log.warning("record_recalled_message_failed | tool=recall_recent_messages | message_id=%s", message_id_text, exc_info=True)
         try:
             message_id_arg: Any = int(message_id_text) if message_id_text.isdigit() else message_id_text
-            await api_call("delete_msg", message_id=message_id_arg)
+            await call_napcat_api(api_call, "delete_msg", message_id=message_id_arg)
             recalled_ids.append(message_id_text)
             preview_lines.append(
                 f"[{time.strftime('%H:%M:%S', time.localtime(int(item.get('time', 0) or 0)))}] "
@@ -4964,7 +4965,7 @@ async def _handle_analyze_voice(args: dict[str, Any], context: dict[str, Any]) -
     # 尝试通过 NapCat API 获取语音文件
     if not voice_url and voice_file_id and api_call:
         try:
-            result = await api_call("get_record", file=voice_file_id, out_format="mp3")
+            result = await call_napcat_api(api_call, "get_record", file=voice_file_id, out_format="mp3")
             if isinstance(result, dict):
                 # 某些实现直接返回转录文本
                 text = str(result.get("text", "")).strip()
@@ -6211,9 +6212,9 @@ async def _handle_send_face(args: dict[str, Any], context: dict[str, Any]) -> To
 
     try:
         if group_id:
-            await api_call("send_group_msg", group_id=group_id, message=[seg])
+            await call_napcat_api(api_call, "send_group_msg", group_id=group_id, message=[seg])
         elif user_id:
-            await api_call("send_private_msg", user_id=int(user_id), message=[seg])
+            await call_napcat_api(api_call, "send_private_msg", user_id=int(user_id), message=[seg])
         else:
             return ToolCallResult(ok=False, data={}, display="无法确定发送目标")
         return ToolCallResult(
@@ -6323,9 +6324,9 @@ async def _handle_send_emoji(args: dict[str, Any], context: dict[str, Any]) -> T
 
     try:
         if group_id:
-            await api_call("send_group_msg", group_id=group_id, message=[seg])
+            await call_napcat_api(api_call, "send_group_msg", group_id=group_id, message=[seg])
         elif user_id:
-            await api_call("send_private_msg", user_id=int(user_id), message=[seg])
+            await call_napcat_api(api_call, "send_private_msg", user_id=int(user_id), message=[seg])
         else:
             return ToolCallResult(ok=False, data={}, display="无法确定发送目标")
         desc = e.description or key.split("/")[-1]

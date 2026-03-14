@@ -19,6 +19,7 @@ SKIP_NAPCAT=0
 HOST_INPUT=""
 PORT_INPUT=""
 WEBUI_TOKEN_INPUT=""
+ONEBOT_ACCESS_TOKEN_INPUT=""
 SERVICE_NAME_INPUT="yukiko"
 
 info() { printf '[INFO] %s\n' "$*"; }
@@ -37,6 +38,8 @@ Options:
   --host <host>             Bind host written to .env (default: keep current or 0.0.0.0)
   --port <port>             Bind port written to .env (default: keep current or 8081)
   --webui-token <token>     WebUI token written to .env
+  --onebot-access-token <token>
+                            OneBot Access Token written to .env
   --service-name <name>     systemd service name (default: yukiko)
   --service                 Enable systemd install (default)
   --no-service              Skip systemd install
@@ -248,10 +251,12 @@ write_env_values() {
   local host="$1"
   local port="$2"
   local token="$3"
+  local onebot_access_token="$4"
   upsert_env "HOST" "$host"
   upsert_env "PORT" "$port"
   upsert_env "WEBUI_TOKEN" "$token"
-  info "Updated .env: HOST=$host PORT=$port WEBUI_TOKEN=***"
+  upsert_env "ONEBOT_ACCESS_TOKEN" "$onebot_access_token"
+  info "Updated .env: HOST=$host PORT=$port WEBUI_TOKEN=*** ONEBOT_ACCESS_TOKEN=***"
 }
 
 bootstrap_python() {
@@ -386,6 +391,11 @@ detect_napcat_custom_tree() {
       return
     fi
 
+    if find "$root" -maxdepth 9 -type f -path "*/opt/QQ/resources/app/napcat/napcat.mjs" 2>/dev/null | grep -q .; then
+      echo "custom_tree"
+      return
+    fi
+
     if find "$root" -maxdepth 4 -type f \( -path "*/Nap[Cc]at*/opt/QQ/qq" -o -path "*/napcat*/opt/QQ/qq" \) 2>/dev/null | grep -q .; then
       echo "custom_tree"
       return
@@ -424,6 +434,11 @@ detect_napcat() {
     return
   fi
 
+  if [[ -f /opt/QQ/resources/app/napcat/napcat.mjs ]]; then
+    echo "shell"
+    return
+  fi
+
   # Check for NapCat in current project directory (Windows-style structure)
   if [[ -d "$ROOT_DIR/../NapCat.Shell.Windows.Node" ]]; then
     echo "local"
@@ -444,7 +459,11 @@ detect_napcat() {
 
   # Check systemd service
   if command_exists systemctl; then
-    if systemctl is-active --quiet napcat 2>/dev/null || systemctl is-enabled --quiet napcat 2>/dev/null; then
+    if systemctl list-units --all --type=service --no-legend 2>/dev/null | grep -Eiq 'napcat'; then
+      echo "systemd"
+      return
+    fi
+    if systemctl list-unit-files --type=service --no-legend 2>/dev/null | grep -Eiq 'napcat'; then
       echo "systemd"
       return
     fi
@@ -561,6 +580,10 @@ parse_args() {
         WEBUI_TOKEN_INPUT="${2:-}"
         shift 2
         ;;
+      --onebot-access-token)
+        ONEBOT_ACCESS_TOKEN_INPUT="${2:-}"
+        shift 2
+        ;;
       --service-name)
         SERVICE_NAME_INPUT="${2:-}"
         shift 2
@@ -625,20 +648,23 @@ main() {
     fi
   fi
 
-  local current_host current_port current_token
+  local current_host current_port current_token current_onebot_access_token
   current_host="$(get_env_value HOST)"
   current_port="$(get_env_value PORT)"
   current_token="$(get_env_value WEBUI_TOKEN)"
+  current_onebot_access_token="$(get_env_value ONEBOT_ACCESS_TOKEN)"
 
-  local host_default port_default token_default
+  local host_default port_default token_default onebot_access_token_default
   host_default="${current_host:-0.0.0.0}"
   port_default="${current_port:-8081}"
   token_default="${current_token:-$(random_token)}"
+  onebot_access_token_default="${current_onebot_access_token:-$(random_token)}"
 
-  local host port webui_token service_name install_service open_firewall
+  local host port webui_token onebot_access_token service_name install_service open_firewall
   host="${HOST_INPUT:-$host_default}"
   port="${PORT_INPUT:-$port_default}"
   webui_token="${WEBUI_TOKEN_INPUT:-$token_default}"
+  onebot_access_token="${ONEBOT_ACCESS_TOKEN_INPUT:-$onebot_access_token_default}"
   service_name="${SERVICE_NAME_INPUT:-yukiko}"
   install_service="$AUTO_INSTALL_SERVICE"
   open_firewall="$AUTO_OPEN_FIREWALL"
@@ -661,6 +687,7 @@ main() {
     done
 
     webui_token="$(ask_input "WEBUI_TOKEN" "$webui_token")"
+    onebot_access_token="$(ask_input "ONEBOT_ACCESS_TOKEN (NapCat OneBot token)" "$onebot_access_token")"
     service_name="$(ask_input "systemd service name" "$service_name")"
 
     if ask_yes_no "Install and start systemd service now?" "yes"; then
@@ -685,7 +712,7 @@ main() {
     exit 1
   fi
 
-  write_env_values "$host" "$port" "$webui_token"
+  write_env_values "$host" "$port" "$webui_token" "$onebot_access_token"
 
   local pm
   pm="$(detect_pkg_manager)"

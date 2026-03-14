@@ -86,6 +86,7 @@ class ThinkingEngine:
         current_user_id: str = "",
         current_user_name: str = "",
         recent_speakers: list[tuple[str, str, str]] | None = None,
+        compat_context: str = "",
     ) -> str:
         _ = (interest_keywords, conflict_keywords)
         text = normalize_text(user_text)
@@ -132,6 +133,7 @@ class ThinkingEngine:
                             sensitive_context=sensitive_context,
                             user_profile_summary=user_profile_summary,
                             scene_tag=scene_tag,
+                            compat_context=compat_context,
                         ),
                     },
                 ]
@@ -165,6 +167,7 @@ class ThinkingEngine:
         sensitive_context: str,
         user_profile_summary: str,
         scene_tag: str,
+        compat_context: str,
     ) -> str:
         now_local = datetime.now().astimezone()
         now_label = now_local.strftime("%Y-%m-%d %H:%M:%S %z")
@@ -187,6 +190,9 @@ class ThinkingEngine:
             if style_guide:
                 profile_block += f"\n回复风格建议: {style_guide}"
             blocks.append(profile_block)
+        compat_block = normalize_text(compat_context)
+        if compat_block:
+            blocks.append(clip_text(compat_block, 900))
         if memory_context:
             rows = [f"- {clip_text(normalize_text(item), 80)}" for item in memory_context[-8:] if normalize_text(item)]
             if rows:

@@ -35,20 +35,28 @@ echo YuKiKo Cookie Launcher
 echo ============================================
 echo 1. bilibili
 echo 2. douyin
-echo 3. kuaishou
-echo 4. zhihu
-echo 5. weibo
-echo 6. all
+echo 3. qzone
+echo 4. kuaishou
+echo 5. zhihu
+echo 6. weibo
+echo 7. all
 echo.
-set /p SITE_CHOICE=Select site [1-6, default 1]:
+echo Shortcuts: b=bilibili  d=douyin  q=qzone  k=kuaishou  a=all
+set /p SITE_CHOICE=Select site [1-7 or shortcut, default 1]:
 if "%SITE_CHOICE%"=="" set "SITE_CHOICE=1"
 
 set "SITE_ARG=--site bilibili"
 if "%SITE_CHOICE%"=="2" set "SITE_ARG=--site douyin"
-if "%SITE_CHOICE%"=="3" set "SITE_ARG=--site kuaishou"
-if "%SITE_CHOICE%"=="4" set "SITE_ARG=--site zhihu"
-if "%SITE_CHOICE%"=="5" set "SITE_ARG=--site weibo"
-if "%SITE_CHOICE%"=="6" set "SITE_ARG=--all"
+if /I "%SITE_CHOICE%"=="b" set "SITE_ARG=--site bilibili"
+if /I "%SITE_CHOICE%"=="d" set "SITE_ARG=--site douyin"
+if "%SITE_CHOICE%"=="3" set "SITE_ARG=--site q"
+if /I "%SITE_CHOICE%"=="q" set "SITE_ARG=--site q"
+if "%SITE_CHOICE%"=="4" set "SITE_ARG=--site kuaishou"
+if /I "%SITE_CHOICE%"=="k" set "SITE_ARG=--site kuaishou"
+if "%SITE_CHOICE%"=="5" set "SITE_ARG=--site zhihu"
+if "%SITE_CHOICE%"=="6" set "SITE_ARG=--site weibo"
+if "%SITE_CHOICE%"=="7" set "SITE_ARG=--all"
+if /I "%SITE_CHOICE%"=="a" set "SITE_ARG=--all"
 
 echo.
 echo Browser:
@@ -69,9 +77,19 @@ if "%SITE_CHOICE%"=="1" (
     set /p USE_QR=Use bilibili QR login? [y/N]:
     if /I "%USE_QR%"=="Y" set "QR_ARG=--qr"
 )
+if /I "%SITE_CHOICE%"=="b" (
+    echo.
+    set /p USE_QR=Use bilibili QR login? [y/N]:
+    if /I "%USE_QR%"=="Y" set "QR_ARG=--qr"
+)
 
 echo.
 echo Starting cookie extraction...
+echo Output files:
+echo   data\cookies\*_cookies.json
+echo   data\cookies\*_cookie.txt
+echo   data\cookies\*_for_yukiko.yml
+echo   data\cookies\yukiko_cookie_import.yml
 echo.
 call :run_python scripts\get_cookies_windows.py %SITE_ARG% %BROWSER_ARG% %QR_ARG%
 set "EXIT_CODE=%ERRORLEVEL%"

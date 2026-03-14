@@ -36,23 +36,32 @@ class _BackupOKClient:
             ]
         }
 
+    async def chat_json(self, messages):
+        return {"ok": True, "source": "backup"}
+
+    async def generate_image(self, prompt: str, size: str = "1024x1024"):
+        return f"https://backup.example/{size}.png"
+
 
 class ModelClientFailoverRegressionTests(unittest.TestCase):
+    def _build_client(self) -> ModelClient:
+        cfg = {
+            "provider": "primary_test_provider",
+            "fallback_providers": ["backup_test_provider"],
+            "providers": {
+                "primary_test_provider": {"api_key": "x-primary"},
+                "backup_test_provider": {"api_key": "x-backup"},
+            },
+        }
+        return ModelClient(cfg)
+
     def test_chat_text_with_retry_uses_failover_path(self) -> None:
         original_clients = dict(ModelClient._CLIENTS)
         try:
             ModelClient._CLIENTS["primary_test_provider"] = _Primary401Client
             ModelClient._CLIENTS["backup_test_provider"] = _BackupOKClient
 
-            cfg = {
-                "provider": "primary_test_provider",
-                "fallback_providers": ["backup_test_provider"],
-                "providers": {
-                    "primary_test_provider": {"api_key": "x-primary"},
-                    "backup_test_provider": {"api_key": "x-backup"},
-                },
-            }
-            client = ModelClient(cfg)
+            client = self._build_client()
 
             result = asyncio.run(
                 client.chat_text_with_retry(
@@ -61,6 +70,40 @@ class ModelClientFailoverRegressionTests(unittest.TestCase):
                 )
             )
             self.assertEqual(result, "fallback-ok")
+            self.assertEqual(client._active_provider, "backup_test_provider")
+        finally:
+            ModelClient._CLIENTS.clear()
+            ModelClient._CLIENTS.update(original_clients)
+
+    def test_chat_json_uses_failover_path(self) -> None:
+        original_clients = dict(ModelClient._CLIENTS)
+        try:
+            ModelClient._CLIENTS["primary_test_provider"] = _Primary401Client
+            ModelClient._CLIENTS["backup_test_provider"] = _BackupOKClient
+
+            client = self._build_client()
+
+            result = asyncio.run(
+                client.chat_json(
+                    messages=[{"role": "user", "content": "ping"}],
+                )
+            )
+            self.assertEqual(result, {"ok": True, "source": "backup"})
+            self.assertEqual(client._active_provider, "backup_test_provider")
+        finally:
+            ModelClient._CLIENTS.clear()
+            ModelClient._CLIENTS.update(original_clients)
+
+    def test_generate_image_uses_failover_path(self) -> None:
+        original_clients = dict(ModelClient._CLIENTS)
+        try:
+            ModelClient._CLIENTS["primary_test_provider"] = _Primary401Client
+            ModelClient._CLIENTS["backup_test_provider"] = _BackupOKClient
+
+            client = self._build_client()
+
+            result = asyncio.run(client.generate_image(prompt="draw cat", size="512x512"))
+            self.assertEqual(result, "https://backup.example/512x512.png")
             self.assertEqual(client._active_provider, "backup_test_provider")
         finally:
             ModelClient._CLIENTS.clear()

@@ -22,6 +22,7 @@ from nonebot import on_message, on_metaevent, on_notice, on_request
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageEvent, MessageSegment
 
 from core.chat_splitter import coalesce_for_rate_limit, split_semantic_text
+from core.napcat_compat import call_napcat_bot_api
 from core import prompt_loader as _pl
 from core.engine import EngineMessage, YukikoEngine
 from core.queue import GroupQueueDispatcher
@@ -352,7 +353,8 @@ async def _maybe_block_group_send_on_error(bot: Bot, event: MessageEvent, exc: E
             if _should_skip_group_member_probe(group_id):
                 info = {}
             else:
-                info = await bot.call_api(
+                info = await call_napcat_bot_api(
+                    bot,
                     "get_group_member_info",
                     group_id=group_id,
                     user_id=int(bot.self_id),
@@ -1088,7 +1090,7 @@ def register_handlers(engine: YukikoEngine) -> None:
 
             api_name = "get_group_msg_history" if chat_type == "group" else "get_friend_msg_history"
             try:
-                payload = await bot.call_api(api_name, **kwargs)
+                payload = await call_napcat_bot_api(bot, api_name, **kwargs)
             except Exception as exc:
                 _log.debug("login_backlog_fetch_history_failed | api=%s | peer=%s | err=%s", api_name, peer_id, exc)
                 break
@@ -1141,7 +1143,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             conv_state = {}
 
         try:
-            recent_raw = await bot.call_api("get_recent_contact", count=int(opts["max_conversations"]))
+            recent_raw = await call_napcat_bot_api(bot, "get_recent_contact", count=int(opts["max_conversations"]))
         except Exception as exc:
             _log.debug("login_backlog_recent_contact_failed | bot=%s | err=%s", bot_id or "-", exc)
             return
@@ -1639,7 +1641,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                 return
 
         async def api_call(api: str, **kwargs: Any) -> Any:
-            return await bot.call_api(api, **kwargs)
+            return await call_napcat_bot_api(bot, api, **kwargs)
 
         # ── 管理员指令拦截 ──
         if engine.admin.is_admin_command(text):
@@ -2938,10 +2940,10 @@ async def _resolve_reply_context(
 
     data: Any = None
     try:
-        data = await bot.call_api("get_msg", message_id=int(mid))
+        data = await call_napcat_bot_api(bot, "get_msg", message_id=int(mid))
     except Exception:
         try:
-            data = await bot.call_api("get_msg", message_id=mid)
+            data = await call_napcat_bot_api(bot, "get_msg", message_id=mid)
         except Exception:
             return event_ctx
     if not isinstance(data, dict):
@@ -3216,7 +3218,7 @@ async def _try_extract_voice_text(bot: Bot, raw_segments: list[dict[str, Any]]) 
             continue
         try:
             # 尝试使用 NapCat 的 get_record API 获取语音文件信息
-            result = await bot.call_api("get_record", file=file_id, out_format="mp3")
+            result = await call_napcat_bot_api(bot, "get_record", file=file_id, out_format="mp3")
             if isinstance(result, dict):
                 # 某些实现会返回 text 字段（语音转文字结果）
                 text = str(result.get("text", "")).strip()
@@ -3229,7 +3231,7 @@ async def _try_extract_voice_text(bot: Bot, raw_segments: list[dict[str, Any]]) 
             # 如果 NapCat 支持 get_msg 获取消息详情中的语音文字
             msg_id = str(data.get("message_id", "") or data.get("id", "")).strip()
             if msg_id:
-                msg_detail = await bot.call_api("get_msg", message_id=int(msg_id))
+                msg_detail = await call_napcat_bot_api(bot, "get_msg", message_id=int(msg_id))
                 if isinstance(msg_detail, dict):
                     # 检查消息详情中是否有语音转文字结果
                     for seg_detail in msg_detail.get("message", []):
@@ -3984,7 +3986,8 @@ async def _try_upload_group_file(bot: Bot, event: MessageEvent, video_url: str) 
     abs_path = str(local_path.resolve())
     file_name = local_path.name
     try:
-        await bot.call_api(
+        await call_napcat_bot_api(
+            bot,
             "upload_group_file",
             group_id=int(group_id),
             file=abs_path,

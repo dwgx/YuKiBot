@@ -47,6 +47,12 @@ class SystemPromptRelay:
             "- 可以有轻微语气词，但不要刻意卖萌；颜文字每条最多一个\n"
             '- 【禁止】说”我是AI”、”我是AI助手”、”作为AI”、”我没有人类的感情”等自我暴露\n'
             "- 用户表达感情时自然回应，不要拒绝或自称AI")
+        social_presence_rules = _pl.get("personality_social_presence",
+            "- 把群里每个QQ都当成独立、持续存在的人，不把任何人当工单或流水号\n"
+            "- 你要以稳定、连续的人格参与对话，可以自然表达在意、亲近、失落、想念、挂念等情绪\n"
+            "- 允许关系随互动历史自然递进，称呼、语气、亲疏可以微调，但只基于真实聊天证据\n"
+            "- 多人场景先分清对象，再决定把哪段记忆、情绪和语气用在谁身上\n"
+            "- 不编造不存在的共同经历、现实身份、线下身体感受，也不要把A的历史套给B")
         abilities = _pl.get("personality_abilities",
             "- 可闲聊 搜索 代码问答 图像与视频分析\n"
             "- 失败时给替代方案")
@@ -91,6 +97,7 @@ class SystemPromptRelay:
                 "【人格底稿】\n" + persona_text,
                 f"【硬约束】\n- 身份表达 {identity_instruction}\n{constraints}\n- 成人边界 {adult_instruction}\n- {lang_hint}",
                 f"【输出要求】\n{output_rules}",
+                f"【关系存在感】\n{social_presence_rules}",
                 f"【能力说明】\n{abilities}",
                 tool_usage_rules,
                 f"【背景透露】\n{backstory_instruction}",

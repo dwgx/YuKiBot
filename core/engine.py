@@ -67,6 +67,11 @@ from core.agent_tools import (
 
 
 from core.affinity import AffinityEngine
+from core.context_compat import (
+    CompatContextInput,
+    build_affinity_summary,
+    build_context_compat_block,
+)
 
 
 from core.config_manager import ConfigManager
@@ -2446,6 +2451,45 @@ class YukikoEngine:
             else {}
         )
 
+        at_other_user_names = (
+            await self._resolve_at_user_names(
+                message.at_other_user_ids or [],
+                message.api_call,
+            )
+            if message.at_other_user_ids
+            else {}
+        )
+
+        compat_context = build_context_compat_block(
+            CompatContextInput(
+                conversation_id=message.conversation_id,
+                user_id=message.user_id,
+                user_name=message.user_name,
+                preferred_name=preferred_name,
+                scene_hint=normalize_text(getattr(trigger, "scene_hint", "")) or "chat",
+                is_private=message.is_private,
+                mentioned=message.mentioned,
+                bot_id=message.bot_id,
+                reply_to_user_id=message.reply_to_user_id,
+                reply_to_user_name=message.reply_to_user_name,
+                reply_to_text=message.reply_to_text,
+                at_other_user_ids=message.at_other_user_ids or [],
+                at_other_user_names=at_other_user_names,
+                recent_speakers=recent_speakers,
+                thread_state=thread_state,
+                user_profile_summary=user_profile_summary,
+                affinity_summary=build_affinity_summary(
+                    self.affinity if hasattr(self, "affinity") else None,
+                    message.user_id,
+                ),
+                bot_mood=(
+                    self.affinity.mood.current
+                    if hasattr(self, "affinity") and hasattr(self.affinity, "mood")
+                    else ""
+                ),
+            )
+        )
+
         runtime_group_context = self._build_runtime_group_context(
             message.conversation_id,
             limit=self.runtime_group_cache_context_limit,
@@ -2574,8 +2618,10 @@ class YukikoEngine:
                     user_profile_summary=user_profile_summary,
                     preferred_name=preferred_name,
                     recent_speakers=recent_speakers,
+                    compat_context=compat_context,
                     user_policies=user_policies,
                     user_directives=user_directives,
+                    at_other_user_names=at_other_user_names,
                 )
 
                 if agent_result is not None:
@@ -2953,6 +2999,7 @@ class YukikoEngine:
                     current_user_id=message.user_id,
                     current_user_name=preferred_name or message.user_name,
                     recent_speakers=recent_speakers,
+                    compat_context=compat_context,
                 )
 
         elif action == "search":
@@ -3067,6 +3114,7 @@ class YukikoEngine:
                         current_user_id=message.user_id,
                         current_user_name=preferred_name or message.user_name,
                         recent_speakers=recent_speakers,
+                        compat_context=compat_context,
                     )
 
                     if not normalize_text(reply_text):
@@ -3111,6 +3159,7 @@ class YukikoEngine:
                     current_user_id=message.user_id,
                     current_user_name=preferred_name or message.user_name,
                     recent_speakers=recent_speakers,
+                    compat_context=compat_context,
                 )
 
                 if not normalize_text(reply_text):
@@ -3134,6 +3183,7 @@ class YukikoEngine:
                     current_user_id=message.user_id,
                     current_user_name=preferred_name or message.user_name,
                     recent_speakers=recent_speakers,
+                    compat_context=compat_context,
                 )
 
                 if not normalize_text(reply_text):
@@ -3385,8 +3435,10 @@ class YukikoEngine:
         user_profile_summary: str,
         preferred_name: str,
         recent_speakers: list[tuple[str, str, str]],
+        compat_context: str,
         user_policies: dict[str, Any] | None = None,
         user_directives: list[str] | None = None,
+        at_other_user_names: dict[str, str] | None = None,
     ) -> EngineResponse | None:
         """尝试走 Agent 循环处理消息。成功返回 EngineResponse，失败返回 None 回退旧管线。"""
 
@@ -3463,6 +3515,7 @@ class YukikoEngine:
                 user_profile_summary=user_profile_summary,
                 preferred_name=preferred_name,
                 recent_speakers=recent_speakers[:8],
+                compat_context=compat_context,
                 user_policies=user_policies or {},
                 user_directives=user_directives or [],
                 thread_state=thread_state if isinstance(thread_state, dict) else {},
@@ -3470,10 +3523,7 @@ class YukikoEngine:
                 media_summary=media_summary,
                 reply_media_summary=reply_media_summary,
                 at_other_user_ids=message.at_other_user_ids or [],
-                at_other_user_names=await self._resolve_at_user_names(
-                    message.at_other_user_ids or [],
-                    message.api_call,
-                ),
+                at_other_user_names=at_other_user_names or {},
                 verbosity=self.get_verbosity(message.group_id),
                 output_style_instruction=self.get_output_style_instruction(
                     message.group_id

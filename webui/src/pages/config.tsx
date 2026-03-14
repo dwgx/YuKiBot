@@ -5,12 +5,13 @@ import {
 } from "@heroui/react";
 import { Save, ChevronLeft, ChevronRight, Undo2 } from "lucide-react";
 import { motion } from "framer-motion";
-import { api, type ImageGenTestResponse } from "../api/client";
+import { api, type EnvSettingEntry, type EnvUpdateResponse, type ImageGenTestResponse } from "../api/client";
 import { NotificationContainer } from "../components/notification";
 import { useNotifications } from "../hooks/useNotifications";
 
 type Cfg = Record<string, unknown>;
 type FieldType = "text" | "password" | "number" | "switch" | "select" | "slider" | "textarea" | "list" | "group_verbosity_map" | "group_text_map";
+type EnvDraftMap = Record<string, string>;
 interface FieldDef { path: string; label: string; type: FieldType; options?: { value: string; label: string }[]; min?: number; max?: number; step?: number; rows?: number; }
 interface SectionDef { key: string; label: string; fields: FieldDef[]; }
 
@@ -483,6 +484,11 @@ export default function ConfigPage() {
   const { notifications, success, danger } = useNotifications();
   const undoSnapshotRef = useRef<Cfg | null>(null);
   const [config, setConfig] = useState<Cfg>({});
+  const [envFile, setEnvFile] = useState("");
+  const [envEntries, setEnvEntries] = useState<EnvSettingEntry[]>([]);
+  const [envDrafts, setEnvDrafts] = useState<EnvDraftMap>({});
+  const [envSaving, setEnvSaving] = useState(false);
+  const [envSaveResult, setEnvSaveResult] = useState<EnvUpdateResponse | null>(null);
   const [fieldDrafts, setFieldDrafts] = useState<Record<string, string>>({});
   const [numberDrafts, setNumberDrafts] = useState<Record<string, string>>({});
   const [listDrafts, setListDrafts] = useState<Record<string, string>>({});
@@ -526,10 +532,15 @@ export default function ConfigPage() {
     return Object.keys(config).filter((k) => typeof k === "string" && k.trim()).sort();
   }, [config]);
 
+  const syncEnvEntries = useCallback((entries: EnvSettingEntry[]) => {
+    setEnvEntries(entries);
+    setEnvDrafts(Object.fromEntries(entries.map((entry) => [entry.key, String(entry.value ?? "")])));
+  }, []);
+
   const load = useCallback(async () => {
     try {
-      const res = await api.getConfig();
-      const merged = withDefaults((res.config || {}) as Cfg);
+      const [configRes, envRes] = await Promise.all([api.getConfig(), api.getEnvSettings()]);
+      const merged = withDefaults((configRes.config || {}) as Cfg);
       setConfig(merged);
       setFieldDrafts({});
       setNumberDrafts({});
@@ -537,12 +548,15 @@ export default function ConfigPage() {
       setRawConfigText(JSON.stringify(merged, null, 2));
       setRawConfigError("");
       setRawConfigDirty(false);
+      setEnvFile(envRes.env_file || "");
+      syncEnvEntries(envRes.entries || []);
+      setEnvSaveResult(null);
     } catch (e: unknown) {
       setMsg(e instanceof Error ? e.message : "加载失败");
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [syncEnvEntries]);
   useEffect(() => { load(); }, [load]);
   useEffect(() => {
     if (topLevelJsonKeys.length === 0) return;
@@ -715,6 +729,33 @@ export default function ConfigPage() {
     }
   };
 
+  const handleEnvSave = async () => {
+    setEnvSaving(true);
+    setEnvSaveResult(null);
+    try {
+      const payload = Object.fromEntries(envEntries.map((entry) => [entry.key, envDrafts[entry.key] ?? ""]));
+      const res = await api.updateEnvSettings(payload);
+      setEnvSaveResult(res);
+      syncEnvEntries(res.entries || []);
+
+      if (res.reauth_required) {
+        success("环境变量已保存", "WEBUI_TOKEN 已更新，正在跳转到登录页", 3000);
+        window.setTimeout(() => {
+          api.clearToken();
+          window.location.href = "/webui/login";
+        }, 800);
+        return;
+      }
+
+      success("环境变量已保存", res.message || "保存完成", 4000);
+    } catch (e: unknown) {
+      const detail = e instanceof Error ? e.message : "未知错误";
+      danger("环境变量保存失败", detail, 5000);
+    } finally {
+      setEnvSaving(false);
+    }
+  };
+
   const handleUndo = async () => {
     if (!undoSnapshotRef.current) return;
     setSaving(true);
@@ -881,6 +922,39 @@ export default function ConfigPage() {
     return <motion.div key={field.path} className={cls} initial={{ opacity: 0, y: 4 }} animate={{ opacity: 1, y: 0 }} whileHover={{ y: -1 }} transition={{ duration: 0.16 }}>{control}</motion.div>;
   };
 
+  const renderEnvField = (entry: EnvSettingEntry) => {
+    const value = envDrafts[entry.key] ?? "";
+    const hintParts = [entry.description];
+    if (entry.secret) {
+      hintParts.push(entry.present ? "已配置，保持当前占位值表示不修改，清空表示删除。" : "未配置，直接填写后保存即可。");
+    }
+    if (entry.restart_required) {
+      hintParts.push("修改后需要重启服务。");
+    } else {
+      hintParts.push("支持直接热更新。");
+    }
+    return (
+      <motion.div
+        key={entry.key}
+        className="rounded-2xl border border-default-400/25 bg-content2/35 p-4"
+        initial={{ opacity: 0, y: 4 }}
+        animate={{ opacity: 1, y: 0 }}
+        whileHover={{ y: -1 }}
+        transition={{ duration: 0.16 }}
+      >
+        <Input
+          label={entry.label}
+          labelPlacement="outside"
+          type={entry.secret ? "password" : "text"}
+          value={value}
+          onValueChange={(next) => setEnvDrafts((prev) => ({ ...prev, [entry.key]: next }))}
+          description={`${entry.key} · ${hintParts.join(" ")}`}
+          classNames={INPUT_CLASSES}
+        />
+      </motion.div>
+    );
+  };
+
   if (loading) return <div className="flex justify-center py-20"><Spinner size="lg" /></div>;
 
   return (
@@ -903,6 +977,41 @@ export default function ConfigPage() {
           {SECTIONS.map((section) => <Button key={section.key} size="sm" radius="full" variant={activeSection === section.key ? "solid" : "flat"} color={activeSection === section.key ? "primary" : "default"} onPress={() => setActiveSection(section.key)}>{section.label}</Button>)}
         </div>
       </div>
+
+      <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
+        <CardHeader className="flex flex-wrap items-center justify-between gap-3">
+          <div className="space-y-1">
+            <div className="font-semibold">环境变量与 NapCat 连接</div>
+            <div className="text-xs text-default-500">{envFile || ".env"}</div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {envSaveResult?.restart_required && <Chip size="sm" variant="flat" color="warning">需要重启</Chip>}
+            {envSaveResult?.reauth_required && <Chip size="sm" variant="flat" color="danger">需要重新登录</Chip>}
+            {envSaveResult && !envSaveResult.restart_required && !envSaveResult.reauth_required && (
+              <Chip size="sm" variant="flat" color="success">已热更新</Chip>
+            )}
+            <Button color="secondary" startContent={<Save size={16} />} isLoading={envSaving} onPress={handleEnvSave}>
+              保存 .env
+            </Button>
+          </div>
+        </CardHeader>
+        <CardBody className="space-y-4">
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+            {envEntries.map(renderEnvField)}
+          </div>
+          {envSaveResult && (
+            <div className="rounded-2xl border border-default-400/25 bg-content2/35 p-4 text-sm text-default-600">
+              <div>{envSaveResult.message}</div>
+              {envSaveResult.changed_keys.length > 0 && (
+                <div className="mt-2 text-xs text-default-500">已更新: {envSaveResult.changed_keys.join(", ")}</div>
+              )}
+              {envSaveResult.reload_message && (
+                <div className="mt-2 text-xs text-default-500">{envSaveResult.reload_message}</div>
+              )}
+            </div>
+          )}
+        </CardBody>
+      </Card>
 
       <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
         <CardHeader className="flex items-center justify-between gap-3">
