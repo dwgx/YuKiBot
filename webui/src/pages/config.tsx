@@ -172,9 +172,13 @@ const SECTIONS: SectionDef[] = [
     { path: "music.max_voice_duration_seconds", label: "最大语音时长(秒,0=不限)", type: "number", min: 0, max: 600 },
     { path: "music.break_limit_enable", label: "启用破限策略", type: "switch" },
     { path: "music.trial_max_duration_ms", label: "试听阈值(ms)", type: "number", min: 0, max: 180000 },
+    { path: "music.artist_guard_enable", label: "启用歌手一致性校验", type: "switch" },
+    { path: "music.artist_guard_allow_mismatch_fallback", label: "歌手不一致时允许回退", type: "switch" },
     { path: "music.cache_keep_files", label: "缓存保留文件数", type: "number", min: 10, max: 200 },
+    { path: "music.cache_dir", label: "缓存目录", type: "text" },
     { path: "music.local_source_enable", label: "启用本地音源匹配", type: "switch" },
     { path: "music.unblock_enable", label: "启用音源解锁", type: "switch" },
+    { path: "music.unblock_api_base", label: "解锁 API 地址", type: "text" },
     { path: "music.unblock_sources", label: "解锁音源(逗号分隔)", type: "text" },
   ]},
   { key: "image_gen", label: "图片生成", fields: [

@@ -31,10 +31,140 @@ function clip(text: string, max = 64): string {
 
 function hasImageSegment(msg: ChatMessageItem | null): boolean {
   if (!msg) return false;
-  if (Array.isArray(msg.segments) && msg.segments.some((seg) => String(seg?.type || "").toLowerCase() === "image")) {
+  if (Array.isArray(msg.segments) && msg.segments.some((seg) => {
+    const segType = String(seg?.type || "").toLowerCase();
+    return segType === "image" || segType === "mface";
+  })) {
     return true;
   }
-  return String(msg.text || "").includes("[image]");
+  return (
+    String(msg.text || "").includes("[image]")
+    || String(msg.text || "").includes("[mface]")
+    || String(msg.text || "").includes("[图片]")
+  );
+}
+
+type MessageMediaKind = "image" | "video" | "audio" | "face";
+type MessageMediaItem = {
+  key: string;
+  kind: MessageMediaKind;
+  url: string;
+  label: string;
+  faceId: string;
+};
+
+function asSegmentData(raw: unknown): Record<string, unknown> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  return raw as Record<string, unknown>;
+}
+
+function firstNonEmptyValue(data: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = String(data[key] ?? "").trim();
+    if (value) return value;
+  }
+  return "";
+}
+
+function normalizeSegmentMediaUrl(raw: string, kind: MessageMediaKind): string {
+  const value = String(raw || "").trim();
+  if (!value) return "";
+  if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || /^blob:/i.test(value)) return value;
+  if (value.startsWith("//")) return `https:${value}`;
+  if (value.startsWith("/")) return value;
+  if (value.startsWith("base64://")) {
+    const body = value.slice("base64://".length);
+    if (!body) return "";
+    if (kind === "video") return `data:video/mp4;base64,${body}`;
+    if (kind === "audio") return `data:audio/mpeg;base64,${body}`;
+    return `data:image/png;base64,${body}`;
+  }
+  return "";
+}
+
+function faceFallbackLabel(faceId: string): string {
+  const id = String(faceId || "").trim();
+  const map: Record<string, string> = {
+    "14": "😄",
+    "76": "👍",
+    "66": "❤️",
+    "63": "🌹",
+    "182": "😎",
+    "271": "👏",
+  };
+  return map[id] || "🙂";
+}
+
+function extractMessageMediaItems(msg: ChatMessageItem): MessageMediaItem[] {
+  const out: MessageMediaItem[] = [];
+  const segs = Array.isArray(msg.segments) ? msg.segments : [];
+  segs.forEach((seg, idx) => {
+    const segType = String(seg?.type || "").toLowerCase();
+    const data = asSegmentData(seg?.data);
+    if (segType === "image" || segType === "mface") {
+      const url = normalizeSegmentMediaUrl(
+        firstNonEmptyValue(data, ["url", "image_url", "src", "origin", "download_url", "file", "path"]),
+        "image",
+      );
+      out.push({
+        key: `${idx}-${segType}`,
+        kind: "image",
+        url,
+        label: segType === "mface" ? "表情包" : "图片",
+        faceId: "",
+      });
+      return;
+    }
+    if (segType === "video") {
+      const url = normalizeSegmentMediaUrl(
+        firstNonEmptyValue(data, ["url", "video_url", "src", "download_url", "file", "path"]),
+        "video",
+      );
+      out.push({
+        key: `${idx}-${segType}`,
+        kind: "video",
+        url,
+        label: "视频",
+        faceId: "",
+      });
+      return;
+    }
+    if (segType === "record" || segType === "audio") {
+      const url = normalizeSegmentMediaUrl(
+        firstNonEmptyValue(data, ["url", "audio_url", "src", "download_url", "file", "path"]),
+        "audio",
+      );
+      out.push({
+        key: `${idx}-${segType}`,
+        kind: "audio",
+        url,
+        label: "语音",
+        faceId: "",
+      });
+      return;
+    }
+    if (segType === "face") {
+      const faceId = firstNonEmptyValue(data, ["id", "face_id", "emoji_id"]);
+      out.push({
+        key: `${idx}-${segType}`,
+        kind: "face",
+        url: "",
+        label: "QQ表情",
+        faceId,
+      });
+    }
+  });
+  return out;
+}
+
+function stripMediaPlaceholders(text: string): string {
+  const raw = String(text || "");
+  if (!raw) return "";
+  return raw
+    .replace(/\[(?:image|video|record|audio|mface|face|file)\]/gi, " ")
+    .replace(/\[(?:图片|视频|语音|音频|表情|消息)\]/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
 }
 
 function resolveQQAvatar(userId: string, size = 100): string {
@@ -486,6 +616,12 @@ export default function ChatPage() {
     y: number;
     message: ChatMessageItem | null;
   }>({ open: false, x: 0, y: 0, message: null });
+  const [mediaPreview, setMediaPreview] = useState<{
+    open: boolean;
+    kind: "image" | "video";
+    url: string;
+    title: string;
+  }>({ open: false, kind: "image", url: "", title: "" });
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const messagesScrollRef = useRef<HTMLDivElement | null>(null);
   const thinkingScrollRef = useRef<HTMLDivElement | null>(null);
@@ -597,6 +733,32 @@ export default function ChatPage() {
   const closeContextMenu = useCallback(() => {
     setContextMenu((prev) => (prev.open ? { open: false, x: 0, y: 0, message: null } : prev));
   }, []);
+  const closeMediaPreview = useCallback(() => {
+    setMediaPreview((prev) => (prev.open ? { open: false, kind: "image", url: "", title: "" } : prev));
+  }, []);
+  const openMediaPreview = useCallback((kind: "image" | "video", url: string, title = "") => {
+    const nextUrl = String(url || "").trim();
+    if (!nextUrl) return;
+    setMediaPreview({
+      open: true,
+      kind,
+      url: nextUrl,
+      title: String(title || "").trim(),
+    });
+  }, []);
+  useEffect(() => {
+    if (!mediaPreview.open) return;
+    const onKeyDown = (evt: KeyboardEvent) => {
+      if (evt.key === "Escape") closeMediaPreview();
+    };
+    const bodyOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = bodyOverflow;
+    };
+  }, [closeMediaPreview, mediaPreview.open]);
   const clearTransientErrorTimer = useCallback(() => {
     if (transientErrorTimerRef.current != null) {
       window.clearTimeout(transientErrorTimerRef.current);
@@ -1639,6 +1801,9 @@ export default function ChatPage() {
               {messages.map((msg) => {
                 const msgAvatarUrl = resolveQQAvatar(msg.sender_id, 100);
                 const msgDisplayName = msg.sender_name || msg.sender_id || "未知";
+                const mediaItems = extractMessageMediaItems(msg);
+                const cleanedText = stripMediaPlaceholders(msg.text || "");
+                const displayText = cleanedText || (mediaItems.length === 0 ? "[空消息]" : "");
                 return (
                   <div key={`${msg.message_id}-${msg.seq}-${msg.timestamp}`} className={`stapxs-msg-row ${msg.is_self ? "is-self" : ""}`}>
                     {!msg.is_self && (
@@ -1675,9 +1840,88 @@ export default function ChatPage() {
                         {msg.is_essence && <Chip size="sm" variant="flat" color="warning">精华</Chip>}
                         {msg.is_recalled && <Chip size="sm" variant="flat" color="warning">此消息已撤回</Chip>}
                       </div>
-                      <div className="stapxs-msg-text">
-                        {msg.text || "[空消息]"}
-                      </div>
+                      {displayText && (
+                        <div className="stapxs-msg-text">
+                          {displayText}
+                        </div>
+                      )}
+                      {mediaItems.length > 0 && (
+                        <div className="stapxs-msg-media">
+                          {mediaItems.map((item) => {
+                            if (item.kind === "image") {
+                              if (item.url) {
+                                return (
+                                  <button
+                                    type="button"
+                                    key={item.key}
+                                    className="stapxs-msg-media-image-btn"
+                                    onClick={() => openMediaPreview("image", item.url, `${item.label}预览`)}
+                                    title="点击放大查看"
+                                  >
+                                    <img src={item.url} alt={item.label} loading="lazy" className="stapxs-msg-media-image" />
+                                  </button>
+                                );
+                              }
+                              return (
+                                <div key={item.key} className="stapxs-msg-media-fallback">
+                                  {item.label}（当前无可播放地址）
+                                </div>
+                              );
+                            }
+                            if (item.kind === "video") {
+                              if (item.url) {
+                                return (
+                                  <div key={item.key} className="stapxs-msg-media-video-wrap">
+                                    <video
+                                      className="stapxs-msg-media-video"
+                                      src={item.url}
+                                      controls
+                                      preload="metadata"
+                                      playsInline
+                                    />
+                                    <button
+                                      type="button"
+                                      className="stapxs-msg-media-open-btn"
+                                      onClick={() => openMediaPreview("video", item.url, "视频预览")}
+                                    >
+                                      全屏查看
+                                    </button>
+                                  </div>
+                                );
+                              }
+                              return (
+                                <div key={item.key} className="stapxs-msg-media-fallback">
+                                  视频（当前无可播放地址）
+                                </div>
+                              );
+                            }
+                            if (item.kind === "audio") {
+                              if (item.url) {
+                                return (
+                                  <audio
+                                    key={item.key}
+                                    className="stapxs-msg-media-audio"
+                                    src={item.url}
+                                    controls
+                                    preload="metadata"
+                                  />
+                                );
+                              }
+                              return (
+                                <div key={item.key} className="stapxs-msg-media-fallback">
+                                  语音（当前无可播放地址）
+                                </div>
+                              );
+                            }
+                            return (
+                              <div key={item.key} className="stapxs-msg-face-chip" title={`face_id=${item.faceId || "-"}`}>
+                                <span>{faceFallbackLabel(item.faceId)}</span>
+                                <span>QQ表情{item.faceId ? ` #${item.faceId}` : ""}</span>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
                       {msg.is_recalled && (
                         <div className="mt-2 text-[11px] text-warning-700/90">
                           此消息已撤回，保留原文仅用于对话追踪。
@@ -2097,6 +2341,45 @@ export default function ChatPage() {
           </Card>
         </div>
       </div>
+
+      {mediaPreview.open && (
+        <div
+          className="stapxs-media-preview fixed inset-0 z-[95] flex items-center justify-center p-4"
+          onClick={closeMediaPreview}
+        >
+          <div className="stapxs-media-preview-panel" onClick={(evt) => evt.stopPropagation()}>
+            <div className="stapxs-media-preview-head">
+              <div className="truncate">{mediaPreview.title || "媒体预览"}</div>
+              <div className="flex items-center gap-2">
+                <a
+                  href={mediaPreview.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="stapxs-media-preview-link"
+                >
+                  新窗口打开
+                </a>
+                <Button size="sm" variant="light" isIconOnly onPress={closeMediaPreview}>
+                  <X size={14} />
+                </Button>
+              </div>
+            </div>
+            <div className="stapxs-media-preview-body">
+              {mediaPreview.kind === "video" ? (
+                <video
+                  className="stapxs-media-preview-video"
+                  src={mediaPreview.url}
+                  controls
+                  autoPlay
+                  playsInline
+                />
+              ) : (
+                <img className="stapxs-media-preview-image" src={mediaPreview.url} alt={mediaPreview.title || "预览图片"} />
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {contextMenu.open && contextMenu.message && (
         <div
