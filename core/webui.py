@@ -12,6 +12,7 @@ import copy
 import inspect
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -29,7 +30,7 @@ import httpx
 import yaml
 from dotenv import dotenv_values, set_key, unset_key
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import Request
 
 from core.napcat_compat import build_napcat_diagnostics, call_napcat_bot_api
@@ -452,6 +453,22 @@ async def _check_auth(request: Request) -> None:
     auth = request.headers.get("Authorization", "")
     if auth != f"Bearer {token}":
         raise HTTPException(401, "认证失败")
+
+
+async def _check_auth_or_query_token(request: Request, query_token: str = "") -> None:
+    """兼容 <img>/<video> 无法自定义 Authorization 头的场景。"""
+    token = _get_token()
+    if not token:
+        raise HTTPException(403, "WEBUI_TOKEN 未配置")
+
+    auth = request.headers.get("Authorization", "")
+    if auth == f"Bearer {token}":
+        return
+
+    if normalize_text(str(query_token)) == token:
+        return
+
+    raise HTTPException(401, "认证失败")
 
 
 def _mask_sensitive(data: dict) -> dict:
@@ -2748,6 +2765,12 @@ def _render_message_text(raw_message: Any, segments: Any) -> str:
     text = ""
     if isinstance(raw_message, str):
         text = normalize_text(raw_message)
+        if text and "[CQ:" in text and not seg_list:
+            parsed_segments = _normalize_message_segments(text)
+            if parsed_segments:
+                parsed_text = _render_message_text("", parsed_segments)
+                if parsed_text:
+                    return parsed_text
     elif raw_message is not None and not isinstance(raw_message, (list, dict)):
         text = normalize_text(str(raw_message))
     elif isinstance(raw_message, dict):
@@ -2915,9 +2938,11 @@ def _format_chat_message_item(item: dict[str, Any], *, bot_self_id: str) -> dict
         or sender_id
     )
     role = normalize_text(str(sender.get("role", ""))).lower()
-    segments = item.get("message", [])
-    if not isinstance(segments, list):
-        segments = []
+    segments = _normalize_message_segments(item.get("message"))
+    if not segments:
+        segments = _normalize_message_segments(item.get("segments"))
+    if not segments:
+        segments = _normalize_message_segments(item.get("raw_message"))
     text = _render_message_text(item.get("raw_message", ""), segments)
     ts = int(item.get("time", 0) or 0)
     return {
@@ -3154,6 +3179,11 @@ def _decode_base64_payload(value: str) -> bytes | None:
     return None
 
 
+def _guess_media_type_from_hint(hint: str, fallback: str = "application/octet-stream") -> str:
+    guessed, _ = mimetypes.guess_type(normalize_text(str(hint)))
+    return guessed or fallback
+
+
 async def _download_image_bytes(url: str) -> tuple[bytes | None, str]:
     target = normalize_text(url)
     if not target:
@@ -3185,6 +3215,61 @@ async def _download_image_bytes(url: str) -> tuple[bytes | None, str]:
             return None, f"http_error:{normalize_text(str(exc))}"
 
     return None, "unsupported_url"
+
+
+async def _resolve_image_preview_bytes(
+    file_token: str, *, bot_id: str = ""
+) -> tuple[bytes | None, str, str]:
+    token = normalize_text(file_token)
+    if not token:
+        return None, "", "empty_file"
+
+    blob, source = await _download_image_bytes(token)
+    if blob:
+        return blob, _guess_media_type_from_hint(token, "image/png"), f"token_{source}"
+
+    get_image_payload: Any = None
+    get_image_error = ""
+    for kwargs in (
+        {"file": token},
+        {"file_id": token},
+        {"id": token},
+    ):
+        try:
+            get_image_payload = await _onebot_call("get_image", bot_id=bot_id, **kwargs)
+            get_image_error = ""
+            break
+        except HTTPException as exc:
+            get_image_error = normalize_text(str(exc.detail))
+        except Exception as exc:
+            get_image_error = normalize_text(str(exc))
+
+    if isinstance(get_image_payload, dict):
+        for key in ("path", "file", "file_path", "local_path", "filename"):
+            raw_local = normalize_text(str(get_image_payload.get(key, "")))
+            if not raw_local:
+                continue
+            local_file = _resolve_local_path_from_file_uri(raw_local)
+            if local_file is None:
+                continue
+            with contextlib.suppress(Exception):
+                data = local_file.read_bytes()
+                if data:
+                    mime = _guess_media_type_from_hint(
+                        local_file.name, "image/png"
+                    )
+                    return data, mime, f"get_image_{key}"
+
+        for key in ("url", "image_url", "download_url", "src"):
+            remote = normalize_text(str(get_image_payload.get(key, "")))
+            if not remote:
+                continue
+            blob, source = await _download_image_bytes(remote)
+            if blob:
+                mime = _guess_media_type_from_hint(remote, "image/png")
+                return blob, mime, f"get_image_{key}_{source}"
+
+    return None, "", get_image_error or "image_not_found"
 
 
 async def _extract_image_bytes_from_message(payload: dict[str, Any], *, bot_id: str = "") -> tuple[bytes | None, str]:
@@ -3399,6 +3484,35 @@ async def chat_history(
         "items": mapped[-int(limit):],
         "permission": permission,
     }
+
+
+@router.get("/chat/media/image")
+async def chat_media_image(
+    request: Request,
+    file: str = Query(""),
+    bot_id: str = Query(""),
+    token: str = Query(""),
+):
+    await _check_auth_or_query_token(request, token)
+
+    file_token = normalize_text(file)
+    if not file_token:
+        raise HTTPException(400, "file 不能为空")
+
+    blob, media_type, source = await _resolve_image_preview_bytes(
+        file_token, bot_id=bot_id
+    )
+    if not blob:
+        raise HTTPException(404, f"图片预览解析失败: {source}")
+
+    return Response(
+        content=blob,
+        media_type=media_type or "image/png",
+        headers={
+            "Cache-Control": "private, max-age=20",
+            "X-Media-Source": source,
+        },
+    )
 
 
 @router.post("/chat/send-text", dependencies=[Depends(_check_auth)])

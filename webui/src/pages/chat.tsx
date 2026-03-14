@@ -51,6 +51,7 @@ type MessageMediaItem = {
   url: string;
   label: string;
   faceId: string;
+  fileToken: string;
 };
 
 function asSegmentData(raw: unknown): Record<string, unknown> {
@@ -71,7 +72,7 @@ function normalizeSegmentMediaUrl(raw: string, kind: MessageMediaKind): string {
   if (!value) return "";
   if (/^https?:\/\//i.test(value) || /^data:/i.test(value) || /^blob:/i.test(value)) return value;
   if (value.startsWith("//")) return `https:${value}`;
-  if (value.startsWith("/")) return value;
+  if (value.startsWith("/api/") || value.startsWith("/webui/")) return value;
   if (value.startsWith("base64://")) {
     const body = value.slice("base64://".length);
     if (!body) return "";
@@ -80,6 +81,17 @@ function normalizeSegmentMediaUrl(raw: string, kind: MessageMediaKind): string {
     return `data:image/png;base64,${body}`;
   }
   return "";
+}
+
+function buildImageProxyUrl(fileToken: string): string {
+  const token = String(api.getToken() || "").trim();
+  const file = String(fileToken || "").trim();
+  if (!file || !token) return "";
+  const query = new URLSearchParams({
+    file,
+    token,
+  });
+  return `/api/webui/chat/media/image?${query.toString()}`;
 }
 
 function faceFallbackLabel(faceId: string): string {
@@ -102,16 +114,20 @@ function extractMessageMediaItems(msg: ChatMessageItem): MessageMediaItem[] {
     const segType = String(seg?.type || "").toLowerCase();
     const data = asSegmentData(seg?.data);
     if (segType === "image" || segType === "mface") {
-      const url = normalizeSegmentMediaUrl(
+      const directUrl = normalizeSegmentMediaUrl(
         firstNonEmptyValue(data, ["url", "image_url", "src", "origin", "download_url", "file", "path"]),
         "image",
       );
+      const fileToken = firstNonEmptyValue(data, ["file", "file_id", "id", "image_id", "path"]);
+      const proxyUrl = buildImageProxyUrl(fileToken);
+      const url = proxyUrl || directUrl;
       out.push({
         key: `${idx}-${segType}`,
         kind: "image",
         url,
         label: segType === "mface" ? "表情包" : "图片",
         faceId: "",
+        fileToken,
       });
       return;
     }
@@ -126,6 +142,7 @@ function extractMessageMediaItems(msg: ChatMessageItem): MessageMediaItem[] {
         url,
         label: "视频",
         faceId: "",
+        fileToken: "",
       });
       return;
     }
@@ -140,6 +157,7 @@ function extractMessageMediaItems(msg: ChatMessageItem): MessageMediaItem[] {
         url,
         label: "语音",
         faceId: "",
+        fileToken: "",
       });
       return;
     }
@@ -151,6 +169,7 @@ function extractMessageMediaItems(msg: ChatMessageItem): MessageMediaItem[] {
         url: "",
         label: "QQ表情",
         faceId,
+        fileToken: "",
       });
     }
   });
@@ -171,6 +190,18 @@ function resolveQQAvatar(userId: string, size = 100): string {
   const id = String(userId || "").trim();
   if (!/^\d{5,}$/.test(id)) return "";
   return `https://q1.qlogo.cn/g?b=qq&nk=${encodeURIComponent(id)}&s=${encodeURIComponent(String(size))}`;
+}
+
+function resolveQQGroupAvatar(groupId: string, size = 100): string {
+  const id = String(groupId || "").trim();
+  if (!/^\d{5,}$/.test(id)) return "";
+  const safeSize = [0, 40, 100, 140, 640].includes(size) ? size : 100;
+  return `https://p.qlogo.cn/gh/${encodeURIComponent(id)}/${encodeURIComponent(id)}/${safeSize}`;
+}
+
+function resolveConversationAvatar(chatType: "group" | "private", peerId: string, size = 100): string {
+  if (chatType === "group") return resolveQQGroupAvatar(peerId, size);
+  return resolveQQAvatar(peerId, size);
 }
 
 function avatarInitial(label: string): string {
@@ -1693,7 +1724,7 @@ export default function ChatPage() {
             {filteredConversations.map((item) => {
               const active = selectedId === item.conversation_id;
               const title = item.peer_name || item.peer_id || "未知会话";
-              const avatarUrl = resolveQQAvatar(item.peer_id, 100);
+              const avatarUrl = resolveConversationAvatar(item.chat_type, item.peer_id, 100);
               return (
                 <button
                   type="button"
