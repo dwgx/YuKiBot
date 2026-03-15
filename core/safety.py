@@ -1,10 +1,10 @@
 """安全引擎 — 可调尺度的内容管控 + QQ 输出敏感词过滤。
 
-尺度等级 (scale):
-0 = 无限制  — 仅拦截绝对红线（儿童色情、恐怖主义等）
-1 = 宽松    — 拦截违法实施意图（黑客/毒品/武器 + 教程/方法）
-2 = 标准    — 拦截违法 + 自伤 + 露骨内容（默认）
-3 = 严格    — 拦截所有敏感词，不需要意图线索
+支持两层控制：
+1) `scale`（0-3）保留历史兼容，主要控制违法/自伤等硬风险。
+2) `profile`（conservative/normal/open/very_open）控制成人话题开放度。
+
+`very_open` 允许轻度性暗示/轻微癖好话题，但仍严格拦截 R18/露骨/未成年相关内容。
 
 输出过滤 (output_filter):
 独立于尺度，始终生效。将 bot 回复中的 QQ 敏感词替换为安全文本，
@@ -63,9 +63,20 @@ class SafetyEngine:
     SCALE_NAMES: dict[int, str] = {
         0: "无限制", 1: "宽松", 2: "标准", 3: "严格",
     }
+    PROFILE_NAMES: dict[str, str] = {
+        "conservative": "保守",
+        "normal": "一般",
+        "open": "开放",
+        "very_open": "很开放",
+    }
 
     def __init__(self, config: dict[str, Any]):
         self.scale: int = max(0, min(3, int(config.get("scale", 2))))
+        raw_profile = config.get("profile", config.get("mode", config.get("level", "")))
+        profile = self._normalize_profile(raw_profile)
+        if not profile:
+            profile = self._profile_from_scale(self.scale)
+        self.profile: str = profile
         self.user_cooldown = timedelta(seconds=max(30, int(config.get("user_cooldown_seconds", 120))))
         self.repeat_violation_limit = max(1, int(config.get("repeat_violation_limit", 3)))
         self.long_cooldown = timedelta(seconds=max(120, int(config.get("long_cooldown_seconds", 600))))
@@ -98,19 +109,39 @@ class SafetyEngine:
         self._self_harm_terms: set[str] = {
             "自杀", "轻生", "上吊", "割腕", "结束生命", "自残",
         }
-        self._explicit_terms: set[str] = {
-            "pornhub", "porn", "r18", "18禁", "hentai", "nsfw",
-            "黄色网址", "成人网站", "黄网", "做爱", "性交", "口交",
-            "约炮", "成人视频", "里番",
+        # 永久拦截：露骨/R18/裸体/未成年等成人内容（所有档位都拦截）
+        self._sexual_explicit_terms: set[str] = {
+            "pornhub", "porn", "r18", "18禁", "hentai", "nsfw", "xxx",
+            "黄色网址", "成人网站", "黄网", "AV视频", "成人影片", "里番",
+            "无码", "裸体", "露点", "露逼", "露阴", "露穴",
+            "性交", "做爱", "口交", "肛交", "轮奸", "群交",
+        }
+        # 轻度性暗示（保守档会拦）
+        self._sexual_suggestive_terms: set[str] = {
+            "色色", "色一点", "暧昧", "调情", "挑逗", "情话", "性暗示",
+        }
+        # 轻微癖好（仅 very_open 放行）
+        self._sexual_mild_kink_terms: set[str] = {
+            "sm", "spank", "捆绑", "主奴", "dom", "sub", "调教",
         }
         self._intent_cues: set[str] = {
             "怎么买", "哪里买", "怎么做", "教程", "方法", "步骤",
             "教我", "给我", "渠道", "链接", "网址", "网站",
             "资源", "发送", "发给我", "下载", "how to", "where to",
         }
+        self._sexual_request_cues: set[str] = {
+            "来点", "说点", "写点", "讲点", "聊点", "想看", "想要",
+            "扮演", "剧情", "台词", "角色扮演", "rp",
+        }
 
-        _log.info("SafetyEngine 初始化: scale=%d (%s), 输出敏感词=%d 条",
-                    self.scale, self.SCALE_NAMES.get(self.scale, "?"), len(self._output_sensitive))
+        _log.info(
+            "SafetyEngine 初始化: scale=%d (%s), profile=%s (%s), 输出敏感词=%d 条",
+            self.scale,
+            self.SCALE_NAMES.get(self.scale, "?"),
+            self.profile,
+            self.PROFILE_NAMES.get(self.profile, "?"),
+            len(self._output_sensitive),
+        )
 
     # ── 输入评估 ──────────────────────────────────────────────
 
@@ -155,32 +186,59 @@ class SafetyEngine:
         # 绝对红线 — 任何尺度都拦截
         if any(term in content for term in _ABSOLUTE_BLOCK_TERMS):
             return "high_risk"
+        # 露骨/R18 永久拦截（任何档位都不放开）
+        if self._has_risky_term(content, self._sexual_explicit_terms):
+            return "high_risk"
 
         # scale 0: 仅拦截绝对红线
+        has_intent = any(cue in content for cue in self._intent_cues)
+        sexual_intent = has_intent or self._has_sexual_request_intent(content)
+
+        # profile: 保守档连轻度性暗示都拦截（需有请求意图）
+        if (
+            self.profile == "conservative"
+            and sexual_intent
+            and self._has_risky_term(content, self._sexual_suggestive_terms)
+        ):
+            return "high_risk"
+
+        # 轻微癖好仅在 very_open 放行
+        if (
+            self.profile in {"conservative", "normal", "open"}
+            and sexual_intent
+            and self._has_risky_term(content, self._sexual_mild_kink_terms)
+        ):
+            return "high_risk"
+
         if self.scale == 0:
             return "safe"
-
-        has_intent = any(cue in content for cue in self._intent_cues)
 
         # scale 1: 违法 + 意图
         if self.scale >= 1:
             if self._has_risky_term(content, self._illegal_terms) and has_intent:
                 return "illegal"
 
-        # scale 2: + 自伤/露骨 + 意图
+        # scale 2: + 自伤 + 意图
         if self.scale >= 2:
             if self._has_risky_term(content, self._self_harm_terms) and has_intent:
-                return "high_risk"
-            if self._has_risky_term(content, self._explicit_terms) and has_intent:
                 return "high_risk"
 
         # scale 3: 所有敏感词直接拦截，不需要意图
         if self.scale >= 3:
-            all_terms = self._illegal_terms | self._self_harm_terms | self._explicit_terms
+            all_terms = (
+                self._illegal_terms
+                | self._self_harm_terms
+                | self._sexual_explicit_terms
+                | self._sexual_suggestive_terms
+                | self._sexual_mild_kink_terms
+            )
             if self._has_risky_term(content, all_terms):
                 return "high_risk"
 
         return "safe"
+
+    def _has_sexual_request_intent(self, content: str) -> bool:
+        return any(cue in content for cue in self._sexual_request_cues)
 
     @staticmethod
     def _has_risky_term(content: str, terms: set[str]) -> bool:
@@ -234,9 +292,40 @@ class SafetyEngine:
     def set_scale(self, level: int) -> str:
         """设置尺度等级，返回描述。"""
         self.scale = max(0, min(3, level))
+        self.profile = self._profile_from_scale(self.scale)
         name = self.SCALE_NAMES.get(self.scale, "?")
-        _log.info("尺度已调整为 %d (%s)", self.scale, name)
-        return f"尺度已设为 {self.scale} ({name})"
+        profile_name = self.PROFILE_NAMES.get(self.profile, self.profile)
+        _log.info(
+            "尺度已调整为 %d (%s), profile=%s (%s)",
+            self.scale,
+            name,
+            self.profile,
+            profile_name,
+        )
+        return f"尺度已设为 {self.scale} ({name})，档位 {profile_name}"
+
+    def set_profile(self, profile: str) -> str:
+        normalized = self._normalize_profile(profile)
+        if not normalized:
+            return "无效档位，请使用: 保守/一般/开放/很开放"
+        self.profile = normalized
+        profile_to_scale = {
+            "conservative": 3,
+            "normal": 2,
+            "open": 1,
+            "very_open": 0,
+        }
+        self.scale = profile_to_scale.get(self.profile, self.scale)
+        profile_name = self.PROFILE_NAMES.get(self.profile, self.profile)
+        scale_name = self.SCALE_NAMES.get(self.scale, str(self.scale))
+        _log.info(
+            "安全档位已调整: profile=%s (%s), scale=%d (%s)",
+            self.profile,
+            profile_name,
+            self.scale,
+            scale_name,
+        )
+        return f"安全档位已设为 {profile_name} (scale={self.scale}/{scale_name})"
 
     # ── 内部工具 ──────────────────────────────────────────────
 
@@ -268,3 +357,27 @@ class SafetyEngine:
             "参数", "模型", "请求", "合规", "安全", "风控",
         )
         return any(cue in content for cue in cues)
+
+    @staticmethod
+    def _profile_from_scale(scale: int) -> str:
+        return {
+            3: "conservative",
+            2: "normal",
+            1: "open",
+            0: "very_open",
+        }.get(int(scale), "normal")
+
+    @staticmethod
+    def _normalize_profile(raw: Any) -> str:
+        text = normalize_text(str(raw)).lower()
+        if not text:
+            return ""
+        if text in {"保守", "conservative", "strict", "safe"}:
+            return "conservative"
+        if text in {"一般", "普通", "normal", "default", "balanced"}:
+            return "normal"
+        if text in {"开放", "open"}:
+            return "open"
+        if text in {"很开放", "较开放", "very_open", "very-open", "veryopen"}:
+            return "very_open"
+        return ""

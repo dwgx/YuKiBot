@@ -245,7 +245,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "resend_enable": True,
             "max_choices": 12,
         },
-        "safety": {"scale": 2},
+        "safety": {"scale": 2, "profile": "normal"},
         "output": {
             "verbosity": "medium",
             "token_saving": False,
@@ -261,6 +261,8 @@ def _built_in_config_defaults() -> dict[str, Any]:
         },
         "trigger": {
             "ai_listen_enable": False,
+            "ai_listen_keyword_enable": True,
+            "ai_listen_min_keyword_hits": 1,
             "delegate_undirected_to_ai": False,
             "delegate_undirected_min_signal": 1.0,
             "ai_listen_min_messages": 5,

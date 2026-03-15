@@ -1225,6 +1225,8 @@ class ToolExecutor:
                     "douyin.com/",
                     "kuaishou.com/",
                     "acfun.cn/v/ac",
+                    "acfun.com/v/ac",
+                    "m.acfun.cn/v/",
                 )
             ):
                 return url
@@ -8240,15 +8242,16 @@ class ToolExecutor:
             return False
 
         if "acfun.cn" in host or "acfun.com" in host:
-            blocked_cues = ("/search", "/rank", "/bangumi")
+            blocked_cues = ("/search", "/rank", "/a/")
             if any(cue in path for cue in blocked_cues):
                 return False
             if re.search(r"/v/ac\d+", path, flags=re.IGNORECASE):
                 return True
-            if "ac=" in query:
+            if re.search(r"(?:^|&)ac=\d+", query, flags=re.IGNORECASE):
                 return True
-            short_path = path.strip("/")
-            return bool(short_path and len(short_path) >= 6)
+            if re.search(r"/bangumi/aa\d+", path, flags=re.IGNORECASE):
+                return True
+            return False
 
         if "youku.com" in host:
             # 优酷视频详情页: /v_show/id_xxx.html

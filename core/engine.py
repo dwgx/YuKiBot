@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 from pathlib import Path
@@ -956,6 +956,8 @@ class YukikoEngine:
             lambda: deque(maxlen=self.runtime_group_cache_max_messages)
         )
 
+        self._group_member_name_cache: dict[int, dict[str, Any]] = {}
+
         self._agent_conversation_locks: dict[str, asyncio.Lock] = {}
 
         # 媒体 artifact 索引: message_id -> [{"type": "...", "url": str, "file_id": str, "data_uri": str}]
@@ -1147,6 +1149,7 @@ class YukikoEngine:
 
         allow_non_to_me = bool(bot_cfg.get("allow_non_to_me", False))
         ai_listen_enable = bool(trigger_cfg.get("ai_listen_enable", False))
+        explicit_ai_listen_on = ai_listen_defined and ai_listen_enable
         delegate_undirected = bool(
             trigger_cfg.get("delegate_undirected_to_ai", False)
         )
@@ -1156,10 +1159,18 @@ class YukikoEngine:
             or "mention_only"
         )
 
-        if policy in {"off", "disabled", "mention_only", "directed_only"}:
+        if policy in {"off", "disabled"}:
             allow_non_to_me = False
             ai_listen_enable = False
             delegate_undirected = False
+        elif policy in {"mention_only", "directed_only"}:
+            if explicit_ai_listen_on:
+                # 显式开启旁听时，自动切到高置信非指向模式，避免“开了开关但完全不触发”。
+                policy = "high_confidence_only"
+            else:
+                allow_non_to_me = False
+                ai_listen_enable = False
+                delegate_undirected = False
         elif policy == "high_confidence_only":
             if not allow_non_to_me_defined:
                 allow_non_to_me = True
@@ -1167,6 +1178,10 @@ class YukikoEngine:
                 ai_listen_enable = True
             if not delegate_defined:
                 delegate_undirected = False
+
+        if explicit_ai_listen_on and policy not in {"off", "disabled"}:
+            allow_non_to_me = True
+            ai_listen_enable = True
 
         if not allow_non_to_me:
             ai_listen_enable = False
@@ -1416,6 +1431,11 @@ class YukikoEngine:
         self.runtime_group_cache_context_limit = max(
             4,
             int(routing_cfg.get("runtime_group_cache_context_limit", 12)),
+        )
+
+        self.group_member_name_cache_ttl_seconds = max(
+            30,
+            int(routing_cfg.get("group_member_name_cache_ttl_seconds", 300)),
         )
 
         queue_cfg = self.config.get("queue", {})
@@ -2271,7 +2291,19 @@ class YukikoEngine:
                 bot_id=message.bot_id,
                 timestamp=message.timestamp,
             ),
-            recent_messages=[],
+            recent_messages=self._build_runtime_group_context(
+                message.conversation_id,
+                limit=18,
+            ),
+            memory_keywords=(
+                self.memory.get_conversation_keyword_hints(
+                    message.conversation_id,
+                    limit=10,
+                )
+                if allow_memory
+                and hasattr(self.memory, "get_conversation_keyword_hints")
+                else []
+            ),
         )
 
         if trigger.reason == "overload_notice":
@@ -2546,6 +2578,8 @@ class YukikoEngine:
             await self._resolve_at_user_names(
                 message.at_other_user_ids or [],
                 message.api_call,
+                group_id=message.group_id,
+                raw_segments=message.raw_segments,
             )
             if message.at_other_user_ids
             else {}
@@ -4989,6 +5023,7 @@ class YukikoEngine:
         ):
 
             listen_probe = bool(getattr(trigger, "listen_probe", False))
+            busy_users = int(getattr(trigger, "busy_users", 0) or 0)
 
             # 阈值=0 表示关闭非指向自动接话（仅对白名单指向消息放行）。
 
@@ -5000,9 +5035,11 @@ class YukikoEngine:
 
                 return "self_check:not_directed_reply_threshold_disabled"
 
+            # 多人群聊继续要求 listen_probe；低活跃群仅依赖高置信门槛。
             if (
-                not listen_probe
-            ) or confidence < self.self_check_non_direct_reply_min_confidence:
+                (not listen_probe and busy_users > 1)
+                or confidence < self.self_check_non_direct_reply_min_confidence
+            ):
 
                 return "self_check:not_directed_reply"
 
@@ -6327,6 +6364,8 @@ class YukikoEngine:
                     "douyin.com/",
                     "kuaishou.com/",
                     "acfun.cn/v/ac",
+                    "acfun.com/v/ac",
+                    "m.acfun.cn/v/",
                 )
             ):
 
@@ -6636,52 +6675,226 @@ class YukikoEngine:
         self,
         user_ids: list[str],
         api_call: Callable[..., Awaitable[Any]] | None,
+        *,
+        group_id: int = 0,
+        raw_segments: list[dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """解析 @提及用户的昵称，返回 {qq_id: name} 映射。"""
 
         names: dict[str, str] = {}
-
         if not user_ids:
-
             return names
 
-        for uid in user_ids[:5]:
-
-            # 优先从 memory 中获取
-
-            display = (
-                self.memory.get_display_name(uid)
-                if hasattr(self.memory, "get_display_name")
-                else ""
-            )
-
-            if display:
-
-                names[uid] = display
-
+        normalized_ids: list[str] = []
+        seen_ids: set[str] = set()
+        for raw_uid in user_ids[:8]:
+            uid = normalize_text(str(raw_uid))
+            if not uid or uid in seen_ids:
                 continue
+            seen_ids.add(uid)
+            normalized_ids.append(uid)
+            if len(normalized_ids) >= 5:
+                break
+        if not normalized_ids:
+            return names
 
-            # 回退到 API 查询
+        def _unwrap_payload(raw: Any) -> Any:
+            if isinstance(raw, dict):
+                data = raw.get("data")
+                if data is not None:
+                    return data
+            return raw
 
-            if api_call:
+        def _pick_display_name(row: dict[str, Any]) -> str:
+            if not isinstance(row, dict):
+                return ""
+            for value in (
+                row.get("card"),
+                row.get("nickname"),
+                row.get("remark"),
+                row.get("display_name"),
+                row.get("nick"),
+                row.get("name"),
+            ):
+                clean = normalize_text(str(value or ""))
+                if clean and not re.fullmatch(r"[1-9]\d{5,11}", clean):
+                    return clean
+            return ""
 
+        # 优先用 @ 段里携带的名字（最贴近当前消息，不依赖额外 API）。
+        inline_names: dict[str, str] = {}
+        for seg in raw_segments or []:
+            if not isinstance(seg, dict):
+                continue
+            if normalize_text(str(seg.get("type", ""))).lower() != "at":
+                continue
+            data = seg.get("data", {}) or {}
+            uid = normalize_text(
+                str(
+                    data.get("qq")
+                    or data.get("user_id")
+                    or data.get("uid")
+                    or ""
+                )
+            )
+            if not uid or uid not in normalized_ids:
+                continue
+            name = normalize_text(
+                str(
+                    data.get("name")
+                    or data.get("nickname")
+                    or data.get("card")
+                    or data.get("text")
+                    or ""
+                )
+            )
+            if name.startswith("@"):
+                name = normalize_text(name[1:])
+            if name and not re.fullmatch(r"[1-9]\d{5,11}", name):
+                inline_names[uid] = name
+
+        for uid in normalized_ids:
+            inline = inline_names.get(uid, "")
+            if inline:
+                names[uid] = inline
+
+        unresolved = [uid for uid in normalized_ids if uid not in names]
+        if not unresolved:
+            return names
+
+        group_num = int(group_id or 0)
+        cache_names: dict[str, str] = {}
+        cache_valid = False
+        if group_num > 0:
+            bucket = self._group_member_name_cache.get(group_num, {})
+            if isinstance(bucket, dict):
+                raw_cached_names = bucket.get("names")
+                if isinstance(raw_cached_names, dict):
+                    for raw_uid, raw_name in raw_cached_names.items():
+                        uid = normalize_text(str(raw_uid))
+                        label = normalize_text(str(raw_name))
+                        if uid and label:
+                            cache_names[uid] = label
+                expires_at = bucket.get("expires_at")
+                if isinstance(expires_at, datetime):
+                    cache_valid = expires_at > datetime.now(timezone.utc)
+
+        if cache_valid and cache_names:
+            for uid in list(unresolved):
+                label = cache_names.get(uid, "")
+                if label:
+                    names[uid] = label
+                    unresolved.remove(uid)
+
+        # memory 可补充历史称呼，但优先级低于当前消息和群内实时信息。
+        if unresolved and hasattr(self.memory, "get_display_name"):
+            for uid in list(unresolved):
+                label = normalize_text(str(self.memory.get_display_name(uid)))
+                if label:
+                    names[uid] = label
+                    unresolved.remove(uid)
+
+        # 群聊里尽量补齐 card/nickname，提升 @对象识别准确度。
+        if unresolved and group_num > 0 and api_call:
+            should_refresh_cache = (not cache_valid) or any(
+                uid not in cache_names for uid in unresolved
+            )
+            if should_refresh_cache:
                 try:
-
-                    info = await api_call("get_stranger_info", user_id=int(uid))
-
-                    if isinstance(info, dict):
-
-                        nick = normalize_text(str(info.get("nickname", "")))
-
-                        if nick:
-
-                            names[uid] = nick
-
+                    members_raw = await api_call(
+                        "get_group_member_list", group_id=group_num
+                    )
+                    members = _unwrap_payload(members_raw)
+                    latest_names: dict[str, str] = {}
+                    if isinstance(members, list):
+                        for item in members:
+                            if not isinstance(item, dict):
+                                continue
+                            uid = normalize_text(
+                                str(
+                                    item.get("user_id")
+                                    or item.get("uin")
+                                    or item.get("uid")
+                                    or item.get("qq")
+                                    or ""
+                                )
+                            )
+                            if not uid:
+                                continue
+                            label = _pick_display_name(item)
+                            if not label:
+                                continue
+                            latest_names[uid] = label
+                            if uid in unresolved and uid not in names:
+                                names[uid] = label
+                    if latest_names:
+                        ttl_seconds = max(
+                            30,
+                            int(
+                                getattr(
+                                    self,
+                                    "group_member_name_cache_ttl_seconds",
+                                    300,
+                                )
+                            ),
+                        )
+                        self._group_member_name_cache[group_num] = {
+                            "names": latest_names,
+                            "expires_at": datetime.now(timezone.utc)
+                            + timedelta(seconds=ttl_seconds),
+                        }
+                        cache_names = latest_names
                 except Exception:
-
                     pass
+            unresolved = [uid for uid in normalized_ids if uid not in names]
 
-        return names
+        if unresolved and group_num > 0 and api_call:
+            for uid in list(unresolved):
+                try:
+                    member_raw = await api_call(
+                        "get_group_member_info",
+                        group_id=group_num,
+                        user_id=int(uid),
+                        no_cache=True,
+                    )
+                    member = _unwrap_payload(member_raw)
+                    if not isinstance(member, dict):
+                        continue
+                    label = _pick_display_name(member)
+                    if not label:
+                        continue
+                    names[uid] = label
+                    cache_names[uid] = label
+                except Exception:
+                    continue
+            if cache_names:
+                ttl_seconds = max(
+                    30,
+                    int(getattr(self, "group_member_name_cache_ttl_seconds", 300)),
+                )
+                self._group_member_name_cache[group_num] = {
+                    "names": cache_names,
+                    "expires_at": datetime.now(timezone.utc)
+                    + timedelta(seconds=ttl_seconds),
+                }
+            unresolved = [uid for uid in normalized_ids if uid not in names]
+
+        if unresolved and api_call:
+            for uid in list(unresolved):
+                try:
+                    info_raw = await api_call("get_stranger_info", user_id=int(uid))
+                    info = _unwrap_payload(info_raw)
+                    if not isinstance(info, dict):
+                        continue
+                    nick = normalize_text(
+                        str(info.get("nickname") or info.get("nick") or info.get("name") or "")
+                    )
+                    if nick:
+                        names[uid] = nick
+                except Exception:
+                    continue
+
+        return {uid: names[uid] for uid in normalized_ids if uid in names}
 
     def _get_stream_callback(self, conversation_id: str) -> Any:
         """获取当前会话的流式回调队列（如果存在）。"""
@@ -8892,6 +9105,8 @@ class YukikoEngine:
                     "douyin.com/",
                     "kuaishou.com/",
                     "acfun.cn/v/ac",
+                    "acfun.com/v/ac",
+                    "m.acfun.cn/v/",
                 )
             )
         )

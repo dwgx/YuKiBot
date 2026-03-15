@@ -781,14 +781,21 @@ def register_handlers(engine: YukikoEngine) -> None:
 
         allow_non_to_me_flag = bool(bot_cfg_any.get("allow_non_to_me", False))
         ai_listen_enable_flag = bool(trigger_cfg_any.get("ai_listen_enable", False))
+        explicit_ai_listen_on = ai_listen_defined and ai_listen_enable_flag
         delegate_undirected_flag = bool(trigger_cfg_any.get("delegate_undirected_to_ai", False))
         policy = (
             normalize_text(str(control_cfg_any.get("undirected_policy", ""))).lower()
             or "high_confidence_only"
         )
 
-        if policy in {"off", "disabled", "mention_only", "directed_only"}:
+        if policy in {"off", "disabled"}:
             return False, False, False, policy
+        if policy in {"mention_only", "directed_only"}:
+            if explicit_ai_listen_on:
+                # 显式开启旁听时自动提升为高置信模式，避免“开关已开但入口硬拦截”。
+                policy = "high_confidence_only"
+            else:
+                return False, False, False, policy
 
         if policy == "high_confidence_only":
             # 仅在字段缺省时才注入策略默认值；显式配置优先，避免“关不掉旁听”。
@@ -798,6 +805,10 @@ def register_handlers(engine: YukikoEngine) -> None:
                 ai_listen_enable_flag = allow_non_to_me_flag
             if not delegate_undirected_defined:
                 delegate_undirected_flag = False
+
+        if explicit_ai_listen_on and policy not in {"off", "disabled"}:
+            allow_non_to_me_flag = True
+            ai_listen_enable_flag = True
 
         if not allow_non_to_me_flag:
             ai_listen_enable_flag = False
@@ -2805,13 +2816,19 @@ def _extract_at_targets(event: MessageEvent) -> list[str]:
         except Exception:
             raw = ""
         if raw:
-            targets.extend(re.findall(r"\[at:qq=(\d+)\]", raw, flags=re.IGNORECASE))
-            targets.extend(re.findall(r"CQ:at,qq=(\d+)", raw, flags=re.IGNORECASE))
+            targets.extend(
+                re.findall(r"\[at:qq=([0-9]+|all)\]", raw, flags=re.IGNORECASE)
+            )
+            targets.extend(
+                re.findall(r"CQ:at,qq=([0-9]+|all)", raw, flags=re.IGNORECASE)
+            )
 
     uniq: list[str] = []
     seen: set[str] = set()
     for item in targets:
         key = str(item).strip()
+        if key.lower() == "all":
+            key = "all"
         if not key or key in seen:
             continue
         seen.add(key)

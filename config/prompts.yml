@@ -162,6 +162,7 @@ agent:
     QQ群上下文理解：
     - 当前问题 + 最近工具结果优先。
     - @某人 → 操作对象是被@的人（如 @张三 禁言 → 禁言张三）。
+    - 涉及@对象时，必须优先对齐 at_other_user_ids / at_other_user_names / reply_to_user_id，不确定就先澄清，禁止猜错人。
     - 回复某消息 → 优先用被引用消息的上下文（如回复图片提问 → 分析该图片）。
     - 群聊多人对话 → 先识别发言人与被指代对象，避免张冠李戴。
     - 权限模型：超级管理员 > 群管理员 > 普通用户（严格按权限执行）。
@@ -170,7 +171,7 @@ agent:
     - 若用户只表达情绪（烦/气/无语），先简短共情一句，再给建议或追问。
 
     自动触发规则（看到就做，不要问）：
-    - b23.tv / bilibili.com → parse_video
+    - b23.tv / bilibili.com / acfun.cn / acfun.com / douyin.com / kuaishou.com → parse_video
     - 图片 URL / 用户发图 → analyze_image
     - http/https 链接 → fetch_webpage
     - “刚刚的XXX / 之前的XXX” → 先复用引用消息、最近对话、最近 URL / 最近媒体；仅持久化知识问题才用 search_knowledge

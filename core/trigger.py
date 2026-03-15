@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 
-from collections import defaultdict, deque
+from collections import Counter, defaultdict, deque
 
 from dataclasses import dataclass, field
 
@@ -13,7 +13,7 @@ from typing import Any
 
 
 from utils.learning_guard import assess_preferred_name_learning
-from utils.text import normalize_text
+from utils.text import normalize_text, tokenize
 
 
 @dataclass(slots=True)
@@ -125,11 +125,28 @@ class TriggerEngine:
             1, int(trigger_config.get("ai_listen_min_unique_users", 3))
         )
 
-        # 本地关键词/词表监听已停用，只保留结构性信号。
-        self.ai_listen_keyword_enable = False
-        self.ai_listen_keywords: list[str] = []
+        self.ai_listen_keyword_enable = bool(
+            trigger_config.get("ai_listen_keyword_enable", True)
+        )
+        raw_keywords = trigger_config.get("ai_listen_keywords", [])
+        keywords: list[str] = []
+        if isinstance(raw_keywords, str):
+            keywords = [
+                normalize_text(item).lower()
+                for item in re.split(r"[\s,，;；\n]+", raw_keywords)
+                if normalize_text(item)
+            ]
+        elif isinstance(raw_keywords, list):
+            keywords = [
+                normalize_text(str(item)).lower()
+                for item in raw_keywords
+                if normalize_text(str(item))
+            ]
+        self.ai_listen_keywords = list(dict.fromkeys(keywords))
         self.explicit_request_cues: tuple[str, ...] = ()
-        self.ai_listen_min_keyword_hits = 0
+        self.ai_listen_min_keyword_hits = max(
+            1, int(trigger_config.get("ai_listen_min_keyword_hits", 1))
+        )
 
         self.ai_listen_min_score = max(
             0.5, float(trigger_config.get("ai_listen_min_score", 1.2))
@@ -248,10 +265,16 @@ class TriggerEngine:
         )
 
     def evaluate(
-        self, payload: TriggerInput, recent_messages: list[str]
+        self,
+        payload: TriggerInput,
+        recent_messages: list[str],
+        memory_keywords: list[str] | None = None,
     ) -> TriggerResult:
-
-        _ = recent_messages
+        keyword_rows = (
+            [normalize_text(str(item)) for item in (memory_keywords or []) if normalize_text(str(item))]
+            if self.ai_listen_keyword_enable
+            else []
+        )
 
         now = payload.timestamp
 
@@ -286,7 +309,12 @@ class TriggerEngine:
             )
 
             listen_probe_reason = self._decide_ai_probe_reason(
-                payload, now, busy_messages, busy_users
+                payload,
+                now,
+                busy_messages,
+                busy_users,
+                recent_messages=recent_messages,
+                memory_keywords=keyword_rows,
             )
 
             listen_probe = bool(listen_probe_reason)
@@ -626,6 +654,9 @@ class TriggerEngine:
         now: datetime,
         busy_messages: int,
         busy_users: int,
+        *,
+        recent_messages: list[str] | None = None,
+        memory_keywords: list[str] | None = None,
     ) -> str:
 
         if not self.ai_listen_enable:
@@ -638,6 +669,8 @@ class TriggerEngine:
             busy_messages=busy_messages,
             busy_users=busy_users,
             text=payload.text,
+            recent_messages=recent_messages or [],
+            memory_keywords=memory_keywords or [],
         )
 
         return reason
@@ -649,6 +682,8 @@ class TriggerEngine:
         busy_messages: int,
         busy_users: int,
         text: str = "",
+        recent_messages: list[str] | None = None,
+        memory_keywords: list[str] | None = None,
     ) -> str:
 
         if not self.ai_listen_enable:
@@ -662,12 +697,17 @@ class TriggerEngine:
             return ""
 
         clean_text = normalize_text(text).lower()
+        keyword_hits = self._match_memory_keywords(
+            clean_text=clean_text,
+            recent_messages=recent_messages or [],
+            memory_keywords=memory_keywords or [],
+        )
 
         # 群里几乎没人说话时，不走"监听探测"，直接交给正常路由链路处理。
 
         if busy_users <= 1 and busy_messages <= max(
             2, self.ai_listen_min_messages // 2
-        ):
+        ) and keyword_hits < self.ai_listen_min_keyword_hits:
 
             return ""
 
@@ -689,7 +729,14 @@ class TriggerEngine:
             busy_messages,
             busy_users,
             explicit_signal=explicit_signal,
+            keyword_hits=keyword_hits,
         )
+
+        if keyword_hits >= self.ai_listen_min_keyword_hits:
+
+            self._last_ai_probe_at[conversation_id] = now
+
+            return "ai_listen_probe_memory_keyword"
 
         if not heat_ok and score < self.ai_listen_min_score:
 
@@ -782,6 +829,7 @@ class TriggerEngine:
         busy_users: int,
         *,
         explicit_signal: float = 0.0,
+        keyword_hits: int = 0,
     ) -> float:
         msg_ratio = busy_messages / max(1, self.ai_listen_min_messages)
         user_ratio = busy_users / max(1, self.ai_listen_min_unique_users)
@@ -792,7 +840,79 @@ class TriggerEngine:
         ):
             score += 0.5
         score += min(1.6, explicit_signal * 0.9)
+        score += min(1.2, max(0, int(keyword_hits)) * 0.4)
         return score
+
+    @staticmethod
+    def _is_keyword_token(token: str) -> bool:
+        word = normalize_text(str(token)).lower()
+        if not word:
+            return False
+        if re.fullmatch(r"\d+", word):
+            return False
+        if len(word) < 2:
+            return False
+        return True
+
+    def _match_memory_keywords(
+        self,
+        *,
+        clean_text: str,
+        recent_messages: list[str],
+        memory_keywords: list[str],
+    ) -> int:
+
+        if not self.ai_listen_keyword_enable:
+            return 0
+
+        user_tokens = {item for item in tokenize(clean_text) if self._is_keyword_token(item)}
+
+        keyword_pool: set[str] = set()
+
+        for raw in memory_keywords:
+            word = normalize_text(str(raw)).lower()
+            if self._is_keyword_token(word):
+                keyword_pool.add(word)
+            for token in tokenize(word):
+                if self._is_keyword_token(token):
+                    keyword_pool.add(token)
+
+        for raw in self.ai_listen_keywords:
+            word = normalize_text(str(raw)).lower()
+            if self._is_keyword_token(word):
+                keyword_pool.add(word)
+            for token in tokenize(word):
+                if self._is_keyword_token(token):
+                    keyword_pool.add(token)
+
+        recent_counter: Counter[str] = Counter()
+        for raw in recent_messages[-48:]:
+            line = normalize_text(str(raw)).lower()
+            if not line:
+                continue
+            for token in tokenize(line):
+                if self._is_keyword_token(token):
+                    recent_counter[token] += 1
+
+        for token, count in recent_counter.items():
+            if count >= 2:
+                keyword_pool.add(token)
+
+        if not keyword_pool:
+            return 0
+
+        hits = 0
+        for keyword in keyword_pool:
+            if re.fullmatch(r"[a-z0-9_]{2,}", keyword):
+                if keyword in user_tokens:
+                    hits += 1
+            elif keyword in clean_text or keyword in user_tokens:
+                hits += 1
+
+            if hits >= max(1, self.ai_listen_min_keyword_hits):
+                break
+
+        return hits
 
     def peek_followup_candidate(
         self, conversation_id: str, user_id: str, now: datetime

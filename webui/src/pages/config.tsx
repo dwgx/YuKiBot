@@ -207,7 +207,15 @@ const SECTIONS: SectionDef[] = [
     { path: "emotion.warn_cooldown_seconds", label: "警告冷却(秒)", type: "number", min: 5, max: 120 },
     { path: "emotion.strike_cooldown_seconds", label: "惩罚冷却(秒)", type: "number", min: 10, max: 300 },
   ]},
-  { key: "safety", label: "安全设置", fields: [{ path: "safety.scale", label: "安全尺度 (0宽松-3最严)", type: "slider", min: 0, max: 3, step: 1 }] },
+  { key: "safety", label: "安全设置", fields: [
+    { path: "safety.profile", label: "安全档位", type: "select", options: [
+      { value: "conservative", label: "conservative(保守)" },
+      { value: "normal", label: "normal(一般)" },
+      { value: "open", label: "open(开放)" },
+      { value: "very_open", label: "very_open(很开放)" },
+    ]},
+    { path: "safety.scale", label: "兼容尺度 (0宽松-3最严)", type: "slider", min: 0, max: 3, step: 1 },
+  ]},
   { key: "output", label: "输出设置", fields: [
     { path: "output.verbosity", label: "详略度", type: "select", options: [{ value: "verbose", label: "详细" }, { value: "medium", label: "中等" }, { value: "brief", label: "简洁" }, { value: "minimal", label: "极简" }] },
     { path: "output.token_saving", label: "省 Token 模式", type: "switch" },
@@ -226,6 +234,8 @@ const SECTIONS: SectionDef[] = [
   ]},
   { key: "trigger", label: "触发策略", fields: [
     { path: "trigger.ai_listen_enable", label: "旁听探测开关", type: "switch" },
+    { path: "trigger.ai_listen_keyword_enable", label: "记忆关键词触发", type: "switch" },
+    { path: "trigger.ai_listen_min_keyword_hits", label: "关键词命中阈值", type: "number", min: 1, max: 8 },
     { path: "trigger.delegate_undirected_to_ai", label: "非指向消息交给 AI 判定", type: "switch" },
     { path: "trigger.ai_listen_min_messages", label: "旁听最少消息数", type: "number", min: 1, max: 50 },
     { path: "trigger.ai_listen_min_score", label: "旁听最低分", type: "number", min: 0.5, max: 10, step: 0.1 },

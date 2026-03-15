@@ -617,7 +617,10 @@ class AdminEngine:
             if getattr(engine, "safety", None) is not None:
                 scale = int(getattr(engine.safety, "scale", 2))
                 names = getattr(engine.safety, "SCALE_NAMES", {})
-                lines.append(f"  安全尺度  {scale} ({names.get(scale, '?')})")
+                profile = normalize_text(str(getattr(engine.safety, "profile", "")))
+                profile_names = getattr(engine.safety, "PROFILE_NAMES", {})
+                profile_label = profile_names.get(profile, profile or "?")
+                lines.append(f"  安全尺度  {scale} ({names.get(scale, '?')}) | 档位 {profile_label}")
             if getattr(engine, "agent", None) is not None:
                 agent_enable = getattr(engine.agent, "enable", False)
                 lines.append(f"  Agent模式 {'开启' if agent_enable else '关闭'}")
@@ -1036,11 +1039,18 @@ class AdminEngine:
         if not arg:
             level = int(getattr(engine.safety, "scale", 2))
             names = getattr(engine.safety, "SCALE_NAMES", {})
-            return f"当前尺度 {level} ({names.get(level, 'unknown')})"
+            profile = normalize_text(str(getattr(engine.safety, "profile", "")))
+            profile_names = getattr(engine.safety, "PROFILE_NAMES", {})
+            return f"当前尺度 {level} ({names.get(level, 'unknown')})，档位 {profile_names.get(profile, profile or 'unknown')}"
         try:
             level = int(arg)
         except Exception:
-            return "用法: /yuki 尺度 <0-3>"
+            setter = getattr(engine.safety, "set_profile", None)
+            if callable(setter):
+                result = setter(arg)
+                if "无效档位" not in normalize_text(str(result)):
+                    return str(result)
+            return "用法: /yuki 尺度 <0-3|保守|一般|开放|很开放>"
         return engine.safety.set_scale(level)
 
     async def _act_sensitive(self, **kwargs: Any) -> str:

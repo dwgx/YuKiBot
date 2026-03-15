@@ -3,11 +3,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
+import logging
 import os
 import re
 import shutil
 from collections import Counter
 from dataclasses import dataclass, field
+from html import unescape
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -17,6 +20,8 @@ import httpx
 from core.prompt_policy import PromptPolicy
 from core.system_prompts import SystemPromptRelay
 from utils.text import clip_text, normalize_text
+
+_log = logging.getLogger("yukiko.video_analyzer")
 
 
 @dataclass(slots=True)
@@ -224,6 +229,12 @@ class VideoAnalyzer:
         self._kuaishou_enable = bool(ks_cfg.get("enable", True))
         self._kuaishou_cookie = normalize_text(str(ks_cfg.get("cookie", "")))
 
+        # AcFun 配置
+        acfun_cfg = va_cfg.get("acfun", {}) or {}
+        self._acfun_enable = bool(acfun_cfg.get("enable", True))
+        self._acfun_cookie = normalize_text(str(acfun_cfg.get("cookie", "")))
+        self._acfun_timeout = max(6, int(acfun_cfg.get("timeout_seconds", 12)))
+
         # 缓存目录
         cache_raw = str(video_cfg.get("cache_dir", "storage/cache/videos"))
         self._cache_dir = Path(cache_raw)
@@ -288,6 +299,10 @@ class VideoAnalyzer:
                     result.analysis_depth = "rich_metadata"
             elif platform == "kuaishou" and self._kuaishou_enable:
                 await self._enrich_kuaishou(result, source_url)
+                if result.analysis_depth == "metadata":
+                    result.analysis_depth = "rich_metadata"
+            elif platform == "acfun" and self._acfun_enable:
+                await self._enrich_acfun(result, source_url)
                 if result.analysis_depth == "metadata":
                     result.analysis_depth = "rich_metadata"
 
@@ -845,6 +860,439 @@ class VideoAnalyzer:
         if parts and len(parts[-1]) >= 8:
             return parts[-1]
         return ""
+
+    # ── Step 2d: AcFun 富元数据 ──
+
+    async def _enrich_acfun(self, result: VideoAnalysisResult, url: str) -> None:
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.acfun.cn/",
+        }
+        if self._acfun_cookie:
+            headers["Cookie"] = self._acfun_cookie
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(float(self._acfun_timeout), connect=6.0),
+                follow_redirects=True,
+                headers=headers,
+            ) as client:
+                resp = await client.get(url)
+        except Exception as exc:
+            result.errors.append(f"acfun_fetch: {exc}")
+            return
+
+        if resp.status_code >= 400:
+            result.errors.append(f"acfun_fetch: HTTP {resp.status_code}")
+            return
+
+        final_url = normalize_text(str(resp.url))
+        if final_url and not result.webpage_url:
+            result.webpage_url = final_url
+        html = resp.text or ""
+
+        title = self._extract_html_title(html)
+        if title and not result.title:
+            result.title = clip_text(title, 220)
+        if not result.description:
+            desc = (
+                self._extract_meta_content(html, "description")
+                or self._extract_meta_content(html, "og:description")
+            )
+            if desc:
+                result.description = clip_text(desc, 320)
+        if not result.thumbnail_url:
+            cover = (
+                self._extract_meta_content(html, "og:image")
+                or self._extract_meta_content(html, "twitter:image")
+            )
+            if cover and re.match(r"^https?://", cover, flags=re.IGNORECASE):
+                result.thumbnail_url = cover
+
+        if not result.tags:
+            keywords = self._extract_meta_content(html, "keywords")
+            if keywords:
+                rows = re.split(r"[，,|/#\s]+", keywords)
+                tags = [normalize_text(item) for item in rows if normalize_text(item)]
+                if tags:
+                    result.tags = list(dict.fromkeys(tags))[:12]
+
+        for marker in (
+            "window.videoInfo",
+            "window.pageInfo",
+            "window.__INITIAL_STATE__",
+            "window.__initialState__",
+        ):
+            payload = self._extract_json_object_after_marker(html, marker)
+            if payload is not None:
+                self._apply_acfun_payload(result, payload)
+
+        for raw in re.findall(
+            r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>",
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            payload = self._safe_json_load(raw)
+            if payload is None:
+                continue
+            self._apply_acfun_payload(result, payload)
+
+    @staticmethod
+    def _extract_html_title(html: str) -> str:
+        if not html:
+            return ""
+        match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        if not match:
+            return ""
+        title = normalize_text(unescape(match.group(1)))
+        if not title:
+            return ""
+        title = re.sub(r"\s*[-_｜|]\s*AcFun.*$", "", title, flags=re.IGNORECASE).strip()
+        return title
+
+    @staticmethod
+    def _extract_meta_content(html: str, key: str) -> str:
+        if not html:
+            return ""
+        escaped = re.escape(normalize_text(key))
+        patterns = (
+            rf"<meta[^>]+(?:name|property)=[\"']{escaped}[\"'][^>]+content=[\"'](.*?)[\"'][^>]*>",
+            rf"<meta[^>]+content=[\"'](.*?)[\"'][^>]+(?:name|property)=[\"']{escaped}[\"'][^>]*>",
+        )
+        for pattern in patterns:
+            match = re.search(pattern, html, flags=re.IGNORECASE | re.DOTALL)
+            if not match:
+                continue
+            value = normalize_text(unescape(match.group(1)))
+            if value:
+                return value
+        return ""
+
+    @classmethod
+    def _extract_json_object_after_marker(cls, html: str, marker: str) -> Any:
+        if not html or not marker:
+            return None
+        start_pos = 0
+        while True:
+            idx = html.find(marker, start_pos)
+            if idx < 0:
+                return None
+            brace_start = html.find("{", idx)
+            if brace_start < 0:
+                return None
+            depth = 0
+            in_string = False
+            escaped = False
+            for cursor in range(brace_start, len(html)):
+                ch = html[cursor]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == "{":
+                    depth += 1
+                    continue
+                if ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        payload = cls._safe_json_load(html[brace_start : cursor + 1])
+                        if payload is not None:
+                            return payload
+                        break
+            start_pos = idx + len(marker)
+
+    @staticmethod
+    def _safe_json_load(raw: Any) -> Any:
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except Exception:
+            pass
+        try:
+            return json.loads(unescape(text))
+        except Exception:
+            return None
+
+    @classmethod
+    def _iter_json_nodes(cls, value: Any, *, max_depth: int = 6, depth: int = 0):
+        if depth > max_depth:
+            return
+        if isinstance(value, dict):
+            yield value
+            for child in value.values():
+                yield from cls._iter_json_nodes(child, max_depth=max_depth, depth=depth + 1)
+            return
+        if isinstance(value, list):
+            for child in value[:40]:
+                yield from cls._iter_json_nodes(child, max_depth=max_depth, depth=depth + 1)
+
+    @classmethod
+    def _pick_first_text_from_nodes(cls, nodes: list[dict[str, Any]], keys: tuple[str, ...]) -> str:
+        for node in nodes:
+            for key in keys:
+                if key not in node:
+                    continue
+                raw = node.get(key)
+                if isinstance(raw, (dict, list)):
+                    continue
+                text = normalize_text(str(raw))
+                if text and not re.fullmatch(r"[1-9]\d{5,15}", text):
+                    return text
+        return ""
+
+    @staticmethod
+    def _to_int(raw: Any) -> int:
+        try:
+            if isinstance(raw, str):
+                normalized = normalize_text(raw).replace(",", "")
+                if re.fullmatch(r"-?\d+(?:\.\d+)?", normalized):
+                    return int(float(normalized))
+                return 0
+            if isinstance(raw, (int, float)):
+                return int(raw)
+        except Exception:
+            return 0
+        return 0
+
+    @staticmethod
+    def _parse_iso8601_duration_seconds(raw: str) -> int:
+        text = normalize_text(raw).upper()
+        if not text:
+            return 0
+        match = re.fullmatch(
+            r"P(?:\d+Y)?(?:\d+M)?(?:\d+D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?",
+            text,
+        )
+        if not match:
+            return 0
+        h = int(match.group(1) or 0)
+        m = int(match.group(2) or 0)
+        s = int(match.group(3) or 0)
+        return h * 3600 + m * 60 + s
+
+    @classmethod
+    def _extract_image_urls_from_value(cls, raw: Any, limit: int = 20) -> list[str]:
+        rows: list[str] = []
+        seen: set[str] = set()
+
+        def _walk(item: Any) -> None:
+            if len(rows) >= max(1, limit):
+                return
+            if isinstance(item, str):
+                url = normalize_text(str(item))
+                if not url or not re.match(r"^https?://", url, flags=re.IGNORECASE):
+                    return
+                if not re.search(r"\.(?:jpe?g|png|webp|gif|bmp)(?:\?|$)", url, flags=re.IGNORECASE):
+                    return
+                if url in seen:
+                    return
+                seen.add(url)
+                rows.append(url)
+                return
+            if isinstance(item, dict):
+                for key in ("url", "src", "image", "cover", "img", "value"):
+                    if key in item:
+                        _walk(item.get(key))
+                for child in item.values():
+                    if isinstance(child, (dict, list)):
+                        _walk(child)
+                return
+            if isinstance(item, list):
+                for child in item[:40]:
+                    _walk(child)
+
+        _walk(raw)
+        return rows
+
+    @classmethod
+    def _apply_acfun_payload(cls, result: VideoAnalysisResult, payload: Any) -> None:
+        nodes = list(cls._iter_json_nodes(payload))
+        if not nodes:
+            return
+
+        if not result.title:
+            title = cls._pick_first_text_from_nodes(
+                nodes,
+                ("title", "videoTitle", "dougaTitle", "name", "headline"),
+            )
+            if title:
+                result.title = clip_text(title, 220)
+
+        if not result.uploader:
+            author_name = ""
+            for node in nodes:
+                author = node.get("author")
+                if isinstance(author, dict):
+                    author_name = normalize_text(
+                        str(
+                            author.get("name")
+                            or author.get("nickname")
+                            or author.get("userName")
+                            or ""
+                        )
+                    )
+                    if author_name:
+                        break
+                for key in ("userName", "upName", "authorName", "ownerName", "creatorName"):
+                    value = normalize_text(str(node.get(key, "")))
+                    if value:
+                        author_name = value
+                        break
+                if author_name:
+                    break
+            if author_name:
+                result.uploader = clip_text(author_name, 80)
+
+        if not result.description:
+            desc = cls._pick_first_text_from_nodes(
+                nodes, ("description", "desc", "summary", "content", "intro")
+            )
+            if desc:
+                result.description = clip_text(desc, 320)
+
+        if not result.thumbnail_url:
+            for node in nodes:
+                for key in (
+                    "thumbnailUrl",
+                    "thumbnailURL",
+                    "coverUrl",
+                    "cover",
+                    "coverImage",
+                    "pic",
+                    "poster",
+                ):
+                    if key not in node:
+                        continue
+                    candidates = cls._extract_image_urls_from_value(node.get(key), limit=1)
+                    if candidates:
+                        result.thumbnail_url = candidates[0]
+                        break
+                if result.thumbnail_url:
+                    break
+
+        if result.duration <= 0:
+            duration_raw = ""
+            for node in nodes:
+                for key in ("durationMillis", "duration_ms", "videoDuration", "duration"):
+                    if key in node:
+                        duration_raw = normalize_text(str(node.get(key, "")))
+                        if duration_raw:
+                            break
+                if duration_raw:
+                    break
+            if duration_raw:
+                duration_int = cls._to_int(duration_raw)
+                if duration_int > 0:
+                    if duration_int >= 1000:
+                        result.duration = max(1, int(duration_int / 1000))
+                    else:
+                        result.duration = duration_int
+                else:
+                    parsed_seconds = cls._parse_iso8601_duration_seconds(duration_raw)
+                    if parsed_seconds > 0:
+                        result.duration = parsed_seconds
+
+        for node in nodes:
+            view = cls._to_int(node.get("viewCount"))
+            if view <= 0:
+                view = cls._to_int(node.get("playCount"))
+            if view > result.view_count:
+                result.view_count = view
+
+            like = cls._to_int(node.get("likeCount"))
+            if like <= 0:
+                like = cls._to_int(node.get("diggCount"))
+            if like > result.like_count:
+                result.like_count = like
+
+            share = cls._to_int(node.get("shareCount"))
+            if share <= 0:
+                share = cls._to_int(node.get("forwardCount"))
+            if share > result.share_count:
+                result.share_count = share
+
+            interact = node.get("interactionStatistic")
+            if isinstance(interact, dict):
+                count = cls._to_int(interact.get("userInteractionCount"))
+                i_type = normalize_text(str(interact.get("interactionType", ""))).lower()
+                if "watch" in i_type and count > result.view_count:
+                    result.view_count = count
+                if "like" in i_type and count > result.like_count:
+                    result.like_count = count
+            elif isinstance(interact, list):
+                for row in interact:
+                    if not isinstance(row, dict):
+                        continue
+                    count = cls._to_int(row.get("userInteractionCount"))
+                    i_type = normalize_text(str(row.get("interactionType", ""))).lower()
+                    if "watch" in i_type and count > result.view_count:
+                        result.view_count = count
+                    if "like" in i_type and count > result.like_count:
+                        result.like_count = count
+
+        if not result.tags:
+            tags: list[str] = []
+            for node in nodes:
+                for key in ("tags", "tagList", "tagNameList", "videoTagList"):
+                    if key not in node:
+                        continue
+                    value = node.get(key)
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict):
+                                name = normalize_text(
+                                    str(
+                                        item.get("name")
+                                        or item.get("tagName")
+                                        or item.get("title")
+                                        or ""
+                                    )
+                                )
+                            else:
+                                name = normalize_text(str(item))
+                            if name and name not in tags:
+                                tags.append(name)
+                    elif isinstance(value, str):
+                        for item in re.split(r"[，,|/#\s]+", value):
+                            name = normalize_text(item)
+                            if name and name not in tags:
+                                tags.append(name)
+                if len(tags) >= 12:
+                    break
+            if tags:
+                result.tags = tags[:12]
+
+        if not result.image_urls:
+            image_urls: list[str] = []
+            for node in nodes:
+                for key in ("imageUrls", "images", "imgs", "pictures", "picList"):
+                    if key not in node:
+                        continue
+                    rows = cls._extract_image_urls_from_value(node.get(key), limit=20)
+                    for row in rows:
+                        if row not in image_urls:
+                            image_urls.append(row)
+                if len(image_urls) >= 20:
+                    break
+            if image_urls:
+                result.post_type = "image_text"
+                result.image_urls = image_urls[:20]
+                if not result.thumbnail_url:
+                    result.thumbnail_url = result.image_urls[0]
 
     async def _extract_keyframes(self, video_path: str) -> list[Path]:
         """用 ffmpeg 提取关键帧：优先场景变化检测，不足时补充均匀采样。"""

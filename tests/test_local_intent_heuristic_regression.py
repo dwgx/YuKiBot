@@ -362,6 +362,59 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             "self_check:undirected_requires_listen_probe",
         )
 
+    def test_self_check_allows_quiet_group_non_directed_reply_without_listen_probe(
+        self,
+    ) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.self_check_enable = True
+        engine.self_check_block_at_other = False
+        engine.routing_zero_disables_undirected = True
+        engine.non_directed_high_confidence_only = True
+        engine.self_check_listen_probe_min_confidence = 0.6
+        engine.self_check_non_direct_reply_min_confidence = 0.82
+        engine._extract_first_image_url_from_text = lambda text: ""
+        engine._extract_first_video_url_from_text = lambda text: ""
+        engine._looks_like_image_analyze_intent = lambda text: False
+        engine._looks_like_video_resolve_intent = lambda text: False
+        engine._looks_like_local_file_request = lambda text: False
+        engine._pick_local_path_candidate = lambda text: ""
+        engine._looks_like_github_request = lambda text: False
+        engine._looks_like_repo_readme_request = lambda text: False
+        engine._looks_like_explicit_request = lambda text: False
+        engine._is_passive_multimodal_text = lambda text: False
+        engine._has_recent_directed_hint = lambda message: False
+        engine._looks_like_bot_call = lambda text: False
+        engine._looks_like_media_instruction = lambda text: False
+        engine._extract_multimodal_user_text = lambda text: text
+        engine._is_cross_user_context_collision = (
+            lambda message, trigger, text: False
+        )
+        engine._looks_like_low_info_group_chitchat = lambda text: False
+        engine._allow_at_other_target_dialog = lambda message, text: False
+
+        message = EngineMessage(
+            conversation_id="group:1",
+            user_id="2",
+            text="这题怎么写",
+            mentioned=False,
+            is_private=False,
+        )
+        trigger = SimpleNamespace(
+            followup_candidate=False,
+            active_session=False,
+            busy_users=1,
+            listen_probe=False,
+            reason="not_directed",
+        )
+        decision = RouterDecision(
+            should_handle=True,
+            action="reply",
+            reason="ai",
+            confidence=0.93,
+        )
+
+        self.assertEqual(engine._self_check_decision(message, trigger, decision), "")
+
     def test_choice_followups_accept_only_structural_number_forms(self) -> None:
         self.assertEqual(YukikoEngine._extract_choice_index("1"), 1)
         self.assertEqual(YukikoEngine._extract_choice_index("\u7b2c1\u4e2a"), 1)

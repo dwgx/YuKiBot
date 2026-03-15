@@ -2390,6 +2390,8 @@ class AgentLoop:
                 or "bilibili.com" in first_url
                 or "douyin.com" in first_url
                 or "kuaishou.com" in first_url
+                or "acfun.cn" in first_url
+                or "acfun.com" in first_url
             ):
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
@@ -2731,6 +2733,8 @@ class AgentLoop:
                 "douyin.com/",
                 "kuaishou.com/",
                 "acfun.cn/v/ac",
+                "acfun.com/v/ac",
+                "m.acfun.cn/v/",
             )
         )
 
