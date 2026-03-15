@@ -3466,18 +3466,42 @@ class ToolExecutor:
         target_message_id = normalize_text(
             str(method_args.get("target_message_id", ""))
         )
+
+        def _is_likely_incomplete_media_url(value: str) -> bool:
+            candidate = normalize_text(value)
+            if not candidate or not re.match(r"^https?://", candidate, flags=re.IGNORECASE):
+                return False
+            try:
+                parsed = urlparse(candidate)
+            except Exception:
+                return False
+            host = normalize_text(parsed.netloc).lower()
+            if "multimedia.nt.qq.com.cn" in host:
+                lower_candidate = candidate.lower()
+                # QQ CDN 图片直链常需要 rkey；缺失时通常是被截断后的无效链接。
+                if "fileid=" in lower_candidate and "rkey=" not in lower_candidate:
+                    return True
+            return False
+
         candidates: list[str] = []
         candidate_meta: list[dict[str, str]] = []
         if explicit_url:
             resolved_explicit = self._unwrap_redirect_url(explicit_url)
-            candidates.append(resolved_explicit)
-            candidate_meta.append(
-                {
-                    "source": "explicit_url",
-                    "message_id": target_message_id or "-",
-                    "url": resolved_explicit,
-                }
-            )
+            if _is_likely_incomplete_media_url(resolved_explicit):
+                _tool_log.info(
+                    "vision_explicit_url_incomplete%s | source=%s",
+                    _tool_trace_tag(),
+                    clip_text(resolved_explicit, 160),
+                )
+            else:
+                candidates.append(resolved_explicit)
+                candidate_meta.append(
+                    {
+                        "source": "explicit_url",
+                        "message_id": target_message_id or "-",
+                        "url": resolved_explicit,
+                    }
+                )
         if explicit_url and conversation_id and allow_recent_fallback:
             recent = self._get_recent_media(
                 conversation_id=conversation_id, media_type="image"
@@ -3502,10 +3526,10 @@ class ToolExecutor:
                             "url": normalized_recent,
                         }
                     )
-        if not candidates:
-            message_candidates = self._extract_message_media_urls(
-                raw_segments, media_type="image"
-            )
+        message_candidates = self._extract_message_media_urls(
+            raw_segments, media_type="image"
+        )
+        if message_candidates:
             candidates.extend(message_candidates)
             for item in message_candidates:
                 candidate_meta.append(

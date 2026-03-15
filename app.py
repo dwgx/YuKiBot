@@ -3326,6 +3326,9 @@ def _build_multimodal_text(raw_segments: list[dict[str, Any]], mentioned: bool =
             url = normalize_text(str(data.get("url", "")))
             if seg_type == "image" and summary:
                 media_tokens.append(f"image:{summary}")
+            elif seg_type == "image" and url:
+                # 图片 URL（尤其 QQ CDN）可能很长且带临时参数，截断后会变成无效链接；这里仅保留图片事件标记。
+                media_tokens.append("image:[image]")
             elif url:
                 media_tokens.append(f"{seg_type}:{clip_text(url, 120)}")
             else:
