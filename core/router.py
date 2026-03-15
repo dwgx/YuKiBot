@@ -166,6 +166,9 @@ class RouterEngine:
         if self.mode != "ai_full":
             return fallback
         if not self.model_client.enabled:
+            media_fallback = self._fallback_media_decision_without_model(payload)
+            if media_fallback is not None:
+                return media_fallback
             if (
                 payload.mentioned
                 or payload.is_private
@@ -575,6 +578,55 @@ class RouterEngine:
             )
         return None
 
+    def _fallback_media_decision_without_model(
+        self, payload: RouterInput
+    ) -> RouterDecision | None:
+        has_image_media = any(
+            str(item).startswith("image:") for item in (payload.media_summary or [])
+        )
+        if not has_image_media:
+            return None
+
+        media_user_text = normalize_text(self._extract_multimodal_user_text(payload.text))
+        if self._contains_explicit_adult_intent(media_user_text):
+            return None
+
+        directed = (
+            payload.mentioned
+            or payload.is_private
+            or self._looks_like_bot_address(payload.text)
+        )
+        followup = bool(payload.followup_candidate or payload.active_session)
+        passive_multimodal = self._is_passive_multimodal_event(payload.text)
+
+        if not directed and not followup:
+            return None
+        if not directed and not passive_multimodal and not media_user_text:
+            return None
+
+        if directed:
+            reason = "fallback_direct_media_no_model"
+            query = media_user_text or "分析这张图"
+            confidence = 0.78
+        else:
+            reason = "fallback_followup_media_no_model"
+            query = media_user_text or "继续分析这张图"
+            confidence = 0.72
+
+        return RouterDecision(
+            should_handle=True,
+            action="search",
+            reason=reason,
+            reason_code=reason,
+            confidence=confidence,
+            reply_style="short",
+            tool_args={
+                "method": "media.analyze_image",
+                "method_args": {},
+                "query": query,
+            },
+        )
+
     def _looks_like_bot_address(self, text: str) -> bool:
         content = normalize_text(text).lower()
         if not content:
@@ -640,13 +692,19 @@ class RouterEngine:
             " ",
         )
         content = re.sub(
+            r"\b(?:image|video|record|audio|forward)\s*:[^\s|]+",
+            " ",
+            content,
+            flags=re.IGNORECASE,
+        )
+        content = re.sub(
             r"\[(?:image|video|record|audio|forward|face|at|reply)(?::[^\]]*)?\]",
             " ",
             content,
             flags=re.IGNORECASE,
         )
         content = re.sub(
-            r"\b(?:image|video|record|audio|forward)\s*:\s*\S+",
+            r"\b(?:image|video|record|audio|forward)\s*:\s*(?=$|\|)",
             " ",
             content,
             flags=re.IGNORECASE,
