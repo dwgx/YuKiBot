@@ -38,6 +38,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             config.get("allow_response_fallback_to_chat", False)
         )
         self._http_client: httpx.AsyncClient | None = None
+        self.supports_multimodal_messages = True
 
     def _get_client(self) -> httpx.AsyncClient:
         """获取或创建持久化 httpx 客户端 (连接池复用)。"""
@@ -62,16 +63,18 @@ class OpenAICompatibleClient(BaseLLMClient):
 
     async def chat_completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError(f"缺少密钥，请配置 {self.default_env_key}")
 
         resolved_max_tokens = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
+        model_name = str(model or self.model).strip() or self.model
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model_name,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": resolved_max_tokens,
@@ -92,6 +95,7 @@ class OpenAICompatibleClient(BaseLLMClient):
                     messages=messages,
                     max_tokens=resolved_max_tokens,
                     headers=headers,
+                    model_name=model_name,
                 )
             except Exception as exc:
                 if not self.allow_response_fallback_to_chat:
@@ -132,12 +136,13 @@ class OpenAICompatibleClient(BaseLLMClient):
 
     async def _chat_completion_via_responses(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int,
         headers: dict[str, str],
+        model_name: str,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model_name,
             "input": self._messages_to_responses_input(messages),
             "temperature": self.temperature,
             "max_output_tokens": max(1, int(max_tokens)),
@@ -172,7 +177,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             "id": str(data.get("id", "")),
             "object": "chat.completion",
             "created": int(time.time()),
-            "model": str(data.get("model", self.model)),
+            "model": str(data.get("model", model_name)),
             "choices": [
                 {
                     "index": 0,

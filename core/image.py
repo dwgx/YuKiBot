@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Any
 
+from core.image_gen import detect_nsfw_prompt_reason
 from services.model_client import ModelClient
 
 
@@ -27,6 +28,8 @@ class ImageEngine:
             return ImageResult(ok=False, message="当前配置未启用生图功能。")
         if not self.model_client.enabled:
             return ImageResult(ok=False, message="未配置模型密钥，无法生图。")
+        if detect_nsfw_prompt_reason(content):
+            return ImageResult(ok=False, message="检测到不适当内容，已拒绝生成。")
 
         image_url = await self.model_client.generate_image(content, size=size or self.default_size)
         if not image_url:

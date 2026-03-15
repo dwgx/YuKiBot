@@ -2319,6 +2319,104 @@ async def reload():
         raise HTTPException(500, f"重载失败: {ex}")
 
 
+@router.post("/system/restart", dependencies=[Depends(_check_auth)])
+async def system_restart():
+    """一键重启整个 bot 服务（通过退出进程让 systemd/supervisor 自动拉起）。"""
+    import sys as _sys
+    _log.warning("webui_restart_requested | 即将重启服务")
+
+    async def _delayed_exit():
+        await asyncio.sleep(1.0)
+        os._exit(0)
+
+    asyncio.create_task(_delayed_exit())
+    return {"ok": True, "message": "服务正在重启，请稍后刷新页面"}
+
+
+@router.post("/system/api-check", dependencies=[Depends(_check_auth)])
+async def api_self_check():
+    """自检所有已配置的 API 是否可用。"""
+    e = _engine
+    if not e:
+        raise HTTPException(503, "引擎未初始化")
+
+    results: list[dict[str, Any]] = []
+
+    # 检查主模型
+    if hasattr(e, "model_client") and e.model_client:
+        try:
+            test_messages = [{"role": "user", "content": "ping"}]
+            reply = await asyncio.wait_for(
+                e.model_client.chat_text(test_messages, max_tokens=10),
+                timeout=15,
+            )
+            results.append({
+                "name": "主模型 (chat)",
+                "status": "ok" if reply else "empty_response",
+                "detail": clip_text(normalize_text(reply or ""), 50),
+            })
+        except Exception as ex:
+            results.append({
+                "name": "主模型 (chat)",
+                "status": "error",
+                "detail": str(ex)[:120],
+            })
+
+    # 检查图片生成
+    if hasattr(e, "image_gen") and e.image_gen:
+        try:
+            health_check = getattr(e.image_gen, "health_check", None)
+            model_results: list[dict[str, Any]] = []
+            if callable(health_check):
+                model_results = await asyncio.wait_for(health_check(), timeout=20)
+            if model_results:
+                for item in model_results[:12]:
+                    name = str(item.get("name", "图片模型"))
+                    status = str(item.get("status", "unknown"))
+                    detail = str(item.get("detail", ""))[:120]
+                    results.append(
+                        {
+                            "name": f"图片生成/{name}",
+                            "status": status,
+                            "detail": detail,
+                        }
+                    )
+            else:
+                models = getattr(e.image_gen, "models", []) or []
+                results.append({
+                    "name": "图片生成",
+                    "status": "ok" if models else "no_models",
+                    "detail": f"{len(models)} 个模型已配置",
+                })
+        except Exception as ex:
+            results.append({
+                "name": "图片生成",
+                "status": "error",
+                "detail": str(ex)[:120],
+            })
+
+    # 检查搜索引擎
+    if hasattr(e, "search") and e.search:
+        try:
+            test_result = await asyncio.wait_for(
+                e.search.search("test", max_results=1),
+                timeout=10,
+            )
+            results.append({
+                "name": "搜索引擎",
+                "status": "ok" if test_result else "no_results",
+                "detail": f"返回 {len(test_result) if test_result else 0} 条结果",
+            })
+        except Exception as ex:
+            results.append({
+                "name": "搜索引擎",
+                "status": "error",
+                "detail": str(ex)[:120],
+            })
+
+    return {"ok": True, "results": results}
+
+
 @router.get("/plugins", dependencies=[Depends(_check_auth)])
 async def get_plugins():
     """获取插件管理信息（兼容旧版 WebUI）。"""
@@ -5329,6 +5427,10 @@ def _setup_build_config_from_legacy_payload(body: dict[str, Any]) -> dict[str, A
             "default_model": image_gen_model,
             "default_size": image_gen_size,
             "nsfw_filter": True,
+            "post_review_enable": True,
+            "post_review_fail_closed": True,
+            "post_review_model": "",
+            "post_review_max_tokens": 260,
             "max_prompt_length": 1000,
             "models": image_gen_models,
         },

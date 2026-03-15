@@ -50,7 +50,10 @@ def run() -> None:
     # 6. 平台 cookie（可选）
     cfg["video_analysis"] = _ask_cookies()
 
-    # 7. 生成配置文件
+    # 7. 生成 .env 文件
+    _write_env(cfg)
+
+    # 8. 生成配置文件
     _write_config(cfg)
     print(f"\n配置已写入: {_CONFIG_FILE}")
     print("你可以随时编辑 config/config.yml，然后发 /yukibot 热重载。\n")
@@ -326,7 +329,7 @@ def _ask_image_gen() -> dict[str, Any]:
     """配置图片生成功能。"""
     print("\n── 图片生成配置 ──")
     print("  支持多模型配置（DALL-E / Flux / SD / 任何 OpenAI 兼容 API）")
-    print("  NSFW 过滤强制开启，确保内容安全\n")
+    print("  NSFW 过滤 + 生成后主模型二次审查，确保内容安全\n")
 
     default_model = _input("默认模型名称", "dall-e-3")
     default_size = _input("默认图片尺寸", "1024x1024")
@@ -363,6 +366,10 @@ def _ask_image_gen() -> dict[str, Any]:
         "default_model": default_model,
         "default_size": default_size,
         "nsfw_filter": True,
+        "post_review_enable": True,
+        "post_review_fail_closed": True,
+        "post_review_model": "",
+        "post_review_max_tokens": 260,
         "max_prompt_length": 1000,
         "models": models,
     }
@@ -392,6 +399,67 @@ def _encrypt_pair(a: str, b: str) -> tuple[str, str]:
     except Exception:
         pass
     return a, b
+
+
+def _write_env(cfg: dict[str, Any]) -> None:
+    """自动生成 .env 文件（如果不存在）。"""
+    import secrets
+    env_file = _ROOT / ".env"
+    if env_file.exists():
+        print("\n.env 文件已存在，跳过生成。")
+        return
+
+    # 从 cfg 中提取 API key
+    api_cfg = cfg.get("api", {})
+    provider = str(api_cfg.get("provider", "skiapi")).lower()
+    api_key = str(api_cfg.get("api_key", "")).strip()
+
+    # 生成随机 WEBUI_TOKEN
+    webui_token = secrets.token_urlsafe(32)
+
+    # 询问 OneBot 连接信息
+    print("\n── .env 环境变量配置 ──")
+    host = _input("Bot 监听地址", "127.0.0.1")
+    port = _input("Bot 监听端口", "8081")
+    onebot_token = _input("NapCat/OneBot 访问令牌 (access_token)", "")
+
+    lines = [
+        "# YuKiKo Bot 环境变量 - 由向导自动生成",
+        f"HOST={host}",
+        f"PORT={port}",
+        "DRIVER=~fastapi",
+        "LOG_LEVEL=INFO",
+        "ONEBOT_API_TIMEOUT=60",
+        f"ONEBOT_ACCESS_TOKEN={onebot_token}",
+        f"WEBUI_TOKEN={webui_token}",
+        "",
+        "# API Keys",
+    ]
+
+    # 根据 provider 设置对应的 key
+    key_map = {
+        "skiapi": "SKIAPI_KEY",
+        "openai": "OPENAI_API_KEY",
+        "deepseek": "DEEPSEEK_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "gemini": "GEMINI_API_KEY",
+        "qwen": "QWEN_API_KEY",
+        "moonshot": "MOONSHOT_API_KEY",
+        "newapi": "NEWAPI_API_KEY",
+        "siliconflow": "SILICONFLOW_API_KEY",
+    }
+    env_key = key_map.get(provider, "SKIAPI_KEY")
+    if api_key:
+        lines.append(f"{env_key}={api_key}")
+    else:
+        lines.append(f"# {env_key}=your_key_here")
+
+    lines.append("")
+
+    env_file.write_text("\n".join(lines), encoding="utf-8")
+    print(f"\n.env 已生成: {env_file}")
+    print(f"WEBUI_TOKEN: {webui_token}")
+    print("请妥善保管此 token，用于登录 WebUI 管理面板。")
 
 
 def _write_config(cfg: dict[str, Any]) -> None:

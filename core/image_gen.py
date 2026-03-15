@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -16,20 +17,63 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from utils.text import normalize_matching_text
 
 _log = logging.getLogger("yukiko.image_gen")
 
 # ── NSFW 关键词黑名单（中英文） ──
 _NSFW_KEYWORDS_ZH = frozenset({
-    "裸体", "色情", "成人", "18禁", "无码", "性行为", "做爱",
-    "露点", "情色", "淫秽", "黄色", "三级", "AV", "里番",
-    "脱衣", "内衣", "比基尼", "泳装",
+    "裸体", "全裸", "赤裸", "裸照", "裸图", "露点", "露胸", "露乳", "露阴",
+    "色情", "情色", "淫秽", "黄色", "黄图", "色图", "涩图", "瑟图", "福利图",
+    "成人", "18禁", "18x", "r18", "r-18", "无码", "有码", "里番", "本子", "av",
+    "性行为", "做爱", "性交", "口交", "肛交", "内射", "颜射", "轮奸", "群交",
+    "乳房", "奶头", "阴道", "阴部", "阴茎", "鸡巴", "龟头", "私处",
+    "脱衣", "脱光", "内衣", "比基尼", "泳装",
 })
 _NSFW_KEYWORDS_EN = frozenset({
-    "nude", "naked", "nsfw", "porn", "xxx", "hentai", "erotic",
-    "sexual", "explicit", "r18", "r-18", "lewd", "topless",
+    "nude", "nudes", "naked", "nsfw", "porn", "pornographic", "xxx",
+    "hentai", "erotic", "sexual", "explicit", "r18", "r-18", "lewd",
+    "topless", "boobs", "breasts", "nipples", "vagina", "penis",
+    "dick", "anal", "blowjob", "cumshot", "fetish", "bdsm",
     "underwear", "lingerie", "bikini", "swimsuit",
 })
+_NSFW_REGEX_PATTERNS = (
+    re.compile(r"r[\W_]*1[\W_]*8", re.IGNORECASE),
+    re.compile(r"n[\W_]*s[\W_]*f[\W_]*w", re.IGNORECASE),
+    re.compile(r"p[\W_]*o[\W_]*r[\W_]*n", re.IGNORECASE),
+    re.compile(r"h[\W_]*e[\W_]*n[\W_]*t[\W_]*a[\W_]*i", re.IGNORECASE),
+    re.compile(r"x[\W_]*x[\W_]*x", re.IGNORECASE),
+    re.compile(r"(?:全|赤)?裸(?:体|图|照)?"),
+    re.compile(r"(?:露|漏)\s*(?:点|胸|乳|阴|穴|臀|私处)"),
+    re.compile(r"(?:口|肛|阴|性)\s*交"),
+    re.compile(r"(?:做|干)\s*爱"),
+    re.compile(r"(?:成人|色情|黄色)\s*(?:图|图片|插画|写真|内容|漫画|视频)"),
+)
+
+
+def _compact_nsfw_text(text: str) -> str:
+    normalized = normalize_matching_text(text).lower()
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", normalized)
+
+
+def detect_nsfw_prompt_reason(prompt: str) -> str:
+    """返回命中的 NSFW 规则；空字符串表示未命中。"""
+    raw = str(prompt or "")
+    if not raw.strip():
+        return ""
+    lowered = normalize_matching_text(raw).lower()
+    compact = _compact_nsfw_text(raw)
+
+    for kw in _NSFW_KEYWORDS_EN:
+        if kw in lowered or kw in compact:
+            return kw
+    for kw in _NSFW_KEYWORDS_ZH:
+        if kw in lowered or kw in compact:
+            return kw
+    for pattern in _NSFW_REGEX_PATTERNS:
+        if pattern.search(raw) or pattern.search(lowered) or pattern.search(compact):
+            return f"regex:{pattern.pattern}"
+    return ""
 
 
 @dataclass(slots=True)
@@ -71,6 +115,14 @@ class ImageGenEngine:
         self.default_size = str(img_cfg.get("default_size", "1024x1024"))
         self.nsfw_filter = bool(img_cfg.get("nsfw_filter", True))
         self.max_prompt_length = int(img_cfg.get("max_prompt_length", 1000))
+        self.post_review_enable = bool(img_cfg.get("post_review_enable", True))
+        self.post_review_fail_closed = bool(
+            img_cfg.get("post_review_fail_closed", True)
+        )
+        self.post_review_model = str(img_cfg.get("post_review_model", "")).strip()
+        self.post_review_max_tokens = max(
+            120, min(1200, int(img_cfg.get("post_review_max_tokens", 260)))
+        )
         self.model_client = model_client
 
         # 解析模型配置（兼容按 name 或 model 进行匹配）
@@ -99,16 +151,43 @@ class ImageGenEngine:
         """检查 prompt 是否包含 NSFW 内容。返回 True 表示安全。"""
         if not self.nsfw_filter:
             return True
-        text_lower = prompt.lower()
-        for kw in _NSFW_KEYWORDS_EN:
-            if kw in text_lower:
-                _log.warning("nsfw_blocked | keyword=%s", kw)
-                return False
-        for kw in _NSFW_KEYWORDS_ZH:
-            if kw in prompt:
-                _log.warning("nsfw_blocked | keyword=%s", kw)
-                return False
+        reason = detect_nsfw_prompt_reason(prompt)
+        if reason:
+            _log.warning("nsfw_blocked | reason=%s", reason)
+            return False
         return True
+
+    @property
+    def models(self) -> list[dict[str, Any]]:
+        return self._models
+
+    async def health_check(self) -> list[dict[str, Any]]:
+        """自检所有已配置的图片生成模型是否可用。"""
+        results: list[dict[str, Any]] = []
+        for model_cfg in self._models:
+            name = str(model_cfg.get("name", model_cfg.get("model", "unknown")))
+            base_url = str(model_cfg.get("base_url", "")).strip()
+            api_key = str(model_cfg.get("api_key", "")).strip()
+            if not base_url:
+                results.append({"name": name, "status": "skip", "detail": "无 base_url"})
+                continue
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    # 尝试访问 models 端点验证连通性
+                    headers = {}
+                    if api_key:
+                        headers["Authorization"] = f"Bearer {api_key}"
+                    resp = await client.get(
+                        f"{base_url.rstrip('/')}/models",
+                        headers=headers,
+                    )
+                    if resp.status_code < 500:
+                        results.append({"name": name, "status": "ok", "detail": f"HTTP {resp.status_code}"})
+                    else:
+                        results.append({"name": name, "status": "error", "detail": f"HTTP {resp.status_code}"})
+            except Exception as ex:
+                results.append({"name": name, "status": "error", "detail": str(ex)[:100]})
+        return results
 
     async def generate(
         self,
@@ -128,8 +207,9 @@ class ImageGenEngine:
         if len(content) > self.max_prompt_length:
             content = content[:self.max_prompt_length]
 
-        # NSFW 过滤
-        if not self.check_nsfw(content):
+        # NSFW 过滤（将 style 一并纳入检测，避免通过 style 绕过）
+        nsfw_check_text = content if not style else f"{content}\nstyle: {style}"
+        if not self.check_nsfw(nsfw_check_text):
             return ImageGenResult(ok=False, message="检测到不适当内容，已拒绝生成。")
 
         use_model = model or self.default_model
@@ -162,6 +242,13 @@ class ImageGenEngine:
             )
             primary_result = await self._generate_with_config(content, model_cfg, use_size, style)
             if primary_result.ok:
+                reviewed = await self._apply_post_review(
+                    result=primary_result,
+                    prompt=content,
+                    style=style,
+                )
+                if reviewed is not None:
+                    return reviewed
                 return primary_result
 
             # 兜底容错：主模型暂时不可用时自动切换同配置中的其它模型重试。
@@ -180,6 +267,13 @@ class ImageGenEngine:
                     alt_result = await self._generate_with_config(content, alt_cfg, use_size, style)
                     if alt_result.ok:
                         _log.info("image_gen_failover_ok | model=%s", alt_model)
+                        reviewed = await self._apply_post_review(
+                            result=alt_result,
+                            prompt=content,
+                            style=style,
+                        )
+                        if reviewed is not None:
+                            return reviewed
                         return alt_result
             return primary_result
 
@@ -195,7 +289,20 @@ class ImageGenEngine:
             try:
                 url = await self.model_client.generate_image(content, size=use_size)
                 if url:
-                    return ImageGenResult(ok=True, message="图片已生成。", url=url, model_used=use_model)
+                    generated = ImageGenResult(
+                        ok=True,
+                        message="图片已生成。",
+                        url=url,
+                        model_used=use_model,
+                    )
+                    reviewed = await self._apply_post_review(
+                        result=generated,
+                        prompt=content,
+                        style=style,
+                    )
+                    if reviewed is not None:
+                        return reviewed
+                    return generated
             except Exception as exc:
                 _log.warning("image_gen_fallback_error | %s", exc)
                 fallback_error = str(exc)
@@ -333,3 +440,231 @@ class ImageGenEngine:
             seen.add(model_name)
             models.append({"name": model_name, "type": str(cfg.get("type", "openai_compatible"))})
         return models
+
+    async def _apply_post_review(
+        self,
+        result: ImageGenResult,
+        prompt: str,
+        style: str | None,
+    ) -> ImageGenResult | None:
+        ok, reason = await self._review_generated_image(
+            result=result,
+            prompt=prompt,
+            style=style,
+        )
+        if ok:
+            return None
+        return ImageGenResult(
+            ok=False,
+            message=reason or "生成结果未通过合规审查，已拦截发送。",
+            model_used=result.model_used,
+        )
+
+    async def _review_generated_image(
+        self,
+        result: ImageGenResult,
+        prompt: str,
+        style: str | None,
+    ) -> tuple[bool, str]:
+        if not self.post_review_enable:
+            return True, ""
+
+        if not result.ok:
+            return False, result.message or "图片生成失败"
+
+        client = self.model_client
+        if client is None:
+            return (
+                (not self.post_review_fail_closed),
+                "主模型不可用，无法完成生成后合规审查，已拦截。",
+            )
+        if not bool(getattr(client, "enabled", False)):
+            return (
+                (not self.post_review_fail_closed),
+                "主模型未启用，无法完成生成后合规审查，已拦截。",
+            )
+
+        review_model = self.post_review_model or str(
+            getattr(client, "model", "") or ""
+        ).strip()
+        if not review_model:
+            review_model = str(self.default_model or "").strip()
+
+        protocol_checker = getattr(client, "supports_multimodal_messages", None)
+        if callable(protocol_checker):
+            try:
+                if not bool(protocol_checker()):
+                    return (
+                        (not self.post_review_fail_closed),
+                        "主模型通道不支持图片审查协议，无法完成生成后合规审查，已拦截。",
+                    )
+            except Exception:
+                if self.post_review_fail_closed:
+                    return False, "合规审查协议检测失败，已拦截。"
+
+        checker = getattr(client, "supports_vision_input", None)
+        if callable(checker):
+            try:
+                if not bool(checker(model=review_model)):
+                    return (
+                        (not self.post_review_fail_closed),
+                        "主模型不支持图片输入，无法完成生成后合规审查，已拦截。",
+                    )
+            except Exception:
+                if self.post_review_fail_closed:
+                    return False, "合规审查能力检测失败，已拦截。"
+
+        image_ref = self._build_review_image_ref(result)
+        if not image_ref:
+            return (
+                (not self.post_review_fail_closed),
+                "生成结果缺少可审查的图片内容，已拦截。",
+            )
+
+        messages = self._build_review_messages(
+            image_ref=image_ref,
+            prompt=prompt,
+            style=style,
+        )
+        try:
+            completion_kwargs: dict[str, Any] = {
+                "messages": messages,
+                "max_tokens": self.post_review_max_tokens,
+            }
+            if review_model:
+                completion_kwargs["model"] = review_model
+            data = await client.chat_completion(**completion_kwargs)
+        except Exception as exc:
+            _log.warning("image_gen_post_review_call_failed | %s", exc)
+            if self.post_review_fail_closed:
+                return False, "生成后合规审查调用失败，已拦截。"
+            return True, ""
+
+        answer_text = self._extract_text_from_chat_completion(data)
+        if not answer_text:
+            if self.post_review_fail_closed:
+                return False, "生成后合规审查返回为空，已拦截。"
+            return True, ""
+
+        legal, level, reason = self._parse_review_answer(answer_text)
+        if legal is None and self.post_review_fail_closed:
+            return False, "生成后合规审查结果不可解析，已拦截。"
+
+        decision_level = (level or "").strip().lower()
+        if legal is False or decision_level in {"risky", "blocked"}:
+            detail = reason or "主模型判定为不合规"
+            _log.warning(
+                "image_gen_post_review_blocked | level=%s | reason=%s",
+                decision_level or "-",
+                detail,
+            )
+            return False, f"生成结果未通过合规审查：{detail}"
+        return True, ""
+
+    @staticmethod
+    def _build_review_image_ref(result: ImageGenResult) -> str:
+        url = str(result.url or "").strip()
+        if url:
+            return url
+        b64 = str(result.base64_data or "").strip()
+        if b64:
+            return f"data:image/png;base64,{b64}"
+        return ""
+
+    @staticmethod
+    def _build_review_messages(
+        image_ref: str,
+        prompt: str,
+        style: str | None,
+    ) -> list[dict[str, Any]]:
+        clean_prompt = normalize_matching_text(prompt)
+        style_text = normalize_matching_text(style or "")
+        user_hint = (
+            f"原始生图提示词: {clean_prompt or '(空)'}"
+            + (f"\n风格参数: {style_text}" if style_text else "")
+        )
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你是图片内容合规审核器。严格审查色情/露点/R18/未成年相关内容。"
+                    "必须只输出 JSON，不要任何解释。"
+                    '格式: {"legal": true/false, "level": "safe|risky|blocked", "reason": "简短中文原因"}'
+                ),
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": image_ref}},
+                    {
+                        "type": "text",
+                        "text": (
+                            f"{user_hint}\n"
+                            "请判断该图片是否适合群聊发送。"
+                            "一旦有露骨/成人倾向，legal 必须为 false。"
+                        ),
+                    },
+                ],
+            },
+        ]
+
+    @staticmethod
+    def _extract_text_from_chat_completion(data: dict[str, Any]) -> str:
+        if not isinstance(data, dict):
+            return ""
+        choices = data.get("choices") or []
+        if not isinstance(choices, list) or not choices:
+            return ""
+        message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content", "")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    txt = str(item.get("text", "")).strip()
+                    if txt:
+                        parts.append(txt)
+            return "".join(parts).strip()
+        return str(content).strip()
+
+    @staticmethod
+    def _parse_review_answer(answer: str) -> tuple[bool | None, str, str]:
+        raw = str(answer or "").strip()
+        if not raw:
+            return None, "", ""
+        candidate = raw
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            match = re.search(r"\{[\s\S]*\}", candidate)
+            if not match:
+                return None, "", ""
+            try:
+                obj = json.loads(match.group(0))
+            except Exception:
+                return None, "", ""
+        if not isinstance(obj, dict):
+            return None, "", ""
+        legal_raw = obj.get("legal")
+        legal: bool | None
+        if isinstance(legal_raw, bool):
+            legal = legal_raw
+        elif isinstance(legal_raw, (int, float)):
+            legal = bool(legal_raw)
+        elif isinstance(legal_raw, str):
+            lower = legal_raw.strip().lower()
+            if lower in {"true", "1", "yes", "safe", "allow"}:
+                legal = True
+            elif lower in {"false", "0", "no", "blocked", "deny", "risky"}:
+                legal = False
+            else:
+                legal = None
+        else:
+            legal = None
+        level = str(obj.get("level", "")).strip()
+        reason = str(obj.get("reason", "")).strip()
+        return legal, level, reason

@@ -230,18 +230,21 @@ class ModelClient:
 
     async def chat_completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
-        return await self._invoke_with_failover(
-            "chat_completion",
-            messages=messages,
-            response_format=response_format,
-            max_tokens=max_tokens,
-        )
+        kwargs: dict[str, Any] = {
+            "messages": messages,
+            "response_format": response_format,
+            "max_tokens": max_tokens,
+        }
+        if str(model or "").strip():
+            kwargs["model"] = str(model).strip()
+        return await self._invoke_with_failover("chat_completion", **kwargs)
 
-    async def chat_text(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> str:
+    async def chat_text(self, messages: list[dict[str, Any]], max_tokens: int | None = None) -> str:
         data = await self.chat_completion(messages=messages, max_tokens=max_tokens)
         choices = data.get("choices") or []
         if not choices:
@@ -258,7 +261,7 @@ class ModelClient:
 
     async def chat_text_with_retry(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int | None = None,
         retries: int = 2,
         backoff: float = 1.0,
@@ -276,7 +279,7 @@ class ModelClient:
                     await _aio.sleep(backoff * (attempt + 1))
         raise last_exc  # type: ignore[misc]
 
-    async def chat_json(self, messages: list[dict[str, str]]) -> dict[str, Any]:
+    async def chat_json(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         return await self._invoke_with_failover("chat_json", messages)
 
     async def generate_image(self, prompt: str, size: str = "1024x1024") -> str | None:
@@ -354,6 +357,19 @@ class ModelClient:
         if provider in {"openai", "newapi", "skiapi", "deepseek", "anthropic"}:
             # 这些 provider 同时有文本模型和视觉模型，没有明确信号时保守关闭
             return False
+        return False
+
+    def supports_multimodal_messages(self) -> bool:
+        """判断当前通道是否支持 OpenAI 风格的图片消息块。"""
+        active = self._get_active_client()
+        value = getattr(active, "supports_multimodal_messages", False)
+        if isinstance(value, bool):
+            return value
+        if callable(value):
+            try:
+                return bool(value())
+            except Exception:
+                return False
         return False
 
     @classmethod

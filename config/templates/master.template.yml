@@ -318,6 +318,10 @@ config:
     default_model: dall-e-3
     default_size: 1024x1024
     nsfw_filter: true
+    post_review_enable: true
+    post_review_fail_closed: true
+    post_review_model: ''
+    post_review_max_tokens: 260
     max_prompt_length: 1000
     models: []
   video_analysis:

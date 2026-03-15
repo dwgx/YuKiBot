@@ -22,16 +22,18 @@ class GeminiClient(BaseLLMClient):
 
     async def chat_completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         _ = response_format
         if not self.enabled:
             raise RuntimeError("缺少密钥，请配置 GEMINI_API_KEY")
 
         payload = self._convert_messages(messages, max_tokens=max_tokens)
-        model_name = quote(self.model, safe="-_.")
+        model_name_raw = str(model or self.model).strip() or self.model
+        model_name = quote(model_name_raw, safe="-_.")
         base = self._strip_api_version_suffix(self.base_url)
         url = f"{base}/{self.api_version}/models/{model_name}:generateContent?key={self.api_key}"
 
@@ -57,7 +59,7 @@ class GeminiClient(BaseLLMClient):
                 return base[: -len(suffix)]
         return base
 
-    def _convert_messages(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> dict[str, Any]:
+    def _convert_messages(self, messages: list[dict[str, Any]], max_tokens: int | None = None) -> dict[str, Any]:
         system_parts: list[str] = []
         contents: list[dict[str, Any]] = []
         resolved_max_tokens = self.max_tokens if max_tokens is None else max(1, int(max_tokens))

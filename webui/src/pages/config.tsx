@@ -198,6 +198,10 @@ const SECTIONS: SectionDef[] = [
       { value: "1024x1792", label: "1024x1792" },
     ]},
     { path: "image_gen.nsfw_filter", label: "NSFW 过滤", type: "switch" },
+    { path: "image_gen.post_review_enable", label: "生成后主模型二次审查", type: "switch" },
+    { path: "image_gen.post_review_fail_closed", label: "审查失败时默认拦截(严格)", type: "switch" },
+    { path: "image_gen.post_review_model", label: "二次审查模型(留空=主模型)", type: "text" },
+    { path: "image_gen.post_review_max_tokens", label: "二次审查最大 Tokens", type: "number", min: 120, max: 1200 },
     { path: "image_gen.max_prompt_length", label: "提示词最大长度", type: "number", min: 100, max: 2000 },
   ]},
   { key: "affinity", label: "好感度系统", fields: [

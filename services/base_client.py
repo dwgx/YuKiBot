@@ -29,6 +29,7 @@ class BaseLLMClient:
         self.max_tokens = int(self.config.get("max_tokens", 8192))
         self.timeout_seconds = int(self.config.get("timeout_seconds", 60))
         self.image_model = str(self.config.get("image_model", "gpt-image-1"))
+        self.supports_multimodal_messages = False
 
         self.api_key = self._resolve_api_key()
 
@@ -38,9 +39,10 @@ class BaseLLMClient:
 
     async def chat_completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 

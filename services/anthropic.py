@@ -22,9 +22,10 @@ class AnthropicClient(BaseLLMClient):
 
     async def chat_completion(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
+        model: str | None = None,
     ) -> dict[str, Any]:
         _ = response_format
         if not self.enabled:
@@ -32,8 +33,9 @@ class AnthropicClient(BaseLLMClient):
 
         system_text, converted_messages = self._convert_messages(messages)
         resolved_max_tokens = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
+        model_name = str(model or self.model).strip() or self.model
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model_name,
             "messages": converted_messages,
             "temperature": self.temperature,
             "max_tokens": resolved_max_tokens,
@@ -103,7 +105,7 @@ class AnthropicClient(BaseLLMClient):
         return uniq
 
     @staticmethod
-    def _convert_messages(messages: list[dict[str, str]]) -> tuple[str, list[dict[str, Any]]]:
+    def _convert_messages(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
         system_parts: list[str] = []
         out: list[dict[str, Any]] = []
         for msg in messages:

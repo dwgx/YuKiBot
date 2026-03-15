@@ -24,6 +24,7 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
+from core.image_gen import detect_nsfw_prompt_reason
 from core.napcat_compat import call_napcat_api
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
@@ -140,7 +141,6 @@ class AgentToolRegistry:
         self._handlers: dict[str, ToolHandler] = {}
         self._prompt_hints: list[PromptHint] = []
         self._context_providers: dict[str, tuple[ContextProvider, int, tuple[str, ...]]] = {}
-        self._intent_keyword_routing_enabled = False
 
     def register(self, schema: ToolSchema, handler: ToolHandler) -> None:
         self._schemas[schema.name] = schema
@@ -277,10 +277,6 @@ class AgentToolRegistry:
     # 每个分组始终包含的工具名
     _ALWAYS_INCLUDE = {"final_answer", "think"}
 
-    def set_intent_keyword_routing_enabled(self, enabled: bool) -> None:
-        # 保留兼容入口，但 Agent 不再根据本地关键词裁剪工具。
-        self._intent_keyword_routing_enabled = bool(enabled)
-
     def _tool_visible_for_permission(self, name: str, permission_level: str) -> bool:
         level = normalize_text(permission_level or "user").lower() or "user"
         is_super = level == "super_admin"
@@ -306,12 +302,15 @@ class AgentToolRegistry:
 
     def select_tools_for_intent(
         self,
-        message_text: str,
+        message_text: str = "",
         permission_level: str = "user",
-        force_filter: bool = False,
+        **_kwargs: Any,
     ) -> list[str]:
-        """返回当前权限可见的完整工具列表，不做本地关键词裁剪。"""
-        _ = (message_text, force_filter)
+        """Return all tools visible to the current permission level.
+
+        Tool selection is fully LLM-driven via the system prompt.
+        No local keyword filtering is performed.
+        """
         return self._list_tools_for_permission(permission_level)
 
     def get_schemas_for_prompt_filtered(self, tool_names: list[str]) -> str:
@@ -541,6 +540,7 @@ class AgentToolRegistry:
             )
             return ToolCallResult(ok=False, error=f"invalid_args:{validation_error}")
         try:
+            context["_tool_name"] = name
             return await handler(args=sanitized_args, context=context)
         except Exception as exc:
             _log.exception("tool_call_error | tool=%s | error=%s", name, exc)
@@ -571,6 +571,7 @@ def register_builtin_tools(
     _register_utility_tools(registry)
     _register_crawler_tools(registry)
     _register_memory_tools(registry)
+    _register_daily_report_tools(registry)
     _register_ai_method_tools(registry)
     _register_qzone_tools(registry, config)
     _register_scrapy_llm_tools(registry, model_client)
@@ -766,6 +767,22 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
             category="napcat",
         ),
         _handle_set_group_ban,
+    )
+
+    registry.register_prompt_hint(
+        PromptHint(
+            source="group_ban_context",
+            section="tools_guidance",
+            content=(
+                "当用户说'禁言我XX秒/分钟'、'让我闭嘴'、'把我禁言了'时，使用 set_group_ban 对该用户自己执行禁言。"
+                "当用户说'让bot闭嘴'、'你闭嘴'、'别说话了'时，理解为用户希望你少说话，调整回复频率即可，不需要禁言。"
+                "当管理员说'禁言XX'并@了某人时，对被@的人执行禁言。"
+                "duration 单位是秒：60=1分钟, 600=10分钟, 3600=1小时。"
+                "duration=0 表示解除禁言。"
+            ),
+            priority=25,
+            tool_names=("set_group_ban",),
+        )
     )
 
     # 设置群名片
@@ -1076,6 +1093,34 @@ async def _napcat_api_call(
         return ToolCallResult(ok=True, data=data, display=display_ok)
     except Exception as exc:
         return ToolCallResult(ok=False, error=str(exc))
+
+
+async def _handle_generic_napcat_api(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """Generic handler for NapCat APIs that just pass args through.
+
+    The tool name is inferred from the schema registration context.
+    Uses the tool_name stored in context by the agent loop.
+    """
+    api_call = context.get("api_call")
+    if not callable(api_call):
+        return ToolCallResult(ok=False, error="no_api_call_available")
+    # The tool name is passed via context["_tool_name"] by the agent loop,
+    # or we can infer from the registered schema name
+    tool_name = context.get("_tool_name", "")
+    if not tool_name:
+        return ToolCallResult(ok=False, error="cannot_determine_api_name")
+    # Filter out empty/None args
+    clean_args = {k: v for k, v in args.items() if v is not None and v != ""}
+    try:
+        result = await call_napcat_api(api_call, tool_name, **clean_args)
+        data = {}
+        if isinstance(result, dict):
+            data = result
+        elif isinstance(result, list):
+            data = {"items": result[:50], "total": len(result)}
+        return ToolCallResult(ok=True, data=data, display=f"{tool_name} 执行成功")
+    except Exception as exc:
+        return ToolCallResult(ok=False, error=f"{tool_name}: {exc}")
 
 
 _QQ_ID_SAFE_PATTERN = re.compile(r"^[1-9]\d{5,11}$")
@@ -2243,6 +2288,68 @@ def _register_napcat_extended_tools(registry: AgentToolRegistry) -> None:
 
         ("clean_cache", "清理NapCat缓存。\n使用场景: 用户说'清理缓存'、'清除缓存'时使用",
         {}, [], _handle_clean_cache),
+
+        # ── 第三批: 补全所有缺失的 NapCat API ──
+
+        ("set_qq_profile", "设置机器人的QQ资料(昵称、个签、性别等)。\n使用场景: 用户说'改昵称'、'改资料'时使用",
+        {"nickname": ("string", "昵称"), "personal_note": ("string", "个性签名(可选)"),
+         "sex": ("integer", "性别: 0=未知, 1=男, 2=女(可选)")},
+        ["nickname"], _handle_generic_napcat_api),
+
+        ("send_group_sign", "群签到/打卡(QQ群签到功能)。\n使用场景: 用户说'群签到'时使用",
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_generic_napcat_api),
+
+        ("delete_group_folder", "删除群文件夹。需要管理员权限。\n使用场景: 用户说'删除群文件夹XX'时使用",
+        {"group_id": ("integer", "群号"), "folder_id": ("string", "文件夹ID")},
+        ["group_id", "folder_id"], _handle_generic_napcat_api),
+
+        ("get_file", "获取文件信息(通用)。\n使用场景: 需要获取文件的本地路径或URL时使用",
+        {"file_id": ("string", "文件ID")},
+        ["file_id"], _handle_generic_napcat_api),
+
+        ("get_cookies", "获取QQ Cookies。\n使用场景: 需要获取QQ平台的Cookie用于第三方接口时使用",
+        {"domain": ("string", "域名，如 qzone.qq.com")},
+        ["domain"], _handle_generic_napcat_api),
+
+        ("get_csrf_token", "获取CSRF Token。\n使用场景: 需要QQ平台的CSRF令牌时使用",
+        {}, [], _handle_generic_napcat_api),
+
+        ("get_credentials", "获取QQ凭证(Cookies + CSRF Token)。\n使用场景: 需要完整QQ凭证时使用",
+        {"domain": ("string", "域名")},
+        [], _handle_generic_napcat_api),
+
+        ("can_send_image", "检查是否可以发送图片",
+        {}, [], _handle_generic_napcat_api),
+
+        ("can_send_record", "检查是否可以发送语音",
+        {}, [], _handle_generic_napcat_api),
+
+        ("mark_private_msg_as_read", "标记私聊消息为已读。\n使用场景: 需要标记某人的私聊为已读时使用",
+        {"user_id": ("integer", "好友QQ号")},
+        ["user_id"], _handle_generic_napcat_api),
+
+        ("mark_group_msg_as_read", "标记群消息为已读。\n使用场景: 需要标记某群消息为已读时使用",
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_generic_napcat_api),
+
+        ("send_poke", "通用戳一戳(自动判断群/私聊)。\n使用场景: 用户说'戳他'时使用",
+        {"user_id": ("integer", "目标QQ号"), "group_id": ("integer", "群号(群聊时填，私聊不填)")},
+        ["user_id"], _handle_generic_napcat_api),
+
+        ("nc_get_rkey", "获取NapCat rkey(用于媒体资源访问)。\n使用场景: 内部使用，获取媒体访问密钥",
+        {}, [], _handle_generic_napcat_api),
+
+        ("get_robot_uin_range", "获取机器人QQ号段范围。\n使用场景: 需要判断某QQ号是否是机器人时使用",
+        {}, [], _handle_generic_napcat_api),
+
+        ("get_group_ignore_add_request", "获取被忽略的加群请求列表。\n使用场景: 用户问'有没有被忽略的加群请求'时使用",
+        {"group_id": ("integer", "群号")},
+        ["group_id"], _handle_generic_napcat_api),
+
+        ("ArkShareGroup", "生成群分享卡片(Ark消息)。\n使用场景: 用户说'分享这个群'时使用",
+        {"group_id": ("string", "要分享的群号")},
+        ["group_id"], _handle_generic_napcat_api),
     ]
 
     for name, desc, props, required, handler in _ext_tools:
@@ -4763,6 +4870,12 @@ def _make_image_gen_handler(model_client: Any) -> ToolHandler:
         size = str(args.get("size", "1024x1024")).strip()
         if not prompt:
             return ToolCallResult(ok=False, error="empty prompt")
+        if detect_nsfw_prompt_reason(prompt):
+            return ToolCallResult(
+                ok=False,
+                error="image_prompt_blocked_nsfw",
+                display="检测到不适当内容，已拒绝生成。",
+            )
         try:
             url = await model_client.generate_image(prompt=prompt, size=size)
             if url:
@@ -4834,7 +4947,7 @@ def _estimate_qq_safety(
         reasons.append(f"时长较长({duration}s > {_QQ_VIDEO_DURATION_LIMIT_SEC}s)")
 
     # 5. 平台可信度
-    trusted_platforms = {"bilibili", "douyin", "kuaishou", "acfun"}
+    trusted_platforms = {"bilibili", "douyin", "kuaishou", "acfun", "tencent", "youku", "iqiyi", "mgtv"}
     if platform and platform not in trusted_platforms:
         reasons.append(f"非主流平台({platform})，QQ可能拦截外链")
 
@@ -4842,6 +4955,7 @@ def _estimate_qq_safety(
     if re.search(r"\.(?:mp4|flv|mkv|avi|mov|webm)(?:\?|$)", lower_url, re.IGNORECASE):
         if not any(trusted in lower_url for trusted in (
             "bilibili", "douyin", "kuaishou", "acfun", "douyinvod", "bilivideo",
+            "v.qq.com", "youku", "iqiyi", "mgtv",
         )):
             reasons.append("非平台CDN直链，QQ可能无法预览")
 
@@ -8204,6 +8318,81 @@ def _looks_like_harmful_knowledge_payload(text: str) -> bool:
     if "以后你叫" in content and "叫他" in content:
         return True
     return False
+
+
+# ─────────────────────────────────────────────
+# Daily Report & User Portrait tools
+# ─────────────────────────────────────────────
+
+def _register_daily_report_tools(registry: AgentToolRegistry) -> None:
+    """Register daily report and user portrait tools."""
+
+    async def _handle_daily_report(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        day_key = normalize_text(str(args.get("date", ""))).strip() or None
+        try:
+            report = memory.generate_daily_report(day_key)
+        except Exception as exc:
+            return ToolCallResult(ok=False, error=str(exc)[:200])
+        if not report:
+            return ToolCallResult(ok=True, data={}, display="今天还没有足够的聊天记录生成日报。")
+        return ToolCallResult(ok=True, data={"report": report}, display=report)
+
+    registry.register(
+        ToolSchema(
+            name="daily_report",
+            description=(
+                "生成群聊每日日报/总结。"
+                "使用场景: 用户说'今日总结'、'群聊日报'、'今天聊了什么'时使用。"
+                "可选参数 date 指定日期(YYYY-MM-DD)，默认今天。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "date": {"type": "string", "description": "日期，格式 YYYY-MM-DD，默认今天"},
+                },
+                "required": [],
+            },
+            category="memory",
+        ),
+        _handle_daily_report,
+    )
+
+    async def _handle_user_portrait(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        user_id = normalize_text(str(args.get("user_id", ""))) or normalize_text(str(context.get("user_id", "")))
+        if not user_id:
+            return ToolCallResult(ok=False, error="missing user_id")
+        try:
+            portrait = memory.get_user_portrait(user_id)
+        except Exception as exc:
+            return ToolCallResult(ok=False, error=str(exc)[:200])
+        if not portrait:
+            return ToolCallResult(ok=True, data={}, display="暂无该用户的画像数据。")
+        return ToolCallResult(ok=True, data={"portrait": portrait}, display=portrait)
+
+    registry.register(
+        ToolSchema(
+            name="user_portrait",
+            description=(
+                "查看用户画像/档案。"
+                "使用场景: 用户问'我的画像'、'XX是什么样的人'、'了解一下XX'时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "目标用户QQ号，留空则查当前用户"},
+                },
+                "required": [],
+            },
+            category="memory",
+        ),
+        _handle_user_portrait,
+    )
 
 
 # ─────────────────────────────────────────────

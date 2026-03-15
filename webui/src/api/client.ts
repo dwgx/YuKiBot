@@ -154,6 +154,14 @@ class ApiClient {
     return this.request<{ ok: boolean; message: string }>("/reload", { method: "POST" });
   }
 
+  restart() {
+    return this.request<{ ok: boolean; message: string }>("/system/restart", { method: "POST" });
+  }
+
+  apiCheck() {
+    return this.request<{ ok: boolean; results: Array<{ name: string; status: string; detail: string }> }>("/system/api-check", { method: "POST" });
+  }
+
   getLogs(lines = 200) {
     return this.request<{ lines: string[] }>(`/logs?lines=${lines}`);
   }
