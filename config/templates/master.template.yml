@@ -173,12 +173,20 @@ config:
     runtime_rules: ''
   search:
     enable: true
+    max_results: 8
+    max_image_results: 4
+    timeout_seconds: 18
+    searxng_base: ''
+    allow_private_network: false
     tool_interface:
       enable: true
       browser_enable: true
       github_enable: false
       github_api_base: https://api.github.com
       github_token: ${GITHUB_TOKEN}
+      web_fetch_timeout_seconds: 18
+      web_fetch_max_chars: 1800
+      web_fetch_max_pages: 2
     scrape:
       timeout_seconds: 14
       max_text_len: 7000

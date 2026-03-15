@@ -56,12 +56,12 @@ class SearchEngine:
 
     def __init__(self, config: dict[str, Any]):
         self.enabled = bool(config.get("enable", True))
-        self.max_results = int(config.get("max_results", 5))
-        self.max_image_results = max(1, int(config.get("max_image_results", 3)))
+        self.max_results = int(config.get("max_results", 8))
+        self.max_image_results = max(1, int(config.get("max_image_results", 4)))
         self.endpoint = str(config.get("endpoint", "https://api.duckduckgo.com/")).strip()
         self.html_endpoint = str(config.get("html_endpoint", "https://duckduckgo.com/html/")).strip()
         self.image_endpoint = str(config.get("image_endpoint", "https://duckduckgo.com/i.js")).strip()
-        self.timeout_seconds = float(config.get("timeout_seconds", 15))
+        self.timeout_seconds = float(config.get("timeout_seconds", 18))
         self.allow_private_network = bool(config.get("allow_private_network", False))
         self._searxng_base = str(config.get("searxng_base", "")).strip().rstrip("/")
         self.request_headers = {

@@ -702,7 +702,8 @@ class ToolExecutor:
             conversation_id=conversation_id, raw_segments=raw_segments
         )
         query = self._normalize_multimodal_query(query)
-        query_type = "general"
+        query_type = self._detect_query_type(query)
+        query = self._apply_query_type_hints(query, query_type)
 
         method_name = normalize_text(str(tool_args.get("method", "")))
         if self._tool_interface_enable and method_name:
@@ -7579,6 +7580,17 @@ class ToolExecutor:
             domain in url for domain in ("github.com", "stackoverflow.com", "docs.")
         ):
             score += 2
+        if query_type == "tech" and (
+            "learn.microsoft.com" in url
+            or "readthedocs.io" in url
+            or "developer." in url
+            or "/docs" in url
+        ):
+            score += 2
+        if query_type == "tech" and any(
+            domain in url for domain in ("zhihu.com", "csdn.net", "tieba.baidu.com")
+        ):
+            score -= 2
         if query_type in {"video", "image"} and any(
             domain in url
             for domain in (

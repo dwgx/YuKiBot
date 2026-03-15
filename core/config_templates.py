@@ -218,10 +218,18 @@ def _built_in_config_defaults() -> dict[str, Any]:
         },
         "search": {
             "enable": True,
+            "max_results": 8,
+            "max_image_results": 4,
+            "timeout_seconds": 18,
+            "searxng_base": "",
+            "allow_private_network": False,
             "tool_interface": {
                 "enable": True,
                 "browser_enable": True,
                 "github_enable": False,
+                "web_fetch_timeout_seconds": 18,
+                "web_fetch_max_chars": 1800,
+                "web_fetch_max_pages": 2,
             },
             "scrape": {
                 "timeout_seconds": 14,

@@ -188,6 +188,11 @@ def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dic
     }
     search = {
         "enable": allow_search,
+        "max_results": 8,
+        "max_image_results": 4,
+        "timeout_seconds": 18,
+        "searxng_base": "",
+        "allow_private_network": False,
         "video_resolver": {
             "enable": True,
             "cookies_from_browser": "auto",
@@ -206,6 +211,9 @@ def _ask_features() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dic
             "github_enable": True,
             "github_api_base": "https://api.github.com",
             "github_token": "${GITHUB_TOKEN}",
+            "web_fetch_timeout_seconds": 18,
+            "web_fetch_max_chars": 1800,
+            "web_fetch_max_pages": 2,
         },
     }
     image = {"enable": allow_image}
