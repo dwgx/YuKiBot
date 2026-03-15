@@ -121,7 +121,15 @@ class SearchEngine:
         if self._searxng_base:
             results.extend(await self._search_searxng(clean_query))
 
-        # 并发网页爬虫（替代串行），显著降低慢站点拖累导致的整体等待时间。
+        # DuckDuckGo HTML 质量通常更稳，优先于弱质量抓取源。
+        if len(results) < self.max_results:
+            results.extend(await self._search_duckduckgo_html(clean_query))
+
+        # DuckDuckGo instant API 补充
+        if len(results) < self.max_results:
+            results.extend(await self._search_instant_api(clean_query))
+
+        # 并发网页爬虫兜底，避免单一引擎异常导致无结果。
         if len(results) < self.max_results:
             async def _safe(fn_name: str) -> list[SearchResult]:
                 fn = getattr(self, fn_name, None)
@@ -143,14 +151,6 @@ class SearchEngine:
                     results.extend(chunk)
                 if len(results) >= self.max_results:
                     break
-
-        # DuckDuckGo instant API 补充
-        if len(results) < self.max_results:
-            results.extend(await self._search_instant_api(clean_query))
-
-        # DuckDuckGo HTML 兜底
-        if len(results) < self.max_results:
-            results.extend(await self._search_duckduckgo_html(clean_query))
 
         results = self._dedupe_results(results)[: self.max_results]
         if results:
