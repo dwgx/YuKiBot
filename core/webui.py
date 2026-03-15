@@ -519,6 +519,61 @@ def _deep_merge(base: dict, patch: dict, sensitive_paths: set[str], prefix: str 
     return result
 
 
+def _is_masked_secret_placeholder(value: Any) -> bool:
+    return isinstance(value, str) and normalize_text(value) == "***"
+
+
+def _restore_masked_sensitive_values(
+    submitted: dict[str, Any], current: dict[str, Any]
+) -> dict[str, Any]:
+    """将提交配置中的敏感占位符 *** 恢复为当前真实值，避免覆盖密钥。"""
+    restored = copy.deepcopy(submitted)
+    base = current if isinstance(current, dict) else {}
+    for dotpath in _SENSITIVE_PATHS:
+        keys = [k for k in dotpath.split(".") if k]
+        if not keys:
+            continue
+        _restore_masked_path(restored, base, keys)
+    return restored
+
+
+def _restore_masked_path(target: Any, source: Any, keys: list[str]) -> None:
+    if not keys:
+        return
+
+    head = keys[0]
+    if head == "*":
+        if isinstance(target, list):
+            source_list = source if isinstance(source, list) else []
+            for idx, item in enumerate(target):
+                source_item = source_list[idx] if idx < len(source_list) else None
+                _restore_masked_path(item, source_item, keys[1:])
+        elif isinstance(target, dict):
+            source_dict = source if isinstance(source, dict) else {}
+            for key, item in list(target.items()):
+                _restore_masked_path(item, source_dict.get(key), keys[1:])
+        return
+
+    if not isinstance(target, dict):
+        return
+
+    if len(keys) == 1:
+        if head not in target:
+            return
+        if not _is_masked_secret_placeholder(target.get(head)):
+            return
+        replacement = source.get(head) if isinstance(source, dict) else None
+        if isinstance(replacement, str) and replacement.strip():
+            target[head] = replacement
+        else:
+            target.pop(head, None)
+        return
+
+    next_target = target.get(head)
+    next_source = source.get(head) if isinstance(source, dict) else None
+    _restore_masked_path(next_target, next_source, keys[1:])
+
+
 def _read_log_tail(log_path: Path, lines: int = 100) -> list[str]:
     """读取日志文件的最后 N 行。"""
     if not log_path.exists():
@@ -2128,6 +2183,11 @@ async def put_config(request: Request):
     new_config = body.get("config", {})
     if not isinstance(new_config, dict):
         raise HTTPException(400, "config 必须是对象")
+
+    current_config_raw = getattr(getattr(e, "config_manager", None), "raw", {})
+    if isinstance(current_config_raw, dict):
+        new_config = _restore_masked_sensitive_values(new_config, current_config_raw)
+
     new_config = _strip_deprecated_local_paths_config(new_config)
 
     # 应用控制面板映射
@@ -6031,6 +6091,13 @@ async def setup_save(request: Request):
     if not isinstance(config_data, dict):
         raise HTTPException(400, "config 必须是对象")
 
+    current_config_file = _ROOT_DIR / "config" / "config.yml"
+    current_config_data = (
+        _load_yaml_dict(current_config_file) if current_config_file.exists() else {}
+    )
+    if isinstance(current_config_data, dict):
+        config_data = _restore_masked_sensitive_values(config_data, current_config_data)
+
     # 加密敏感字段
     try:
         from core.crypto import SecretManager
@@ -6038,9 +6105,13 @@ async def setup_save(request: Request):
 
         # 加密 API key
         api_cfg = config_data.get("api", {})
-        if "api_key" in api_cfg and api_cfg["api_key"]:
-            api_key = str(api_cfg["api_key"])
-            if not (api_key.startswith("${") and api_key.endswith("}")):
+        if "api_key" in api_cfg:
+            api_key = normalize_text(str(api_cfg.get("api_key", "")))
+            if not api_key:
+                api_cfg.pop("api_key", None)
+            elif _is_masked_secret_placeholder(api_key):
+                api_cfg.pop("api_key", None)
+            elif not (api_key.startswith("${") and api_key.endswith("}")) and not SecretManager.is_encrypted(api_key):
                 api_cfg["api_key"] = sm.encrypt(api_key)
 
         # 加密 cookie

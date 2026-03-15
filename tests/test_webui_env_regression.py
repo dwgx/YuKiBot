@@ -65,7 +65,40 @@ class WebuiEnvRegressionTests(unittest.IsolatedAsyncioTestCase):
             text = env_file.read_text(encoding="utf-8")
             self.assertIn("ONEBOT_ACCESS_TOKEN=abc123", text)
 
+    def test_restore_masked_sensitive_values_keeps_existing_api_secret(self) -> None:
+        submitted = {"api": {"provider": "skiapi", "api_key": "***"}}
+        current = {"api": {"provider": "skiapi", "api_key": "ENC(existing-secret)"}}
+
+        restored = webui._restore_masked_sensitive_values(submitted, current)
+
+        self.assertEqual(restored["api"]["api_key"], "ENC(existing-secret)")
+
+    def test_restore_masked_sensitive_values_supports_wildcard_paths(self) -> None:
+        submitted = {
+            "image_gen": {
+                "models": [
+                    {"name": "a", "api_key": "***"},
+                    {"name": "b", "api_key": "plain-b"},
+                ]
+            }
+        }
+        current = {
+            "image_gen": {
+                "models": [
+                    {"name": "a", "api_key": "ENC(existing-a)"},
+                    {"name": "b", "api_key": "ENC(existing-b)"},
+                ]
+            }
+        }
+
+        restored = webui._restore_masked_sensitive_values(submitted, current)
+
+        self.assertEqual(
+            restored["image_gen"]["models"][0]["api_key"],
+            "ENC(existing-a)",
+        )
+        self.assertEqual(restored["image_gen"]["models"][1]["api_key"], "plain-b")
+
 
 if __name__ == "__main__":
     unittest.main()
-
