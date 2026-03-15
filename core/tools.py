@@ -1083,94 +1083,11 @@ class ToolExecutor:
     def _rewrite_query_with_context(
         self, query: str, conversation_id: str, user_id: str
     ) -> str:
-        key = f"{conversation_id}:{user_id}"
-        q = normalize_text(query)
-        prev = normalize_text(self._last_search_query.get(key, ""))
-        followup_cfg = self._raw_config.get("search_followup", {})
-        if not isinstance(followup_cfg, dict):
-            followup_cfg = {}
-        resend_media_cues_raw = followup_cfg.get("resend_media_cues", [])
-        if not isinstance(resend_media_cues_raw, list):
-            resend_media_cues_raw = []
-        resend_media_cues = tuple(
-            normalize_text(str(item))
-            for item in resend_media_cues_raw
-            if normalize_text(str(item))
-        )
-
-        short_followup_cues = (
-            "人物",
-            "二次元人物",
-            "再找",
-            "你找一个",
-            "继续",
-            "下载发给我",
-            "下载发我",
-            "给我下载",
-            "帮我下载",
-            "下载一下",
-            *resend_media_cues,
-        )
-
-        merged = q
-        if prev:
-            # 只在明确“延续上一条搜索”时拼接，避免跨话题串台（例如人物搜索被串成搜图）。
-            if any(cue in q for cue in short_followup_cues):
-                if q not in prev:
-                    merged = f"{prev} {q}".strip()
-            elif self._is_generic_search_command(
-                q
-            ) and not self._looks_like_media_request(prev):
-                merged = prev
-
-        # 规范壁纸需求
-        if "动漫" in merged and "壁纸" not in merged:
-            merged = f"{merged} 壁纸".strip()
-        if "二次元" in merged and "壁纸" not in merged:
-            merged = f"{merged} 壁纸".strip()
-
-        self._last_search_query[key] = merged
-        return merged
+        _ = (conversation_id, user_id)
+        return normalize_text(query)
 
     def _rewrite_safe_beauty_query(self, query: str) -> str:
-        content = normalize_text(query)
-        lower = content.lower()
-        if not content:
-            return content
-
-        beauty_cues = ("美女", "帅哥", "颜值", "人像", "舞蹈", "小姐姐", "小哥哥")
-        adult_cues = (
-            "成人",
-            "18禁",
-            "无码",
-            "porn",
-            "nsfw",
-            "r18",
-            "露点",
-            "性行为",
-            "黄网站",
-            "里番",
-        )
-        if any(cue in lower for cue in adult_cues):
-            return content
-        if any(cue in lower for cue in beauty_cues):
-            if "非成人" not in content and "合规" not in content:
-                video_cues = (
-                    "视频",
-                    "video",
-                    "clip",
-                    "b站",
-                    "bilibili",
-                    "抖音",
-                    "快手",
-                )
-                suffix = (
-                    " 短视频 非成人 合规"
-                    if any(v in lower for v in video_cues)
-                    else " 非成人 合规 日常"
-                )
-                return f"{content}{suffix}"
-        return content
+        return normalize_text(query)
 
     def _build_ai_method_schemas(self) -> list[dict[str, Any]]:
         return [
@@ -3651,6 +3568,11 @@ class ToolExecutor:
                 error="image_not_found",
             )
         url_file_map = self._extract_image_url_file_map(raw_segments)
+        if conversation_id:
+            recent_url_file_map = self._get_recent_image_file_map(conversation_id)
+            if recent_url_file_map:
+                for key, token in recent_url_file_map.items():
+                    url_file_map.setdefault(key, token)
 
         if (
             self._vision_route_text_model_to_local
@@ -3874,7 +3796,7 @@ class ToolExecutor:
                 "这张动画表情/动图我已经按多帧尝试识别了，但结果还不够稳定。你可以发更清晰的静态截图，"
                 "或者直接问我它大概想表达什么。"
                 if animated_hint
-                else "这张图我已经尝试识别了，但内容太模糊或信息不足，结果不稳定 你可以发更清晰截图或告诉我要重点看哪一块"
+                else "这张图识别没成功，能再发一次吗？或者告诉我这张图里你主要想看哪一块，我重点看。"
             )
             return ToolResult(
                 ok=False,
@@ -3909,19 +3831,19 @@ class ToolExecutor:
             ok=False,
             tool_name=method_name,
             payload={
-                "text": (
-                    "这些图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
-                    if analyze_all
-                    else (
-                        "这张动画表情/动图这次还是没稳定识别出来。你可以发一张关键帧截图，"
-                        "或者直接问我它像是在表达什么情绪/态度。"
-                        if animated_hint
-                        else "这张图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
+                    "text": (
+                        "这些图这次没识别出来，请发更清晰的图片，或告诉我要重点看哪一块。"
+                        if analyze_all
+                        else (
+                            "这张动画表情/动图这次还是没稳定识别出来。你可以发一张关键帧截图，"
+                            "或者直接问我它像是在表达什么情绪/态度。"
+                            if animated_hint
+                            else "这张图识别没成功，能再发一次吗？或者告诉我这张图里你主要想看哪一块，我重点看。"
+                        )
                     )
-                )
-            },
-            error="vision_analyze_failed",
-        )
+                },
+                error="vision_analyze_failed",
+            )
 
     async def _method_video_analyze(
         self,
@@ -4733,7 +4655,7 @@ class ToolExecutor:
                     _tool_trace_tag(),
                 )
                 return downloaded
-            provider_hint = normalize_text(self._vision_provider).lower()
+            provider_hint = self._resolve_vision_provider_hint()
             if provider_hint in {"anthropic", "gemini", "skiapi"}:
                 _tool_log.warning(
                     "vision_image_ref_empty%s | source=http_url | reason=download_failed_for_provider_%s",
@@ -4788,6 +4710,15 @@ class ToolExecutor:
             mime=mime,
             source="local_file",
         )
+
+    def _resolve_vision_provider_hint(self) -> str:
+        provider_hint = normalize_text(self._vision_provider).lower()
+        if provider_hint:
+            return provider_hint
+        model_client = getattr(self.image_engine, "model_client", None)
+        if model_client is None:
+            return ""
+        return normalize_text(str(getattr(model_client, "provider", ""))).lower()
 
     async def _download_image_as_data_uri(self, url: str) -> str:
         """下载远程图片并转为 data URI（base64），用于 vision API。"""
@@ -9702,6 +9633,7 @@ class ToolExecutor:
             return
         images = self._extract_message_media_urls(raw_segments, media_type="image")
         videos = self._extract_message_media_urls(raw_segments, media_type="video")
+        image_file_map = self._extract_image_url_file_map(raw_segments)
         if not images and not videos:
             self._cleanup_recent_media_cache()
             return
@@ -9714,14 +9646,37 @@ class ToolExecutor:
             state["updated_at"] = now
             image_old = state.get("image", [])
             video_old = state.get("video", [])
+            image_file_old = state.get("image_file_map", {})
             if not isinstance(image_old, list):
                 image_old = []
             if not isinstance(video_old, list):
                 video_old = []
+            if not isinstance(image_file_old, dict):
+                image_file_old = {}
             if images:
                 state["image"] = (images + image_old)[: self._recent_media_cache_limit]
             if videos:
                 state["video"] = (videos + video_old)[: self._recent_media_cache_limit]
+            if image_file_map:
+                merged_image_file_map: dict[str, str] = {}
+                map_cap = max(self._recent_media_cache_limit * 6, 32)
+                for source_map in (image_file_map, image_file_old):
+                    for raw_key, raw_token in source_map.items():
+                        map_key = normalize_text(str(raw_key))
+                        map_token = normalize_text(str(raw_token))
+                        if (
+                            not map_key
+                            or not map_token
+                            or map_key in merged_image_file_map
+                        ):
+                            continue
+                        merged_image_file_map[map_key] = map_token
+                        if len(merged_image_file_map) >= map_cap:
+                            break
+                    if len(merged_image_file_map) >= map_cap:
+                        break
+                if merged_image_file_map:
+                    state["image_file_map"] = merged_image_file_map
             self._recent_media_by_conversation[key] = state
         self._cleanup_recent_media_cache()
 
@@ -9747,6 +9702,30 @@ class ToolExecutor:
                 seen.add(value)
                 out.append(value)
                 if len(out) >= self._recent_media_cache_limit:
+                    return out
+        return out
+
+    def _get_recent_image_file_map(self, conversation_id: str) -> dict[str, str]:
+        keys = self._recent_media_scope_keys(conversation_id)
+        if not keys:
+            return {}
+        self._cleanup_recent_media_cache()
+        out: dict[str, str] = {}
+        cap = max(self._recent_media_cache_limit * 6, 32)
+        for key in keys:
+            state = self._recent_media_by_conversation.get(key, {})
+            if not isinstance(state, dict):
+                continue
+            rows = state.get("image_file_map", {})
+            if not isinstance(rows, dict):
+                continue
+            for raw_url, raw_file_token in rows.items():
+                url = normalize_text(str(raw_url))
+                file_token = normalize_text(str(raw_file_token))
+                if not url or not file_token or url in out:
+                    continue
+                out[url] = file_token
+                if len(out) >= cap:
                     return out
         return out
 

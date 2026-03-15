@@ -2049,8 +2049,75 @@ def register_handlers(engine: YukikoEngine) -> None:
                         short_chunk_chars=90,
                     )
                     rate_limited = True
+            if text_chunks:
+                base_chunk_chars = (
+                    multi_reply_chat_max_chars if action == "reply" else multi_reply_max_chars
+                )
+                safe_chunk_chars = max(240, min(920, base_chunk_chars + 140))
+                text_chunks = _rebalance_text_chunks_for_send(
+                    text_chunks,
+                    max_chars=safe_chunk_chars,
+                )
+                if not text_chunks and reply_text:
+                    text_chunks = [reply_text]
 
             chunk_count = len(text_chunks)
+
+            async def _retry_send_remaining_text(remaining_text: str) -> bool:
+                nonlocal prefixed_sent, delivered
+                pending = _normalize_reply_text(remaining_text)
+                if not pending:
+                    return False
+                base_chunk_chars = (
+                    multi_reply_chat_max_chars if action == "reply" else multi_reply_max_chars
+                )
+                safe_chunk_chars = max(240, min(920, base_chunk_chars + 140))
+                approx_needed = max(1, math.ceil(len(pending) / max(120, safe_chunk_chars)))
+                retry_max_chunks = max(8, min(48, approx_needed + 4))
+                retry_chunks = _split_reply_chunks(
+                    pending,
+                    max_lines=max(6, (multi_reply_chat_max_lines if action == "reply" else multi_reply_max_lines)),
+                    max_chars=safe_chunk_chars,
+                    max_chunks=retry_max_chunks,
+                )
+                retry_chunks = _rebalance_text_chunks_for_send(
+                    retry_chunks or [pending],
+                    max_chars=safe_chunk_chars,
+                )
+                if not retry_chunks:
+                    return False
+                _log.warning(
+                    "text_send_retry_start | trace=%s | chunks=%d | chars=%d",
+                    payload.trace_id,
+                    len(retry_chunks),
+                    len(pending),
+                )
+                for idx, chunk in enumerate(retry_chunks):
+                    msg = Message()
+                    if not prefixed_sent:
+                        msg += prefix
+                        prefixed_sent = True
+                    if idx == 0:
+                        msg += Message("（补发剩余内容）\n")
+                    msg += Message(chunk)
+                    ok = await send_msg(msg)
+                    if not ok:
+                        _log.warning(
+                            "text_send_retry_fail | trace=%s | chunk=%d/%d",
+                            payload.trace_id,
+                            idx + 1,
+                            len(retry_chunks),
+                        )
+                        return False
+                    delivered = True
+                    if idx < len(retry_chunks) - 1 and multi_reply_interval_ms > 0:
+                        await asyncio.sleep(multi_reply_interval_ms / 1000)
+                _log.info(
+                    "text_send_retry_ok | trace=%s | chunks=%d",
+                    payload.trace_id,
+                    len(retry_chunks),
+                )
+                return True
 
             # ── 有视频时：先发视频（或文件）确认可达，再发文本/封面 ──
             if video_url:
@@ -2138,20 +2205,39 @@ def register_handlers(engine: YukikoEngine) -> None:
                 #    如果视频没投递成功，仅发文本，不发封面，避免“只有坏缩略图”。
                 send_cover_seg = cover_seg if video_delivered else None
                 first_chunk = True
+                failed_index = -1
                 for idx, chunk in enumerate(text_chunks):
                     msg = Message()
                     if not prefixed_sent:
                         msg += prefix
                         prefixed_sent = True
                     msg += Message(chunk)
-                    if first_chunk and send_cover_seg is not None:
+                    attach_cover = first_chunk and send_cover_seg is not None
+                    if attach_cover:
                         msg += send_cover_seg
-                        send_cover_seg = None
+                    ok = await send_msg(msg)
+                    if ok:
+                        delivered = True
+                        if attach_cover:
+                            send_cover_seg = None
+                    else:
+                        failed_index = idx
+                        _log.warning(
+                            "text_chunk_send_fail | trace=%s | chunk=%d/%d | with_video=true",
+                            payload.trace_id,
+                            idx + 1,
+                            len(text_chunks),
+                        )
+                        break
                     first_chunk = False
-                    await send_msg(msg)
-                    delivered = True
                     if idx < len(text_chunks) - 1 and multi_reply_interval_ms > 0:
                         await asyncio.sleep(multi_reply_interval_ms / 1000)
+                if failed_index >= 0:
+                    remaining_text = _normalize_reply_text(
+                        "\n".join(text_chunks[failed_index:])
+                    )
+                    if remaining_text:
+                        await _retry_send_remaining_text(remaining_text)
 
                 # 无文本但视频成功且有封面，补发封面
                 if not text_chunks and send_cover_seg is not None:
@@ -2165,16 +2251,33 @@ def register_handlers(engine: YukikoEngine) -> None:
 
             else:
                 # ── 无视频：正常发文本+图片 ──
+                failed_index = -1
                 for idx, chunk in enumerate(text_chunks):
                     msg = Message()
                     if not prefixed_sent:
                         msg += prefix
                         prefixed_sent = True
                     msg += Message(chunk)
-                    await send_msg(msg)
-                    delivered = True
+                    ok = await send_msg(msg)
+                    if ok:
+                        delivered = True
+                    else:
+                        failed_index = idx
+                        _log.warning(
+                            "text_chunk_send_fail | trace=%s | chunk=%d/%d | with_video=false",
+                            payload.trace_id,
+                            idx + 1,
+                            len(text_chunks),
+                        )
+                        break
                     if idx < len(text_chunks) - 1 and multi_reply_interval_ms > 0:
                         await asyncio.sleep(multi_reply_interval_ms / 1000)
+                if failed_index >= 0:
+                    remaining_text = _normalize_reply_text(
+                        "\n".join(text_chunks[failed_index:])
+                    )
+                    if remaining_text:
+                        await _retry_send_remaining_text(remaining_text)
 
                 if image_urls:
                     send_count = min(len(image_urls), multi_image_max_count)
@@ -3303,6 +3406,29 @@ def _split_reply_chunks(
     if tail:
         head.append(tail)
     return [chunk for chunk in head if chunk.strip()]
+
+
+def _rebalance_text_chunks_for_send(
+    chunks: list[str],
+    max_chars: int = 520,
+) -> list[str]:
+    safe_max = max(120, int(max_chars or 520))
+    out: list[str] = []
+    for raw in chunks or []:
+        piece = _normalize_reply_text(raw)
+        if not piece:
+            continue
+        if len(piece) <= safe_max:
+            out.append(piece)
+            continue
+        split_rows = _split_line_by_sentence(piece, max_chars=safe_max)
+        if not split_rows:
+            split_rows = _hard_wrap_text(piece, max_chars=safe_max)
+        for row in split_rows:
+            clean = _normalize_reply_text(row)
+            if clean:
+                out.append(clean)
+    return out
 
 
 def _split_line_by_sentence(line: str, max_chars: int) -> list[str]:

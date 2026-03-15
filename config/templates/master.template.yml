@@ -226,6 +226,7 @@ config:
   trigger:
     ai_listen_enable: false
     delegate_undirected_to_ai: false
+    delegate_undirected_min_signal: 1.0
     ai_listen_min_messages: 5
     ai_listen_min_unique_users: 2
     ai_listen_min_score: 2.4

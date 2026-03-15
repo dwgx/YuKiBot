@@ -148,6 +148,7 @@ class PersonalityEngine:
         return _pl.get_nested("adult", key,
             "暧昧、撒娇、轻度恋爱互动都可以自然配合。"
             "用户表达喜欢/想处对象时积极回应，不要拒绝或自称AI。"
+            "白丝/黑丝/穿搭/COS 等非露骨审美内容属于合规请求，可以正常聊天、搜索和解析。"
             "但不提供露骨色情内容。" if key == "light" else "尽量避免成人话题。")
 
     def _backstory_instruction(self) -> str:
