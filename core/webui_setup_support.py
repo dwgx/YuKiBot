@@ -19,6 +19,7 @@ from core.config_templates import (
     ensure_prompts_file as _ensure_prompts_file_from_template,
     load_config_template,
 )
+from core.image_gen import generate_image_with_model_config
 from utils.text import normalize_text
 
 
@@ -72,12 +73,16 @@ class WebUISetupSupport:
         "siliconflow": {"model": "Qwen/Qwen2.5-72B-Instruct", "base_url": "https://api.siliconflow.cn/v1", "endpoint_type": "openai"},
     }
     _SETUP_IMAGE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
-        "skiapi": {"model": "grok-imagine-1.0", "base_url": "https://skiapi.dev/v1", "env": "${SKIAPI_KEY}"},
-        "openai": {"model": "dall-e-3", "base_url": "https://api.openai.com/v1", "env": "${OPENAI_API_KEY}"},
-        "xai": {"model": "grok-imagine-1.0", "base_url": "https://api.x.ai/v1", "env": "${XAI_API_KEY}"},
-        "flux": {"model": "flux-1-schnell", "base_url": "https://api.siliconflow.cn/v1", "env": "${SILICONFLOW_API_KEY}"},
+        "skiapi": {"model": "gpt-image-1", "base_url": "https://skiapi.dev/v1", "env": "${SKIAPI_KEY}"},
+        "openai": {"model": "gpt-image-1", "base_url": "https://api.openai.com/v1", "env": "${OPENAI_API_KEY}"},
+        "gemini": {"model": "gemini-2.5-flash-image", "base_url": "https://generativelanguage.googleapis.com", "env": "${GEMINI_API_KEY}"},
+        "xai": {"model": "grok-imagine-image", "base_url": "https://api.x.ai/v1", "env": "${XAI_API_KEY}"},
+        "newapi": {"model": "gpt-image-1", "base_url": "https://api.openai.com/v1", "env": "${NEWAPI_API_KEY}"},
+        "openrouter": {"model": "google/gemini-2.5-flash-image", "base_url": "https://openrouter.ai/api/v1", "env": "${OPENROUTER_API_KEY}"},
+        "siliconflow": {"model": "black-forest-labs/FLUX.1-schnell", "base_url": "https://api.siliconflow.cn/v1", "env": "${SILICONFLOW_API_KEY}"},
+        "flux": {"model": "black-forest-labs/FLUX.1-schnell", "base_url": "https://api.siliconflow.cn/v1", "env": "${SILICONFLOW_API_KEY}"},
         "sd": {"model": "stable-diffusion-xl", "base_url": "http://127.0.0.1:7860", "env": "${API_KEY}"},
-        "custom": {"model": "dall-e-3", "base_url": "", "env": "${API_KEY}"},
+        "custom": {"model": "gpt-image-1", "base_url": "", "env": "${API_KEY}"},
     }
     _SETUP_ENDPOINT_TYPE_OPTIONS = [
         {"value": "openai_response", "label": "OpenAI-Response"},
@@ -381,7 +386,11 @@ class WebUISetupSupport:
             base = normalize_text(self._SETUP_PROVIDER_DEFAULTS.get(image_provider, {}).get("base_url", "")).rstrip("/")
         if not base:
             return ""
-        if base.endswith("/v1"):
+        if image_provider in {"gemini", "sd"}:
+            return base
+        if "/openai" in base.lower():
+            return base
+        if base.endswith("/v1") or base.endswith("/v1beta"):
             return base
         return f"{base}/v1"
 
@@ -801,63 +810,44 @@ class WebUISetupSupport:
     async def test_image_gen(self, request: Request) -> dict[str, Any]:
         body = await request.json()
         provider = normalize_text(str(body.get("provider", "openai"))).lower() or "openai"
-        model = normalize_text(str(body.get("model", ""))) or "dall-e-3"
+        provider_defaults = self._SETUP_IMAGE_PROVIDER_DEFAULTS.get(provider, self._SETUP_IMAGE_PROVIDER_DEFAULTS.get("openai", {}))
+        model = normalize_text(str(body.get("model", ""))) or provider_defaults.get("model", "gpt-image-1")
         api_key = normalize_text(str(body.get("api_key", "")))
         base_url = normalize_text(str(body.get("base_url", "")))
         size = normalize_text(str(body.get("size", ""))) or "1024x1024"
         if not base_url:
-            if api_key and api_key.startswith("sk-O"):
-                base_url = "https://skiapi.dev/v1"
-            else:
-                provider_defaults = self._SETUP_PROVIDER_DEFAULTS.get(provider, self._SETUP_PROVIDER_DEFAULTS.get("skiapi", {}))
-                base_url = provider_defaults.get("base_url", "https://skiapi.dev")
-                if not base_url.endswith("/v1"):
-                    base_url = f"{base_url}/v1"
-        if not api_key:
-            env_var = {"openai": "OPENAI_API_KEY", "xai": "XAI_API_KEY"}.get(provider, "SKIAPI_KEY")
-            api_key = os.environ.get(env_var, "")
+            base_url = self._setup_resolve_image_gen_base_url(
+                image_provider=provider,
+                image_base_url_raw="",
+                resolved_api_key=api_key,
+            )
+        if not api_key and provider != "sd":
+            env_placeholder = provider_defaults.get("env", "") or self._SETUP_API_ENV_MAP.get(provider, "")
+            env_var = ""
+            if env_placeholder.startswith("${") and env_placeholder.endswith("}"):
+                env_var = env_placeholder[2:-1].strip()
+            api_key = normalize_text(os.environ.get(env_var, "")) if env_var else ""
             if not api_key:
-                return {"ok": False, "message": f"API Key 为空（可设置环境变量 {env_var}）"}
+                return {"ok": False, "message": f"API Key 为空（可设置环境变量 {env_var or 'API_KEY'}）"}
         try:
-            headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-            if "grok-imagine" in model.lower():
-                payload = {"model": model, "prompt": "A cute anime catgirl with pink hair, wearing a maid outfit, smiling happily, high quality, detailed", "n": 1}
-            else:
-                payload = {"model": model, "prompt": "A cute anime catgirl with pink hair, wearing a maid outfit, smiling happily, high quality, detailed", "n": 1, "size": size}
-            async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-                response = await client.post(f"{base_url}/images/generations", headers=headers, json=payload)
-            if response.status_code >= 400:
-                detail = ""
-                try:
-                    data = response.json()
-                    if isinstance(data, dict):
-                        err = data.get("error")
-                        if isinstance(err, dict):
-                            detail = normalize_text(str(err.get("message", "")))
-                        elif isinstance(err, str):
-                            detail = normalize_text(err)
-                        if not detail:
-                            detail = normalize_text(str(data.get("message", "")))
-                        if not detail:
-                            detail = normalize_text(str(data.get("code", "")))
-                except Exception:
-                    detail = ""
-                if not detail:
-                    detail = normalize_text((response.text or "")[:220])
-                return {"ok": False, "message": f"HTTP {response.status_code}: {detail or '请求失败'}"}
-            try:
-                data = response.json()
-            except Exception:
-                return {"ok": False, "message": f"返回非 JSON: {(response.text or '')[:180]}"}
-            if not isinstance(data, dict):
-                return {"ok": False, "message": "返回格式异常"}
-            image_data = data.get("data")
-            if not isinstance(image_data, list) or not image_data:
-                return {"ok": False, "message": "返回数据中没有图片"}
-            image_url = image_data[0].get("url")
-            if not image_url:
-                return {"ok": False, "message": "图片 URL 为空"}
-            return {"ok": True, "message": "生成成功", "image_url": image_url}
+            result = await generate_image_with_model_config(
+                prompt="A cute anime catgirl with pink hair, wearing a maid outfit, smiling happily, high quality, detailed",
+                model_cfg={
+                    "name": model,
+                    "provider": provider,
+                    "model": model,
+                    "api_base": base_url,
+                    "api_key": api_key,
+                },
+                size=size,
+            )
+            image_url = normalize_text(result.url) or (f"data:image/png;base64,{result.base64_data}" if result.base64_data else "")
+            return {
+                "ok": bool(result.ok),
+                "message": result.message if not result.ok else "生成成功",
+                "image_url": image_url,
+                "model_used": result.model_used,
+            }
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
 

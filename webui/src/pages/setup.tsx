@@ -37,12 +37,29 @@ const ENDPOINT_TYPE_OPTIONS = [
 ];
 
 const IMAGE_GEN_DEFAULTS: Record<string, { model: string; baseUrl: string; env: string }> = {
-  skiapi: { model: "grok-imagine-1.0", baseUrl: "https://skiapi.dev/v1", env: "SKIAPI_KEY" },
-  openai: { model: "dall-e-3", baseUrl: "https://api.openai.com/v1", env: "OPENAI_API_KEY" },
-  xai: { model: "grok-imagine-1.0", baseUrl: "https://api.x.ai/v1", env: "XAI_API_KEY" },
-  flux: { model: "flux-1-schnell", baseUrl: "https://api.siliconflow.cn/v1", env: "SILICONFLOW_API_KEY" },
+  skiapi: { model: "gpt-image-1", baseUrl: "https://skiapi.dev/v1", env: "SKIAPI_KEY" },
+  openai: { model: "gpt-image-1", baseUrl: "https://api.openai.com/v1", env: "OPENAI_API_KEY" },
+  gemini: { model: "gemini-2.5-flash-image", baseUrl: "https://generativelanguage.googleapis.com", env: "GEMINI_API_KEY" },
+  xai: { model: "grok-imagine-image", baseUrl: "https://api.x.ai/v1", env: "XAI_API_KEY" },
+  newapi: { model: "gpt-image-1", baseUrl: "https://api.openai.com/v1", env: "NEWAPI_API_KEY" },
+  openrouter: { model: "google/gemini-2.5-flash-image", baseUrl: "https://openrouter.ai/api/v1", env: "OPENROUTER_API_KEY" },
+  siliconflow: { model: "black-forest-labs/FLUX.1-schnell", baseUrl: "https://api.siliconflow.cn/v1", env: "SILICONFLOW_API_KEY" },
+  flux: { model: "black-forest-labs/FLUX.1-schnell", baseUrl: "https://api.siliconflow.cn/v1", env: "SILICONFLOW_API_KEY" },
   sd: { model: "stable-diffusion-xl", baseUrl: "http://127.0.0.1:7860", env: "API_KEY" },
-  custom: { model: "dall-e-3", baseUrl: "", env: "API_KEY" },
+  custom: { model: "gpt-image-1", baseUrl: "", env: "API_KEY" },
+};
+
+const IMAGE_GEN_MODEL_HINTS: Record<string, string> = {
+  skiapi: "推荐 gpt-image-1；如网关支持，也可手动填其它 OpenAI 兼容图片模型。",
+  openai: "推荐 gpt-image-1。",
+  gemini: "推荐 gemini-2.5-flash-image；这项会走 Google 官方 Gemini 图片接口。",
+  xai: "推荐 grok-imagine-image。",
+  newapi: "推荐 gpt-image-1 或你的 NEWAPI 网关实际支持的图片模型。",
+  openrouter: "推荐 google/gemini-2.5-flash-image。",
+  siliconflow: "推荐 black-forest-labs/FLUX.1-schnell。",
+  flux: "Flux 预设默认走 SiliconFlow。",
+  sd: "本地 Stable Diffusion WebUI 通常填 stable-diffusion-xl 即可。",
+  custom: "自定义网关可填 OpenAI 兼容、Gemini 原生或本地 SD WebUI。",
 };
 
 const IMAGE_GEN_DEFAULT_BASES = new Set(
@@ -1025,7 +1042,7 @@ export default function SetupPage() {
               <div className="flex items-center justify-between p-3 rounded-lg bg-content2">
                 <div>
                   <p className="text-sm font-medium">AI 图片生成</p>
-                  <p className="text-xs text-default-400">支持 DALL-E / Flux / SD 等多模型</p>
+                    <p className="text-xs text-default-400">支持 OpenAI / Gemini / xAI / Flux / SD / 自定义网关</p>
                 </div>
                 <Switch isSelected={imageGenEnable} onValueChange={setImageGenEnable} />
               </div>
@@ -1049,17 +1066,22 @@ export default function SetupPage() {
                     classNames={{ trigger: "bg-content2" }}
                   >
                     <SelectItem key="skiapi">SKIAPI</SelectItem>
-                    <SelectItem key="openai">OpenAI (DALL-E)</SelectItem>
-                    <SelectItem key="xai">xAI (Grok Imagine)</SelectItem>
-                    <SelectItem key="flux">Flux</SelectItem>
+                    <SelectItem key="openai">OpenAI</SelectItem>
+                    <SelectItem key="gemini">Gemini</SelectItem>
+                    <SelectItem key="xai">xAI</SelectItem>
+                    <SelectItem key="newapi">NEWAPI</SelectItem>
+                    <SelectItem key="openrouter">OpenRouter</SelectItem>
+                    <SelectItem key="siliconflow">SiliconFlow</SelectItem>
+                    <SelectItem key="flux">Flux（SiliconFlow）</SelectItem>
                     <SelectItem key="sd">Stable Diffusion</SelectItem>
                     <SelectItem key="custom">自定义</SelectItem>
                   </Select>
                   <Input
                     label="模型名称"
+                    description={IMAGE_GEN_MODEL_HINTS[imageGenProvider] || "填写当前提供商实际支持的图片模型名称"}
                     value={imageGenModel}
                     onValueChange={setImageGenModel}
-                    placeholder="dall-e-3"
+                    placeholder="gpt-image-1"
                     classNames={{ inputWrapper: "bg-content2" }}
                   />
                   <Input
@@ -1453,4 +1475,3 @@ export default function SetupPage() {
     </div>
   );
 }
-

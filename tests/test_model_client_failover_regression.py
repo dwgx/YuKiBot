@@ -39,7 +39,8 @@ class _BackupOKClient:
     async def chat_json(self, messages):
         return {"ok": True, "source": "backup"}
 
-    async def generate_image(self, prompt: str, size: str = "1024x1024"):
+    async def generate_image(self, prompt: str, size: str = "1024x1024", style: str | None = None):
+        _ = style
         return f"https://backup.example/{size}.png"
 
 

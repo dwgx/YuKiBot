@@ -30,8 +30,13 @@ class _DummyModelClient:
         self.model = model
         self.last_review_model: str | None = None
 
-    async def generate_image(self, prompt: str, size: str = "1024x1024") -> str:
-        self.calls.append((prompt, size))
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        style: str | None = None,
+    ) -> str:
+        self.calls.append((prompt, size, style or ""))
         return "https://example.com/generated.png"
 
     async def chat_completion(self, messages, response_format=None, max_tokens=None, model=None):

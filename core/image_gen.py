@@ -349,6 +349,317 @@ class ImageGenConfig:
     template_dir: str = "storage/image_templates"
 
 
+_IMAGE_PROVIDER_ALIASES = {
+    "openai_compatible": "openai",
+    "compatible": "openai",
+    "openai-image": "openai",
+    "openai_image": "openai",
+    "google": "gemini",
+    "gemeni": "gemini",
+    "x.ai": "xai",
+    "grok": "xai",
+    "new-api": "newapi",
+    "new_api": "newapi",
+    "open_router": "openrouter",
+    "silicon_flow": "siliconflow",
+    "flux": "siliconflow",
+    "stable-diffusion": "sd",
+    "stable_diffusion": "sd",
+    "stable diffusion": "sd",
+    "sdwebui": "sd",
+    "sd_webui": "sd",
+    "automatic1111": "sd",
+    "a1111": "sd",
+    "webui": "sd",
+}
+_IMAGE_OPENAI_COMPATIBLE_PROVIDERS = {
+    "openai",
+    "skiapi",
+    "xai",
+    "newapi",
+    "siliconflow",
+}
+_IMAGE_PROVIDER_DEFAULTS = {
+    "openai": {"base_url": "https://api.openai.com"},
+    "skiapi": {"base_url": "https://skiapi.dev/v1"},
+    "xai": {"base_url": "https://api.x.ai/v1"},
+    "newapi": {"base_url": "https://api.openai.com/v1"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1"},
+    "siliconflow": {"base_url": "https://api.siliconflow.cn/v1"},
+    "gemini": {"base_url": "https://generativelanguage.googleapis.com"},
+    "sd": {"base_url": "http://127.0.0.1:7860"},
+}
+_GEMINI_IMAGE_MODEL_ALIASES = {
+    "gemini-3.1-flash-image": "gemini-3.1-flash-image-preview",
+}
+_XAI_DIRECT_IMAGE_MODEL_ALIASES = {
+    "grok-imagine-1.0": "grok-imagine-image",
+    "grok-imagine-1.0-fast": "grok-imagine-image",
+    "grok-imagine-1.0-edit": "grok-imagine-image",
+    "grok-imagine-1.0-video": "grok-imagine-image",
+}
+
+
+def normalize_image_provider_name(raw: str) -> str:
+    key = str(raw or "").strip().lower().replace(" ", "_")
+    if not key:
+        return ""
+    return _IMAGE_PROVIDER_ALIASES.get(key, key)
+
+
+def resolve_image_provider_for_config(model_cfg: dict[str, Any]) -> str:
+    provider = normalize_image_provider_name(str(model_cfg.get("provider", "")))
+    api_base = str(model_cfg.get("api_base", model_cfg.get("base_url", ""))).strip().lower()
+    model_name = str(model_cfg.get("model", model_cfg.get("name", ""))).strip().lower()
+    explicit = provider not in {"", "custom"}
+
+    if _looks_sd_webui_base(api_base):
+        return "sd"
+    if _looks_google_image_base(api_base):
+        return "gemini"
+    if _looks_openrouter_image_base(api_base):
+        return "openrouter"
+
+    if explicit:
+        return provider
+
+    if model_name.startswith("gemini-"):
+        return "gemini"
+    if model_name.startswith("grok-imagine"):
+        return "xai"
+    if "stable-diffusion" in model_name or "sdxl" in model_name:
+        return "sd"
+    if "flux" in model_name:
+        return "siliconflow"
+    return "openai"
+
+
+def _looks_google_image_base(base_url: str) -> bool:
+    base = str(base_url or "").strip().lower()
+    return "generativelanguage.googleapis.com" in base
+
+
+def _looks_openrouter_image_base(base_url: str) -> bool:
+    base = str(base_url or "").strip().lower()
+    return "openrouter.ai" in base
+
+
+def _looks_sd_webui_base(base_url: str) -> bool:
+    base = str(base_url or "").strip().lower()
+    return (
+        "/sdapi/" in base
+        or base.endswith(":7860")
+        or "127.0.0.1:7860" in base
+        or "localhost:7860" in base
+    )
+
+
+def _normalize_runtime_image_model_name(provider: str, model_name: str) -> str:
+    current = str(model_name or "").strip()
+    lowered = current.lower()
+    if provider == "gemini":
+        return _GEMINI_IMAGE_MODEL_ALIASES.get(lowered, current)
+    if provider == "xai":
+        return _XAI_DIRECT_IMAGE_MODEL_ALIASES.get(lowered, current)
+    if provider == "openrouter":
+        if "/" in current:
+            return current
+        if lowered.startswith("gemini-"):
+            return f"google/{current}"
+        if lowered.startswith("gpt-image-") or lowered.startswith("dall-e-"):
+            return f"openai/{current}"
+    return current
+
+
+def _merge_image_prompt(prompt: str, style: str | None) -> str:
+    merged = str(prompt or "").strip()
+    style_text = str(style or "").strip()
+    if style_text:
+        merged = f"{merged}\nStyle: {style_text}".strip()
+    return merged
+
+
+def _parse_image_size(size: str) -> tuple[int | None, int | None]:
+    raw = str(size or "").strip().lower()
+    if "x" not in raw:
+        return None, None
+    left, right = raw.split("x", 1)
+    try:
+        width = int(left.strip())
+        height = int(right.strip())
+    except Exception:
+        return None, None
+    if width <= 0 or height <= 0:
+        return None, None
+    return width, height
+
+
+def _to_data_uri(base64_data: str) -> str:
+    raw = str(base64_data or "").strip()
+    if not raw:
+        return ""
+    return f"data:image/png;base64,{raw}"
+
+
+def _split_data_uri_image(url: str) -> tuple[str, str]:
+    raw = str(url or "").strip()
+    if not raw.lower().startswith("data:image/"):
+        return raw, ""
+    _, _, payload = raw.partition(",")
+    return raw, payload.strip()
+
+
+def _build_image_success_result(
+    *,
+    url: str,
+    model_used: str,
+    revised_prompt: str = "",
+) -> ImageGenResult:
+    normalized_url, b64 = _split_data_uri_image(url)
+    return ImageGenResult(
+        ok=True,
+        message="图片已生成。",
+        url=normalized_url,
+        base64_data=b64,
+        model_used=model_used,
+        revised_prompt=revised_prompt,
+    )
+
+
+def _build_image_model_label(model_name: str, fallback_name: str = "") -> str:
+    return str(model_name or "").strip() or str(fallback_name or "").strip() or "未命名模型"
+
+
+async def _generate_with_sd_webui(
+    *,
+    prompt: str,
+    api_base: str,
+    model_name: str,
+    size: str,
+    style: str | None,
+) -> ImageGenResult:
+    base = str(api_base or "").rstrip("/")
+    if not base:
+        return ImageGenResult(ok=False, message=f"模型 {_build_image_model_label(model_name)} 配置不完整。")
+
+    if base.endswith("/sdapi/v1/txt2img"):
+        url = base
+    elif base.endswith("/sdapi/v1"):
+        url = f"{base}/txt2img"
+    else:
+        url = f"{base}/sdapi/v1/txt2img"
+
+    width, height = _parse_image_size(size)
+    payload: dict[str, Any] = {
+        "prompt": _merge_image_prompt(prompt, style),
+        "batch_size": 1,
+    }
+    if width is not None and height is not None:
+        payload["width"] = width
+        payload["height"] = height
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
+            response = await client.post(url, json=payload)
+            response.raise_for_status()
+        data = response.json()
+        if not isinstance(data, dict):
+            return ImageGenResult(ok=False, message=f"模型 {_build_image_model_label(model_name)} 返回格式异常。")
+        images = data.get("images") or []
+        if not isinstance(images, list) or not images:
+            return ImageGenResult(ok=False, message=f"模型 {_build_image_model_label(model_name)} 未返回图片数据。")
+        raw_b64 = str(images[0] or "").strip()
+        if not raw_b64:
+            return ImageGenResult(ok=False, message=f"模型 {_build_image_model_label(model_name)} 未返回有效图片。")
+        return ImageGenResult(
+            ok=True,
+            message="图片已生成。",
+            url=_to_data_uri(raw_b64),
+            base64_data=raw_b64,
+            model_used=model_name,
+        )
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        detail = ""
+        try:
+            payload = exc.response.json() if exc.response is not None else {}
+            if isinstance(payload, dict):
+                detail = str(payload.get("error", "") or payload.get("detail", "") or payload.get("message", "")).strip()
+        except Exception:
+            detail = ""
+        if not detail and exc.response is not None:
+            detail = (exc.response.text or "").strip()[:220]
+        return ImageGenResult(
+            ok=False,
+            message=f"模型 {_build_image_model_label(model_name)} 生成失败（HTTP {status}）：{detail or '请求失败'}",
+        )
+    except Exception as exc:
+        return ImageGenResult(ok=False, message=f"模型 {_build_image_model_label(model_name)} 生成失败：{exc}")
+
+
+async def generate_image_with_model_config(
+    prompt: str,
+    model_cfg: dict[str, Any],
+    size: str,
+    style: str | None = None,
+) -> ImageGenResult:
+    provider = resolve_image_provider_for_config(model_cfg)
+    requested_model = str(model_cfg.get("model", model_cfg.get("name", ""))).strip()
+    model_name = _normalize_runtime_image_model_name(provider, requested_model)
+    api_base = str(model_cfg.get("api_base", model_cfg.get("base_url", ""))).strip()
+    api_key = str(model_cfg.get("api_key", "")).strip()
+    timeout_seconds = int(model_cfg.get("timeout_seconds", 60) or 60)
+    model_label = _build_image_model_label(model_name, requested_model)
+
+    if provider == "sd":
+        return await _generate_with_sd_webui(
+            prompt=prompt,
+            api_base=api_base or _IMAGE_PROVIDER_DEFAULTS["sd"]["base_url"],
+            model_name=model_label,
+            size=size,
+            style=style,
+        )
+
+    if provider == "openrouter" and not api_base:
+        api_base = _IMAGE_PROVIDER_DEFAULTS["openrouter"]["base_url"]
+    if provider == "gemini" and not api_base:
+        api_base = _IMAGE_PROVIDER_DEFAULTS["gemini"]["base_url"]
+    if provider in _IMAGE_OPENAI_COMPATIBLE_PROVIDERS and not api_base:
+        api_base = _IMAGE_PROVIDER_DEFAULTS.get(provider, {}).get("base_url", "")
+
+    if provider != "sd" and not api_key:
+        return ImageGenResult(ok=False, message=f"模型 {model_label} 配置不完整。")
+    if provider not in {"sd"} and provider not in (_IMAGE_OPENAI_COMPATIBLE_PROVIDERS | {"gemini", "openrouter"}):
+        provider = "openai"
+
+    try:
+        from services.model_client import ModelClient
+
+        client_cfg: dict[str, Any] = {
+            "provider": provider,
+            "model": model_name,
+            "image_model": model_name,
+            "timeout_seconds": timeout_seconds,
+        }
+        if api_base:
+            client_cfg["base_url"] = api_base
+        if api_key:
+            client_cfg["api_key"] = api_key
+
+        client = ModelClient(client_cfg)
+        image_url = await client.generate_image(
+            prompt=prompt,
+            size=size,
+            style=style,
+        )
+        if not image_url:
+            return ImageGenResult(ok=False, message=f"模型 {model_label} 生成失败。")
+        return _build_image_success_result(url=image_url, model_used=model_name)
+    except Exception as exc:
+        message = str(exc).strip()
+        return ImageGenResult(ok=False, message=f"模型 {model_label} 生成失败：{message or '未知错误'}")
+
+
 class ImageGenEngine:
     """增强图片生成引擎。"""
 
@@ -573,7 +884,7 @@ class ImageGenEngine:
         if self.model_client and hasattr(self.model_client, "generate_image"):
             fallback_error = ""
             try:
-                url = await self.model_client.generate_image(content, size=use_size)
+                url = await self.model_client.generate_image(content, size=use_size, style=style)
                 if url:
                     generated = ImageGenResult(
                         ok=True,
@@ -642,78 +953,15 @@ class ImageGenEngine:
         style: str | None,
     ) -> ImageGenResult:
         """使用配置的模型生成图片。"""
-        api_base = str(model_cfg.get("api_base", "")).rstrip("/")
-        api_key = str(model_cfg.get("api_key", ""))
-        model_name = str(model_cfg.get("model", model_cfg.get("name", "")))
-
-        if not api_base or not api_key:
-            return ImageGenResult(ok=False, message=f"模型 {model_name} 配置不完整。")
-
-        # 确保 URL 正确：如果 api_base 已经包含 /v1，就不要再加了
-        if api_base.endswith("/v1"):
-            url = f"{api_base}/images/generations"
-        else:
-            url = f"{api_base}/v1/images/generations"
-
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        body: dict[str, Any] = {
-            "model": model_name,
-            "prompt": prompt,
-            "n": 1,
-        }
-
-        # grok-imagine 模型不支持 size 参数
-        if "grok-imagine" not in model_name.lower():
-            body["size"] = size
-
-        if style:
-            body["style"] = style
-
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(url, json=body, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                images = data.get("data", [])
-                if images:
-                    url_result = images[0].get("url", "")
-                    b64 = images[0].get("b64_json", "")
-                    revised = images[0].get("revised_prompt", "")
-                    return ImageGenResult(
-                        ok=True, message="图片已生成。",
-                        url=url_result, base64_data=b64,
-                        model_used=model_name, revised_prompt=revised,
-                    )
-        except httpx.HTTPStatusError as exc:
-            status = exc.response.status_code if exc.response is not None else 0
-            detail = ""
-            try:
-                payload = exc.response.json() if exc.response is not None else {}
-                if isinstance(payload, dict):
-                    err = payload.get("error")
-                    if isinstance(err, dict):
-                        detail = str(err.get("message", "") or err.get("code", "")).strip()
-                    elif isinstance(err, str):
-                        detail = err.strip()
-                    if not detail:
-                        detail = str(payload.get("message", "") or payload.get("code", "")).strip()
-            except Exception:
-                detail = ""
-            if not detail and exc.response is not None:
-                detail = (exc.response.text or "").strip()[:220]
-
-            _log.warning("image_gen_api_error | model=%s | http=%s | detail=%s", model_name, status, detail)
-            if status == 503 and ("无可用渠道" in detail or "distributor" in detail.lower()):
-                return ImageGenResult(
-                    ok=False,
-                    message=f"模型 {model_name} 当前无可用渠道（上游 503），请稍后重试或切换生图模型。",
-                )
-            return ImageGenResult(ok=False, message=f"模型 {model_name} 生成失败（HTTP {status}）：{detail or '请求失败'}")
-        except Exception as exc:
-            _log.warning("image_gen_api_error | model=%s | %s", model_name, exc)
-            return ImageGenResult(ok=False, message=f"模型 {model_name} 生成失败：{exc}")
-
-        return ImageGenResult(ok=False, message=f"模型 {model_name} 生成失败。")
+        result = await generate_image_with_model_config(
+            prompt=prompt,
+            model_cfg=model_cfg,
+            size=size,
+            style=style,
+        )
+        if not result.ok:
+            _log.warning("image_gen_api_error | model=%s | detail=%s", model_cfg.get("model", model_cfg.get("name", "")), result.message)
+        return result
 
     def list_models(self) -> list[dict[str, str]]:
         """列出所有可用的图片生成模型。"""

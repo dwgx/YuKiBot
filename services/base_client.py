@@ -103,7 +103,13 @@ class BaseLLMClient:
         except json.JSONDecodeError:
             return {}
 
-    async def generate_image(self, prompt: str, size: str = "1024x1024") -> str | None:
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        style: str | None = None,
+    ) -> str | None:
+        _ = style
         raise RuntimeError(f"{self.provider} 不支持生图接口")
 
     @staticmethod

@@ -317,8 +317,16 @@ class ModelClient:
     async def chat_json(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
         return await self._invoke_with_failover("chat_json", messages)
 
-    async def generate_image(self, prompt: str, size: str = "1024x1024") -> str | None:
-        return await self._invoke_with_failover("generate_image", prompt=prompt, size=size)
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        style: str | None = None,
+    ) -> str | None:
+        kwargs: dict[str, Any] = {"prompt": prompt, "size": size}
+        if style is not None:
+            kwargs["style"] = style
+        return await self._invoke_with_failover("generate_image", **kwargs)
 
     def supports_vision_input(self, model: str | None = None) -> bool:
         """判断当前模型是否支持图片输入（自动启发式，可被配置覆盖）。"""

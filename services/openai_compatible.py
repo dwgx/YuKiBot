@@ -204,15 +204,24 @@ class OpenAICompatibleClient(BaseLLMClient):
         tail = " | ".join(errors[-2:]) if errors else "未知错误"
         raise RuntimeError(f"{self.provider} 请求失败：{tail}")
 
-    async def generate_image(self, prompt: str, size: str = "1024x1024") -> str | None:
+    async def generate_image(
+        self,
+        prompt: str,
+        size: str = "1024x1024",
+        style: str | None = None,
+    ) -> str | None:
         if not self.enabled:
             raise RuntimeError(f"缺少密钥，请配置 {self.default_env_key}")
 
         payload = {
             "model": self.image_model,
             "prompt": prompt,
-            "size": size,
         }
+        model_name = str(self.image_model or "").strip().lower()
+        if size and "grok-imagine" not in model_name:
+            payload["size"] = size
+        if style:
+            payload["style"] = style
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

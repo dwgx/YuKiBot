@@ -328,10 +328,10 @@ def _ask_cookies() -> dict[str, Any]:
 def _ask_image_gen() -> dict[str, Any]:
     """配置图片生成功能。"""
     print("\n── 图片生成配置 ──")
-    print("  支持多模型配置（DALL-E / Flux / SD / 任何 OpenAI 兼容 API）")
+    print("  支持多模型配置（OpenAI / Gemini / xAI / Flux / SD / 自定义网关）")
     print("  NSFW 过滤 + 生成后主模型二次审查，确保内容安全\n")
 
-    default_model = _input("默认模型名称", "dall-e-3")
+    default_model = _input("默认模型名称", "gpt-image-1")
     default_size = _input("默认图片尺寸", "1024x1024")
 
     models = []

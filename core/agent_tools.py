@@ -4935,7 +4935,7 @@ def _make_image_gen_handler(
                 display=IMAGE_PROMPT_BLOCKED_MESSAGE,
             )
         try:
-            url = await model_client.generate_image(prompt=prompt, size=size)
+            url = await model_client.generate_image(prompt=prompt, size=size, style=style or None)
             if url:
                 return ToolCallResult(ok=True, data={"image_url": url}, display=f"图片已生成")
             return ToolCallResult(ok=False, error="image generation returned empty")
