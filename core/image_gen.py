@@ -430,11 +430,13 @@ def resolve_image_provider_for_config(model_cfg: dict[str, Any]) -> str:
         return "gemini"
     if _looks_openrouter_image_base(api_base):
         return "openrouter"
+    if provider in {"skiapi", "newapi"} and _looks_native_gemini_image_model(model_name):
+        return "gemini"
 
     if explicit:
         return provider
 
-    if model_name.startswith("gemini-"):
+    if _looks_native_gemini_image_model(model_name):
         return "gemini"
     if model_name.startswith("grok-imagine"):
         return "xai"
@@ -463,6 +465,13 @@ def _looks_sd_webui_base(base_url: str) -> bool:
         or "127.0.0.1:7860" in base
         or "localhost:7860" in base
     )
+
+
+def _looks_native_gemini_image_model(model_name: str) -> bool:
+    name = str(model_name or "").strip().lower()
+    if name.startswith("google/"):
+        name = name.split("/", 1)[1]
+    return name.startswith("gemini-") and "image" in name
 
 
 def _looks_skiapi_style_key(api_key: str) -> bool:
@@ -651,6 +660,7 @@ async def generate_image_with_model_config(
     size: str,
     style: str | None = None,
 ) -> ImageGenResult:
+    requested_provider = normalize_image_provider_name(str(model_cfg.get("provider", "")))
     provider = resolve_image_provider_for_config(model_cfg)
     requested_model = str(model_cfg.get("model", model_cfg.get("name", ""))).strip()
     model_name = _normalize_runtime_image_model_name(provider, requested_model)
@@ -658,6 +668,7 @@ async def generate_image_with_model_config(
     api_key = str(model_cfg.get("api_key", "")).strip()
     timeout_seconds = int(model_cfg.get("timeout_seconds", 60) or 60)
     model_label = _build_image_model_label(model_name, requested_model)
+    gemini_via_gateway = provider == "gemini" and requested_provider in {"skiapi", "newapi"}
 
     if provider == "sd":
         return await _generate_with_sd_webui(
@@ -671,11 +682,15 @@ async def generate_image_with_model_config(
     if provider == "openrouter" and not api_base:
         api_base = _IMAGE_PROVIDER_DEFAULTS["openrouter"]["base_url"]
     if provider == "gemini" and not api_base:
-        api_base = _IMAGE_PROVIDER_DEFAULTS["gemini"]["base_url"]
+        api_base = (
+            _IMAGE_PROVIDER_DEFAULTS.get(requested_provider, {}).get("base_url", "")
+            if gemini_via_gateway
+            else _IMAGE_PROVIDER_DEFAULTS["gemini"]["base_url"]
+        ) or _IMAGE_PROVIDER_DEFAULTS["gemini"]["base_url"]
     if provider in _IMAGE_OPENAI_COMPATIBLE_PROVIDERS and not api_base:
         api_base = _IMAGE_PROVIDER_DEFAULTS.get(provider, {}).get("base_url", "")
 
-    if provider == "gemini" and (
+    if provider == "gemini" and not gemini_via_gateway and (
         _looks_skiapi_style_key(api_key) or _looks_known_gateway_base_for_native_gemini(api_base)
     ):
         return ImageGenResult(

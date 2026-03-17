@@ -50,7 +50,7 @@ const IMAGE_GEN_DEFAULTS: Record<string, { model: string; baseUrl: string; env: 
 };
 
 const IMAGE_GEN_MODEL_HINTS: Record<string, string> = {
-  skiapi: "推荐 gpt-image-1；如网关支持，也可手动填其它 OpenAI 兼容图片模型。",
+  skiapi: "推荐 gpt-image-1；如果填 Gemini 图片模型（如 gemini-2.5-flash-image / gemini-3.1-flash-image），系统会自动走 Gemini generateContent 代理通道。",
   openai: "推荐 gpt-image-1。",
   gemini: "推荐 gemini-2.5-flash-image；这项会走 Google 官方 Gemini 图片接口。",
   xai: "推荐 grok-imagine-image。",

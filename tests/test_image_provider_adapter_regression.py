@@ -64,6 +64,16 @@ class ImageProviderAdapterRegressionTests(unittest.TestCase):
             resolve_image_provider_for_config({"provider": "custom", "api_base": "http://127.0.0.1:7860"}),
             "sd",
         )
+        self.assertEqual(
+            resolve_image_provider_for_config(
+                {
+                    "provider": "skiapi",
+                    "model": "gemini-3.1-flash-image",
+                    "api_base": "https://skiapi.dev/v1",
+                }
+            ),
+            "gemini",
+        )
 
     def test_openai_compatible_omits_size_for_grok_imagine(self) -> None:
         client = XAIClient({"api_key": "x-key", "image_model": "grok-imagine-image"})
@@ -198,6 +208,39 @@ class ImageProviderAdapterRegressionTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertIn("不是本地配置错误", result.message)
         self.assertIn("503 distributor", result.message)
+
+    def test_generate_image_with_model_config_routes_skiapi_gemini_image_to_gemini_client(self) -> None:
+        seen: dict[str, str] = {}
+
+        class _InspectModelClient:
+            def __init__(self, config) -> None:
+                seen["provider"] = str(config.get("provider", ""))
+                seen["model"] = str(config.get("model", ""))
+                seen["base_url"] = str(config.get("base_url", ""))
+                seen["api_key"] = str(config.get("api_key", ""))
+
+            async def generate_image(self, **_kwargs) -> str | None:
+                return "https://example.com/gemini-proxy.png"
+
+        with patch("services.model_client.ModelClient", _InspectModelClient):
+            result = asyncio.run(
+                generate_image_with_model_config(
+                    prompt="draw cat",
+                    model_cfg={
+                        "provider": "skiapi",
+                        "model": "gemini-3.1-flash-image",
+                        "api_base": "https://skiapi.dev/v1",
+                        "api_key": "sk-Odemo",
+                    },
+                    size="1024x1024",
+                )
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(seen.get("provider"), "gemini")
+        self.assertEqual(seen.get("model"), "gemini-3.1-flash-image-preview")
+        self.assertEqual(seen.get("base_url"), "https://skiapi.dev/v1")
+        self.assertEqual(seen.get("api_key"), "sk-Odemo")
 
     def test_setup_image_gen_does_not_reuse_skiapi_key_for_gemini(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
