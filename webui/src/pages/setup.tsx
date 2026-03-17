@@ -62,9 +62,30 @@ const IMAGE_GEN_MODEL_HINTS: Record<string, string> = {
   custom: "自定义网关可填 OpenAI 兼容、Gemini 原生或本地 SD WebUI。",
 };
 
-const IMAGE_GEN_DEFAULT_BASES = new Set(
-  Object.values(IMAGE_GEN_DEFAULTS).map((item) => item.baseUrl).filter(Boolean),
+const normalizeImageGenBaseRoot = (value: string) =>
+  String(value || "")
+    .trim()
+    .replace(/\/+$/, "")
+    .replace(/\/(v1beta|v1)$/i, "");
+
+const IMAGE_GEN_DEFAULT_BASE_ROOTS = new Set(
+  Object.values(IMAGE_GEN_DEFAULTS)
+    .map((item) => normalizeImageGenBaseRoot(item.baseUrl))
+    .filter(Boolean),
 );
+
+const shouldResetImageGenBaseUrl = (value: string) => {
+  const root = normalizeImageGenBaseRoot(value);
+  return !root || IMAGE_GEN_DEFAULT_BASE_ROOTS.has(root);
+};
+
+const getImageGenApiKeyDescription = (provider: string) => {
+  const envName = IMAGE_GEN_DEFAULTS[provider]?.env || "API_KEY";
+  if (provider === "gemini") {
+    return `留空则从环境变量 ${envName} 读取；Gemini 原生生图必须使用 Google 官方 Key，不支持 sk-O... 网关 Key`;
+  }
+  return `留空则从环境变量 ${envName} 读取`;
+};
 
 const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
   skiapi: [
@@ -1083,7 +1104,7 @@ export default function SetupPage() {
                         setImageGenProvider(nextProvider);
                         const defaults = IMAGE_GEN_DEFAULTS[nextProvider] || IMAGE_GEN_DEFAULTS.custom;
                         setImageGenModel(defaults.model);
-                        if (!imageGenBaseUrl || IMAGE_GEN_DEFAULT_BASES.has(imageGenBaseUrl)) {
+                        if (shouldResetImageGenBaseUrl(imageGenBaseUrl)) {
                           setImageGenBaseUrl(defaults.baseUrl);
                         }
                       }
@@ -1139,7 +1160,7 @@ export default function SetupPage() {
                     <div className="space-y-3 rounded-xl border border-warning/20 bg-warning/5 p-3">
                       <Input
                         label="API Key"
-                        description={`留空则从环境变量 ${IMAGE_GEN_DEFAULTS[imageGenProvider]?.env || "API_KEY"} 读取`}
+                        description={getImageGenApiKeyDescription(imageGenProvider)}
                         type="password"
                         value={imageGenApiKey}
                         onValueChange={setImageGenApiKey}

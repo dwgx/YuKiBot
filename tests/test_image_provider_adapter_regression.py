@@ -136,6 +136,101 @@ class ImageProviderAdapterRegressionTests(unittest.TestCase):
         self.assertEqual(seen_payloads[0].get("height"), 768)
         self.assertIn("Style: anime poster", str(seen_payloads[0].get("prompt", "")))
 
+    def test_generate_image_with_model_config_rejects_skiapi_key_for_gemini(self) -> None:
+        result = asyncio.run(
+            generate_image_with_model_config(
+                prompt="draw cat",
+                model_cfg={
+                    "provider": "gemini",
+                    "model": "gemini-2.5-flash-image",
+                    "api_base": "https://generativelanguage.googleapis.com",
+                    "api_key": "sk-Odemo",
+                },
+                size="1024x1024",
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Google 官方", result.message)
+        self.assertIn("sk-O", result.message)
+
+    def test_generate_image_with_model_config_rejects_gateway_base_for_gemini(self) -> None:
+        result = asyncio.run(
+            generate_image_with_model_config(
+                prompt="draw cat",
+                model_cfg={
+                    "provider": "gemini",
+                    "model": "gemini-2.5-flash-image",
+                    "api_base": "https://skiapi.dev/v1",
+                    "api_key": "gemini-key",
+                },
+                size="1024x1024",
+            )
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("Google 官方", result.message)
+        self.assertIn("skiapi.dev", result.message)
+
+    def test_generate_image_with_model_config_maps_gateway_distributor_503(self) -> None:
+        class _BrokenModelClient:
+            def __init__(self, _config) -> None:
+                pass
+
+            async def generate_image(self, **_kwargs) -> str | None:
+                raise RuntimeError(
+                    "skiapi 请求失败：https://skiapi.dev/v1/images/generations -> "
+                    "RuntimeError: HTTP 503: 分组 default 下模型 gpt-image-1 无可用渠道（distributor）"
+                )
+
+        with patch("services.model_client.ModelClient", _BrokenModelClient):
+            result = asyncio.run(
+                generate_image_with_model_config(
+                    prompt="draw cat",
+                    model_cfg={
+                        "provider": "skiapi",
+                        "model": "gpt-image-1",
+                        "api_base": "https://skiapi.dev/v1",
+                        "api_key": "sk-Odemo",
+                    },
+                    size="1024x1024",
+                )
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn("不是本地配置错误", result.message)
+        self.assertIn("503 distributor", result.message)
+
+    def test_setup_image_gen_does_not_reuse_skiapi_key_for_gemini(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            logger = SimpleNamespace(
+                info=lambda *args, **kwargs: None,
+                warning=lambda *args, **kwargs: None,
+                error=lambda *args, **kwargs: None,
+            )
+            support = WebUISetupSupport(
+                root_dir=Path(tmp),
+                prompts_file=Path(tmp) / "prompts.yml",
+                logger=logger,
+                load_yaml_dict=lambda path: {},
+                restore_masked_sensitive_values=lambda incoming, existing: incoming,
+                is_masked_secret_placeholder=lambda value: False,
+                strip_deprecated_local_paths_config=lambda config: config,
+            )
+
+            resolved_key = support._setup_resolve_image_gen_api_key(
+                image_provider="gemini",
+                image_api_key_raw="",
+                primary_provider="skiapi",
+                primary_api_key_raw="sk-Odemo",
+            )
+            resolved_base = support._setup_resolve_image_gen_base_url(
+                image_provider="gemini",
+                image_base_url_raw="",
+                resolved_api_key="sk-Odemo",
+            )
+
+        self.assertEqual(resolved_key, "${GEMINI_API_KEY}")
+        self.assertEqual(resolved_base, "https://generativelanguage.googleapis.com")
+
     def test_setup_test_image_gen_reuses_shared_helper(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             logger = SimpleNamespace(

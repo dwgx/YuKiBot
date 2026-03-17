@@ -398,6 +398,17 @@ _XAI_DIRECT_IMAGE_MODEL_ALIASES = {
     "grok-imagine-1.0-edit": "grok-imagine-image",
     "grok-imagine-1.0-video": "grok-imagine-image",
 }
+_GEMINI_GATEWAY_BASE_HINTS = (
+    "skiapi.dev",
+    "openrouter.ai",
+    "api.openai.com",
+    "api.x.ai",
+    "siliconflow.cn",
+    "dmxapi.com",
+    "vveai.com",
+    "jina.ai",
+    "newapi",
+)
 
 
 def normalize_image_provider_name(raw: str) -> str:
@@ -452,6 +463,43 @@ def _looks_sd_webui_base(base_url: str) -> bool:
         or "127.0.0.1:7860" in base
         or "localhost:7860" in base
     )
+
+
+def _looks_skiapi_style_key(api_key: str) -> bool:
+    return str(api_key or "").strip().lower().startswith("sk-o")
+
+
+def _looks_known_gateway_base_for_native_gemini(base_url: str) -> bool:
+    base = str(base_url or "").strip().lower()
+    if not base or _looks_google_image_base(base):
+        return False
+    return any(host in base for host in _GEMINI_GATEWAY_BASE_HINTS)
+
+
+def _build_native_gemini_config_error(*, api_key: str, api_base: str) -> str:
+    hints: list[str] = []
+    if _looks_skiapi_style_key(api_key):
+        hints.append("检测到 `sk-O...` 聚合网关 Key")
+    if _looks_known_gateway_base_for_native_gemini(api_base):
+        hints.append(f"检测到非 Google 官方地址 `{api_base}`")
+    prefix = f"{'，'.join(hints)}；" if hints else ""
+    return (
+        f"{prefix}`Gemini` 提供商只能使用 Google 官方 `GEMINI_API_KEY` "
+        "和 `https://generativelanguage.googleapis.com`。"
+        "如果你想走 SkiAPI / NEWAPI / OpenRouter / 自定义网关，请改用对应的图片提供商。"
+    )
+
+
+def _remap_image_generation_error(*, provider: str, message: str) -> str:
+    raw = str(message or "").strip()
+    lowered = raw.lower()
+    gateway_providers = _IMAGE_OPENAI_COMPATIBLE_PROVIDERS | {"openrouter"}
+    if provider in gateway_providers and "503" in lowered and ("无可用渠道" in raw or "distributor" in lowered):
+        return (
+            "当前图片网关暂无可用生图渠道（上游 503 distributor），不是本地配置错误。"
+            "请稍后重试，或改用官方 OpenAI / 官方 Gemini / OpenRouter / SiliconFlow。"
+        )
+    return raw or "未知错误"
 
 
 def _normalize_runtime_image_model_name(provider: str, model_name: str) -> str:
@@ -627,6 +675,13 @@ async def generate_image_with_model_config(
     if provider in _IMAGE_OPENAI_COMPATIBLE_PROVIDERS and not api_base:
         api_base = _IMAGE_PROVIDER_DEFAULTS.get(provider, {}).get("base_url", "")
 
+    if provider == "gemini" and (
+        _looks_skiapi_style_key(api_key) or _looks_known_gateway_base_for_native_gemini(api_base)
+    ):
+        return ImageGenResult(
+            ok=False,
+            message=f"模型 {model_label} 配置不兼容：{_build_native_gemini_config_error(api_key=api_key, api_base=api_base)}",
+        )
     if provider != "sd" and not api_key:
         return ImageGenResult(ok=False, message=f"模型 {model_label} 配置不完整。")
     if provider not in {"sd"} and provider not in (_IMAGE_OPENAI_COMPATIBLE_PROVIDERS | {"gemini", "openrouter"}):
@@ -656,7 +711,7 @@ async def generate_image_with_model_config(
             return ImageGenResult(ok=False, message=f"模型 {model_label} 生成失败。")
         return _build_image_success_result(url=image_url, model_used=model_name)
     except Exception as exc:
-        message = str(exc).strip()
+        message = _remap_image_generation_error(provider=provider, message=str(exc).strip())
         return ImageGenResult(ok=False, message=f"模型 {model_label} 生成失败：{message or '未知错误'}")
 
 

@@ -368,8 +368,6 @@ class WebUISetupSupport:
             if primary_key:
                 return primary_key
             return self._SETUP_API_ENV_MAP.get(primary_provider, "${API_KEY}")
-        if primary_key.startswith("sk-O"):
-            return primary_key
         if image_provider in self._SETUP_API_ENV_MAP:
             return self._SETUP_API_ENV_MAP.get(image_provider, "${API_KEY}")
         return self._SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_provider, {}).get("env", "${API_KEY}")
@@ -378,7 +376,7 @@ class WebUISetupSupport:
         base = normalize_text(image_base_url_raw).rstrip("/")
         if base:
             return base
-        if normalize_text(resolved_api_key).startswith("sk-O"):
+        if image_provider == "skiapi" and normalize_text(resolved_api_key).lower().startswith("sk-o"):
             return "https://skiapi.dev/v1"
         provider_default = self._SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_provider, {})
         base = normalize_text(provider_default.get("base_url", "")).rstrip("/")
