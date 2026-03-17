@@ -23,6 +23,14 @@ from app import create_engine, register_handlers
 from core.setup import needs_setup, run as run_setup
 
 
+def _is_interactive_tty() -> bool:
+    try:
+        stdin = getattr(sys, "stdin", None)
+        return bool(stdin and hasattr(stdin, "isatty") and stdin.isatty())
+    except Exception:
+        return False
+
+
 def _load_env_files() -> None:
     root = Path(__file__).resolve().parent
     load_dotenv(root / ".env", override=False, encoding="utf-8")
@@ -66,6 +74,9 @@ _log_onebot_reverse_ws_hint()
 #   python main.py setup   → 强制 CLI 向导
 _force_cli_setup = "--setup" in sys.argv or (len(sys.argv) > 1 and sys.argv[1] == "setup")
 if _force_cli_setup:
+    if not _is_interactive_tty():
+        print("[ERROR] --setup 需要交互式终端，请在 SSH 终端手动执行。")
+        sys.exit(2)
     run_setup()
     sys.exit(0)
 elif needs_setup():
@@ -85,6 +96,10 @@ elif needs_setup():
             sys.exit(0)
     else:
         # webui/dist 不存在，回退到 CLI 向导
+        if not _is_interactive_tty():
+            print("WebUI 未构建且当前为非交互环境，无法运行 CLI 向导。")
+            print("请先执行 install.sh 构建 WebUI，或手动创建 config/config.yml 后再启动。")
+            sys.exit(1)
         print("WebUI 未构建，使用 CLI 向导...")
         run_setup()
         sys.exit(0)

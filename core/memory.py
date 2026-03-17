@@ -2317,3 +2317,70 @@ class MemoryEngine:
                     )
             except Exception:
                 pass
+
+    def generate_daily_report(self, day_key: str | None = None) -> str:
+        """Generate a concise, human-readable daily report for group chat.
+
+        Returns a short summary suitable for sending as a message.
+        """
+        key = day_key or datetime.now().date().isoformat()
+        records = self._daily_records.get(key, [])
+        if not records:
+            return ""
+
+        user_count = len(set(uid for role, uid, _, _ in records if role == "user"))
+        msg_count = sum(1 for role, _, _, _ in records if role == "user")
+        keyword_counter = self._daily_keywords.get(key, Counter())
+        emotion_counter = self._daily_emotions.get(key, Counter())
+        top_kw = [w for w, _ in keyword_counter.most_common(5) if normalize_text(w)]
+        dominant_emotion = emotion_counter.most_common(1)[0][0] if emotion_counter else "neutral"
+
+        # Top active users
+        daily_user_counter = self._daily_user_message_count.get(key, Counter())
+        top_users: list[str] = []
+        for uid, count in daily_user_counter.most_common(3):
+            name = self._user_display_names.get(uid, uid)
+            top_users.append(f"{name}({count}条)")
+
+        lines = [f"📊 今日群聊小结 ({key})"]
+        lines.append(f"💬 共 {msg_count} 条消息，{user_count} 人参与")
+        if top_users:
+            lines.append(f"🏆 最活跃: {', '.join(top_users)}")
+        if top_kw:
+            lines.append(f"🔥 热词: {'、'.join(top_kw[:5])}")
+
+        emotion_cn = {
+            "positive": "积极", "negative": "消极", "neutral": "平淡",
+            "curious": "好奇", "excited": "兴奋",
+        }
+        lines.append(f"😊 整体氛围: {emotion_cn.get(dominant_emotion, dominant_emotion)}")
+
+        topic_traces = self._daily_topic_traces.get(key, [])
+        if topic_traces:
+            lines.append(f"📌 话题: {'→'.join(topic_traces[-5:])}")
+
+        return "\n".join(lines)
+
+    def get_user_portrait(self, user_id: str) -> str:
+        """Generate a concise user portrait summary."""
+        profile = self._user_profiles.get(user_id, {})
+        if not profile:
+            return ""
+        name = normalize_text(str(profile.get("display_name", ""))) or user_id
+        msg_count = int(profile.get("message_count", 0))
+        keywords = profile.get("keywords", [])
+        top_kw = keywords[:5] if isinstance(keywords, list) else []
+        style = normalize_text(str(profile.get("language_style", "")))
+        topics = profile.get("topic_preferences", {})
+
+        parts = [f"用户: {name}"]
+        if msg_count:
+            parts.append(f"消息数: {msg_count}")
+        if top_kw:
+            parts.append(f"关键词: {'、'.join(str(k) for k in top_kw)}")
+        if style:
+            parts.append(f"风格: {style}")
+        if isinstance(topics, dict) and topics:
+            top_topics = sorted(topics.items(), key=lambda x: x[1], reverse=True)[:3]
+            parts.append(f"兴趣: {'、'.join(t for t, _ in top_topics)}")
+        return " | ".join(parts)

@@ -255,6 +255,11 @@ class ImageGenerationIntentRegressionTests(unittest.TestCase):
     def test_generation_request_still_matches_real_create_image_intent(self) -> None:
         self.assertTrue(AgentLoop._looks_like_image_generation_request("我生成一张RTX5090图片"))
         self.assertTrue(AgentLoop._looks_like_image_generation_request("帮我画个猫猫表情包"))
+        self.assertTrue(AgentLoop._looks_like_image_generation_request("生成一只小猫"))
+
+    def test_generation_request_does_not_overmatch_text_tasks(self) -> None:
+        self.assertFalse(AgentLoop._looks_like_image_generation_request("生成一份日报"))
+        self.assertFalse(AgentLoop._looks_like_image_generation_request("生成JSON配置"))
 
 
 # ---------------------------------------------------------------------------

@@ -119,6 +119,8 @@ bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yuk
 - `--open-firewall`：尝试放行端口。
 - `--skip-webui-build`：跳过前端构建（不建议发布使用）。
 - `--skip-cli-install`：不安装 `/usr/local/bin/yukiko`。
+- `--skip-post-check`：跳过部署后严格验收（默认开启，不建议发布使用）。
+- `--post-check-timeout <s>`：部署后健康检查超时（默认 20 秒）。
 
 ---
 
@@ -163,6 +165,7 @@ yukiko --help
 
 ```bash
 yukiko install --host 0.0.0.0 --port 18081
+yukiko doctor --strict
 yukiko update --check-only
 yukiko update --restart
 yukiko start
@@ -1158,4 +1161,3 @@ bash install.sh --non-interactive --host 0.0.0.0 --port 18081 --service-name yuk
 - 发布不是“保证永不出错”，而是“即使出错也能快速恢复”。
 - 你可以把这份文档当成发布演练脚本，用事实代替感觉。
 - 只要每次发布都按清单执行，稳定性会持续提升。
-

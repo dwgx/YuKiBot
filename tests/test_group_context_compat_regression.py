@@ -100,6 +100,7 @@ class GroupContextCompatRegressionTests(unittest.TestCase):
         loop.tool_registry = _StubRegistry()
         loop.prompt_policy = _StubPromptPolicy()
         loop.config = {}
+        loop.persona_text = ""
         loop.max_steps = 6
         loop._resolve_permission_level = lambda ctx: "user"  # type: ignore[attr-defined]
 
@@ -119,6 +120,41 @@ class GroupContextCompatRegressionTests(unittest.TestCase):
 
         self.assertIn("【群聊关系兼容层】", prompt)
         self.assertIn("当前用户可能在和 小雨(QQ:20002) 继续同一段对话", prompt)
+
+    def test_agent_turn_target_line_prefers_reply_anchor_then_mentions(self) -> None:
+        ctx_reply = AgentContext(
+            conversation_id="group:1:user:10001",
+            user_id="10001",
+            user_name="妈妈",
+            group_id=1,
+            bot_id="99999",
+            is_private=False,
+            mentioned=True,
+            message_text="她刚才是在说我吗",
+            reply_to_user_id="20002",
+            reply_to_user_name="小雨",
+            at_other_user_ids=["30003"],
+            at_other_user_names={"30003": "阿风"},
+        )
+        line_reply = AgentLoop._build_turn_target_line(ctx_reply)
+        self.assertIn("本轮主要对象: 小雨(QQ:20002)", line_reply)
+        self.assertIn("来源: reply_anchor", line_reply)
+
+        ctx_mention = AgentContext(
+            conversation_id="group:1:user:10001",
+            user_id="10001",
+            user_name="妈妈",
+            group_id=1,
+            bot_id="99999",
+            is_private=False,
+            mentioned=True,
+            message_text="你觉得阿风呢",
+            at_other_user_ids=["30003"],
+            at_other_user_names={"30003": "阿风"},
+        )
+        line_mention = AgentLoop._build_turn_target_line(ctx_mention)
+        self.assertIn("本轮主要对象: 阿风(QQ:30003)", line_mention)
+        self.assertIn("来源: mention", line_mention)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import logging
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 from typing import Any
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -12,11 +15,42 @@ if str(_ROOT) not in sys.path:
 
 from core import prompt_loader as _pl
 from core.agent import AgentContext, AgentLoop
+from core.agent_tools import AgentToolRegistry
+from core.thinking import ThinkingEngine
 from core.trigger import TriggerEngine, TriggerInput
+from plugins.self_learning import Plugin
 
 
 class _DummyModelClient:
     enabled = True
+
+
+class _ThinkingModelClient:
+    enabled = True
+
+    def __init__(self, response: str = "thinking-ok", should_fail: bool = False) -> None:
+        self.response = response
+        self.should_fail = should_fail
+        self.last_messages: list[dict[str, str]] = []
+
+    async def chat_text(self, messages, max_tokens: int = 0) -> str:  # type: ignore[no-untyped-def]
+        _ = max_tokens
+        self.last_messages = messages
+        if self.should_fail:
+            raise RuntimeError("boom")
+        return self.response
+
+
+class _ThinkingPersonality:
+    def system_instruction(self, **kwargs) -> str:
+        _ = kwargs
+        return "SYSTEM_BASE"
+
+    def style_instruction(self, style: str) -> str:
+        return f"STYLE:{style}"
+
+    def scene_instruction(self, scene: str) -> str:
+        return f"SCENE:{scene}"
 
 
 class _DummyToolRegistry:
@@ -29,12 +63,12 @@ class _DummyToolRegistry:
     def get_schemas_for_prompt_filtered(self, selected_tools: list[str]) -> str:
         return "\n".join(f"- {name}" for name in selected_tools)
 
-    def get_prompt_hints_text(self, section: str) -> str:
-        _ = section
+    def get_prompt_hints_text(self, section: str, tool_names: list[str] | None = None) -> str:
+        _ = (section, tool_names)
         return ""
 
-    def get_dynamic_context(self, payload: dict[str, Any]) -> str:
-        _ = payload
+    def get_dynamic_context(self, payload: dict[str, Any], tool_names: list[str] | None = None) -> str:
+        _ = (payload, tool_names)
         return ""
 
 
@@ -130,7 +164,12 @@ def _check_agent_parse_and_prompt() -> list[_Check]:
     prompt = loop._build_system_prompt(ctx)
     user_msg = loop._build_user_message(ctx)
     checks.append(_Check("agent.build_system_prompt", ok="## 可用工具" in prompt and "## 身份" in prompt))
-    checks.append(_Check("agent.build_user_message_media_hint", ok="analyze_image" in user_msg))
+    checks.append(
+        _Check(
+            "agent.build_user_message_media_hint",
+            ok=("analyze_image" in user_msg) or ("附带媒体" in user_msg and "image:" in user_msg),
+        )
+    )
     checks.append(_Check("agent.force_tool_first_image", ok=loop._should_force_image_tool_first(ctx)))
 
     return checks
@@ -197,11 +236,146 @@ def _check_trigger() -> list[_Check]:
     return checks
 
 
+def _check_self_learning_and_thinking() -> list[_Check]:
+    checks: list[_Check] = []
+
+    registry = AgentToolRegistry()
+    plugin = Plugin()
+    asyncio.run(plugin.setup({"enabled": True}, SimpleNamespace(agent_tool_registry=registry)))
+
+    plugin._stats["total_sessions"] = 2
+    plugin._stats["successful_skills"] = 1
+    plugin._cache_loaded = True
+    plugin._skill_cache = {"json_helper": {"name": "json_helper"}}
+
+    dynamic_context = registry.get_dynamic_context(
+        {"ctx": None, "config": {}, "selected_tools": ["learn_from_web"]},
+        tool_names=["learn_from_web"],
+    )
+    checks.append(
+        _Check(
+            "self_learning.dynamic_context",
+            ok="自学习状态" in dynamic_context and "执行后端: disabled" in dynamic_context,
+            detail=dynamic_context[:80],
+        )
+    )
+
+    tools_guidance = registry.get_prompt_hints_text(
+        "tools_guidance",
+        tool_names=["learn_from_web", "send_devlog", "list_my_skills"],
+    )
+    checks.append(
+        _Check(
+            "self_learning.prompt_hints",
+            ok="自我学习流程" in tools_guidance and "send_devlog" in tools_guidance,
+            detail=tools_guidance[:80],
+        )
+    )
+
+    registry.select_tools_for_intent = lambda message_text, perm_level: [  # type: ignore[method-assign]
+        "learn_from_web",
+        "send_devlog",
+        "list_my_skills",
+    ]
+    loop = AgentLoop(
+        _DummyModelClient(),
+        registry,
+        {"agent": {"enable": True}, "admin": {"super_users": []}},
+    )
+    ctx = AgentContext(
+        conversation_id="group:1",
+        user_id="10001",
+        user_name="tester",
+        group_id=1,
+        bot_id="99999",
+        is_private=False,
+        mentioned=True,
+        message_text="继续学习 Agent 状态编排",
+    )
+    prompt = loop._build_system_prompt(ctx)
+    checks.append(
+        _Check(
+            "agent.self_learning_dynamic_prompt",
+            ok="## 动态上下文" in prompt and "自学习状态" in prompt,
+        )
+    )
+
+    thinking_model = _ThinkingModelClient(response="thinking-ok")
+    thinking = ThinkingEngine(
+        {"bot": {"name": "YuKiKo", "allow_thinking": True}},
+        _ThinkingPersonality(),
+        thinking_model,
+    )
+    reply = asyncio.run(
+        thinking.generate_reply(
+            user_text="她刚才是不是不开心",
+            memory_context=["小雨: 我刚才真的有点难过"],
+            related_memories=["她前几天也说过自己压力比较大"],
+            reply_style="serious",
+            search_summary="标题: 群聊回复链\n摘要: reply 和 @ 优先于旧记忆",
+            user_profile_summary="妈妈：日常口语；偏短句",
+            trigger_reason="mentioned",
+            current_user_name="妈妈",
+            recent_speakers=[("20002", "小雨", "我刚才真的有点难过")],
+            compat_context="【群聊关系兼容层】\n- 当前主要回应对象: 妈妈(QQ:10001)",
+            affinity_hint="关系热度 Lv.4 好朋友 / 好感度 66/100",
+            mood_hint="当前心情: slightly_melancholy",
+        )
+    )
+    thinking_payload = (
+        thinking_model.last_messages[1]["content"]
+        if len(thinking_model.last_messages) >= 2
+        else ""
+    )
+    checks.append(
+        _Check(
+            "thinking.payload_context",
+            ok=(
+                reply == "thinking-ok"
+                and "触发信息: mentioned" in thinking_payload
+                and "最近活跃用户" in thinking_payload
+                and "关系热度" in thinking_payload
+                and "工具结果(搜索)" in thinking_payload
+            ),
+            detail=thinking_payload[:80],
+        )
+    )
+
+    thinking_logger = logging.getLogger("yukiko.thinking")
+    old_disabled = thinking_logger.disabled
+    thinking_logger.disabled = True
+    try:
+        fallback_reply = asyncio.run(
+            ThinkingEngine(
+                {"bot": {"name": "YuKiKo", "allow_thinking": True}},
+                _ThinkingPersonality(),
+                _ThinkingModelClient(should_fail=True),
+            ).generate_reply(
+                user_text="这个问题怎么处理",
+                memory_context=[],
+                related_memories=[],
+                reply_style="short",
+            )
+        )
+    finally:
+        thinking_logger.disabled = old_disabled
+    checks.append(
+        _Check(
+            "thinking.fallback_on_error",
+            ok=bool(fallback_reply),
+            detail=fallback_reply[:60],
+        )
+    )
+
+    return checks
+
+
 def main() -> int:
     checks: list[_Check] = []
     checks.extend(_check_prompts())
     checks.extend(_check_agent_parse_and_prompt())
     checks.extend(_check_trigger())
+    checks.extend(_check_self_learning_and_thinking())
 
     passed = [c for c in checks if c.ok]
     failed = [c for c in checks if not c.ok]

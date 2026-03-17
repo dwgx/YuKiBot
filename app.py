@@ -2519,6 +2519,137 @@ def register_handlers(engine: YukikoEngine) -> None:
     @notice_router.handle()
     async def handle_notice(bot: Bot, event: Event) -> None:
         _log_qq_generic_event(kind="qq_notice", event=event, bot_id=str(bot.self_id))
+        payload = _event_to_dict(event)
+        notice_type = normalize_text(str(payload.get("notice_type", ""))).lower()
+        sub_type = normalize_text(str(payload.get("sub_type", ""))).lower()
+        group_id = str(payload.get("group_id", "")).strip()
+        user_id = str(payload.get("user_id", "")).strip()
+        operator_id = str(payload.get("operator_id", "")).strip()
+        bot_id = str(bot.self_id)
+
+        # ── 成员加群 ──
+        if notice_type == "group_increase":
+            nickname = ""
+            try:
+                info = await call_napcat_bot_api(bot, "get_stranger_info", user_id=int(user_id))
+                nickname = str((info or {}).get("nickname", "")).strip()
+            except Exception:
+                pass
+            display = nickname or f"用户{user_id}"
+            _log.info("group_increase | group=%s | user=%s (%s) | sub=%s | operator=%s",
+                       group_id, user_id, display, sub_type, operator_id)
+            if hasattr(engine, "memory") and group_id:
+                engine.memory.add_message(
+                    conversation_id=f"group_{group_id}",
+                    user_id="system",
+                    user_name="系统通知",
+                    content=f"[系统] {display}({user_id}) 加入了群聊" + (f"（由 {operator_id} 邀请）" if operator_id and operator_id != user_id else ""),
+                    role="system",
+                )
+            if hasattr(engine, "affinity") and user_id:
+                engine.affinity.get_user(user_id)
+                if nickname:
+                    engine.affinity.get_user(user_id).nickname = nickname
+
+        # ── 成员退群/被踢 ──
+        elif notice_type == "group_decrease":
+            _log.info("group_decrease | group=%s | user=%s | sub=%s | operator=%s",
+                       group_id, user_id, sub_type, operator_id)
+            action_text = "被移出群聊" if sub_type == "kick" else "退出了群聊"
+            if sub_type == "kick" and operator_id:
+                action_text += f"（操作者: {operator_id}）"
+            if hasattr(engine, "memory") and group_id:
+                engine.memory.add_message(
+                    conversation_id=f"group_{group_id}",
+                    user_id="system",
+                    user_name="系统通知",
+                    content=f"[系统] {user_id} {action_text}",
+                    role="system",
+                )
+
+        # ── 管理员变动 ──
+        elif notice_type == "group_admin":
+            action = "被设为管理员" if sub_type == "set" else "被取消管理员"
+            _log.info("group_admin | group=%s | user=%s | action=%s", group_id, user_id, action)
+            if hasattr(engine, "memory") and group_id:
+                engine.memory.add_message(
+                    conversation_id=f"group_{group_id}",
+                    user_id="system",
+                    user_name="系统通知",
+                    content=f"[系统] {user_id} {action}",
+                    role="system",
+                )
+
+        # ── 群禁言 ──
+        elif notice_type == "group_ban":
+            duration = int(payload.get("duration", 0))
+            if sub_type == "ban" and duration > 0:
+                action = f"被禁言 {duration} 秒"
+            elif sub_type == "lift_ban":
+                action = "被解除禁言"
+            else:
+                action = "禁言状态变更"
+            _log.info("group_ban | group=%s | user=%s | operator=%s | action=%s | duration=%d",
+                       group_id, user_id, operator_id, action, duration)
+            if hasattr(engine, "memory") and group_id:
+                engine.memory.add_message(
+                    conversation_id=f"group_{group_id}",
+                    user_id="system",
+                    user_name="系统通知",
+                    content=f"[系统] {user_id} {action}" + (f"（操作者: {operator_id}）" if operator_id else ""),
+                    role="system",
+                )
+
+        # ── 消息撤回 ──
+        elif notice_type == "group_recall":
+            message_id = str(payload.get("message_id", "")).strip()
+            _log.info("group_recall | group=%s | user=%s | operator=%s | msg_id=%s",
+                       group_id, user_id, operator_id, message_id)
+            if hasattr(engine, "memory") and group_id:
+                engine.memory.add_message(
+                    conversation_id=f"group_{group_id}",
+                    user_id="system",
+                    user_name="系统通知",
+                    content=f"[系统] {user_id} 撤回了一条消息" + (f"（由 {operator_id} 操作）" if operator_id and operator_id != user_id else ""),
+                    role="system",
+                )
+
+        elif notice_type == "friend_recall":
+            message_id = str(payload.get("message_id", "")).strip()
+            _log.info("friend_recall | user=%s | msg_id=%s", user_id, message_id)
+
+        # ── 戳一戳 ──
+        elif notice_type == "notify" and sub_type == "poke":
+            target_id = str(payload.get("target_id", "")).strip()
+            _log.info("poke | group=%s | user=%s -> target=%s", group_id, user_id, target_id)
+            # 如果戳的是bot，可以回应
+            if target_id == bot_id and group_id:
+                try:
+                    await call_napcat_bot_api(bot, "group_poke", group_id=int(group_id), user_id=int(user_id))
+                except Exception:
+                    pass
+
+        # ── 群文件上传 ──
+        elif notice_type == "group_upload":
+            file_info = payload.get("file", {})
+            file_name = str(file_info.get("name", "")).strip() if isinstance(file_info, dict) else ""
+            file_size = int(file_info.get("size", 0)) if isinstance(file_info, dict) else 0
+            _log.info("group_upload | group=%s | user=%s | file=%s | size=%d",
+                       group_id, user_id, file_name, file_size)
+
+        # ── 群名片变更 ──
+        elif notice_type == "group_card":
+            card_new = str(payload.get("card_new", "")).strip()
+            card_old = str(payload.get("card_old", "")).strip()
+            _log.info("group_card | group=%s | user=%s | old=%s | new=%s",
+                       group_id, user_id, card_old, card_new)
+
+        # ── 好友添加 ──
+        elif notice_type == "friend_add":
+            _log.info("friend_add | user=%s", user_id)
+            if hasattr(engine, "affinity") and user_id:
+                engine.affinity.get_user(user_id)
+                engine.affinity.add_affinity(user_id, 5.0, "new_friend")
 
     @request_router.handle()
     async def handle_request(bot: Bot, event: Event) -> None:

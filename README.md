@@ -77,6 +77,21 @@ bash install.sh
 ```
 </details>
 
+<details>
+<summary>网络慢？使用国内镜像 / 本地缓存加速</summary>
+
+```bash
+bash install.sh \
+  --pip-index-url https://pypi.tuna.tsinghua.edu.cn/simple \
+  --npm-registry https://registry.npmmirror.com \
+  --pip-cache-dir ~/.cache/yukiko/pip \
+  --npm-cache-dir ~/.cache/yukiko/npm \
+  --use-uv
+```
+
+也可以直接设置环境变量：`YUKIKO_PIP_INDEX_URL`、`YUKIKO_NPM_REGISTRY`、`YUKIKO_PIP_CACHE_DIR`、`YUKIKO_NPM_CACHE_DIR`、`YUKIKO_USE_UV`。
+</details>
+
 ### 方式二：Windows 手动部署
 
 ```powershell
@@ -226,6 +241,7 @@ ANTHROPIC_API_KEY=                         # Claude（按需）
 yukiko status              # 查看服务状态
 yukiko logs --lines 200    # 查看最近日志
 yukiko doctor              # 部署健康自检
+yukiko doctor --strict     # 严格验收（有 warning 也返回失败）
 yukiko napcat-status       # NapCat 安装检测
 yukiko backup              # 备份 env/config/storage
 yukiko restore --file <backup.tar.gz> --yes
@@ -237,6 +253,45 @@ yukiko update --check-only # 检查更新
 yukiko update --restart    # 更新并重启
 yukiko uninstall           # 卸载
 ```
+
+Linux 安装后默认会执行严格部署后检查（服务活性 + WebUI 健康 + doctor --strict）。
+如需跳过可用：`bash install.sh --skip-post-check`，也可用 `--post-check-timeout 30` 调整超时。
+
+### 一键卸载 / 完整清理
+
+```bash
+# Linux（默认完整清理 + 卸载服务/NapCat + 卸载前自动备份）
+bash uninstall.sh --yes
+
+# Linux：只卸载服务和 CLI，保留数据
+yukiko uninstall --keep-napcat --keep-cli --yes
+```
+
+```powershell
+# Windows（默认完整清理 + 卸载前自动备份）
+.\uninstall.bat --yes
+```
+
+```bash
+# macOS（默认完整清理 + 卸载前自动备份）
+bash uninstall.sh --yes
+```
+
+如需更细粒度控制，可组合使用：`--purge-runtime`、`--purge-state`、`--purge-env`、`--purge-data`、`--backup-dir`、`--backup-name`、`--no-backup`。
+
+### 项目接管自检（推荐）
+
+当你准备大改 Prompt / 路由 / Agent / API 策略时，先跑一遍：
+
+```bash
+python scripts/project_takeover_selfcheck.py
+```
+
+该脚本会执行：
+- `scripts/agent_deep_selfcheck.py`
+- 关键回归测试（本地关键词回归、群聊上下文回归、记忆集成回归、模型降级回归）
+
+接管改造说明见：[`docs/zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md`](docs/zh-CN/TAKEOVER_IMPROVEMENT_PLAN.md)
 
 ## 🔍 常见问题
 
@@ -307,6 +362,7 @@ YuKiKo/
 ├── install.sh           # Linux 交互式安装脚本
 ├── bootstrap.sh         # 远程一键部署脚本
 ├── start.sh / start.bat # 一键启动脚本
+├── uninstall.sh / uninstall.bat # 一键卸载脚本
 └── .env.example         # 环境变量模板
 ```
 

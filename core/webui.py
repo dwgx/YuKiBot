@@ -1,7 +1,7 @@
 """WebUI 管理 API — 挂载到 nonebot FastAPI 上的管理接口。
 
 提供配置编辑、提示词编辑、日志查看、状态查询等 REST + WebSocket 端点。
-认证方式：Bearer token，配置在 .env WEBUI_TOKEN。
+认证方式：Bearer token 或同源 HttpOnly cookie，配置在 .env WEBUI_TOKEN。
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 import yaml
 from dotenv import dotenv_values, set_key, unset_key
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, WebSocket
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import Request
 
@@ -46,6 +46,11 @@ from core.config_templates import (
     load_prompts_template,
 )
 from core.image_gen import ImageGenEngine
+from core.webui_auth_routes import build_auth_status_router
+from core.webui_cookie_routes import build_cookie_router
+from core.webui_log_routes import build_log_router
+from core.webui_route_context import WebUIRouteContext
+from core.webui_setup_support import WebUISetupSupport
 from core import prompt_loader as _pl
 from utils.text import clip_text, normalize_text
 
@@ -78,6 +83,8 @@ _ENV_EXAMPLE_FILE = _ROOT_DIR / ".env.example"
 _PROMPTS_FILE = _ROOT_DIR / "config" / "prompts.yml"
 _SQL_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SQLITE_HEADER = b"SQLite format 3\x00"
+_WEBUI_AUTH_COOKIE = "yukiko_webui_session"
+_WEBUI_AUTH_COOKIE_MAX_AGE = 7 * 24 * 3600
 _UPDATE_TASKS: dict[str, dict[str, Any]] = {}
 _UPDATE_TASKS_LOCK = asyncio.Lock()
 _UPDATE_TASK_MAX_LOG_ENTRIES = 400
@@ -424,6 +431,59 @@ def _get_token() -> str:
     return os.environ.get("WEBUI_TOKEN", "")
 
 
+def _extract_bearer_token(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw.lower().startswith("bearer "):
+        return ""
+    return raw[7:].strip()
+
+
+def _extract_request_auth_token(request: Request) -> str:
+    header_token = _extract_bearer_token(request.headers.get("Authorization", ""))
+    if header_token:
+        return header_token
+    return normalize_text(request.cookies.get(_WEBUI_AUTH_COOKIE, ""))
+
+
+def _extract_websocket_auth_token(ws: WebSocket) -> str:
+    header_token = _extract_bearer_token(ws.headers.get("Authorization", ""))
+    if header_token:
+        return header_token
+    return normalize_text(ws.cookies.get(_WEBUI_AUTH_COOKIE, ""))
+
+
+def _is_valid_auth_token(candidate: str, expected: str | None = None) -> bool:
+    token = str(expected or _get_token() or "").strip()
+    if not token:
+        return False
+    return normalize_text(candidate) == token
+
+
+def _auth_cookie_secure_from_scheme(scheme: str) -> bool:
+    return str(scheme or "").lower() == "https"
+
+
+def _set_auth_cookie(response: Response, request: Request, token: str) -> None:
+    response.set_cookie(
+        key=_WEBUI_AUTH_COOKIE,
+        value=str(token),
+        httponly=True,
+        samesite="strict",
+        secure=_auth_cookie_secure_from_scheme(request.url.scheme),
+        max_age=_WEBUI_AUTH_COOKIE_MAX_AGE,
+        path="/",
+    )
+
+
+def _clear_auth_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=_WEBUI_AUTH_COOKIE,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+
+
 async def _reload_engine_config(engine: Any) -> tuple[bool, str]:
     """兼容同步/异步的配置重载入口。"""
     reloader = getattr(engine, "reload_config", None)
@@ -446,29 +506,25 @@ async def _reload_engine_config(engine: Any) -> tuple[bool, str]:
 
 
 async def _check_auth(request: Request) -> None:
-    """检查 Bearer token 认证。"""
+    """检查 Bearer token / HttpOnly cookie 认证。"""
     token = _get_token()
     if not token:
         raise HTTPException(403, "WEBUI_TOKEN 未配置")
-    auth = request.headers.get("Authorization", "")
-    if auth != f"Bearer {token}":
+    auth_token = _extract_request_auth_token(request)
+    if not _is_valid_auth_token(auth_token, token):
         raise HTTPException(401, "认证失败")
 
 
-async def _check_auth_or_query_token(request: Request, query_token: str = "") -> None:
-    """兼容 <img>/<video> 无法自定义 Authorization 头的场景。"""
+async def _check_ws_auth(ws: WebSocket) -> bool:
     token = _get_token()
     if not token:
-        raise HTTPException(403, "WEBUI_TOKEN 未配置")
-
-    auth = request.headers.get("Authorization", "")
-    if auth == f"Bearer {token}":
-        return
-
-    if normalize_text(str(query_token)) == token:
-        return
-
-    raise HTTPException(401, "认证失败")
+        await ws.close(code=1008, reason="WEBUI_TOKEN 未配置")
+        return False
+    auth_token = _extract_websocket_auth_token(ws)
+    if _is_valid_auth_token(auth_token, token):
+        return True
+    await ws.close(code=1008, reason="Unauthorized")
+    return False
 
 
 def _mask_sensitive(data: dict) -> dict:
@@ -1475,7 +1531,7 @@ def _json_safe_value(value: Any, max_len: int = 1000) -> Any:
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8")[:max_len]
-        except:
+        except UnicodeDecodeError:
             return f"<binary {len(value)} bytes>"
 
     s = str(value)
@@ -1511,7 +1567,7 @@ def _to_float(value: Any) -> float | None:
     """安全转换为 float。"""
     try:
         return float(value)
-    except:
+    except (TypeError, ValueError):
         return None
 
 
@@ -1919,112 +1975,48 @@ def _save_yaml_dict(path: Path, data: dict[str, Any]) -> None:
         yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
+_setup_support = WebUISetupSupport(
+    root_dir=_ROOT_DIR,
+    prompts_file=_PROMPTS_FILE,
+    logger=_log,
+    load_yaml_dict=_load_yaml_dict,
+    restore_masked_sensitive_values=_restore_masked_sensitive_values,
+    is_masked_secret_placeholder=_is_masked_secret_placeholder,
+    strip_deprecated_local_paths_config=_strip_deprecated_local_paths_config,
+)
+setup_router = _setup_support.router
+_normalize_image_gen_models_for_save = _setup_support._normalize_image_gen_models_for_save
+_ensure_image_gen_default_model = _setup_support._ensure_image_gen_default_model
+_setup_resolve_image_gen_base_url = _setup_support._setup_resolve_image_gen_base_url
+
+
+_route_context = WebUIRouteContext(
+    get_engine=lambda: _engine,
+    get_start_time=lambda: _start_time,
+    get_token=_get_token,
+    check_auth=_check_auth,
+    check_ws_auth=_check_ws_auth,
+    set_auth_cookie=_set_auth_cookie,
+    clear_auth_cookie=_clear_auth_cookie,
+    count_registered_napcat_tools=lambda: _count_registered_napcat_tools(),
+    collect_napcat_status=lambda bot_id="": _collect_napcat_status(bot_id=bot_id),
+    resolve_log_file_path=_resolve_log_file_path,
+    read_log_tail=_read_log_tail,
+    split_log_chunks=_split_log_chunks,
+    cookie_capabilities_payload=_setup_support.cookie_capabilities_payload,
+    start_bilibili_qr_session=_setup_support.start_bilibili_qr_session,
+    bilibili_qr_status=_setup_support.bilibili_qr_status,
+    cancel_bilibili_qr_session=_setup_support.cancel_bilibili_qr_session,
+    logger=_log,
+)
+router.include_router(build_auth_status_router(_route_context))
+router.include_router(build_log_router(_route_context))
+router.include_router(build_cookie_router(_route_context))
+
+
 # ============================================================================
 # API Endpoints
 # ============================================================================
-
-@router.get("/health")
-async def health():
-    """健康检查端点。"""
-    return {"status": "ok"}
-
-
-@router.post("/auth")
-async def auth(request: Request):
-    """认证端点，验证 token。"""
-    body = await request.json()
-    token = str(body.get("token", ""))
-    expected = _get_token()
-
-    if not expected:
-        raise HTTPException(403, "WEBUI_TOKEN 未配置")
-
-    if token != expected:
-        raise HTTPException(401, "Token 错误")
-
-    return {"ok": True}
-
-
-@router.get("/status")
-async def status():
-    """获取 Bot 运行状态。"""
-    e = _engine
-    if not e:
-        raise HTTPException(503, "引擎未初始化")
-
-    admin = getattr(e, "admin", None)
-    uptime = int(time.time() - getattr(admin, "_started", _start_time))
-    msg_count = getattr(admin, "_count", 0)
-    white = list(getattr(admin, "_white", set()))
-
-    mc = getattr(e, "model_client", None)
-    provider = getattr(mc, "provider", "?") if mc else "?"
-    model = getattr(mc, "model", "?") if mc else "?"
-
-    agent = getattr(e, "agent", None)
-    agent_enable = getattr(agent, "enable", False) if agent else False
-
-    safety = getattr(e, "safety", None)
-    scale = int(getattr(safety, "scale", 2)) if safety else 2
-
-    reg = getattr(e, "agent_tool_registry", None)
-    tool_count = getattr(reg, "tool_count", 0) if reg else 0
-
-    plugins_obj = getattr(e, "plugins", None)
-    plugin_map = getattr(plugins_obj, "plugins", {}) if plugins_obj else {}
-    plugin_list = []
-    if isinstance(plugin_map, dict):
-        for name, obj in plugin_map.items():
-            desc = getattr(obj, "description", "") or ""
-            plugin_list.append({"name": name, "description": str(desc)})
-
-    queue_cfg = e.config.get("queue", {}) if isinstance(getattr(e, "config", None), dict) else {}
-    if not isinstance(queue_cfg, dict):
-        queue_cfg = {}
-    runtime_agent_rows: list[dict[str, Any]] = []
-    runtime_state_provider = getattr(e, "runtime_agent_state_provider", None)
-    if callable(runtime_state_provider):
-        try:
-            provider_rows = runtime_state_provider(limit=200)
-            if inspect.isawaitable(provider_rows):
-                provider_rows = await provider_rows
-            if isinstance(provider_rows, list):
-                runtime_agent_rows = [row for row in provider_rows if isinstance(row, dict)]
-        except Exception:
-            runtime_agent_rows = []
-
-    group_concurrency = max(1, int(queue_cfg.get("group_concurrency", 1) or 1))
-    single_inflight = bool(queue_cfg.get("single_inflight_per_conversation", True))
-    max_concurrent_total = max(0, int(queue_cfg.get("max_concurrent_total", 0) or 0))
-    multi_conversation_enabled = (not single_inflight) and max_concurrent_total != 1
-
-    return {
-        "uptime_seconds": uptime,
-        "message_count": msg_count,
-        "whitelist_groups": white,
-        "model": f"{provider}/{model}",
-        "agent_enabled": agent_enable,
-        "tool_count": tool_count,
-        "safety_scale": scale,
-        "bot_name": getattr(e, "bot_name", "YuKiKo"),
-        "plugins": plugin_list,
-        "queue": {
-            "group_concurrency": group_concurrency,
-            "single_inflight_per_conversation": single_inflight,
-            "max_concurrent_total": max_concurrent_total,
-            "multi_conversation_enabled": multi_conversation_enabled,
-            "active_conversations": len(runtime_agent_rows),
-        },
-        "napcat": {
-            "registered_tools": _count_registered_napcat_tools(),
-            "diagnostics_path": "/api/webui/napcat/status",
-        },
-    }
-
-
-@router.get("/napcat/status", dependencies=[Depends(_check_auth)])
-async def napcat_status(bot_id: str = Query("", description="可选，指定 OneBot bot_id")):
-    return await _collect_napcat_status(bot_id=bot_id)
 
 
 @router.get("/env", dependencies=[Depends(_check_auth)])
@@ -2538,14 +2530,6 @@ async def put_plugin(plugin_name: str, request: Request):
     return {"ok": True, "message": message, "plugin": updated}
 
 
-@router.get("/logs", dependencies=[Depends(_check_auth)])
-async def get_logs(lines: int = Query(100, ge=1, le=10000)):
-    """获取最近的日志。"""
-    log_file = _resolve_log_file_path()
-    log_lines = _read_log_tail(log_file, lines)
-    return {"lines": log_lines}
-
-
 @router.get("/db/overview", dependencies=[Depends(_check_auth)])
 async def db_overview():
     """获取所有数据库概览。"""
@@ -2609,7 +2593,7 @@ async def db_tables(
                 quoted = _quote_ident(table)
                 cursor.execute(f"SELECT COUNT(*) FROM {quoted}")
                 item["row_count"] = cursor.fetchone()[0]
-            except:
+            except sqlite3.Error:
                 item["row_count"] = None
         result.append(item)
 
@@ -3649,9 +3633,8 @@ async def chat_media_image(
     request: Request,
     file: str = Query(""),
     bot_id: str = Query(""),
-    token: str = Query(""),
 ):
-    await _check_auth_or_query_token(request, token)
+    await _check_auth(request)
 
     file_token = normalize_text(file)
     if not file_token:
@@ -4610,1737 +4593,10 @@ async def delete_image_gen_model(model_name: str):
         raise HTTPException(500, f"重载失败: {ex}")
 
 
-@router.websocket("/logs/stream")
-async def ws_log_stream(ws: WebSocket, token: str = Query("")):
-    """WebSocket 日志流。"""
-    # 验证 token
-    expected = _get_token()
-    if not expected or token != expected:
-        await ws.close(code=1008, reason="Unauthorized")
-        return
-
-    await ws.accept()
-
-    log_file = _resolve_log_file_path()
-    last_file = log_file
-    last_size = log_file.stat().st_size if log_file.exists() else 0
-
-    try:
-        while True:
-            await asyncio.sleep(1)
-            log_file = _resolve_log_file_path()
-            if log_file != last_file:
-                last_file = log_file
-                last_size = 0
-
-            if not log_file.exists():
-                continue
-
-            current_size = log_file.stat().st_size
-            if current_size > last_size:
-                # 读取新增内容
-                with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                    f.seek(last_size)
-                    new_content = f.read()
-                    if new_content:
-                        for raw_line in new_content.splitlines():
-                            for line in _split_log_chunks(raw_line):
-                                await ws.send_text(json.dumps({"line": line}, ensure_ascii=False))
-                last_size = current_size
-            elif current_size < last_size:
-                # 文件被截断或重新创建
-                last_size = 0
-
-    except WebSocketDisconnect:
-        # 浏览器主动断开属于正常行为，不记错误日志。
-        _log.debug("WebSocket 日志流断开")
-    except RuntimeError as e:
-        msg = normalize_text(str(e)).lower()
-        if "websocket" in msg and ("disconnect" in msg or "close" in msg):
-            _log.debug("WebSocket 日志流关闭: %s", e)
-        else:
-            _log.error(f"WebSocket 日志流错误: {e}")
-    except Exception as e:
-        _log.error(f"WebSocket 日志流错误: {e}")
-    finally:
-        with contextlib.suppress(Exception):
-            await ws.close()
-
-
-# ============================================================================
-# Cookie 管理 API
-# ============================================================================
-
-@router.get("/cookies/capabilities", dependencies=[Depends(_check_auth)])
-async def cookies_capabilities():
-    """返回 Cookie 自动提取能力（按当前部署环境）。"""
-    return {"ok": True, "data": _cookie_capabilities_payload()}
-
-
-@router.post("/cookies/bilibili-qr/start", dependencies=[Depends(_check_auth)])
-async def cookies_bilibili_qr_start():
-    """开始 B站二维码登录会话（Cookie 页面）。"""
-    result = await _start_bilibili_qr_session()
-    if not result.get("ok"):
-        return JSONResponse(result, status_code=503)
-    return result
-
-
-@router.get("/cookies/bilibili-qr/status", dependencies=[Depends(_check_auth)])
-async def cookies_bilibili_qr_status(session_id: str = Query("")):
-    """轮询 B站二维码状态（Cookie 页面）。"""
-    sid = normalize_text(session_id)
-    if not sid:
-        return JSONResponse({"ok": False, "status": "error", "message": "缺少 session_id"}, status_code=400)
-    result = await _bilibili_qr_status(sid)
-    if not result.get("ok") and str(result.get("status", "") or "") in {"expired", "error"}:
-        return JSONResponse(result, status_code=410 if result.get("status") == "expired" else 400)
-    return result
-
-
-@router.post("/cookies/bilibili-qr/cancel", dependencies=[Depends(_check_auth)])
-async def cookies_bilibili_qr_cancel(request: Request):
-    """取消 B站二维码会话（Cookie 页面）。"""
-    body = await request.json()
-    sid = normalize_text(str(body.get("session_id", "")))
-    if not sid:
-        return JSONResponse({"ok": False, "message": "缺少 session_id"}, status_code=400)
-    return _cancel_bilibili_qr_session(sid)
-
-
-@router.post("/cookies/extract", dependencies=[Depends(_check_auth)])
-async def extract_cookie(request: Request):
-    """提取平台 Cookie。"""
-    def _cookie_error(
-        *,
-        status_code: int,
-        code: str,
-        message: str,
-        hint: str = "",
-        detail: str = "",
-    ) -> JSONResponse:
-        payload: dict[str, Any] = {"ok": False, "error_code": code, "message": message}
-        if hint:
-            payload["hint"] = hint
-        if detail:
-            payload["detail"] = detail
-        return JSONResponse(payload, status_code=status_code)
-
-    try:
-        body = await request.json()
-        platform = normalize_text(str(body.get("platform", "bilibili"))).lower() or "bilibili"
-        if platform == "qq":
-            platform = "qzone"
-        browser = normalize_text(str(body.get("browser", "edge"))).lower() or "edge"
-        allow_close = bool(body.get("allow_close", False))
-        loop = asyncio.get_running_loop()
-
-        from core.cookie_auth import (
-            extract_bilibili_cookies,
-            extract_douyin_cookie,
-            extract_kuaishou_cookie,
-            extract_qzone_cookies,
-        )
-
-        if platform == "bilibili":
-            result = await loop.run_in_executor(
-                None,
-                lambda: extract_bilibili_cookies(browser=browser, auto_close=allow_close),
-            )
-            if result and isinstance(result, dict):
-                sessdata = normalize_text(str(result.get("sessdata", "") or result.get("SESSDATA", "")))
-                bili_jct = normalize_text(str(result.get("bili_jct", "") or result.get("BILI_JCT", "")))
-                if sessdata:
-                    cookie_dict = {"SESSDATA": sessdata}
-                    if bili_jct:
-                        cookie_dict["bili_jct"] = bili_jct
-                    return JSONResponse(
-                        {
-                            "ok": True,
-                            "cookie": json.dumps(cookie_dict, ensure_ascii=False),
-                            "message": "B站 Cookie 提取成功（浏览器）",
-                            "sessdata": sessdata,
-                            "bili_jct": bili_jct,
-                        }
-                    )
-            return _cookie_error(
-                status_code=400,
-                code="bilibili_extract_failed",
-                message="B站 Cookie 提取失败",
-                hint="请先在浏览器登录 B站，或改用“B站扫码登录”。",
-            )
-
-        elif platform == "douyin":
-            cookie = await loop.run_in_executor(
-                None,
-                lambda: extract_douyin_cookie(browser=browser, auto_close=allow_close),
-            )
-            if cookie:
-                return JSONResponse({"ok": True, "cookie": cookie, "message": "抖音 Cookie 提取成功"})
-            return _cookie_error(
-                status_code=400,
-                code="douyin_extract_failed",
-                message="抖音 Cookie 提取失败",
-                hint="请确认已在当前浏览器登录抖音账号后重试。",
-            )
-
-        elif platform == "kuaishou":
-            cookie = await loop.run_in_executor(
-                None,
-                lambda: extract_kuaishou_cookie(browser=browser, auto_close=allow_close),
-            )
-            if cookie:
-                return JSONResponse({"ok": True, "cookie": cookie, "message": "快手 Cookie 提取成功"})
-            return _cookie_error(
-                status_code=400,
-                code="kuaishou_extract_failed",
-                message="快手 Cookie 提取失败",
-                hint="请确认已在当前浏览器登录快手账号后重试。",
-            )
-
-        elif platform == "qzone":
-            cookie = await loop.run_in_executor(
-                None,
-                lambda: extract_qzone_cookies(browser=browser, auto_close=allow_close),
-            )
-            if cookie:
-                return JSONResponse({"ok": True, "cookie": cookie, "message": "QQ空间 Cookie 提取成功"})
-            return _cookie_error(
-                status_code=400,
-                code="qzone_extract_failed",
-                message="QQ空间 Cookie 提取失败",
-                hint="请先登录 qzone.qq.com / user.qzone.qq.com，再重试提取。",
-            )
-
-        else:
-            return _cookie_error(
-                status_code=400,
-                code="unsupported_platform",
-                message="不支持的平台",
-            )
-
-    except Exception as e:
-        _log.error(f"Cookie 提取失败: {e}", exc_info=True)
-        return _cookie_error(
-            status_code=500,
-            code="internal_error",
-            message="Cookie 提取失败（内部错误）",
-            hint="请查看日志并检查浏览器登录状态后重试。",
-            detail=str(e),
-        )
-
-
-@router.post("/cookies/save", dependencies=[Depends(_check_auth)])
-async def save_cookie(request: Request):
-    """保存 Cookie 到配置文件。"""
-    try:
-        body = await request.json()
-        platform = normalize_text(str(body.get("platform", "bilibili"))).lower() or "bilibili"
-        if platform == "qq":
-            platform = "qzone"
-        cookie = body.get("cookie", "")
-
-        if not cookie:
-            return JSONResponse({"error": "Cookie 不能为空"}, status_code=400)
-
-        config_file = _ROOT_DIR / "config" / "config.yml"
-        if not config_file.exists():
-            return JSONResponse({"error": "配置文件不存在"}, status_code=404)
-
-        config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
-        if not isinstance(config, dict):
-            config = {}
-
-        if platform == "bilibili":
-            # B站支持 JSON 或标准 cookie 字符串。
-            try:
-                cookie_dict: dict[str, Any]
-                if isinstance(cookie, dict):
-                    cookie_dict = cookie
-                else:
-                    cookie_text = normalize_text(str(cookie))
-                    if cookie_text.startswith("{") and cookie_text.endswith("}"):
-                        parsed = json.loads(cookie_text)
-                        if not isinstance(parsed, dict):
-                            raise ValueError("invalid_cookie_json")
-                        cookie_dict = parsed
-                    else:
-                        cookie_dict = {}
-                        for part in cookie_text.split(";"):
-                            seg = part.strip()
-                            if not seg or "=" not in seg:
-                                continue
-                            k, v = seg.split("=", 1)
-                            key = normalize_text(k)
-                            if key:
-                                cookie_dict[key] = v.strip()
-                sessdata = normalize_text(
-                    str(cookie_dict.get("SESSDATA", "") or cookie_dict.get("sessdata", ""))
-                )
-                bili_jct = normalize_text(
-                    str(cookie_dict.get("bili_jct", "") or cookie_dict.get("BILI_JCT", ""))
-                )
-                if not sessdata:
-                    return JSONResponse({"error": "B站 Cookie 缺少 SESSDATA"}, status_code=400)
-
-                if "video_analysis" not in config:
-                    config["video_analysis"] = {}
-                if "bilibili" not in config["video_analysis"]:
-                    config["video_analysis"]["bilibili"] = {}
-
-                config["video_analysis"]["bilibili"]["sessdata"] = sessdata
-                config["video_analysis"]["bilibili"]["bili_jct"] = bili_jct
-            except Exception:
-                return JSONResponse({"error": "B站 Cookie 格式错误"}, status_code=400)
-
-        elif platform in ["douyin", "kuaishou", "qzone"]:
-            if "video_analysis" not in config:
-                config["video_analysis"] = {}
-            if platform not in config["video_analysis"]:
-                config["video_analysis"][platform] = {}
-
-            config["video_analysis"][platform]["cookie"] = cookie
-        else:
-            return JSONResponse({"error": "不支持的平台"}, status_code=400)
-
-        # 保存配置
-        config_file.write_text(
-            yaml.safe_dump(config, allow_unicode=True, default_flow_style=False),
-            encoding="utf-8"
-        )
-
-        return JSONResponse({"message": f"{platform} Cookie 保存成功"})
-
-    except Exception as e:
-        _log.error(f"Cookie 保存失败: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
-
-
 # ============================================================================
 # Setup Mode Endpoints
 # ============================================================================
 
-_setup_done = False
-_setup_uvicorn_server: Any | None = None
-_setup_bili_qr_sessions: dict[str, dict[str, Any]] = {}
-_SETUP_BILI_QR_TTL_SECONDS = 150
-
-setup_router = APIRouter(prefix="/api/webui/setup", tags=["setup"])
-
-_SETUP_COOKIE_PLATFORM_DOMAINS: dict[str, list[str]] = {
-    "bilibili": [".bilibili.com"],
-    "douyin": [".douyin.com"],
-    "kuaishou": [".kuaishou.com"],
-    "qzone": [".qq.com", ".i.qq.com", ".qzone.qq.com"],
-}
-
-_SETUP_COOKIE_PLATFORM_SITES: dict[str, str] = {
-    "bilibili": "bilibili.com",
-    "douyin": "douyin.com",
-    "kuaishou": "kuaishou.com",
-    "qzone": "qzone.qq.com",
-}
-
-_SETUP_COOKIE_IMPORTANT_KEYS = {
-    "bilibili": ["SESSDATA", "bili_jct"],
-    "douyin": ["sessionid", "ttwid"],
-    "kuaishou": ["kuaishou.sid", "userId"],
-    "qzone": ["p_skey", "p_uin"],
-}
-
-_SETUP_API_ENV_MAP = {
-    "skiapi": "${SKIAPI_KEY}",
-    "openai": "${OPENAI_API_KEY}",
-    "deepseek": "${DEEPSEEK_API_KEY}",
-    "newapi": "${NEWAPI_API_KEY}",
-    "anthropic": "${ANTHROPIC_API_KEY}",
-    "gemini": "${GEMINI_API_KEY}",
-    "openrouter": "${OPENROUTER_API_KEY}",
-    "xai": "${XAI_API_KEY}",
-    "qwen": "${QWEN_API_KEY}",
-    "moonshot": "${MOONSHOT_API_KEY}",
-    "mistral": "${MISTRAL_API_KEY}",
-    "zhipu": "${ZHIPU_API_KEY}",
-    "siliconflow": "${SILICONFLOW_API_KEY}",
-}
-
-
-def _cleanup_bilibili_qr_sessions() -> None:
-    now = time.time()
-    expired = [
-        sid for sid, data in _setup_bili_qr_sessions.items()
-        if now - float(data.get("created_at", 0.0) or 0.0) >= _SETUP_BILI_QR_TTL_SECONDS
-    ]
-    for sid in expired:
-        _setup_bili_qr_sessions.pop(sid, None)
-
-
-def _cookie_capabilities_payload() -> dict[str, Any]:
-    from core.cookie_auth import get_cookie_runtime_capabilities
-    payload = get_cookie_runtime_capabilities()
-    payload["qr_session_ttl_seconds"] = _SETUP_BILI_QR_TTL_SECONDS
-    return payload
-
-
-async def _start_bilibili_qr_session() -> dict[str, Any]:
-    from core.cookie_auth import bilibili_qr_create_session
-
-    _cleanup_bilibili_qr_sessions()
-    session = await bilibili_qr_create_session()
-    if not session:
-        return {"ok": False, "message": "当前环境未启用 B站扫码依赖，请安装 bilibili-api-python 后重试"}
-
-    session_id = uuid.uuid4().hex
-    _setup_bili_qr_sessions[session_id] = {
-        "qr": session.get("qr"),
-        "created_at": time.time(),
-    }
-    return {
-        "ok": True,
-        "session_id": session_id,
-        "qr_url": str(session.get("qr_url", "") or ""),
-        "qr_image_data_uri": str(session.get("qr_image_data_uri", "") or ""),
-        "qr_terminal": str(session.get("qr_terminal", "") or ""),
-        "expires_in_seconds": int(session.get("timeout_seconds", 120) or 120),
-        "message": "请使用 B站 App 扫描二维码并在手机确认",
-    }
-
-
-async def _bilibili_qr_status(session_id: str) -> dict[str, Any]:
-    from core.cookie_auth import bilibili_qr_check_state
-
-    _cleanup_bilibili_qr_sessions()
-    item = _setup_bili_qr_sessions.get(session_id)
-    if not item:
-        return {"ok": False, "status": "expired", "message": "二维码会话不存在或已过期，请重新获取"}
-
-    qr = item.get("qr")
-    if qr is None:
-        _setup_bili_qr_sessions.pop(session_id, None)
-        return {"ok": False, "status": "error", "message": "二维码会话异常，请重新获取"}
-
-    result = await bilibili_qr_check_state(qr)
-    status = str(result.get("status", "") or "")
-    if status in {"done", "expired", "error"}:
-        _setup_bili_qr_sessions.pop(session_id, None)
-    return result
-
-
-def _cancel_bilibili_qr_session(session_id: str) -> dict[str, Any]:
-    _cleanup_bilibili_qr_sessions()
-    existed = bool(_setup_bili_qr_sessions.pop(session_id, None))
-    return {"ok": True, "cancelled": existed}
-
-_SETUP_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
-    "skiapi": {"model": "claude-opus-4-6", "base_url": "https://skiapi.dev", "endpoint_type": "openai"},
-    "openai": {"model": "gpt-5.2", "base_url": "https://api.openai.com", "endpoint_type": "openai_response"},
-    "anthropic": {"model": "claude-sonnet-4-5-20250929", "base_url": "https://api.anthropic.com", "endpoint_type": "anthropic"},
-    "gemini": {"model": "gemini-2.5-pro", "base_url": "https://generativelanguage.googleapis.com", "endpoint_type": "gemini"},
-    "deepseek": {"model": "deepseek-chat", "base_url": "https://api.deepseek.com", "endpoint_type": "openai"},
-    "newapi": {"model": "gpt-5-codex", "base_url": "https://api.openai.com/v1", "endpoint_type": "openai"},
-    "openrouter": {"model": "openrouter/auto", "base_url": "https://openrouter.ai/api/v1", "endpoint_type": "openai"},
-    "xai": {"model": "grok-4.1-mini", "base_url": "https://api.x.ai/v1", "endpoint_type": "openai"},
-    "qwen": {"model": "qwen-max-latest", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "endpoint_type": "openai"},
-    "moonshot": {"model": "kimi-thinking-preview", "base_url": "https://api.moonshot.cn/v1", "endpoint_type": "openai"},
-    "mistral": {"model": "mistral-medium-latest", "base_url": "https://api.mistral.ai", "endpoint_type": "openai"},
-    "zhipu": {"model": "glm-4-plus", "base_url": "https://open.bigmodel.cn/api/paas/v4", "endpoint_type": "openai"},
-    "siliconflow": {"model": "Qwen/Qwen2.5-72B-Instruct", "base_url": "https://api.siliconflow.cn/v1", "endpoint_type": "openai"},
-}
-
-_SETUP_IMAGE_PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
-    "skiapi": {"model": "grok-imagine-1.0", "base_url": "https://skiapi.dev/v1", "env": "${SKIAPI_KEY}"},
-    "openai": {"model": "dall-e-3", "base_url": "https://api.openai.com/v1", "env": "${OPENAI_API_KEY}"},
-    "xai": {"model": "grok-imagine-1.0", "base_url": "https://api.x.ai/v1", "env": "${XAI_API_KEY}"},
-    "flux": {"model": "flux-1-schnell", "base_url": "https://api.siliconflow.cn/v1", "env": "${SILICONFLOW_API_KEY}"},
-    "sd": {"model": "stable-diffusion-xl", "base_url": "http://127.0.0.1:7860", "env": "${API_KEY}"},
-    "custom": {"model": "dall-e-3", "base_url": "", "env": "${API_KEY}"},
-}
-
-_SETUP_ENDPOINT_TYPE_OPTIONS = [
-    {"value": "openai_response", "label": "OpenAI-Response"},
-    {"value": "openai", "label": "OpenAI"},
-    {"value": "anthropic", "label": "Anthropic"},
-    {"value": "dmxapi", "label": "DMXAPI"},
-    {"value": "gemini", "label": "Gemini"},
-    {"value": "weiyi_ai", "label": "唯—AI (A)"},
-]
-
-
-def _setup_candidate_base_urls(base_url: str, prefer_v1: bool = True) -> list[str]:
-    base = normalize_text(base_url).rstrip("/")
-    if not base:
-        return []
-    with_v1 = base if base.endswith("/v1") else f"{base}/v1"
-    without_v1 = base[:-3] if base.endswith("/v1") else base
-    candidates = [with_v1, without_v1] if prefer_v1 else [without_v1, with_v1]
-    uniq: list[str] = []
-    for item in candidates:
-        value = item.rstrip("/")
-        if value and value not in uniq:
-            uniq.append(value)
-    return uniq
-
-
-def _setup_strip_api_version_suffix(base_url: str) -> str:
-    base = normalize_text(base_url).rstrip("/")
-    for suffix in ("/v1beta", "/v1"):
-        if base.endswith(suffix):
-            return base[: -len(suffix)]
-    return base
-
-
-def _setup_normalize_endpoint_type(raw: str, provider: str) -> str:
-    value = normalize_text(raw).lower().replace("-", "_")
-    aliases = {
-        "openairesponse": "openai_response",
-        "openai_response": "openai_response",
-        "responses": "openai_response",
-        "openai": "openai",
-        "chat_completions": "openai",
-        "anthropic": "anthropic",
-        "gemini": "gemini",
-        "dmxapi": "dmxapi",
-        "weiyi": "weiyi_ai",
-        "weiyi_ai": "weiyi_ai",
-        "jina": "jina",
-        "openai_image": "openai_image",
-        "image_openai": "openai_image",
-    }
-    normalized = aliases.get(value, value)
-    if normalized:
-        return normalized
-    return _SETUP_PROVIDER_DEFAULTS.get(provider, {}).get("endpoint_type", "openai")
-
-
-def _setup_resolve_api_key(provider: str, raw_api_key: str) -> str:
-    key = normalize_text(raw_api_key)
-    if key.startswith("${") and key.endswith("}"):
-        env_name = key[2:-1].strip()
-        return normalize_text(os.environ.get(env_name, ""))
-    if key:
-        return key
-    placeholder = _SETUP_API_ENV_MAP.get(provider, "")
-    if placeholder.startswith("${") and placeholder.endswith("}"):
-        env_name = placeholder[2:-1].strip()
-        return normalize_text(os.environ.get(env_name, ""))
-    return ""
-
-
-def _setup_resolve_image_gen_api_key(
-    *,
-    image_provider: str,
-    image_api_key_raw: str,
-    primary_provider: str,
-    primary_api_key_raw: str,
-) -> str:
-    key = normalize_text(image_api_key_raw)
-    if key:
-        return key
-
-    primary_key = normalize_text(primary_api_key_raw)
-    # 主模型与生图同 provider 时，优先复用主模型密钥/占位符。
-    if image_provider == primary_provider:
-        if primary_key:
-            return primary_key
-        return _SETUP_API_ENV_MAP.get(primary_provider, "${API_KEY}")
-
-    # skiapi 密钥（sk-O...）可作为聚合网关生图密钥使用。
-    if primary_key.startswith("sk-O"):
-        return primary_key
-
-    if image_provider in _SETUP_API_ENV_MAP:
-        return _SETUP_API_ENV_MAP.get(image_provider, "${API_KEY}")
-    return _SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_provider, {}).get("env", "${API_KEY}")
-
-
-def _setup_resolve_image_gen_base_url(*, image_provider: str, image_base_url_raw: str, resolved_api_key: str) -> str:
-    base = normalize_text(image_base_url_raw).rstrip("/")
-    if base:
-        return base
-
-    # skiapi 密钥优先落到 skiapi 域名，避免 provider 选项与密钥来源不一致。
-    if normalize_text(resolved_api_key).startswith("sk-O"):
-        return "https://skiapi.dev/v1"
-
-    provider_default = _SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_provider, {})
-    base = normalize_text(provider_default.get("base_url", "")).rstrip("/")
-    if not base:
-        base = normalize_text(_SETUP_PROVIDER_DEFAULTS.get(image_provider, {}).get("base_url", "")).rstrip("/")
-    if not base:
-        return ""
-    if base.endswith("/v1"):
-        return base
-    return f"{base}/v1"
-
-
-def _normalize_image_gen_models_for_save(
-    incoming_models: Any,
-    existing_models: Any,
-    default_provider: str = "openai",
-) -> list[dict[str, Any]]:
-    normalized: list[dict[str, Any]] = []
-    old_lookup: dict[str, dict[str, Any]] = {}
-
-    if isinstance(existing_models, list):
-        for item in existing_models:
-            if not isinstance(item, dict):
-                continue
-            for key in (
-                normalize_text(str(item.get("name", ""))).lower(),
-                normalize_text(str(item.get("model", ""))).lower(),
-            ):
-                if key:
-                    old_lookup[key] = item
-
-    if not isinstance(incoming_models, list):
-        return normalized
-
-    for raw in incoming_models:
-        if not isinstance(raw, dict):
-            continue
-        item = copy.deepcopy(raw)
-        provider = normalize_text(str(item.get("provider", ""))).lower() or default_provider or "openai"
-        model_name = normalize_text(str(item.get("model", ""))) or normalize_text(str(item.get("name", "")))
-        if not model_name:
-            continue
-        name = normalize_text(str(item.get("name", ""))) or model_name
-        item["provider"] = provider
-        item["model"] = model_name
-        item["name"] = name
-
-        lookup = old_lookup.get(name.lower()) or old_lookup.get(model_name.lower())
-        api_key = str(item.get("api_key", "")).strip()
-        if api_key == "***":
-            if isinstance(lookup, dict) and lookup.get("api_key"):
-                item["api_key"] = lookup.get("api_key")
-            else:
-                item.pop("api_key", None)
-        elif not api_key and isinstance(lookup, dict) and lookup.get("api_key"):
-            item["api_key"] = lookup.get("api_key")
-
-        resolved_key = normalize_text(str(item.get("api_key", "")))
-        api_base = normalize_text(str(item.get("api_base", ""))).rstrip("/")
-        if not api_base:
-            old_base = normalize_text(str(lookup.get("api_base", ""))).rstrip("/") if isinstance(lookup, dict) else ""
-            if old_base:
-                item["api_base"] = old_base
-            else:
-                auto_base = _setup_resolve_image_gen_base_url(
-                    image_provider=provider,
-                    image_base_url_raw="",
-                    resolved_api_key=resolved_key,
-                )
-                if auto_base:
-                    item["api_base"] = auto_base
-        else:
-            item["api_base"] = api_base
-
-        normalized.append(item)
-
-    return normalized
-
-
-def _ensure_image_gen_default_model(image_cfg: dict[str, Any]) -> tuple[str, bool]:
-    """确保 default_model 命中 models；未命中时自动回填首个模型。"""
-    if not isinstance(image_cfg, dict):
-        return "", False
-
-    models = image_cfg.get("models", [])
-    if not isinstance(models, list) or not models:
-        return normalize_text(str(image_cfg.get("default_model", ""))), False
-
-    valid_keys: set[str] = set()
-    first_model = ""
-    for item in models:
-        if not isinstance(item, dict):
-            continue
-        model_name = normalize_text(str(item.get("model", "")))
-        display_name = normalize_text(str(item.get("name", "")))
-        if model_name:
-            if not first_model:
-                first_model = model_name
-            valid_keys.add(model_name)
-            valid_keys.add(model_name.lower())
-        if display_name:
-            if not first_model:
-                first_model = display_name
-            valid_keys.add(display_name)
-            valid_keys.add(display_name.lower())
-
-    current_default = normalize_text(str(image_cfg.get("default_model", "")))
-    if not first_model:
-        return current_default, False
-
-    if not current_default:
-        image_cfg["default_model"] = first_model
-        return first_model, True
-
-    if current_default in valid_keys or current_default.lower() in valid_keys:
-        return current_default, False
-
-    image_cfg["default_model"] = first_model
-    return first_model, True
-
-
-def _setup_extract_response_text_openai(data: dict[str, Any]) -> str:
-    output_text = normalize_text(str(data.get("output_text", "")))
-    if output_text:
-        return output_text
-
-    output = data.get("output")
-    if isinstance(output, list):
-        parts: list[str] = []
-        for item in output:
-            if not isinstance(item, dict):
-                continue
-            content = item.get("content")
-            if not isinstance(content, list):
-                continue
-            for block in content:
-                if not isinstance(block, dict):
-                    continue
-                text = normalize_text(str(block.get("text", "") or block.get("output_text", "")))
-                if text:
-                    parts.append(text)
-        merged = normalize_text("\n".join(parts))
-        if merged:
-            return merged
-    return ""
-
-
-def _setup_build_config_from_legacy_payload(body: dict[str, Any]) -> dict[str, Any]:
-    provider = normalize_text(str(body.get("provider", "skiapi"))).lower() or "skiapi"
-    defaults = _SETUP_PROVIDER_DEFAULTS.get(provider, _SETUP_PROVIDER_DEFAULTS["skiapi"])
-    model = normalize_text(str(body.get("model", ""))) or defaults.get("model", "")
-    base_url = normalize_text(str(body.get("base_url", "")))
-    endpoint_type = _setup_normalize_endpoint_type(str(body.get("endpoint_type", "")), provider)
-    api_key_raw = normalize_text(str(body.get("api_key", "")))
-
-    api_cfg: dict[str, Any] = {
-        "provider": provider,
-        "model": model,
-        "temperature": 0.7,
-        "max_tokens": 1200,
-        "timeout_seconds": 120,
-        "endpoint_type": endpoint_type,
-    }
-    if base_url:
-        api_cfg["base_url"] = base_url
-    if api_key_raw:
-        api_cfg["api_key"] = api_key_raw
-    else:
-        api_cfg["api_key"] = _SETUP_API_ENV_MAP.get(provider, "${API_KEY}")
-
-    bot_name = normalize_text(str(body.get("bot_name", ""))) or "YuKiKo"
-    allow_search = bool(body.get("search", True))
-    allow_image = bool(body.get("image", True))
-    allow_markdown = bool(body.get("markdown", True))
-    super_admin_qq = normalize_text(str(body.get("super_admin_qq", "")))
-    verbosity = normalize_text(str(body.get("verbosity", "medium"))).lower() or "medium"
-    token_saving = bool(body.get("token_saving", False))
-    music_enable = bool(body.get("music", True))
-    music_api_base = normalize_text(str(body.get("music_api_base", ""))) or "http://mc.alger.fun/api"
-
-    # 图片生成配置
-    image_gen_enable = bool(body.get("image_gen_enable", True))
-    image_gen_provider = normalize_text(str(body.get("image_gen_provider", ""))).lower()
-    if not image_gen_provider:
-        image_gen_provider = provider if provider in _SETUP_IMAGE_PROVIDER_DEFAULTS else "openai"
-    image_defaults = _SETUP_IMAGE_PROVIDER_DEFAULTS.get(image_gen_provider, {})
-    image_gen_api_key = normalize_text(str(body.get("image_gen_api_key", "")))
-    image_gen_base_url = normalize_text(str(body.get("image_gen_base_url", "")))
-    image_gen_model = normalize_text(str(body.get("image_gen_model", ""))) or image_defaults.get("model", "dall-e-3")
-    image_gen_size = normalize_text(str(body.get("image_gen_size", ""))) or "1024x1024"
-
-    resolved_image_gen_api_key = _setup_resolve_image_gen_api_key(
-        image_provider=image_gen_provider,
-        image_api_key_raw=image_gen_api_key,
-        primary_provider=provider,
-        primary_api_key_raw=api_key_raw,
-    )
-    resolved_image_gen_base_url = _setup_resolve_image_gen_base_url(
-        image_provider=image_gen_provider,
-        image_base_url_raw=image_gen_base_url,
-        resolved_api_key=resolved_image_gen_api_key,
-    )
-
-    # 构建图片生成模型配置
-    image_gen_models = []
-    if image_gen_enable:
-        model_config: dict[str, Any] = {
-            # name 统一用模型名，避免与 default_model 脱节导致运行时匹配失败
-            "name": image_gen_model,
-            "provider": image_gen_provider,
-            "model": image_gen_model,
-            "default_size": image_gen_size,
-        }
-        if resolved_image_gen_base_url:
-            model_config["api_base"] = resolved_image_gen_base_url
-        if resolved_image_gen_api_key:
-            model_config["api_key"] = resolved_image_gen_api_key
-        image_gen_models.append(model_config)
-
-    config_data: dict[str, Any] = {
-        "api": api_cfg,
-        "bot": {
-            "name": bot_name,
-            "allow_search": allow_search,
-            "allow_image": allow_image,
-            "allow_markdown": allow_markdown,
-        },
-        "admin": {
-            "super_admin_qq": super_admin_qq,
-            "super_users": [super_admin_qq] if super_admin_qq else [],
-        },
-        "output": {
-            "verbosity": verbosity,
-            "token_saving": token_saving,
-            "style_instruction": "",
-            "group_overrides": {},
-            "group_style_overrides": {},
-        },
-        "music": {
-            "enable": music_enable,
-            "api_base": music_api_base,
-        },
-        "video_analysis": {
-            "bilibili": {
-                "enable": True,
-                "sessdata": normalize_text(str(body.get("bili_sessdata", ""))),
-                "bili_jct": normalize_text(str(body.get("bili_jct", ""))),
-            },
-            "douyin": {
-                "enable": True,
-                "cookie": normalize_text(str(body.get("douyin_cookie", ""))),
-            },
-            "kuaishou": {
-                "enable": True,
-                "cookie": normalize_text(str(body.get("kuaishou_cookie", ""))),
-            },
-            "qzone": {
-                "enable": True,
-                "cookie": normalize_text(str(body.get("qzone_cookie", ""))),
-            },
-        },
-        "image_gen": {
-            "enable": image_gen_enable,
-            "default_model": image_gen_model,
-            "default_size": image_gen_size,
-            "nsfw_filter": True,
-            "post_review_enable": True,
-            "post_review_fail_closed": True,
-            "post_review_model": "",
-            "post_review_max_tokens": 260,
-            "max_prompt_length": 1000,
-            "models": image_gen_models,
-        },
-    }
-    return config_data
-
-
-@setup_router.get("/health")
-async def setup_health():
-    """Setup 模式健康检查。"""
-    return {"status": "setup_mode"}
-
-
-@setup_router.get("/status")
-async def setup_status():
-    """Setup 模式状态。"""
-    config_file = _ROOT_DIR / "config" / "config.yml"
-    return {"setup_done": config_file.exists()}
-
-
-@setup_router.get("/defaults")
-async def setup_defaults():
-    """获取 Setup 默认选项。"""
-    providers = []
-    for key in [
-        "skiapi", "openai", "anthropic", "gemini", "deepseek", "newapi",
-        "openrouter", "xai", "qwen", "moonshot", "mistral", "zhipu", "siliconflow",
-    ]:
-        default_item = _SETUP_PROVIDER_DEFAULTS.get(key, {})
-        label = {
-            "skiapi": "SKIAPI",
-            "openai": "OpenAI",
-            "anthropic": "Anthropic",
-            "gemini": "Gemini",
-            "deepseek": "DeepSeek",
-            "newapi": "NEWAPI",
-            "openrouter": "OpenRouter",
-            "xai": "xAI (Grok)",
-            "qwen": "Qwen",
-            "moonshot": "Moonshot (Kimi)",
-            "mistral": "Mistral",
-            "zhipu": "Zhipu",
-            "siliconflow": "SiliconFlow",
-        }.get(key, key)
-        providers.append(
-            {
-                "value": key,
-                "label": label,
-                "default_model": default_item.get("model", ""),
-                "default_base_url": default_item.get("base_url", ""),
-                "default_endpoint_type": default_item.get("endpoint_type", "openai"),
-            }
-        )
-    return {
-        "providers": providers,
-        "endpoint_types": _SETUP_ENDPOINT_TYPE_OPTIONS,
-        "verbosity_options": [
-            {"value": "verbose", "label": "详细"},
-            {"value": "medium", "label": "中等"},
-            {"value": "brief", "label": "偏短"},
-            {"value": "minimal", "label": "极简"},
-        ],
-    }
-
-
-@setup_router.get("/cookie-capabilities")
-async def setup_cookie_capabilities():
-    """返回 Cookie 自动提取能力（按当前部署环境）。"""
-    return {"ok": True, "data": _cookie_capabilities_payload()}
-
-
-@setup_router.post("/bilibili-qr/start")
-async def setup_bilibili_qr_start():
-    """开始 B站二维码登录会话（Setup 页面）。"""
-    result = await _start_bilibili_qr_session()
-    if not result.get("ok"):
-        return JSONResponse(result, status_code=503)
-    return result
-
-
-@setup_router.get("/bilibili-qr/status")
-async def setup_bilibili_qr_status(session_id: str = Query("")):
-    """轮询 B站二维码状态（Setup 页面）。"""
-    sid = normalize_text(session_id)
-    if not sid:
-        return JSONResponse({"ok": False, "status": "error", "message": "缺少 session_id"}, status_code=400)
-    result = await _bilibili_qr_status(sid)
-    if not result.get("ok") and str(result.get("status", "") or "") in {"expired", "error"}:
-        return JSONResponse(result, status_code=410 if result.get("status") == "expired" else 400)
-    return result
-
-
-@setup_router.post("/bilibili-qr/cancel")
-async def setup_bilibili_qr_cancel(request: Request):
-    """取消 B站二维码会话（Setup 页面）。"""
-    body = await request.json()
-    sid = normalize_text(str(body.get("session_id", "")))
-    if not sid:
-        return JSONResponse({"ok": False, "message": "缺少 session_id"}, status_code=400)
-    return _cancel_bilibili_qr_session(sid)
-
-
-@setup_router.post("/test-api")
-async def setup_test_api(request: Request):
-    """测试 API 配置连通性。"""
-    body = await request.json()
-    provider = normalize_text(str(body.get("provider", "skiapi"))).lower() or "skiapi"
-    defaults = _SETUP_PROVIDER_DEFAULTS.get(provider, _SETUP_PROVIDER_DEFAULTS["skiapi"])
-    endpoint_type = _setup_normalize_endpoint_type(str(body.get("endpoint_type", "")), provider)
-    model = normalize_text(str(body.get("model", ""))) or defaults.get("model", "")
-    base_url = normalize_text(str(body.get("base_url", ""))) or defaults.get("base_url", "")
-    api_key = _setup_resolve_api_key(provider, str(body.get("api_key", "")))
-
-    try:
-        timeout_seconds = max(5.0, min(60.0, float(body.get("timeout_seconds", 18))))
-    except Exception:
-        timeout_seconds = 18.0
-
-    if not model:
-        return {"ok": False, "message": "模型名称不能为空"}
-    if not base_url:
-        return {"ok": False, "message": "Base URL 不能为空"}
-    if not api_key:
-        env_hint = _SETUP_API_ENV_MAP.get(provider, "${API_KEY}")
-        return {"ok": False, "message": f"API Key 为空（可设置环境变量 {env_hint}）"}
-
-    async def _post_json(url: str, headers: dict[str, str], payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds / 2))) as client:
-            response = await client.post(url, headers=headers, json=payload)
-        if response.status_code >= 400:
-            detail = ""
-            try:
-                data = response.json()
-                if isinstance(data, dict):
-                    err = data.get("error")
-                    if isinstance(err, dict):
-                        detail = normalize_text(str(err.get("message", "")))
-                    if not detail:
-                        detail = normalize_text(str(data.get("message", "")))
-            except Exception:
-                detail = ""
-            if not detail:
-                detail = normalize_text((response.text or "")[:220])
-            raise RuntimeError(f"HTTP {response.status_code}: {detail or '请求失败'}")
-        try:
-            data = response.json()
-        except Exception as exc:
-            raise RuntimeError(f"返回非 JSON: {(response.text or '')[:180]}") from exc
-        if not isinstance(data, dict):
-            raise RuntimeError("返回格式异常：顶层不是对象")
-        return response.status_code, data
-
-    async def _post_sse_collect(url: str, headers: dict[str, str], payload: dict[str, Any]) -> tuple[int, str]:
-        """流式(SSE)连通性探测：聚合文本增量，返回最终文本。"""
-        text_parts: list[str] = []
-        status_code = 0
-        last_response_obj: dict[str, Any] = {}
-        async with httpx.AsyncClient(timeout=httpx.Timeout(timeout_seconds, connect=min(10.0, timeout_seconds / 2))) as client:
-            async with client.stream("POST", url, headers=headers, json=payload) as response:
-                status_code = int(response.status_code)
-                if response.status_code >= 400:
-                    body = normalize_text((await response.aread()).decode(errors="ignore")[:220])
-                    raise RuntimeError(f"HTTP {response.status_code}: {body or '请求失败'}")
-
-                async for raw_line in response.aiter_lines():
-                    line = normalize_text(raw_line)
-                    if not line or line.startswith(":"):
-                        continue
-                    if line.startswith("data:"):
-                        line = normalize_text(line[5:])
-                    if not line:
-                        continue
-                    if line == "[DONE]":
-                        break
-                    try:
-                        event = json.loads(line)
-                    except Exception:
-                        continue
-                    if not isinstance(event, dict):
-                        continue
-
-                    # OpenAI Responses 流式事件
-                    event_type = normalize_text(str(event.get("type", ""))).lower()
-                    if event_type == "response.output_text.delta":
-                        delta = event.get("delta")
-                        if delta is not None:
-                            text_parts.append(str(delta))
-                        continue
-                    if event_type == "response.completed":
-                        resp = event.get("response")
-                        if isinstance(resp, dict):
-                            last_response_obj = resp
-                        continue
-                    if event_type in {"error", "response.error"}:
-                        err = event.get("error")
-                        if isinstance(err, dict):
-                            msg = normalize_text(str(err.get("message", "")))
-                            raise RuntimeError(msg or "流式接口返回错误事件")
-                        raise RuntimeError(normalize_text(str(err)) or "流式接口返回错误事件")
-
-                    # 兼容 Chat Completions 风格流式
-                    choices = event.get("choices")
-                    if isinstance(choices, list) and choices:
-                        c0 = choices[0] if isinstance(choices[0], dict) else {}
-                        delta = c0.get("delta") if isinstance(c0.get("delta"), dict) else {}
-                        maybe_content = delta.get("content") if isinstance(delta, dict) else None
-                        if isinstance(maybe_content, str):
-                            text_parts.append(maybe_content)
-                        elif isinstance(maybe_content, list):
-                            for part in maybe_content:
-                                if isinstance(part, dict):
-                                    t = part.get("text")
-                                    if t is not None:
-                                        text_parts.append(str(t))
-                                elif part is not None:
-                                    text_parts.append(str(part))
-
-        merged = normalize_text("".join(text_parts))
-        if merged:
-            return status_code, merged
-        if last_response_obj:
-            recovered = _setup_extract_response_text_openai(last_response_obj)
-            if recovered:
-                return status_code, recovered
-        raise RuntimeError("stream 成功但未返回文本")
-
-    started = time.perf_counter()
-    errors: list[str] = []
-
-    try:
-        # OpenAI 兼容协议族（含 DMXAPI/唯AI/Jina）
-        if endpoint_type in {"openai", "openai_response", "openai_image", "dmxapi", "weiyi_ai", "jina"}:
-            if endpoint_type == "dmxapi" and not normalize_text(str(body.get("base_url", ""))):
-                base_url = "https://www.dmxapi.com/v1"
-            elif endpoint_type == "weiyi_ai" and not normalize_text(str(body.get("base_url", ""))):
-                base_url = "https://api.vveai.com/v1"
-            elif endpoint_type == "jina" and not normalize_text(str(body.get("base_url", ""))):
-                base_url = "https://api.jina.ai/v1"
-
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            }
-            for base in _setup_candidate_base_urls(base_url, prefer_v1=True):
-                try:
-                    if endpoint_type == "openai_response":
-                        payload = {
-                            "model": model,
-                            "input": [
-                                {
-                                    "role": "user",
-                                    "content": [
-                                        {"type": "input_text", "text": "ping"},
-                                    ],
-                                }
-                            ],
-                            "max_output_tokens": 24,
-                            "temperature": 0,
-                        }
-                        try:
-                            status_code, data = await _post_json(f"{base}/responses", headers, payload)
-                            content = _setup_extract_response_text_openai(data)
-                        except Exception as exc:
-                            # 兼容 SkiAPI 等要求 Responses 必须 stream=true 的网关
-                            message = normalize_text(str(exc)).lower()
-                            if "stream must be set to true" not in message and "stream must be true" not in message:
-                                raise
-                            stream_payload = dict(payload)
-                            stream_payload["stream"] = True
-                            status_code, content = await _post_sse_collect(f"{base}/responses", headers, stream_payload)
-                        if not content:
-                            raise RuntimeError("responses 成功但未返回文本")
-                        elapsed_ms = int((time.perf_counter() - started) * 1000)
-                        return {
-                            "ok": True,
-                            "message": f"连接成功（Responses）",
-                            "latency_ms": elapsed_ms,
-                            "status_code": status_code,
-                        }
-
-                    if endpoint_type == "openai_image":
-                        payload = {
-                            "model": model,
-                            "prompt": "API connectivity check image",
-                            "size": "256x256",
-                        }
-                        status_code, data = await _post_json(f"{base}/images/generations", headers, payload)
-                        items = data.get("data")
-                        if not isinstance(items, list) or not items:
-                            raise RuntimeError("images 接口成功但未返回 data")
-                        elapsed_ms = int((time.perf_counter() - started) * 1000)
-                        return {
-                            "ok": True,
-                            "message": f"连接成功（Image Generation）",
-                            "latency_ms": elapsed_ms,
-                            "status_code": status_code,
-                        }
-
-                    payload = {
-                        "model": model,
-                        "messages": [{"role": "user", "content": "ping"}],
-                        "max_tokens": 24,
-                        "temperature": 0,
-                    }
-                    status_code, data = await _post_json(f"{base}/chat/completions", headers, payload)
-                    choices = data.get("choices")
-                    if not isinstance(choices, list) or not choices:
-                        raise RuntimeError("chat/completions 成功但无 choices")
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return {
-                        "ok": True,
-                        "message": "连接成功（Chat Completions）",
-                        "latency_ms": elapsed_ms,
-                        "status_code": status_code,
-                    }
-                except Exception as exc:
-                    errors.append(f"{base} -> {exc}")
-
-        elif endpoint_type == "anthropic":
-            headers = {
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "Content-Type": "application/json",
-            }
-            payload = {
-                "model": model,
-                "messages": [{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
-                "max_tokens": 24,
-                "temperature": 0,
-            }
-            for base in _setup_candidate_base_urls(base_url, prefer_v1=True):
-                try:
-                    status_code, data = await _post_json(f"{base}/messages", headers, payload)
-                    content = data.get("content")
-                    if not isinstance(content, list) or not content:
-                        raise RuntimeError("Anthropic 成功但无 content")
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return {
-                        "ok": True,
-                        "message": "连接成功（Anthropic Messages）",
-                        "latency_ms": elapsed_ms,
-                        "status_code": status_code,
-                    }
-                except Exception as exc:
-                    errors.append(f"{base} -> {exc}")
-
-        elif endpoint_type == "gemini":
-            base_root = _setup_strip_api_version_suffix(base_url)
-            headers = {"Content-Type": "application/json"}
-            model_escaped = model.replace("/", "%2F")
-            payload = {
-                "contents": [{"role": "user", "parts": [{"text": "ping"}]}],
-                "generationConfig": {"temperature": 0, "maxOutputTokens": 24},
-            }
-            for version in ("v1beta", "v1"):
-                url = f"{base_root}/{version}/models/{model_escaped}:generateContent?key={api_key}"
-                try:
-                    status_code, data = await _post_json(url, headers, payload)
-                    candidates = data.get("candidates")
-                    if not isinstance(candidates, list) or not candidates:
-                        raise RuntimeError("Gemini 成功但无 candidates")
-                    elapsed_ms = int((time.perf_counter() - started) * 1000)
-                    return {
-                        "ok": True,
-                        "message": f"连接成功（Gemini {version}）",
-                        "latency_ms": elapsed_ms,
-                        "status_code": status_code,
-                    }
-                except Exception as exc:
-                    errors.append(f"{url} -> {exc}")
-
-        else:
-            return {"ok": False, "message": f"不支持的端点类型: {endpoint_type}"}
-
-    except Exception as exc:
-        return {"ok": False, "message": str(exc)}
-
-    tail = " | ".join(errors[-2:]) if errors else "未知错误"
-    return {
-        "ok": False,
-        "message": f"连通性检测失败: {tail}",
-        "latency_ms": int((time.perf_counter() - started) * 1000),
-    }
-
-
-@setup_router.post("/test-image-gen")
-async def setup_test_image_gen(request: Request):
-    """测试图片生成配置。"""
-    body = await request.json()
-    provider = normalize_text(str(body.get("provider", "openai"))).lower() or "openai"
-    model = normalize_text(str(body.get("model", ""))) or "dall-e-3"
-    api_key = normalize_text(str(body.get("api_key", "")))
-    base_url = normalize_text(str(body.get("base_url", "")))
-    size = normalize_text(str(body.get("size", ""))) or "1024x1024"
-
-    # 使用与主 API 配置相同的默认值
-    if not base_url:
-        # 如果 API key 是 SKIAPI 的（sk-O 开头），强制使用 SKIAPI 域名
-        if api_key and api_key.startswith("sk-O"):
-            base_url = "https://skiapi.dev/v1"
-        else:
-            provider_defaults = _SETUP_PROVIDER_DEFAULTS.get(provider, _SETUP_PROVIDER_DEFAULTS.get("skiapi", {}))
-            base_url = provider_defaults.get("base_url", "https://skiapi.dev")
-            # 确保有 /v1 后缀（除非已经有了）
-            if not base_url.endswith("/v1"):
-                base_url = f"{base_url}/v1"
-
-    # 解析 API Key
-    if not api_key:
-        env_map = {
-            "openai": "OPENAI_API_KEY",
-            "xai": "XAI_API_KEY",
-        }
-        env_var = env_map.get(provider, "SKIAPI_KEY")
-        api_key = os.environ.get(env_var, "")
-        if not api_key:
-            return {"ok": False, "message": f"API Key 为空（可设置环境变量 {env_var}）"}
-
-    try:
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        # 根据模型构建不同的 payload（Grok Imagine 不支持 size）
-        if "grok-imagine" in model.lower():
-            payload = {
-                "model": model,
-                "prompt": "A cute anime catgirl with pink hair, wearing a maid outfit, smiling happily, high quality, detailed",
-                "n": 1,
-            }
-        else:
-            # OpenAI / DALL-E 标准格式
-            payload = {
-                "model": model,
-                "prompt": "A cute anime catgirl with pink hair, wearing a maid outfit, smiling happily, high quality, detailed",
-                "n": 1,
-                "size": size,
-            }
-
-        async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0)) as client:
-            response = await client.post(f"{base_url}/images/generations", headers=headers, json=payload)
-
-        if response.status_code >= 400:
-            detail = ""
-            try:
-                data = response.json()
-                if isinstance(data, dict):
-                    err = data.get("error")
-                    if isinstance(err, dict):
-                        detail = normalize_text(str(err.get("message", "")))
-                    elif isinstance(err, str):
-                        detail = normalize_text(err)
-                    if not detail:
-                        detail = normalize_text(str(data.get("message", "")))
-                    if not detail:
-                        detail = normalize_text(str(data.get("code", "")))
-            except Exception:
-                detail = ""
-            if not detail:
-                detail = normalize_text((response.text or "")[:220])
-            return {"ok": False, "message": f"HTTP {response.status_code}: {detail or '请求失败'}"}
-
-        try:
-            data = response.json()
-        except Exception:
-            return {"ok": False, "message": f"返回非 JSON: {(response.text or '')[:180]}"}
-
-        if not isinstance(data, dict):
-            return {"ok": False, "message": "返回格式异常"}
-
-        # 提取图片 URL
-        image_data = data.get("data")
-        if not isinstance(image_data, list) or not image_data:
-            return {"ok": False, "message": "返回数据中没有图片"}
-
-        image_url = image_data[0].get("url")
-        if not image_url:
-            return {"ok": False, "message": "图片 URL 为空"}
-
-        return {
-            "ok": True,
-            "message": "生成成功",
-            "image_url": image_url,
-        }
-
-    except Exception as exc:
-        return {"ok": False, "message": str(exc)}
-
-
-def _join_cookie_pairs(cookies: dict[str, str], important: list[str] | None = None) -> str:
-    """Join cookie dict into cookie string, pinning important keys first."""
-    if not cookies:
-        return ""
-    parts: list[str] = []
-    pinned = set(important or [])
-    for key in important or []:
-        val = str(cookies.get(key, "") or "")
-        if val:
-            parts.append(f"{key}={val}")
-    for key, val in cookies.items():
-        if key in pinned:
-            continue
-        value = str(val or "")
-        if value:
-            parts.append(f"{key}={value}")
-    return "; ".join(parts)
-
-
-def _format_platform_cookie_payload(
-    platform: str,
-    raw_by_domain: dict[str, dict[str, str]],
-) -> dict[str, str] | None:
-    """Format extracted cookies into the payload expected by the frontend."""
-    if platform == "bilibili":
-        bili = raw_by_domain.get(".bilibili.com", {})
-        sessdata = str(bili.get("SESSDATA", "") or "")
-        if not sessdata:
-            return None
-        return {
-            "sessdata": sessdata,
-            "bili_jct": str(bili.get("bili_jct", "") or ""),
-        }
-
-    if platform == "douyin":
-        dy = raw_by_domain.get(".douyin.com", {})
-        cookie = _join_cookie_pairs(dy, _SETUP_COOKIE_IMPORTANT_KEYS.get("douyin", []))
-        return {"cookie": cookie} if cookie else None
-
-    if platform == "kuaishou":
-        ks = raw_by_domain.get(".kuaishou.com", {})
-        cookie = _join_cookie_pairs(ks)
-        return {"cookie": cookie} if cookie else None
-
-    if platform == "qzone":
-        qq = raw_by_domain.get(".qq.com", {})
-        qz = raw_by_domain.get(".qzone.qq.com", {})
-        iqq = raw_by_domain.get(".i.qq.com", {})
-        merged = {**qq, **iqq, **qz}
-        if not str(merged.get("p_skey", "") or merged.get("skey", "") or ""):
-            return None
-        cookie = _join_cookie_pairs(merged, _SETUP_COOKIE_IMPORTANT_KEYS.get("qzone", []))
-        return {"cookie": cookie} if cookie else None
-
-    return None
-
-
-def _not_found_message(
-    *,
-    platform: str,
-    running: bool,
-    allow_close: bool,
-    sources: dict[str, str],
-) -> str:
-    site = _SETUP_COOKIE_PLATFORM_SITES.get(platform, platform)
-    source_used = ",".join(sorted({str(v) for v in sources.values() if str(v)})) or "none"
-
-    qzone_hint = ""
-    if platform == "qzone":
-        qzone_hint = (
-            "\n\n[QQ Space Cookie Guide]\n"
-            "1. Visit https://qzone.qq.com and login with YOUR QQ account\n"
-            "2. After login, it redirects to https://user.qzone.qq.com/yourQQ\n"
-            "3. Make sure page fully loaded with your posts/albums visible\n"
-            "4. Do NOT just visit others' space, MUST login to YOUR OWN space\n"
-            "5. Chrome/Edge v130+ may need admin privileges"
-        )
-
-    if running and not allow_close:
-        return (
-            f"Not found {site} Cookie. Tried no-close extraction (source={source_used}) failed. "
-            f"Please confirm browser logged in to {site}; "
-            f"if still fails, enable auto-close retry or run as admin."
-            f"{qzone_hint}"
-        )
-
-    if running and allow_close:
-        return (
-            f"Not found {site} Cookie. Tried auto-close retry (source={source_used}) failed. "
-            f"Please confirm account logged in current browser profile."
-            f"{qzone_hint}"
-        )
-
-    return (
-        f"Not found {site} Cookie (source={source_used}). "
-        f"Please login {site} in browser first; "
-        f"If Chromium v130+, recommend running as admin."
-        f"{qzone_hint}"
-    )
-
-
-@setup_router.post("/extract-cookie")
-async def setup_extract_cookie(request: Request):
-    """Extract cookies from browser for a specific platform."""
-    import asyncio
-    body = await request.json()
-    platform = str(body.get("platform", ""))
-    browser = str(body.get("browser", "edge"))
-    allow_close = bool(body.get("allow_close", False))
-    if platform not in _SETUP_COOKIE_PLATFORM_DOMAINS:
-        raise HTTPException(400, f"Unknown platform: {platform}")
-
-    loop = asyncio.get_running_loop()
-    domains = _SETUP_COOKIE_PLATFORM_DOMAINS[platform]
-
-    try:
-        def _extract_platform():
-            from core.cookie_auth import extract_browser_cookies_with_source, is_browser_running
-
-            raw: dict[str, dict[str, str]] = {}
-            sources: dict[str, str] = {}
-            for domain in domains:
-                cookies, source = extract_browser_cookies_with_source(
-                    browser=browser,
-                    domain=domain,
-                    auto_close=allow_close,
-                )
-                sources[domain] = source
-                if cookies:
-                    raw[domain] = cookies
-            running = bool(is_browser_running(browser))
-            return raw, sources, running
-
-        raw_by_domain, sources, running = await loop.run_in_executor(None, _extract_platform)
-        payload = _format_platform_cookie_payload(platform, raw_by_domain)
-
-        _log.info(
-            "setup_extract_cookie | platform=%s | browser=%s | allow_close=%s | sources=%s | ok=%s",
-            platform, browser, allow_close, sources, bool(payload),
-        )
-
-        if payload:
-            return {
-                "ok": True,
-                "data": payload,
-                "meta": {"browser": browser, "sources": sources, "running": running},
-            }
-        return {
-            "ok": False,
-            "message": _not_found_message(
-                platform=platform, running=running,
-                allow_close=allow_close, sources=sources,
-            ),
-            "meta": {"browser": browser, "sources": sources, "running": running, "allow_close": allow_close},
-        }
-    except ImportError as exc:
-        return {"ok": False, "message": f"Missing dependency: {exc}"}
-    except Exception as exc:
-        return {"ok": False, "message": str(exc)}
-
-
-# Smart extract state
-_smart_extract_result: dict | None = None
-_smart_extract_meta: dict | None = None
-_smart_extract_status: str = "idle"  # idle | running | done | error
-_smart_extract_error: str = ""
-
-
-@setup_router.post("/smart-extract")
-async def setup_smart_extract(request: Request):
-    """Smart extract all platform cookies (default: no browser restart)."""
-    import asyncio
-    global _smart_extract_result, _smart_extract_meta, _smart_extract_status, _smart_extract_error
-
-    if _smart_extract_status == "running":
-        return {"ok": False, "message": "Extraction in progress, please wait..."}
-
-    body = await request.json()
-    browser = str(body.get("browser", "edge"))
-    allow_close = bool(body.get("allow_close", False))
-    setup_url = str(request.base_url).rstrip("/") + "/webui/setup"
-
-    _smart_extract_status = "running"
-    _smart_extract_result = None
-    _smart_extract_meta = None
-    _smart_extract_error = ""
-
-    loop = asyncio.get_running_loop()
-
-    async def _do_extract():
-        global _smart_extract_result, _smart_extract_meta, _smart_extract_status, _smart_extract_error
-        try:
-            def _sync_extract():
-                from core.cookie_auth import smart_extract_all_cookies, smart_extract_all_cookies_no_restart
-                mode = "no_restart"
-                restart_attempted = False
-                raw, meta = smart_extract_all_cookies_no_restart(
-                    browser=browser, include_meta=True,
-                )
-                # If allow_close and some platforms missing, try restart approach
-                if allow_close:
-                    missing = [d for d in [".bilibili.com", ".douyin.com", ".kuaishou.com", ".qq.com", ".qzone.qq.com"]
-                               if d not in raw or not raw[d]]
-                    if missing:
-                        restart_attempted = True
-                        restarted = smart_extract_all_cookies(
-                            browser=browser, setup_url=setup_url,
-                            domains=missing,
-                        )
-                        if restarted:
-                            mode = "restart"
-                        for d, cookies in restarted.items():
-                            if cookies and (d not in raw or len(cookies) > len(raw.get(d, {}))):
-                                raw[d] = cookies
-                return raw, meta, mode, restart_attempted
-
-            raw, meta, mode, restart_attempted = await loop.run_in_executor(None, _sync_extract)
-
-            # Format per-platform
-            result = {}
-            platform_counts: dict[str, int] = {}
-            for platform in ["bilibili", "douyin", "kuaishou", "qzone"]:
-                payload = _format_platform_cookie_payload(platform, raw)
-                if payload:
-                    result[platform] = payload
-                    platform_counts[platform] = len(payload)
-                else:
-                    platform_counts[platform] = 0
-
-            _smart_extract_result = result
-            _smart_extract_meta = {
-                "browser": browser,
-                "sources": meta.get("sources", {}),
-                "warnings": meta.get("warnings", []),
-                "mode": mode,
-                "restart_attempted": restart_attempted,
-                "platform_counts": platform_counts,
-                "found_platforms": sorted(result.keys()),
-            }
-            _smart_extract_status = "done"
-        except Exception as exc:
-            _smart_extract_status = "error"
-            _smart_extract_error = str(exc)
-
-    asyncio.create_task(_do_extract())
-    return {"ok": True, "status": "running"}
-
-
-@setup_router.get("/smart-extract-result")
-async def setup_smart_extract_result():
-    """Get smart extraction result."""
-    if _smart_extract_status == "idle":
-        return {"status": "idle"}
-    elif _smart_extract_status == "running":
-        return {"status": "running"}
-    elif _smart_extract_status == "error":
-        return {"status": "error", "message": _smart_extract_error}
-    else:
-        return {"status": "done", "data": _smart_extract_result, "meta": _smart_extract_meta or {}}
-
-
-@setup_router.post("/save")
-async def setup_save(request: Request):
-    """保存 Setup 配置。"""
-    body = await request.json()
-    config_data = body.get("config")
-    if not isinstance(config_data, dict):
-        config_data = _setup_build_config_from_legacy_payload(body if isinstance(body, dict) else {})
-
-    if not isinstance(config_data, dict):
-        raise HTTPException(400, "config 必须是对象")
-
-    current_config_file = _ROOT_DIR / "config" / "config.yml"
-    current_config_data = (
-        _load_yaml_dict(current_config_file) if current_config_file.exists() else {}
-    )
-    if isinstance(current_config_data, dict):
-        config_data = _restore_masked_sensitive_values(config_data, current_config_data)
-
-    # 加密敏感字段
-    try:
-        from core.crypto import SecretManager
-        sm = SecretManager(_ROOT_DIR / "storage" / ".secret_key")
-
-        # 加密 API key
-        api_cfg = config_data.get("api", {})
-        if "api_key" in api_cfg:
-            api_key = normalize_text(str(api_cfg.get("api_key", "")))
-            if not api_key:
-                api_cfg.pop("api_key", None)
-            elif _is_masked_secret_placeholder(api_key):
-                api_cfg.pop("api_key", None)
-            elif not (api_key.startswith("${") and api_key.endswith("}")) and not SecretManager.is_encrypted(api_key):
-                api_cfg["api_key"] = sm.encrypt(api_key)
-
-        # 加密 cookie
-        video_cfg = config_data.get("video_analysis", {})
-        if "bilibili" in video_cfg:
-            bili = video_cfg["bilibili"]
-            if "sessdata" in bili and bili["sessdata"]:
-                bili["sessdata"] = sm.encrypt(str(bili["sessdata"]))
-            if "bili_jct" in bili and bili["bili_jct"]:
-                bili["bili_jct"] = sm.encrypt(str(bili["bili_jct"]))
-
-        for platform in ["douyin", "kuaishou", "qzone"]:
-            if platform in video_cfg and "cookie" in video_cfg[platform]:
-                cookie = video_cfg[platform]["cookie"]
-                if cookie:
-                    video_cfg[platform]["cookie"] = sm.encrypt(str(cookie))
-
-        # 加密 image_gen 模型 API key
-        image_gen_cfg = config_data.get("image_gen", {})
-        models = image_gen_cfg.get("models", []) if isinstance(image_gen_cfg, dict) else []
-        if isinstance(models, list):
-            for model_cfg in models:
-                if not isinstance(model_cfg, dict):
-                    continue
-                api_key = normalize_text(str(model_cfg.get("api_key", "")))
-                if not api_key:
-                    continue
-                if api_key.startswith("${") and api_key.endswith("}"):
-                    continue
-                if SecretManager.is_encrypted(api_key):
-                    continue
-                model_cfg["api_key"] = sm.encrypt(api_key)
-
-    except Exception as e:
-        _log.warning(f"加密失败，使用明文存储: {e}")
-
-    # 合并到模板
-    template = load_config_template()
-    merged = _deep_merge_template(template, _strip_deprecated_local_paths_config(config_data))
-
-    # 写入配置文件
-    config_file = _ROOT_DIR / "config" / "config.yml"
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-
-    header = (
-        "# YuKiKo Bot 配置文件\n"
-        "# 由 WebUI Setup 自动生成\n"
-        "# 修改后发送 /yukibot 或 /yukiko 即可热重载\n\n"
-    )
-
-    with open(config_file, "w", encoding="utf-8") as f:
-        f.write(header)
-        yaml.safe_dump(merged, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-
-    # 确保 prompts.yml 存在
-    _ensure_prompts_file_from_template(_PROMPTS_FILE)
-
-    _log.info("Setup 配置已保存")
-
-    # 停止 setup server
-    global _setup_uvicorn_server
-    if _setup_uvicorn_server:
-        _setup_uvicorn_server.should_exit = True
-
-    return {"ok": True, "message": "配置已保存，Setup 完成"}
-
-
-def _make_spa_app(dist_dir: Path, api_router: APIRouter):
-    """创建 SPA 应用（用于 Setup 模式）。"""
-    from fastapi import FastAPI
-    from starlette.staticfiles import StaticFiles
-    from starlette.responses import FileResponse, Response
-
-    app = FastAPI()
-    app.include_router(api_router)
-
-    if dist_dir.exists():
-        index_file = dist_dir / "index.html"
-        assets_dir = dist_dir / "assets"
-
-        if assets_dir.exists():
-            app.mount("/webui/assets", StaticFiles(directory=str(assets_dir)), name="assets")
-
-        @app.get("/webui/{path:path}")
-        async def spa_handler(path: str):
-            if path.lower().startswith("setup"):
-                if index_file.exists():
-                    return FileResponse(index_file)
-            file_path = dist_dir / path
-            if file_path.is_file() and ".." not in path:
-                return FileResponse(file_path)
-            if index_file.exists():
-                return FileResponse(index_file)
-            return Response("Not found", status_code=404)
-
-        @app.get("/webui")
-        async def spa_root():
-            if index_file.exists():
-                return FileResponse(index_file)
-            return Response("Not found", status_code=404)
-
-        @app.get("/")
-        async def root_redirect():
-            from starlette.responses import RedirectResponse
-            return RedirectResponse(url="/webui/setup", status_code=307)
-
-    return app
-
-
 def run_setup_server(host: str = "127.0.0.1", port: int = 8081):
     """运行 Setup 服务器。"""
-    import uvicorn
-
-    # 构建 SPA 应用
-    webui_dist = Path(__file__).resolve().parents[1] / "webui" / "dist"
-    app = _make_spa_app(webui_dist, api_router=setup_router)
-
-    print(f"\n  YuKiKo 首次运行配置向导")
-    print(f"  请在浏览器打开: http://{host}:{port}/webui/setup\n")
-
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning")
-    server = uvicorn.Server(config)
-
-    global _setup_uvicorn_server
-    _setup_uvicorn_server = server
-
-    try:
-        server.run()
-    finally:
-        _setup_uvicorn_server = None
+    return _setup_support.run_setup_server(host=host, port=port)

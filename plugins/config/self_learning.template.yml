@@ -1,16 +1,31 @@
 # SelfLearning 插件配置模板
 
 # 是否启用自我学习功能
-enabled: true
+enabled: false
+
+# 是否允许执行自生成/外部提供的 Python 代码
+# ⚠️ 当前实现是“最佳努力受限运行”，不是强隔离沙盒
+allow_code_execution: false
+
+# 是否已明确接受“非强隔离，仅限受信任代码”的风险
+acknowledge_unsafe_execution: false
+
+# 代码执行后端
+# - disabled: 禁用执行（默认）
+# - local_subprocess: 本地 subprocess 受限运行，仅限受信任开发场景
+execution_backend: disabled
+
+# 危险功能是否仅允许 super_admin 使用
+super_admin_only: true
 
 # 沙盒模式
-# - isolated: 完全隔离的沙盒环境（推荐）
-# - restricted: 受限环境，可访问部分系统资源
-# - full: 完全访问（危险，仅用于开发）
+# - isolated: 最佳努力隔离（非强沙盒）
+# - restricted: 受限运行（非强沙盒）
+# - full: 完全访问（危险，仅用于受信任开发）
 sandbox_mode: isolated
 
 # 是否自动测试新创建的代码
-auto_test: true
+auto_test: false
 
 # 是否在群里广播 DEVLOG
 devlog_broadcast: true
@@ -22,7 +37,7 @@ devlog_broadcast: true
 learning_source: both
 
 # 是否保存成功的技能
-save_skills: true
+save_skills: false
 
 # 最大学习时间（秒）
 max_learning_time_seconds: 300
@@ -31,7 +46,7 @@ max_learning_time_seconds: 300
 max_code_lines: 500
 
 # 测试超时时间（秒）
-test_timeout_seconds: 60
+test_timeout_seconds: 15
 
 # DEVLOG 发送冷却时间（秒）
 devlog_cooldown_seconds: 30

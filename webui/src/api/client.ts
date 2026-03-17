@@ -2,9 +2,11 @@ const BASE = "/api/webui";
 
 class ApiClient {
   private token = "";
+  private sessionReady = false;
 
   setToken(t: string) {
     this.token = t;
+    this.sessionReady = false;
     localStorage.setItem("webui_token", t);
   }
 
@@ -17,7 +19,33 @@ class ApiClient {
 
   clearToken() {
     this.token = "";
+    this.sessionReady = false;
     localStorage.removeItem("webui_token");
+  }
+
+  async ensureSessionCookie(): Promise<boolean> {
+    const token = this.getToken().trim();
+    if (!token) return false;
+    if (this.sessionReady) return true;
+    const res = await fetch(`${BASE}/auth`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      credentials: "same-origin",
+      body: JSON.stringify({ token }),
+    });
+    if (res.status === 401) {
+      this.clearToken();
+      return false;
+    }
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `HTTP ${res.status}`);
+    }
+    this.sessionReady = true;
+    return true;
   }
 
   private async fetchWithAuth(path: string, opts?: RequestInit): Promise<Response> {
@@ -30,6 +58,7 @@ class ApiClient {
     const res = await fetch(`${BASE}${path}`, {
       ...opts,
       headers,
+      credentials: "same-origin",
     });
     if (res.status === 401) {
       this.clearToken();
@@ -58,6 +87,20 @@ class ApiClient {
       method: "POST",
       body: JSON.stringify({ token }),
     });
+  }
+
+  async logout() {
+    try {
+      await fetch(`${BASE}/auth/logout`, {
+        method: "POST",
+        headers: this.getToken()
+          ? { Authorization: `Bearer ${this.getToken()}` }
+          : undefined,
+        credentials: "same-origin",
+      });
+    } finally {
+      this.clearToken();
+    }
   }
 
   getStatus() {
@@ -418,8 +461,7 @@ class ApiClient {
 
   logsStreamUrl(): string {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const token = encodeURIComponent(this.getToken());
-    return `${proto}//${location.host}/api/webui/logs/stream?token=${token}`;
+    return `${proto}//${location.host}/api/webui/logs/stream`;
   }
 }
 

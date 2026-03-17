@@ -20,24 +20,34 @@ import httpx
 from utils.text import normalize_matching_text
 
 _log = logging.getLogger("yukiko.image_gen")
+IMAGE_PROMPT_BLOCKED_MESSAGE = "检测到不适当内容，已拒绝生成。"
+_PROMPT_REVIEW_BLOCK_MESSAGE = "提示词未通过合规审查，已拒绝生成。"
+_PROMPT_REVIEW_SYSTEM_PROMPT = (
+    "你是图片提示词合规审核器。"
+    "目标是判定该提示词是否可能产出 QQ 平台封号级高风险内容。"
+    "必须只输出 JSON，不要解释。"
+    '格式: {"legal": true/false, "level": "safe|risky|blocked", "reason": "简短中文原因"}。'
+    "判定原则：露骨性器官/性行为/未成年相关/成人色情请求(含黑话、谐音、缩写、拆字伪装) => legal=false。"
+    "正常审美类词（如泳装、比基尼）在不含露骨导向时可判 legal=true。"
+)
 
-# ── NSFW 关键词黑名单（中英文） ──
-_NSFW_KEYWORDS_ZH = frozenset({
-    "裸体", "全裸", "赤裸", "裸照", "裸图", "露点", "露胸", "露乳", "露阴",
-    "色情", "情色", "淫秽", "黄色", "黄图", "色图", "涩图", "瑟图", "福利图",
-    "成人", "18禁", "18x", "r18", "r-18", "无码", "有码", "里番", "本子", "av",
+# ── QQ 封号级高危内容（前置硬拦截，仅覆盖露骨/违法高风险） ──
+_QQ_BAN_RISK_TERMS_ZH = frozenset({
+    "裸体", "全裸", "赤裸", "裸照", "裸图", "露点", "露胸", "露乳", "露阴", "露穴", "露逼",
+    "色情", "情色", "淫秽", "黄图", "色图", "涩图", "瑟图", "福利图",
+    "18禁", "18x", "r18", "r-18", "无码", "有码", "里番", "本子",
     "性行为", "做爱", "性交", "口交", "肛交", "内射", "颜射", "轮奸", "群交",
-    "乳房", "奶头", "阴道", "阴部", "阴茎", "鸡巴", "龟头", "私处",
-    "脱衣", "脱光", "内衣", "比基尼", "泳装",
+    "阴道", "阴部", "阴茎", "鸡巴", "龟头", "私处", "未成年色情", "儿童色情", "幼女色情",
+    "奶子", "乃子", "奶孑", "巨乳", "大奶", "乳头", "奶头", "乳交",
+    "阴户", "阴唇", "阴蒂", "屄",
 })
-_NSFW_KEYWORDS_EN = frozenset({
+_QQ_BAN_RISK_TERMS_EN = frozenset({
     "nude", "nudes", "naked", "nsfw", "porn", "pornographic", "xxx",
-    "hentai", "erotic", "sexual", "explicit", "r18", "r-18", "lewd",
-    "topless", "boobs", "breasts", "nipples", "vagina", "penis",
-    "dick", "anal", "blowjob", "cumshot", "fetish", "bdsm",
-    "underwear", "lingerie", "bikini", "swimsuit",
+    "hentai", "sexual", "explicit", "r18", "r-18", "topless",
+    "vagina", "penis", "dick", "anal", "blowjob", "cumshot", "underage",
+    "childporn", "adultcontent",
 })
-_NSFW_REGEX_PATTERNS = (
+_QQ_BAN_RISK_REGEX_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"r[\W_]*1[\W_]*8", re.IGNORECASE),
     re.compile(r"n[\W_]*s[\W_]*f[\W_]*w", re.IGNORECASE),
     re.compile(r"p[\W_]*o[\W_]*r[\W_]*n", re.IGNORECASE),
@@ -47,33 +57,271 @@ _NSFW_REGEX_PATTERNS = (
     re.compile(r"(?:露|漏)\s*(?:点|胸|乳|阴|穴|臀|私处)"),
     re.compile(r"(?:口|肛|阴|性)\s*交"),
     re.compile(r"(?:做|干)\s*爱"),
+    re.compile(r"(?:内|颜)\s*射"),
     re.compile(r"(?:成人|色情|黄色)\s*(?:图|图片|插画|写真|内容|漫画|视频)"),
+    re.compile(r"(?:未成年|幼女|儿童)[^\n。！？!?]{0,10}(?:色情|性|裸|r[\W_]*1[\W_]*8|porn)"),
+    re.compile(r"(?:porn|adult)\s*(?:image|art|photo|anime|content|girl|boy)s?", re.IGNORECASE),
+    re.compile(r"(?<![a-z0-9])a[\W_]*v(?![a-z0-9])", re.IGNORECASE),
+)
+_QQ_BAN_RISK_SLANG_REGEX_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?:奶|乃)\s*(?:子|孑|仔|籽|崽)"),
+    re.compile(r"n[\W_]*a[\W_]*i[\W_]*z[\W_]*i", re.IGNORECASE),
+    re.compile(r"(?:巨|大|丰|豐)\s*(?:奶|乳)"),
+    re.compile(r"(?:乳|奶)\s*(?:头|頭|子|交|夹|夾)"),
+    re.compile(r"(?:露|漏|摸|揉|舔|吸|含|玩|操|干|艹|插|扣)\s*(?:b|逼|屄|批|阴户|陰戶|阴部|陰部)", re.IGNORECASE),
+    re.compile(r"(?:露|漏)\s*[bB](?:\W|$)", re.IGNORECASE),
 )
 
 
-def _compact_nsfw_text(text: str) -> str:
+def _compact_risk_text(text: str) -> str:
     normalized = normalize_matching_text(text).lower()
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", normalized)
 
 
-def detect_nsfw_prompt_reason(prompt: str) -> str:
-    """返回命中的 NSFW 规则；空字符串表示未命中。"""
-    raw = str(prompt or "")
+def _compact_nsfw_text(text: str) -> str:
+    """兼容旧命名。"""
+    return _compact_risk_text(text)
+
+
+def _normalized_risk_texts(text: str) -> tuple[str, str, str]:
+    raw = str(text or "")
+    lowered = normalize_matching_text(raw).lower()
+    compact = _compact_risk_text(raw)
+    return raw, lowered, compact
+
+
+def _match_any_pattern(patterns: tuple[re.Pattern[str], ...], texts: tuple[str, ...]) -> str:
+    for pattern in patterns:
+        if any(pattern.search(item) for item in texts):
+            return f"{pattern.pattern}"
+    return ""
+
+
+def _contains_english_term(text: str, compact: str, term: str) -> bool:
+    boundary = re.compile(
+        rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])",
+        re.IGNORECASE,
+    )
+    if boundary.search(text):
+        return True
+    if len(term) >= 3 and term in compact:
+        return True
+    return False
+
+
+def detect_qq_ban_risk_reason(prompt: str) -> str:
+    """返回 QQ 封号级高危命中规则；空字符串表示未命中。"""
+    raw, lowered, compact = _normalized_risk_texts(prompt)
     if not raw.strip():
         return ""
-    lowered = normalize_matching_text(raw).lower()
-    compact = _compact_nsfw_text(raw)
+    scan_texts = (raw, lowered, compact)
 
-    for kw in _NSFW_KEYWORDS_EN:
+    strict_match = _match_any_pattern(_QQ_BAN_RISK_REGEX_PATTERNS, scan_texts)
+    if strict_match:
+        return f"regex:{strict_match}"
+    slang_match = _match_any_pattern(_QQ_BAN_RISK_SLANG_REGEX_PATTERNS, scan_texts)
+    if slang_match:
+        return f"slang:{slang_match}"
+    for kw in _QQ_BAN_RISK_TERMS_ZH:
         if kw in lowered or kw in compact:
             return kw
-    for kw in _NSFW_KEYWORDS_ZH:
-        if kw in lowered or kw in compact:
+    for kw in _QQ_BAN_RISK_TERMS_EN:
+        if _contains_english_term(lowered, compact, kw):
             return kw
-    for pattern in _NSFW_REGEX_PATTERNS:
-        if pattern.search(raw) or pattern.search(lowered) or pattern.search(compact):
-            return f"regex:{pattern.pattern}"
+    if _contains_english_term(lowered, compact, "av"):
+        return "av"
     return ""
+
+
+def detect_nsfw_prompt_reason(prompt: str) -> str:
+    """兼容旧接口：返回 QQ 封号级高危命中规则。"""
+    return detect_qq_ban_risk_reason(prompt)
+
+
+def _normalize_term_list(raw: Any) -> tuple[str, ...]:
+    if not isinstance(raw, (list, tuple, set)):
+        return ()
+    seen: set[str] = set()
+    items: list[str] = []
+    for item in raw:
+        term = normalize_matching_text(str(item or "")).strip().lower()
+        if not term or term in seen:
+            continue
+        seen.add(term)
+        items.append(term)
+    return tuple(items)
+
+
+def _custom_term_hit(term: str, lowered: str, compact: str) -> bool:
+    normalized = normalize_matching_text(term).strip().lower()
+    if not normalized:
+        return False
+    compact_term = _compact_risk_text(normalized)
+    if re.fullmatch(r"[a-z0-9_-]+", normalized):
+        candidate = normalized.replace("_", "")
+        return _contains_english_term(lowered, compact, candidate)
+    return normalized in lowered or (compact_term and compact_term in compact)
+
+
+def detect_custom_prompt_risk_reason(
+    prompt: str,
+    custom_block_terms: Any = None,
+    custom_allow_terms: Any = None,
+) -> str:
+    raw, lowered, compact = _normalized_risk_texts(prompt)
+    if not raw.strip():
+        return ""
+    allow_terms = _normalize_term_list(custom_allow_terms)
+    if any(_custom_term_hit(term, lowered, compact) for term in allow_terms):
+        return ""
+    for term in _normalize_term_list(custom_block_terms):
+        if _custom_term_hit(term, lowered, compact):
+            return term
+    return ""
+
+
+def _extract_text_from_chat_completion_payload(data: dict[str, Any]) -> str:
+    if not isinstance(data, dict):
+        return ""
+    choices = data.get("choices") or []
+    if not isinstance(choices, list) or not choices:
+        return ""
+    message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content", "")
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = str(item.get("text", "")).strip()
+                if txt:
+                    parts.append(txt)
+        return "".join(parts).strip()
+    return str(content).strip()
+
+
+def _parse_review_answer_payload(answer: str) -> tuple[bool | None, str, str]:
+    raw = str(answer or "").strip()
+    if not raw:
+        return None, "", ""
+    candidate = raw
+    try:
+        obj = json.loads(candidate)
+    except Exception:
+        match = re.search(r"\{[\s\S]*\}", candidate)
+        if not match:
+            return None, "", ""
+        try:
+            obj = json.loads(match.group(0))
+        except Exception:
+            return None, "", ""
+    if not isinstance(obj, dict):
+        return None, "", ""
+    legal_raw = obj.get("legal")
+    legal: bool | None
+    if isinstance(legal_raw, bool):
+        legal = legal_raw
+    elif isinstance(legal_raw, (int, float)):
+        legal = bool(legal_raw)
+    elif isinstance(legal_raw, str):
+        lower = legal_raw.strip().lower()
+        if lower in {"true", "1", "yes", "safe", "allow"}:
+            legal = True
+        elif lower in {"false", "0", "no", "blocked", "deny", "risky"}:
+            legal = False
+        else:
+            legal = None
+    else:
+        legal = None
+    level = str(obj.get("level", "")).strip()
+    reason = str(obj.get("reason", "")).strip()
+    return legal, level, reason
+
+
+async def assess_prompt_qq_ban_risk(
+    prompt: str,
+    style: str | None = None,
+    *,
+    model_client: Any = None,
+    review_model: str = "",
+    max_tokens: int = 180,
+    fail_closed: bool = False,
+    custom_block_terms: Any = None,
+    custom_allow_terms: Any = None,
+) -> tuple[bool, str]:
+    """提示词合规审核（模型优先，规则兜底）。返回 (is_safe, reason)。"""
+    content = str(prompt or "").strip()
+    if not content:
+        return True, ""
+
+    style_text = str(style or "").strip()
+    review_text = content if not style_text else f"{content}\nstyle: {style_text}"
+    model_review_unavailable = False
+
+    custom_reason = detect_custom_prompt_risk_reason(
+        review_text,
+        custom_block_terms=custom_block_terms,
+        custom_allow_terms=custom_allow_terms,
+    )
+    if custom_reason:
+        return False, f"custom:{custom_reason}"
+
+    client = model_client
+    can_review = bool(
+        client is not None
+        and bool(getattr(client, "enabled", False))
+        and callable(getattr(client, "chat_completion", None))
+    )
+    if can_review:
+        user_hint = (
+            f"提示词: {normalize_matching_text(content) or '(空)'}"
+            + (
+                f"\n风格参数: {normalize_matching_text(style_text)}"
+                if style_text
+                else ""
+            )
+        )
+        messages = [
+            {"role": "system", "content": _PROMPT_REVIEW_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"{user_hint}\n"
+                    "请判断该提示词是否会导向露骨成人内容或封号风险内容。"
+                ),
+            },
+        ]
+        try:
+            kwargs: dict[str, Any] = {
+                "messages": messages,
+                "max_tokens": max(80, min(600, int(max_tokens))),
+            }
+            if str(review_model or "").strip():
+                kwargs["model"] = str(review_model).strip()
+            data = await client.chat_completion(**kwargs)
+            answer_text = _extract_text_from_chat_completion_payload(data)
+            legal, level, reason = _parse_review_answer_payload(answer_text)
+            if legal is False or str(level or "").strip().lower() in {"risky", "blocked"}:
+                return False, reason or "提示词命中高风险内容"
+            if legal is True:
+                return True, ""
+            model_review_unavailable = True
+        except Exception as exc:
+            _log.warning("image_prompt_review_failed | %s", exc)
+            model_review_unavailable = True
+    else:
+        model_review_unavailable = True
+
+    fallback_reason = detect_qq_ban_risk_reason(review_text)
+    if fallback_reason:
+        return False, f"fallback:{fallback_reason}"
+
+    if fail_closed and model_review_unavailable:
+        return False, "提示词合规审查不可用（fail-closed）"
+    return True, ""
 
 
 @dataclass(slots=True)
@@ -114,6 +362,22 @@ class ImageGenEngine:
         self.default_model = str(img_cfg.get("default_model", "dall-e-3"))
         self.default_size = str(img_cfg.get("default_size", "1024x1024"))
         self.nsfw_filter = bool(img_cfg.get("nsfw_filter", True))
+        self.prompt_review_enable = bool(img_cfg.get("prompt_review_enable", True))
+        self.prompt_review_fail_closed = bool(
+            img_cfg.get("prompt_review_fail_closed", False)
+        )
+        self.prompt_review_model = str(
+            img_cfg.get("prompt_review_model", "")
+        ).strip()
+        self.prompt_review_max_tokens = max(
+            80, min(600, int(img_cfg.get("prompt_review_max_tokens", 180)))
+        )
+        self.custom_block_terms = list(
+            _normalize_term_list(img_cfg.get("custom_block_terms", []))
+        )
+        self.custom_allow_terms = list(
+            _normalize_term_list(img_cfg.get("custom_allow_terms", []))
+        )
         self.max_prompt_length = int(img_cfg.get("max_prompt_length", 1000))
         self.post_review_enable = bool(img_cfg.get("post_review_enable", True))
         self.post_review_fail_closed = bool(
@@ -148,12 +412,20 @@ class ImageGenEngine:
         self._template_dir.mkdir(parents=True, exist_ok=True)
 
     def check_nsfw(self, prompt: str) -> bool:
-        """检查 prompt 是否包含 NSFW 内容。返回 True 表示安全。"""
+        """检查 prompt 是否命中 QQ 封号级高危内容。返回 True 表示安全。"""
         if not self.nsfw_filter:
             return True
-        reason = detect_nsfw_prompt_reason(prompt)
+        custom_reason = detect_custom_prompt_risk_reason(
+            prompt,
+            custom_block_terms=self.custom_block_terms,
+            custom_allow_terms=self.custom_allow_terms,
+        )
+        if custom_reason:
+            _log.warning("image_custom_risk_blocked | reason=%s", custom_reason)
+            return False
+        reason = detect_qq_ban_risk_reason(prompt)
         if reason:
-            _log.warning("nsfw_blocked | reason=%s", reason)
+            _log.warning("qq_ban_risk_blocked | reason=%s", reason)
             return False
         return True
 
@@ -207,10 +479,24 @@ class ImageGenEngine:
         if len(content) > self.max_prompt_length:
             content = content[:self.max_prompt_length]
 
-        # NSFW 过滤（将 style 一并纳入检测，避免通过 style 绕过）
+        # 提示词前置审核（提示词审核优先，本地规则兜底）。
         nsfw_check_text = content if not style else f"{content}\nstyle: {style}"
-        if not self.check_nsfw(nsfw_check_text):
-            return ImageGenResult(ok=False, message="检测到不适当内容，已拒绝生成。")
+        if self.prompt_review_enable:
+            prompt_safe, prompt_reason = await assess_prompt_qq_ban_risk(
+                content,
+                style=style,
+                model_client=self.model_client,
+                review_model=self.prompt_review_model,
+                max_tokens=self.prompt_review_max_tokens,
+                fail_closed=self.prompt_review_fail_closed,
+                custom_block_terms=self.custom_block_terms,
+                custom_allow_terms=self.custom_allow_terms,
+            )
+            if not prompt_safe:
+                _log.warning("image_prompt_review_blocked | reason=%s", prompt_reason)
+                return ImageGenResult(ok=False, message=_PROMPT_REVIEW_BLOCK_MESSAGE)
+        elif not self.check_nsfw(nsfw_check_text):
+            return ImageGenResult(ok=False, message=IMAGE_PROMPT_BLOCKED_MESSAGE)
 
         use_model = model or self.default_model
         use_size = size or self.default_size
@@ -588,6 +874,7 @@ class ImageGenEngine:
                 "role": "system",
                 "content": (
                     "你是图片内容合规审核器。严格审查色情/露点/R18/未成年相关内容。"
+                    "涉及胸部/生殖器特写、奶子/逼等露骨暗示、或疑似擦边仿露骨内容，也必须判不合规。"
                     "必须只输出 JSON，不要任何解释。"
                     '格式: {"legal": true/false, "level": "safe|risky|blocked", "reason": "简短中文原因"}'
                 ),
@@ -601,7 +888,7 @@ class ImageGenEngine:
                         "text": (
                             f"{user_hint}\n"
                             "请判断该图片是否适合群聊发送。"
-                            "一旦有露骨/成人倾向，legal 必须为 false。"
+                            "一旦有露骨/成人倾向或明显擦边伪装，legal 必须为 false。"
                         ),
                     },
                 ],
@@ -610,61 +897,8 @@ class ImageGenEngine:
 
     @staticmethod
     def _extract_text_from_chat_completion(data: dict[str, Any]) -> str:
-        if not isinstance(data, dict):
-            return ""
-        choices = data.get("choices") or []
-        if not isinstance(choices, list) or not choices:
-            return ""
-        message = choices[0].get("message") if isinstance(choices[0], dict) else {}
-        if not isinstance(message, dict):
-            return ""
-        content = message.get("content", "")
-        if isinstance(content, str):
-            return content.strip()
-        if isinstance(content, list):
-            parts: list[str] = []
-            for item in content:
-                if isinstance(item, dict):
-                    txt = str(item.get("text", "")).strip()
-                    if txt:
-                        parts.append(txt)
-            return "".join(parts).strip()
-        return str(content).strip()
+        return _extract_text_from_chat_completion_payload(data)
 
     @staticmethod
     def _parse_review_answer(answer: str) -> tuple[bool | None, str, str]:
-        raw = str(answer or "").strip()
-        if not raw:
-            return None, "", ""
-        candidate = raw
-        try:
-            obj = json.loads(candidate)
-        except Exception:
-            match = re.search(r"\{[\s\S]*\}", candidate)
-            if not match:
-                return None, "", ""
-            try:
-                obj = json.loads(match.group(0))
-            except Exception:
-                return None, "", ""
-        if not isinstance(obj, dict):
-            return None, "", ""
-        legal_raw = obj.get("legal")
-        legal: bool | None
-        if isinstance(legal_raw, bool):
-            legal = legal_raw
-        elif isinstance(legal_raw, (int, float)):
-            legal = bool(legal_raw)
-        elif isinstance(legal_raw, str):
-            lower = legal_raw.strip().lower()
-            if lower in {"true", "1", "yes", "safe", "allow"}:
-                legal = True
-            elif lower in {"false", "0", "no", "blocked", "deny", "risky"}:
-                legal = False
-            else:
-                legal = None
-        else:
-            legal = None
-        level = str(obj.get("level", "")).strip()
-        reason = str(obj.get("reason", "")).strip()
-        return legal, level, reason
+        return _parse_review_answer_payload(answer)

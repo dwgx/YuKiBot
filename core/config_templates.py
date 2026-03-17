@@ -44,7 +44,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
     return {
         "control": {
             "chat_mode": "balanced",
-            "undirected_policy": "mention_only",
+            "undirected_policy": "high_confidence_only",
             "knowledge_learning": "aggressive",
             "memory_recall_level": "light",
             "emoji_level": "medium",
@@ -98,7 +98,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "allow_markdown": True,
             "allow_search": True,
             "allow_image": True,
-            "allow_non_to_me": False,
+            "allow_non_to_me": True,
             "private_chat_mode": "off",
             "private_chat_whitelist": [],
             "max_reply_chars": 520,
@@ -253,7 +253,14 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "resend_enable": True,
             "max_choices": 12,
         },
-        "safety": {"scale": 2, "profile": "normal"},
+        "safety": {
+            "scale": 2,
+            "profile": "normal",
+            "custom_block_terms": [],
+            "custom_allow_terms": [],
+            "group_profiles": {},
+            "output_sensitive_words": {},
+        },
         "output": {
             "verbosity": "medium",
             "token_saving": False,
@@ -268,10 +275,10 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "non_whitelist_mode": "silent",
         },
         "trigger": {
-            "ai_listen_enable": False,
+            "ai_listen_enable": True,
             "ai_listen_keyword_enable": True,
             "ai_listen_min_keyword_hits": 1,
-            "delegate_undirected_to_ai": False,
+            "delegate_undirected_to_ai": True,
             "delegate_undirected_min_signal": 1.0,
             "ai_listen_min_messages": 5,
             "ai_listen_min_unique_users": 2,

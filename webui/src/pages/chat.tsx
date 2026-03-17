@@ -84,12 +84,10 @@ function normalizeSegmentMediaUrl(raw: string, kind: MessageMediaKind): string {
 }
 
 function buildImageProxyUrl(fileToken: string): string {
-  const token = String(api.getToken() || "").trim();
   const file = String(fileToken || "").trim();
-  if (!file || !token) return "";
+  if (!file) return "";
   const query = new URLSearchParams({
     file,
-    token,
   });
   return `/api/webui/chat/media/image?${query.toString()}`;
 }
@@ -1830,6 +1828,16 @@ export default function ChatPage() {
                 <p className="text-default-400 text-sm">暂无聊天记录</p>
               )}
               {messages.map((msg) => {
+                const isSystemEvent = msg.sender_id === "system" || msg.sender_name === "系统通知";
+                if (isSystemEvent) {
+                  return (
+                    <div key={`${msg.message_id}-${msg.seq}-${msg.timestamp}`} className="flex justify-center my-1">
+                      <span className="text-xs text-default-400 bg-default-100/50 rounded-full px-3 py-0.5">
+                        {msg.text || "[系统事件]"}
+                      </span>
+                    </div>
+                  );
+                }
                 const msgAvatarUrl = resolveQQAvatar(msg.sender_id, 100);
                 const msgDisplayName = msg.sender_name || msg.sender_id || "未知";
                 const mediaItems = extractMessageMediaItems(msg);

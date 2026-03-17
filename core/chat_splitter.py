@@ -7,6 +7,7 @@ from utils.text import normalize_text
 
 _URL_PATTERN = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 _WRAP_TOKEN_PATTERN = re.compile(r"https?://[^\s]+|[^\s]+", re.IGNORECASE)
+_CODE_BLOCK_PATTERN = re.compile(r"```[\s\S]*?```", re.MULTILINE)
 
 
 def split_semantic_text(
@@ -15,7 +16,10 @@ def split_semantic_text(
     max_chars: int = 220,
     max_chunks: int = 6,
 ) -> list[str]:
-    """Split reply text by semantic sections first, then by sentence length."""
+    """Split reply text by semantic sections first, then by sentence length.
+
+    Preserves code blocks as atomic units to avoid breaking syntax.
+    """
     if max_lines <= 0 or max_chars <= 0 or max_chunks <= 0:
         return []
 
@@ -23,12 +27,31 @@ def split_semantic_text(
     if not normalized:
         return []
 
-    sections = _split_sections(normalized)
+    # Extract code blocks as atomic units
+    code_blocks: dict[str, str] = {}
+    def _mask_code(match: re.Match[str]) -> str:
+        key = f"__CODEBLOCK{len(code_blocks)}__"
+        code_blocks[key] = match.group(0)
+        return key
+
+    masked = _CODE_BLOCK_PATTERN.sub(_mask_code, normalized)
+
+    sections = _split_sections(masked)
     chunks: list[str] = []
     for section in sections:
         for chunk in _split_section(section, max_lines=max_lines, max_chars=max_chars):
             if chunk.strip():
                 chunks.append(chunk.strip())
+
+    # Restore code blocks
+    if code_blocks:
+        restored: list[str] = []
+        for chunk in chunks:
+            for key, block in code_blocks.items():
+                chunk = chunk.replace(key, block)
+            restored.append(chunk)
+        chunks = restored
+
     if len(chunks) <= max_chunks:
         return chunks
     return _limit_chunks_preserve_tail(

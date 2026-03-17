@@ -49,6 +49,28 @@ class CookieAuthScanLoginTests(unittest.TestCase):
         self.assertTrue(caps["platforms"]["kuaishou"]["browser_scan_login"])
         self.assertTrue(caps["platforms"]["qzone"]["browser_scan_login"])
 
+    @patch("core.cookie_auth._stdin_is_tty", return_value=False)
+    @patch("core.cookie_auth.bilibili_qr_login_sync")
+    def test_interactive_bilibili_cookie_skips_when_non_tty(self, mock_qr_login, _mock_tty) -> None:
+        result = cookie_auth.interactive_bilibili_cookie()
+
+        mock_qr_login.assert_not_called()
+        self.assertEqual(result, {"sessdata": "", "bili_jct": ""})
+
+    @patch("core.cookie_auth._stdin_is_tty", return_value=True)
+    @patch("core.cookie_auth.bilibili_qr_login_sync", return_value=None)
+    @patch("core.cookie_auth._safe_input", side_effect=["1", "4"])
+    def test_interactive_bilibili_cookie_scan_fail_then_skip(
+        self,
+        _mock_safe_input,
+        mock_qr_login,
+        _mock_tty,
+    ) -> None:
+        result = cookie_auth.interactive_bilibili_cookie()
+
+        self.assertEqual(mock_qr_login.call_count, 1)
+        self.assertEqual(result, {"sessdata": "", "bili_jct": ""})
+
 
 if __name__ == "__main__":
     unittest.main()

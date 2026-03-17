@@ -16,6 +16,17 @@ SKIP_WEBUI_BUILD=0
 SKIP_CLI_INSTALL=0
 SKIP_NAPCAT=0
 FAST_DEPLOY=0
+SKIP_POST_CHECK=0
+POST_CHECK_TIMEOUT=20
+PIP_INDEX_URL_INPUT="${YUKIKO_PIP_INDEX_URL:-}"
+PIP_EXTRA_INDEX_URL_INPUT="${YUKIKO_PIP_EXTRA_INDEX_URL:-}"
+PIP_FIND_LINKS_INPUT="${YUKIKO_PIP_FIND_LINKS:-}"
+PIP_CACHE_DIR_INPUT="${YUKIKO_PIP_CACHE_DIR:-}"
+PIP_TIMEOUT_INPUT="${YUKIKO_PIP_TIMEOUT:-}"
+PIP_RETRIES_INPUT="${YUKIKO_PIP_RETRIES:-}"
+NPM_REGISTRY_INPUT="${YUKIKO_NPM_REGISTRY:-}"
+NPM_CACHE_DIR_INPUT="${YUKIKO_NPM_CACHE_DIR:-}"
+USE_UV_INPUT="${YUKIKO_USE_UV:-}"
 
 HOST_INPUT=""
 PORT_INPUT=""
@@ -49,7 +60,19 @@ Options:
   --skip-webui-build        Skip npm build step
   --skip-cli-install        Skip installing /usr/local/bin/yukiko
   --skip-napcat             Skip NapCat detection and install
+  --skip-post-check         Skip strict post-deploy health checks
+  --post-check-timeout <s>  Post-deploy check timeout in seconds (default: 20)
   --fast                    Fast deploy: skip webui build + skip NapCat auto-install
+  --pip-index-url <url>     Custom Python package index mirror
+  --pip-extra-index-url <url>
+                            Secondary Python package index mirror
+  --pip-find-links <path>   Local wheel dir / extra Python package source
+  --pip-cache-dir <dir>     Reuse pip cache directory for faster deploys
+  --pip-timeout <s>         pip network timeout seconds
+  --pip-retries <n>         pip retry count
+  --npm-registry <url>      Custom npm registry mirror
+  --npm-cache-dir <dir>     Reuse npm cache directory for faster deploys
+  --use-uv                  Use uv for Python dependency sync when available
   --non-interactive         Use defaults and CLI arguments, no prompts
   -h, --help                Show this help
 
@@ -57,6 +80,7 @@ Examples:
   bash install.sh
   bash install.sh --host 0.0.0.0 --port 18081 --open-firewall
   bash install.sh --fast --non-interactive --port 8081
+  bash install.sh --pip-index-url https://pypi.tuna.tsinghua.edu.cn/simple --npm-registry https://registry.npmmirror.com
   bash install.sh --non-interactive --port 9000 --no-service
 EOF
 }
@@ -70,6 +94,145 @@ require_linux() {
 
 command_exists() {
   command -v "$1" >/dev/null 2>&1
+}
+
+export_if_nonempty() {
+  local key="$1"
+  local value="${2:-}"
+  if [[ -n "$value" ]]; then
+    export "$key=$value"
+  fi
+}
+
+validate_optional_integer() {
+  local value="${1:-}"
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+  [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+apply_acceleration_env() {
+  export_if_nonempty "YUKIKO_PIP_INDEX_URL" "$PIP_INDEX_URL_INPUT"
+  export_if_nonempty "YUKIKO_PIP_EXTRA_INDEX_URL" "$PIP_EXTRA_INDEX_URL_INPUT"
+  export_if_nonempty "YUKIKO_PIP_FIND_LINKS" "$PIP_FIND_LINKS_INPUT"
+  export_if_nonempty "YUKIKO_PIP_CACHE_DIR" "$PIP_CACHE_DIR_INPUT"
+  export_if_nonempty "YUKIKO_PIP_TIMEOUT" "$PIP_TIMEOUT_INPUT"
+  export_if_nonempty "YUKIKO_PIP_RETRIES" "$PIP_RETRIES_INPUT"
+  export_if_nonempty "YUKIKO_NPM_REGISTRY" "$NPM_REGISTRY_INPUT"
+  export_if_nonempty "YUKIKO_NPM_CACHE_DIR" "$NPM_CACHE_DIR_INPUT"
+  if [[ -n "$USE_UV_INPUT" ]]; then
+    export YUKIKO_USE_UV="$USE_UV_INPUT"
+  fi
+}
+
+normalize_health_host() {
+  local host="$1"
+  if [[ -z "$host" || "$host" == "0.0.0.0" || "$host" == "::" || "$host" == "*" ]]; then
+    printf '127.0.0.1'
+    return
+  fi
+  printf '%s' "$host"
+}
+
+port_in_use() {
+  local port="$1"
+  if command_exists ss; then
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}$" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command_exists lsof; then
+    if lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  if command_exists netstat; then
+    if netstat -ltn 2>/dev/null | awk '{print $4}' | grep -E "[:.]${port}$" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+wait_service_active() {
+  local service_name="$1"
+  local timeout_seconds="${2:-40}"
+  local start_ts now elapsed
+  start_ts="$(date +%s)"
+  while true; do
+    if run_root systemctl is-active --quiet "$service_name"; then
+      return 0
+    fi
+    now="$(date +%s)"
+    elapsed=$(( now - start_ts ))
+    if (( elapsed >= timeout_seconds )); then
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+wait_webui_health() {
+  local host="$1"
+  local port="$2"
+  local timeout_seconds="${3:-20}"
+  if ! command_exists curl; then
+    warn "curl not found, skipped WebUI health check."
+    return 2
+  fi
+
+  local health_host url start_ts now elapsed
+  health_host="$(normalize_health_host "$host")"
+  url="http://${health_host}:${port}/api/webui/health"
+  start_ts="$(date +%s)"
+  while true; do
+    if curl -fsS --connect-timeout 2 --max-time 5 "$url" >/dev/null 2>&1; then
+      info "WebUI health check passed: $url"
+      return 0
+    fi
+    now="$(date +%s)"
+    elapsed=$(( now - start_ts ))
+    if (( elapsed >= timeout_seconds )); then
+      warn "WebUI health check timed out: $url"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+run_post_deploy_checks() {
+  local service_name="$1"
+  local host="$2"
+  local port="$3"
+  local timeout_seconds="$4"
+
+  if [[ "$SKIP_POST_CHECK" -eq 1 ]]; then
+    warn "Skipping post-deploy checks (--skip-post-check)."
+    return 0
+  fi
+
+  info "Running strict post-deploy checks..."
+  if ! wait_service_active "$service_name" "$timeout_seconds"; then
+    error "Service did not become active in ${timeout_seconds}s: $service_name"
+    run_root systemctl status "$service_name" --no-pager || true
+    return 1
+  fi
+  if ! wait_webui_health "$host" "$port" "$timeout_seconds"; then
+    error "WebUI health check failed."
+    run_root journalctl -u "$service_name" --no-pager -n 120 || true
+    return 1
+  fi
+
+  if [[ -f "$MANAGER_SCRIPT" ]]; then
+    if ! YUKIKO_ROOT="$ROOT_DIR" YUKIKO_SERVICE_NAME="$service_name" bash "$MANAGER_SCRIPT" doctor --service-name "$service_name" --timeout-seconds "$timeout_seconds" --strict; then
+      error "Strict doctor failed after deployment."
+      return 1
+    fi
+  fi
+
+  info "Post-deploy checks passed."
+  return 0
 }
 
 run_root() {
@@ -272,6 +435,7 @@ bootstrap_python() {
     exit 1
   fi
   info "Bootstrapping python environment..."
+  apply_acceleration_env
   python3 "$ROOT_DIR/scripts/deploy.py"
 }
 
@@ -286,14 +450,9 @@ build_webui() {
   fi
 
   info "Building WebUI..."
-  pushd "$ROOT_DIR/webui" >/dev/null
-  if [[ -f package-lock.json ]]; then
-    npm ci --no-fund --no-audit || npm install --no-fund --no-audit
-  else
-    npm install --no-fund --no-audit
-  fi
-  npm run build
-  popd >/dev/null
+  apply_acceleration_env
+  export YUKIKO_WEBUI_FORCE_INSTALL=1
+  bash "$ROOT_DIR/build-webui.sh"
 }
 
 open_firewall_port() {
@@ -623,10 +782,54 @@ parse_args() {
         SKIP_NAPCAT=1
         shift
         ;;
+      --skip-post-check)
+        SKIP_POST_CHECK=1
+        shift
+        ;;
+      --post-check-timeout)
+        POST_CHECK_TIMEOUT="${2:-}"
+        shift 2
+        ;;
       --fast)
         FAST_DEPLOY=1
         SKIP_WEBUI_BUILD=1
         SKIP_NAPCAT=1
+        shift
+        ;;
+      --pip-index-url)
+        PIP_INDEX_URL_INPUT="${2:-}"
+        shift 2
+        ;;
+      --pip-extra-index-url)
+        PIP_EXTRA_INDEX_URL_INPUT="${2:-}"
+        shift 2
+        ;;
+      --pip-find-links)
+        PIP_FIND_LINKS_INPUT="${2:-}"
+        shift 2
+        ;;
+      --pip-cache-dir)
+        PIP_CACHE_DIR_INPUT="${2:-}"
+        shift 2
+        ;;
+      --pip-timeout)
+        PIP_TIMEOUT_INPUT="${2:-}"
+        shift 2
+        ;;
+      --pip-retries)
+        PIP_RETRIES_INPUT="${2:-}"
+        shift 2
+        ;;
+      --npm-registry)
+        NPM_REGISTRY_INPUT="${2:-}"
+        shift 2
+        ;;
+      --npm-cache-dir)
+        NPM_CACHE_DIR_INPUT="${2:-}"
+        shift 2
+        ;;
+      --use-uv)
+        USE_UV_INPUT="auto"
         shift
         ;;
       --non-interactive)
@@ -720,9 +923,40 @@ main() {
     error "Invalid PORT: $port"
     exit 1
   fi
+  if [[ ! "$POST_CHECK_TIMEOUT" =~ ^[0-9]+$ ]] || (( POST_CHECK_TIMEOUT < 5 || POST_CHECK_TIMEOUT > 120 )); then
+    error "Invalid --post-check-timeout: $POST_CHECK_TIMEOUT (must be 5-120)"
+    exit 1
+  fi
+  if ! validate_optional_integer "$PIP_TIMEOUT_INPUT"; then
+    error "Invalid --pip-timeout: $PIP_TIMEOUT_INPUT"
+    exit 1
+  fi
+  if ! validate_optional_integer "$PIP_RETRIES_INPUT"; then
+    error "Invalid --pip-retries: $PIP_RETRIES_INPUT"
+    exit 1
+  fi
   if [[ -z "$service_name" ]]; then
     error "Service name cannot be empty."
     exit 1
+  fi
+
+  apply_acceleration_env
+
+  if port_in_use "$port"; then
+    local service_path_existing="/etc/systemd/system/${service_name}.service"
+    if run_root test -f "$service_path_existing" && run_root systemctl is-active --quiet "$service_name"; then
+      warn "Port ${port} is currently occupied, but ${service_name} service is active. Reusing this port."
+    else
+      if [[ "$NON_INTERACTIVE" -eq 1 ]]; then
+        error "Port ${port} is already in use. Choose another port or stop conflicting service."
+        exit 1
+      fi
+      warn "Port ${port} appears to be in use."
+      if ! ask_yes_no "Continue deployment and reuse this port anyway?" "no"; then
+        error "Deployment cancelled due to port conflict."
+        exit 1
+      fi
+    fi
   fi
 
   write_env_values "$host" "$port" "$webui_token" "$onebot_access_token"
@@ -757,6 +991,7 @@ main() {
 
   if [[ "$install_service" -eq 1 ]]; then
     install_systemd_service "$service_name" "$service_user" "$ROOT_DIR"
+    run_post_deploy_checks "$service_name" "$host" "$port" "$POST_CHECK_TIMEOUT"
   fi
 
   echo

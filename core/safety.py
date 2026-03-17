@@ -47,6 +47,17 @@ _ABSOLUTE_BLOCK_TERMS: set[str] = {
 }
 
 
+def _normalize_term_list(raw: Any) -> set[str]:
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    terms: set[str] = set()
+    for item in raw:
+        term = normalize_text(str(item)).lower()
+        if term:
+            terms.add(term)
+    return terms
+
+
 @dataclass(slots=True)
 class SafetyDecision:
     risk_level: str
@@ -99,6 +110,22 @@ class SafetyEngine:
             for k, v in custom_output.items():
                 self._output_sensitive[str(k)] = str(v)
 
+        self._custom_block_terms: set[str] = _normalize_term_list(
+            config.get("custom_block_terms", [])
+        )
+        self._custom_allow_terms: set[str] = _normalize_term_list(
+            config.get("custom_allow_terms", [])
+        )
+
+        # ── 群级别 profile 覆盖 ──
+        self._group_profiles: dict[str, str] = {}
+        group_overrides = config.get("group_profiles", {})
+        if isinstance(group_overrides, dict):
+            for gid, prof in group_overrides.items():
+                normalized = self._normalize_profile(prof)
+                if normalized:
+                    self._group_profiles[str(gid).strip()] = normalized
+
         # ── 各级别词库 ──
         self._illegal_terms: set[str] = {
             "入侵", "攻击", "爆破", "盗号", "木马", "钓鱼", "绕过鉴权",
@@ -142,6 +169,23 @@ class SafetyEngine:
             self.PROFILE_NAMES.get(self.profile, "?"),
             len(self._output_sensitive),
         )
+
+    # ── 群级别 profile 管理 ──
+
+    def get_effective_profile(self, group_id: str = "") -> str:
+        """获取群的有效 profile，群级别覆盖优先于全局。"""
+        gid = str(group_id).strip()
+        if gid and gid in self._group_profiles:
+            return self._group_profiles[gid]
+        return self.profile
+
+    def set_group_profile(self, group_id: str, profile: str) -> bool:
+        """设置群级别的 NSFW profile 覆盖。"""
+        normalized = self._normalize_profile(profile)
+        if not normalized:
+            return False
+        self._group_profiles[str(group_id).strip()] = normalized
+        return True
 
     # ── 输入评估 ──────────────────────────────────────────────
 
@@ -188,6 +232,12 @@ class SafetyEngine:
             return "high_risk"
         # 露骨/R18 永久拦截（任何档位都不放开）
         if self._has_risky_term(content, self._sexual_explicit_terms):
+            return "high_risk"
+        if (
+            self._custom_block_terms
+            and not self._has_risky_term(content, self._custom_allow_terms)
+            and self._has_risky_term(content, self._custom_block_terms)
+        ):
             return "high_risk"
 
         # scale 0: 仅拦截绝对红线

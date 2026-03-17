@@ -226,6 +226,12 @@ class LearningGuardRegressionTests(unittest.TestCase):
 
         self.assertFalse(loop._tool_is_high_risk("music_play_by_id"))
 
+    def test_agent_tool_registry_compat_intent_keyword_toggle(self) -> None:
+        registry = AgentToolRegistry()
+        self.assertFalse(registry.get_intent_keyword_routing_enabled())
+        registry.set_intent_keyword_routing_enabled(True)
+        self.assertTrue(registry.get_intent_keyword_routing_enabled())
+
     def test_vision_retry_runs_when_first_answer_is_empty(self) -> None:
         executor = _DummyExecutor()
         executor._vision_second_pass_enable = True

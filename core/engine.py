@@ -344,16 +344,25 @@ class PluginRegistry:
                 supports_interactive_setup = callable(interactive_fn)
 
                 if needs_setup and supports_interactive_setup:
+                    stdin = getattr(sys, "stdin", None)
+                    stdin_is_tty = bool(
+                        stdin and hasattr(stdin, "isatty") and stdin.isatty()
+                    )
+                    if not stdin_is_tty:
+                        self.logger.warning(
+                            "插件 %s 需要首次配置，但当前为非交互环境，已跳过向导",
+                            file.stem,
+                        )
+                    else:
+                        self.logger.info("插件 %s 需要首次配置，启动向导...", file.stem)
 
-                    self.logger.info("插件 %s 需要首次配置，启动向导...", file.stem)
+                        try:
 
-                    try:
+                            interactive_fn()
 
-                        interactive_fn()
+                        except Exception as exc:
 
-                    except Exception as exc:
-
-                        self.logger.warning("插件 %s 配置向导失败: %s", file.stem, exc)
+                            self.logger.warning("插件 %s 配置向导失败: %s", file.stem, exc)
 
                 plugin = plugin_cls()
 
@@ -849,8 +858,6 @@ class YukikoEngine:
 
         self.agent_tool_registry = AgentToolRegistry()
 
-        self.agent_tool_registry.set_intent_keyword_routing_enabled(False)
-
         register_builtin_tools(
             registry=self.agent_tool_registry,
             search_engine=self.search,
@@ -894,6 +901,7 @@ class YukikoEngine:
             model_client=self.model_client,
             tool_registry=self.agent_tool_registry,
             config=self.config,
+            persona_text=self.personality.persona_text if hasattr(self, "personality") else "",
         )
 
         # ── 爬虫 + 知识库 ──
@@ -1143,7 +1151,6 @@ class YukikoEngine:
             cfg.get("control", {}) if isinstance(cfg.get("control"), dict) else {}
         )
 
-        allow_non_to_me_defined = "allow_non_to_me" in bot_cfg
         ai_listen_defined = "ai_listen_enable" in trigger_cfg
         delegate_defined = "delegate_undirected_to_ai" in trigger_cfg
 
@@ -1172,12 +1179,11 @@ class YukikoEngine:
                 ai_listen_enable = False
                 delegate_undirected = False
         elif policy == "high_confidence_only":
-            if not allow_non_to_me_defined:
-                allow_non_to_me = True
-            if not ai_listen_defined:
-                ai_listen_enable = True
+            # high_confidence_only 语义上就表示“允许非指向进入高置信门控”。
+            allow_non_to_me = True
+            ai_listen_enable = True
             if not delegate_defined:
-                delegate_undirected = False
+                delegate_undirected = True
 
         if explicit_ai_listen_on and policy not in {"off", "disabled"}:
             allow_non_to_me = True
@@ -1507,10 +1513,6 @@ class YukikoEngine:
         if not isinstance(control_cfg, dict):
 
             control_cfg = {}
-
-        if hasattr(self, "agent_tool_registry"):
-
-            self.agent_tool_registry.set_intent_keyword_routing_enabled(False)
 
         self.control_chat_mode = (
             normalize_text(str(control_cfg.get("chat_mode", "balanced"))).lower()
@@ -2462,6 +2464,30 @@ class YukikoEngine:
                         + [f"[引用对象近期]{item}" for item in reply_target_recent]
                     )[-16:]
 
+            mention_target_ids: list[str] = []
+            for raw_uid in (message.at_other_user_ids or [])[:3]:
+                uid = normalize_text(str(raw_uid))
+                if not uid:
+                    continue
+                if uid in {bot_uid, current_uid, reply_target_uid}:
+                    continue
+                if uid not in mention_target_ids:
+                    mention_target_ids.append(uid)
+
+            if mention_target_ids:
+                for mention_uid in mention_target_ids:
+                    mention_recent = self._build_recent_user_lines_by_user_id(
+                        recent_messages=recent_messages,
+                        user_id=mention_uid,
+                        limit=3,
+                    )
+                    if not mention_recent:
+                        continue
+                    memory_context = (
+                        memory_context
+                        + [f"[点名对象近期]{item}" for item in mention_recent]
+                    )[-18:]
+
             if message.reply_to_message_id and hasattr(
                 self.memory, "get_message_media_artifacts"
             ):
@@ -2539,6 +2565,19 @@ class YukikoEngine:
             if allow_memory and hasattr(self.memory, "get_recent_speakers")
             else []
         )
+
+        # ── Phase 1: 生成好感度 & 心情提示注入思考引擎 ──
+        affinity_hint = ""
+        mood_hint = ""
+        if hasattr(self, "affinity") and message.user_id:
+            try:
+                affinity_hint = self.affinity.affinity_prompt_hint(message.user_id)
+            except Exception:
+                pass
+            try:
+                mood_hint = self.affinity.mood_prompt_hint()
+            except Exception:
+                pass
 
         user_policies = (
             self.memory.get_agent_policies(message.user_id)
@@ -2622,15 +2661,26 @@ class YukikoEngine:
             message.conversation_id,
             limit=self.runtime_group_cache_context_limit,
         )
+        focused_runtime_group_context = self._build_focused_runtime_group_context(
+            message=message,
+            rows=runtime_group_context,
+            limit=max(4, self.runtime_group_cache_context_limit // 2),
+        )
 
-        # 群聊 @bot / 私聊时，避免额外注入群里其他人的短期缓存，降低跨用户污染概率。
+        # 群聊 @bot / 私聊时，默认避免整段群聊缓存污染；
+        # 但保留“当前人 + 引用对象 + @对象”的定向缓存，减少跨用户串台。
 
         allow_group_context = bool(message.is_private or not message.mentioned)
+        runtime_group_context_for_turn = (
+            runtime_group_context if allow_group_context else focused_runtime_group_context
+        )
 
-        if runtime_group_context and allow_group_context:
+        if runtime_group_context_for_turn:
+            prefix = "[群聊缓存]" if allow_group_context else "[群聊定向缓存]"
 
             memory_context = (
-                memory_context + [f"[群聊缓存]{item}" for item in runtime_group_context]
+                memory_context
+                + [f"{prefix}{item}" for item in runtime_group_context_for_turn]
             )[-18:]
 
         if alias_call_hint:
@@ -2740,7 +2790,7 @@ class YukikoEngine:
                     trigger=trigger,
                     explicit_bot_addressed=explicit_bot_addressed,
                     thread_state=thread_state,
-                    runtime_group_context=runtime_group_context,
+                    runtime_group_context=runtime_group_context_for_turn,
                     memory_context=memory_context,
                     related_memories=related_memories,
                     user_profile_summary=user_profile_summary,
@@ -2785,7 +2835,7 @@ class YukikoEngine:
             followup_candidate=trigger.followup_candidate,
             listen_probe=trigger.listen_probe,
             risk_level=safety.risk_level,
-            runtime_group_context=runtime_group_context,
+            runtime_group_context=runtime_group_context_for_turn,
         )
 
         decision, route_fail_reason = await self._route_with_failover(router_input)
@@ -2843,6 +2893,12 @@ class YukikoEngine:
 
         threshold_source = "routing.min_confidence"
 
+        trigger_reason_norm = normalize_text(str(trigger.reason)).lower()
+        ai_gate_reason = trigger_reason_norm in {
+            "ai_router_gate",
+            "ai_router_candidate",
+        } or trigger_reason_norm.startswith("ai_listen_probe")
+
         if not directed_like_call:
 
             if trigger.followup_candidate or trigger.active_session:
@@ -2851,10 +2907,7 @@ class YukikoEngine:
 
                 threshold_source = "routing.followup_min_confidence"
 
-            elif normalize_text(str(trigger.reason)).lower() in {
-                "ai_router_gate",
-                "ai_router_candidate",
-            }:
+            elif ai_gate_reason:
 
                 effective_min_confidence = self.ai_gate_min_confidence
 
@@ -2872,7 +2925,7 @@ class YukikoEngine:
             message.conversation_id,
             message.user_id,
             directed_like_call,
-            normalize_text(str(trigger.reason)),
+            trigger_reason_norm,
             threshold_source,
             float(effective_min_confidence),
             float(decision.confidence),
@@ -2885,8 +2938,11 @@ class YukikoEngine:
             self.routing_zero_disables_undirected
             and self.non_directed_high_confidence_only
             and not directed_like_call
-            and normalize_text(str(trigger.reason)).lower()
-            in {"ai_router_candidate", "ai_router_gate", "not_directed"}
+            and (
+                trigger_reason_norm
+                in {"ai_router_candidate", "ai_router_gate", "not_directed"}
+                or trigger_reason_norm.startswith("ai_listen_probe")
+            )
             and effective_min_confidence <= 0.0
         ):
 
@@ -3129,6 +3185,8 @@ class YukikoEngine:
                     current_user_name=preferred_name or message.user_name,
                     recent_speakers=recent_speakers,
                     compat_context=compat_context,
+                    affinity_hint=affinity_hint,
+                    mood_hint=mood_hint,
                 )
 
         elif action == "search":
@@ -3244,6 +3302,8 @@ class YukikoEngine:
                         current_user_name=preferred_name or message.user_name,
                         recent_speakers=recent_speakers,
                         compat_context=compat_context,
+                        affinity_hint=affinity_hint,
+                        mood_hint=mood_hint,
                     )
 
                     if not normalize_text(reply_text):
@@ -3289,6 +3349,8 @@ class YukikoEngine:
                     current_user_name=preferred_name or message.user_name,
                     recent_speakers=recent_speakers,
                     compat_context=compat_context,
+                    affinity_hint=affinity_hint,
+                    mood_hint=mood_hint,
                 )
 
                 if not normalize_text(reply_text):
@@ -3313,6 +3375,8 @@ class YukikoEngine:
                     current_user_name=preferred_name or message.user_name,
                     recent_speakers=recent_speakers,
                     compat_context=compat_context,
+                    affinity_hint=affinity_hint,
+                    mood_hint=mood_hint,
                 )
 
                 if not normalize_text(reply_text):
@@ -3679,6 +3743,8 @@ class YukikoEngine:
                     if hasattr(self, "affinity") and hasattr(self.affinity, "mood")
                     else ""
                 ),
+                affinity_hint=affinity_hint,
+                mood_hint=mood_hint,
             )
 
             # 含媒体或"文本里明确是媒体重任务"时，放宽超时预算
@@ -6597,7 +6663,6 @@ class YukikoEngine:
         return lines
 
     @staticmethod
-    @staticmethod
     def _build_media_summary(
         raw_segments: list[dict[str, Any]], limit: int = 8
     ) -> list[str]:
@@ -7169,6 +7234,70 @@ class YukikoEngine:
         rows = [normalize_text(item) for item in list(cache)[-max(1, limit) :]]
 
         return [item for item in rows if item]
+
+    @staticmethod
+    def _extract_runtime_group_row_user_id(row: str) -> str:
+        match = re.search(r"QQ:(\d{5,16})", normalize_text(row))
+        if not match:
+            return ""
+        return normalize_text(str(match.group(1)))
+
+    def _build_focused_runtime_group_context(
+        self,
+        message: EngineMessage,
+        rows: list[str],
+        limit: int = 8,
+    ) -> list[str]:
+        """在被 @/回复他人时收敛群聊缓存，只保留与当前轮相关的人物线索。"""
+        if not rows:
+            return []
+
+        target_ids: list[str] = []
+        for raw_uid in [
+            str(message.user_id or ""),
+            str(message.reply_to_user_id or ""),
+            *(message.at_other_user_ids or []),
+        ]:
+            uid = normalize_text(raw_uid)
+            if not uid:
+                continue
+            if uid == normalize_text(str(message.bot_id or "")):
+                continue
+            if uid not in target_ids:
+                target_ids.append(uid)
+
+        if not target_ids:
+            return rows[-max(1, limit) :]
+
+        target_set = set(target_ids)
+        focused_reversed: list[str] = []
+        seen: set[str] = set()
+        for raw_row in reversed(rows):
+            row = normalize_text(raw_row)
+            if not row or row in seen:
+                continue
+            row_uid = self._extract_runtime_group_row_user_id(row)
+            if row_uid and row_uid in target_set:
+                focused_reversed.append(row)
+                seen.add(row)
+            if len(focused_reversed) >= max(1, limit):
+                break
+
+        if not focused_reversed:
+            return rows[-max(1, min(limit, 4)) :]
+
+        focused = list(reversed(focused_reversed))
+
+        # 补 1 条最近公共上下文，避免多人对话只剩单句导致语义断层。
+        if len(focused) < max(2, limit // 2):
+            for raw_row in reversed(rows):
+                row = normalize_text(raw_row)
+                if not row or row in seen:
+                    continue
+                focused.append(row)
+                break
+
+        return focused[-max(1, limit) :]
 
     async def _ai_error_reply(
         self,
@@ -9842,6 +9971,7 @@ class YukikoEngine:
                 if (
                     row.startswith("[当前用户近期]")
                     or row.startswith("[引用对象近期]")
+                    or row.startswith("[点名对象近期]")
                     or row.startswith("[引用图片记忆]")
                     or row.startswith("[引用图片base64")
                     or row.startswith("[引用图片URL")
@@ -9851,6 +9981,7 @@ class YukikoEngine:
                     or row.startswith("[引用音频记忆]")
                     or row.startswith("[引用音频URL")
                     or row.startswith("[引用音频文件")
+                    or row.startswith("[群聊定向缓存]")
                 )
             ]
 

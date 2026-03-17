@@ -3,14 +3,14 @@ import {
   Card, CardBody, CardHeader, Input, Switch, Button, Select, SelectItem, Textarea,
   Spinner, Slider, Chip, Tabs, Tab,
 } from "@heroui/react";
-import { Save, ChevronLeft, ChevronRight, Undo2 } from "lucide-react";
+import { Save, Undo2 } from "lucide-react";
 import { motion } from "framer-motion";
 import { api, type EnvSettingEntry, type EnvUpdateResponse, type ImageGenTestResponse } from "../api/client";
 import { NotificationContainer } from "../components/notification";
 import { useNotifications } from "../hooks/useNotifications";
 
 type Cfg = Record<string, unknown>;
-type FieldType = "text" | "password" | "number" | "switch" | "select" | "slider" | "textarea" | "list" | "group_verbosity_map" | "group_text_map";
+type FieldType = "text" | "password" | "number" | "switch" | "select" | "slider" | "textarea" | "list" | "group_verbosity_map" | "group_text_map" | "text_map";
 type EnvDraftMap = Record<string, string>;
 interface FieldDef { path: string; label: string; type: FieldType; options?: { value: string; label: string }[]; min?: number; max?: number; step?: number; rows?: number; }
 interface SectionDef { key: string; label: string; fields: FieldDef[]; }
@@ -198,11 +198,17 @@ const SECTIONS: SectionDef[] = [
       { value: "1024x1792", label: "1024x1792" },
     ]},
     { path: "image_gen.nsfw_filter", label: "NSFW 过滤", type: "switch" },
+    { path: "image_gen.prompt_review_enable", label: "生成前提示词审查", type: "switch" },
+    { path: "image_gen.prompt_review_fail_closed", label: "提示词审查失败时默认拦截", type: "switch" },
+    { path: "image_gen.prompt_review_model", label: "提示词审查模型(留空=主模型)", type: "text" },
+    { path: "image_gen.prompt_review_max_tokens", label: "提示词审查最大 Tokens", type: "number", min: 80, max: 600 },
     { path: "image_gen.post_review_enable", label: "生成后主模型二次审查", type: "switch" },
     { path: "image_gen.post_review_fail_closed", label: "审查失败时默认拦截(严格)", type: "switch" },
     { path: "image_gen.post_review_model", label: "二次审查模型(留空=主模型)", type: "text" },
     { path: "image_gen.post_review_max_tokens", label: "二次审查最大 Tokens", type: "number", min: 120, max: 1200 },
     { path: "image_gen.max_prompt_length", label: "提示词最大长度", type: "number", min: 100, max: 2000 },
+    { path: "image_gen.custom_block_terms", label: "额外拦截词（逗号/换行分隔）", type: "list" },
+    { path: "image_gen.custom_allow_terms", label: "额外放行词（仅覆盖自定义拦截词）", type: "list" },
   ]},
   { key: "affinity", label: "好感度系统", fields: [
     { path: "affinity.enable", label: "启用好感度系统", type: "switch" },
@@ -227,6 +233,10 @@ const SECTIONS: SectionDef[] = [
       { value: "very_open", label: "very_open(很开放)" },
     ]},
     { path: "safety.scale", label: "兼容尺度 (0宽松-3最严)", type: "slider", min: 0, max: 3, step: 1 },
+    { path: "safety.custom_block_terms", label: "额外安全拦截词（逗号/换行分隔）", type: "list" },
+    { path: "safety.custom_allow_terms", label: "额外安全放行词（仅覆盖自定义拦截词）", type: "list" },
+    { path: "safety.group_profiles", label: "群聊安全档位覆盖（每行: 群号=profile）", type: "group_text_map", rows: 4 },
+    { path: "safety.output_sensitive_words", label: "输出敏感词替换（每行: 原词=替换词）", type: "text_map", rows: 6 },
   ]},
   { key: "output", label: "输出设置", fields: [
     { path: "output.verbosity", label: "详略度", type: "select", options: [{ value: "verbose", label: "详细" }, { value: "medium", label: "中等" }, { value: "brief", label: "简洁" }, { value: "minimal", label: "极简" }] },
@@ -481,6 +491,30 @@ function formatGroupTextMap(value: unknown): string {
     .sort((a, b) => Number(a[0]) - Number(b[0]));
   return rows.map(([gid, text]) => `${gid}=${text}`).join("\n");
 }
+function parseTextMap(input: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  const lines = input.split(/\r?\n/g);
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const pair = line.match(/^([^=:=：，,]+?)\s*(?:=|:|：|，|,)\s*(.+)$/);
+    if (!pair) continue;
+    const key = String(pair[1] || "").trim();
+    const value = String(pair[2] || "").trim();
+    if (!key || !value) continue;
+    map[key] = value;
+  }
+  return map;
+}
+function formatTextMap(value: unknown): string {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "";
+  return Object.entries(value as Record<string, unknown>)
+    .map(([key, v]) => [String(key).trim(), String(v ?? "").trim()] as const)
+    .filter(([key, text]) => !!key && !!text)
+    .sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))
+    .map(([key, text]) => `${key}=${text}`)
+    .join("\n");
+}
 function parseNumberInput(raw: string, current: unknown, field: FieldDef): number {
   const text = raw.trim();
   const fallback = typeof current === "number"
@@ -529,28 +563,14 @@ export default function ConfigPage() {
   const [jsonMode, setJsonMode] = useState<"sections" | "raw">("sections");
   const [jsonSectionKey, setJsonSectionKey] = useState("control");
   const [jsonSectionText, setJsonSectionText] = useState("");
-  const [jsonSectionError, setJsonSectionError] = useState("");
   const [imageGenTestPrompt, setImageGenTestPrompt] = useState("一只可爱的猫娘女仆，二次元插画，精致细节");
   const [imageGenTestModel, setImageGenTestModel] = useState("");
   const [imageGenTestSize, setImageGenTestSize] = useState("");
   const [imageGenTestStyle, setImageGenTestStyle] = useState("");
   const [imageGenTesting, setImageGenTesting] = useState(false);
   const [imageGenTestResult, setImageGenTestResult] = useState<ImageGenTestResponse | null>(null);
-  const applyImageGenPreset = (prompt: string, mode: "replace" | "append" = "replace") => {
-    if (mode === "append") {
-      setImageGenTestPrompt((prev) => {
-        const cur = String(prev || "").trim();
-        if (!cur) return prompt;
-        return `${cur}，${prompt}`;
-      });
-      return;
-    }
+  const applyImageGenPreset = (prompt: string) => {
     setImageGenTestPrompt(prompt);
-  };
-  const pickRandomImageGenPreset = () => {
-    if (IMAGE_GEN_PROMPT_PRESETS.length === 0) return;
-    const idx = Math.floor(Math.random() * IMAGE_GEN_PROMPT_PRESETS.length);
-    applyImageGenPreset(IMAGE_GEN_PROMPT_PRESETS[idx].prompt, "replace");
   };
 
   const activeIndex = useMemo(() => Math.max(0, SECTIONS.findIndex((s) => s.key === activeSection)), [activeSection]);
@@ -594,7 +614,6 @@ export default function ConfigPage() {
     }
     const sectionValue = getPath(config, key);
     setJsonSectionText(JSON.stringify(sectionValue, null, 2));
-    setJsonSectionError("");
   }, [config, jsonSectionKey, topLevelJsonKeys]);
 
   useEffect(() => {
@@ -641,6 +660,10 @@ export default function ConfigPage() {
     }
     if (field.type === "group_text_map") {
       updateField(field.path, parseGroupTextMap(raw));
+      return;
+    }
+    if (field.type === "text_map") {
+      updateField(field.path, parseTextMap(raw));
     }
   }, []);
 
@@ -661,6 +684,8 @@ export default function ConfigPage() {
         next = setPath(next, path, parseGroupVerbosityMap(raw));
       } else if (field.type === "group_text_map") {
         next = setPath(next, path, parseGroupTextMap(raw));
+      } else if (field.type === "text_map") {
+        next = setPath(next, path, parseTextMap(raw));
       }
     }
     for (const [path, raw] of Object.entries(numberDrafts)) {
@@ -688,51 +713,6 @@ export default function ConfigPage() {
     }
     return withDefaults(payload);
   }, [applyPendingDrafts, config, rawConfigDirty, rawConfigText]);
-
-  const applyRawConfig = () => {
-    try {
-      const parsed = JSON.parse(rawConfigText);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("根节点必须是 JSON 对象");
-      const merged = withDefaults(parsed as Cfg);
-      setConfig(merged);
-      setRawConfigText(JSON.stringify(merged, null, 2));
-      setRawConfigError("");
-      setRawConfigDirty(false);
-      setMsg("全量配置 JSON 已应用到表单");
-    } catch (e: unknown) {
-      const detail = e instanceof Error ? e.message : "未知错误";
-      setRawConfigError(`JSON 解析失败: ${detail}`);
-      setMsg("全量配置 JSON 应用失败");
-    }
-  };
-
-  const applySectionJson = () => {
-    try {
-      const parsed = JSON.parse(jsonSectionText);
-      const next = setPath(config, jsonSectionKey, parsed);
-      setConfig(next);
-      setRawConfigText(JSON.stringify(next, null, 2));
-      setRawConfigDirty(false);
-      setJsonSectionError("");
-      setMsg(`已应用片段：${jsonSectionKey}`);
-    } catch (e: unknown) {
-      const detail = e instanceof Error ? e.message : "未知错误";
-      setJsonSectionError(`片段 JSON 解析失败: ${detail}`);
-      setMsg("片段应用失败");
-    }
-  };
-
-  const formatRawJson = () => {
-    try {
-      const parsed = JSON.parse(rawConfigText);
-      const pretty = JSON.stringify(parsed, null, 2);
-      setRawConfigText(pretty);
-      setRawConfigError("");
-    } catch (e: unknown) {
-      const detail = e instanceof Error ? e.message : "未知错误";
-      setRawConfigError(`JSON 格式化失败: ${detail}`);
-    }
-  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -833,7 +813,7 @@ export default function ConfigPage() {
 
   const renderField = (field: FieldDef) => {
     const val = getPath(config, field.path);
-    const wide = field.type === "textarea" || field.type === "group_verbosity_map" || field.type === "group_text_map";
+    const wide = field.type === "textarea" || field.type === "group_verbosity_map" || field.type === "group_text_map" || field.type === "text_map";
     const cls = `${SHELL} ${wide ? "lg:col-span-2 2xl:col-span-3" : ""}`;
     const selected = val === undefined || val === null || String(val) === "" ? [] : [String(val)];
 
@@ -922,13 +902,19 @@ export default function ConfigPage() {
           />
         );
       }
-      if (field.type === "group_verbosity_map" || field.type === "group_text_map") {
-        const formatted = field.type === "group_verbosity_map" ? formatGroupVerbosityMap(val) : formatGroupTextMap(val);
+      if (field.type === "group_verbosity_map" || field.type === "group_text_map" || field.type === "text_map") {
+        const formatted = field.type === "group_verbosity_map"
+          ? formatGroupVerbosityMap(val)
+          : field.type === "group_text_map"
+            ? formatGroupTextMap(val)
+            : formatTextMap(val);
         const draft = fieldDrafts[field.path];
         const textValue = draft === undefined ? formatted : draft;
         const description = field.type === "group_verbosity_map"
           ? "每行格式: 群号=verbose|medium|brief|minimal（支持中文别名：详细/中等/简洁/极简）"
-          : "每行格式: 群号=输出指令，例如 ***REMOVED***=多用口语、最多两段";
+          : field.type === "group_text_map"
+            ? "每行格式: 群号=文本，例如 123456=very_open 或 123456=多用口语、最多两段"
+            : "每行格式: 原词=替换词，例如 色情=亲密内容";
         return (
           <Textarea
             label={field.label}
@@ -1006,12 +992,8 @@ export default function ConfigPage() {
       </div>
 
       <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
-        <CardHeader className="flex items-center justify-between gap-3">
+        <CardHeader>
           <div className="font-semibold">{active.label}</div>
-          <div className="flex items-center gap-2">
-            <Button size="sm" variant="flat" startContent={<ChevronLeft size={14} />} isDisabled={activeIndex <= 0} onPress={() => setActiveSection(SECTIONS[Math.max(0, activeIndex - 1)].key)}>上一段</Button>
-            <Button size="sm" variant="flat" endContent={<ChevronRight size={14} />} isDisabled={activeIndex >= SECTIONS.length - 1} onPress={() => setActiveSection(SECTIONS[Math.min(SECTIONS.length - 1, activeIndex + 1)].key)}>下一段</Button>
-          </div>
         </CardHeader>
         <CardBody>
           <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">{active.fields.map(renderField)}</div>
@@ -1085,21 +1067,11 @@ export default function ConfigPage() {
                     variant="flat"
                     color="default"
                     className="cursor-pointer"
-                    onClick={() => applyImageGenPreset(preset.prompt, "replace")}
+                    onClick={() => applyImageGenPreset(preset.prompt)}
                   >
                     {preset.label}
                   </Chip>
                 ))}
-                <Button size="sm" variant="flat" onPress={pickRandomImageGenPreset}>
-                  随机模板
-                </Button>
-                <Button
-                  size="sm"
-                  variant="flat"
-                  onPress={() => applyImageGenPreset("高质量，构图清晰，细节丰富，避免畸形手部和错位五官", "append")}
-                >
-                  追加质量词
-                </Button>
               </div>
             </div>
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
@@ -1223,20 +1195,10 @@ export default function ConfigPage() {
                   minRows={12}
                   maxRows={22}
                   value={jsonSectionText}
-                  onValueChange={setJsonSectionText}
-                  description={jsonSectionError || "仅修改当前片段，应用后会同步到表单和全量 JSON"}
-                  color={jsonSectionError ? "danger" : "default"}
+                  isReadOnly
+                  description="仅用于查看当前片段结构"
                   classNames={INPUT_CLASSES}
                 />
-                <div className="flex flex-wrap gap-2">
-                  <Button variant="flat" onPress={applySectionJson}>应用当前片段</Button>
-                  <Button
-                    variant="light"
-                    onPress={() => navigator.clipboard.writeText(jsonSectionText).catch(() => {})}
-                  >
-                    复制片段
-                  </Button>
-                </div>
               </div>
             </div>
           ) : (
@@ -1252,10 +1214,6 @@ export default function ConfigPage() {
                 color={rawConfigError ? "danger" : "default"}
                 classNames={INPUT_CLASSES}
               />
-              <div className="flex flex-wrap gap-2">
-                <Button variant="flat" onPress={applyRawConfig}>应用 JSON 到表单</Button>
-                <Button variant="light" onPress={formatRawJson}>格式化 JSON</Button>
-              </div>
             </div>
           )}
         </CardBody>

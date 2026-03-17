@@ -24,7 +24,12 @@ from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
-from core.image_gen import detect_nsfw_prompt_reason
+from core.image_gen import (
+    IMAGE_PROMPT_BLOCKED_MESSAGE,
+    assess_prompt_qq_ban_risk,
+    detect_custom_prompt_risk_reason,
+    detect_qq_ban_risk_reason,
+)
 from core.napcat_compat import call_napcat_api
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
@@ -111,6 +116,8 @@ class AgentToolRegistry:
         "set_qq_avatar",
         "set_online_status",
         "set_self_longnick",
+        "create_skill",
+        "test_in_sandbox",
     }
 
     # 群管理员 + 超级管理员可用 — 群内管理操作
@@ -141,6 +148,7 @@ class AgentToolRegistry:
         self._handlers: dict[str, ToolHandler] = {}
         self._prompt_hints: list[PromptHint] = []
         self._context_providers: dict[str, tuple[ContextProvider, int, tuple[str, ...]]] = {}
+        self._intent_keyword_routing_enabled = False
 
     def register(self, schema: ToolSchema, handler: ToolHandler) -> None:
         self._schemas[schema.name] = schema
@@ -299,6 +307,14 @@ class AgentToolRegistry:
             if must_keep in self._schemas and must_keep not in selected:
                 selected.append(must_keep)
         return selected
+
+    def set_intent_keyword_routing_enabled(self, enabled: bool) -> None:
+        """兼容旧版 Engine: 仅保留开关 API，不再启用本地关键词路由。"""
+        self._intent_keyword_routing_enabled = bool(enabled)
+
+    def get_intent_keyword_routing_enabled(self) -> bool:
+        """返回旧版关键词路由开关状态（兼容字段）。"""
+        return bool(self._intent_keyword_routing_enabled)
 
     def select_tools_for_intent(
         self,
@@ -1978,7 +1994,7 @@ async def _handle_set_group_sign(args: dict[str, Any], context: dict[str, Any]) 
     group_id = int(args.get("group_id", 0))
     if not group_id:
         return ToolCallResult(ok=False, error="missing group_id")
-    return await _napcat_api_call(context, "set_group_sign", f"已在群 {group_id} 打卡", group_id=group_id)
+    return await _napcat_api_call(context, "send_group_sign", f"已在群 {group_id} 打卡", group_id=group_id)
 
 
 async def _handle_set_group_name(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
@@ -4700,12 +4716,13 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
                 "properties": {
                     "prompt": {"type": "string", "description": "图片描述（英文效果更好）"},
                     "size": {"type": "string", "description": "图片尺寸，默认 1024x1024"},
+                    "style": {"type": "string", "description": "风格描述（可选，用于生成前风险检测）"},
                 },
                 "required": ["prompt"],
             },
             category="media",
         ),
-        _make_image_gen_handler(model_client),
+        _make_image_gen_handler(model_client, config),
     )
 
     # ── 视频解析工具 ──
@@ -4863,18 +4880,59 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
     )
 
 
-def _make_image_gen_handler(model_client: Any) -> ToolHandler:
+def _make_image_gen_handler(
+    model_client: Any,
+    config: dict[str, Any] | None = None,
+) -> ToolHandler:
     """创建图片生成工具的 handler。"""
+    raw_cfg = config if isinstance(config, dict) else {}
+    image_cfg = raw_cfg.get("image_gen", raw_cfg)
+    if not isinstance(image_cfg, dict):
+        image_cfg = {}
+    prompt_review_enable = bool(image_cfg.get("prompt_review_enable", True))
+    prompt_review_fail_closed = bool(
+        image_cfg.get("prompt_review_fail_closed", False)
+    )
+    prompt_review_model = str(image_cfg.get("prompt_review_model", "")).strip()
+    prompt_review_max_tokens = max(
+        80, min(600, int(image_cfg.get("prompt_review_max_tokens", 180)))
+    )
+    custom_block_terms = list(image_cfg.get("custom_block_terms", []) or [])
+    custom_allow_terms = list(image_cfg.get("custom_allow_terms", []) or [])
+
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         prompt = str(args.get("prompt", "")).strip()
         size = str(args.get("size", "1024x1024")).strip()
+        style = str(args.get("style", "")).strip()
         if not prompt:
             return ToolCallResult(ok=False, error="empty prompt")
-        if detect_nsfw_prompt_reason(prompt):
+        risk_check_text = prompt if not style else f"{prompt}\nstyle: {style}"
+        if prompt_review_enable:
+            safe, _reason = await assess_prompt_qq_ban_risk(
+                prompt,
+                style=style,
+                model_client=model_client,
+                review_model=prompt_review_model,
+                max_tokens=prompt_review_max_tokens,
+                fail_closed=prompt_review_fail_closed,
+                custom_block_terms=custom_block_terms,
+                custom_allow_terms=custom_allow_terms,
+            )
+            if not safe:
+                return ToolCallResult(
+                    ok=False,
+                    error="image_prompt_blocked_nsfw",
+                    display=IMAGE_PROMPT_BLOCKED_MESSAGE,
+                )
+        elif detect_custom_prompt_risk_reason(
+            risk_check_text,
+            custom_block_terms=custom_block_terms,
+            custom_allow_terms=custom_allow_terms,
+        ) or detect_qq_ban_risk_reason(risk_check_text):
             return ToolCallResult(
                 ok=False,
                 error="image_prompt_blocked_nsfw",
-                display="检测到不适当内容，已拒绝生成。",
+                display=IMAGE_PROMPT_BLOCKED_MESSAGE,
             )
         try:
             url = await model_client.generate_image(prompt=prompt, size=size)

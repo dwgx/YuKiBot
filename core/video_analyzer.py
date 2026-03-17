@@ -262,8 +262,12 @@ class VideoAnalyzer:
             return "acfun"
         if "youku.com" in host:
             return "youku"
-        if "v.qq.com" in host or "qq.com" in host:
+        if "v.qq.com" in host or "m.v.qq.com" in host:
             return "tencent"
+        if "iqiyi.com" in host or "iq.com" in host:
+            return "iqiyi"
+        if "mgtv.com" in host:
+            return "mgtv"
         return "unknown"
 
     # ── 主入口 ──

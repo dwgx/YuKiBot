@@ -21,6 +21,68 @@ command_exists() {
   command -v "$1" >/dev/null 2>&1
 }
 
+export_if_nonempty() {
+  local key="$1"
+  local value="${2:-}"
+  if [[ -n "$value" ]]; then
+    export "$key=$value"
+  fi
+}
+
+validate_optional_integer() {
+  local value="${1:-}"
+  if [[ -z "$value" ]]; then
+    return 0
+  fi
+  [[ "$value" =~ ^[0-9]+$ ]]
+}
+
+apply_acceleration_env() {
+  local pip_index_url="${1:-}"
+  local pip_extra_index_url="${2:-}"
+  local pip_find_links="${3:-}"
+  local pip_cache_dir="${4:-}"
+  local pip_timeout="${5:-}"
+  local pip_retries="${6:-}"
+  local npm_registry="${7:-}"
+  local npm_cache_dir="${8:-}"
+  local use_uv="${9:-}"
+
+  export_if_nonempty "YUKIKO_PIP_INDEX_URL" "$pip_index_url"
+  export_if_nonempty "YUKIKO_PIP_EXTRA_INDEX_URL" "$pip_extra_index_url"
+  export_if_nonempty "YUKIKO_PIP_FIND_LINKS" "$pip_find_links"
+  export_if_nonempty "YUKIKO_PIP_CACHE_DIR" "$pip_cache_dir"
+  export_if_nonempty "YUKIKO_PIP_TIMEOUT" "$pip_timeout"
+  export_if_nonempty "YUKIKO_PIP_RETRIES" "$pip_retries"
+  export_if_nonempty "YUKIKO_NPM_REGISTRY" "$npm_registry"
+  export_if_nonempty "YUKIKO_NPM_CACHE_DIR" "$npm_cache_dir"
+  if [[ -n "$npm_cache_dir" ]]; then
+    mkdir -p "$npm_cache_dir" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "$use_uv" ]]; then
+    export YUKIKO_USE_UV="$use_uv"
+  fi
+}
+
+confirm_yes() {
+  local prompt="$1"
+  local confirm
+  read -r -p "$prompt [yes/no]: " confirm
+  [[ "${confirm,,}" == "yes" ]]
+}
+
+resolve_bootstrap_python() {
+  if command_exists python3; then
+    printf 'python3'
+    return 0
+  fi
+  if command_exists python; then
+    printf 'python'
+    return 0
+  fi
+  return 1
+}
+
 run_root() {
   if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
     "$@"
@@ -319,6 +381,7 @@ infer_update_tasks_from_diff() {
 
   local needs_python=0
   local needs_webui=0
+  local needs_webui_deps=0
 
   if printf '%s\n' "$changed" | grep -Eiq '(^|/)requirements(\.txt|/)|(^|/)pyproject\.toml$|(^|/)poetry\.lock$|(^|/)Pipfile(\.lock)?$'; then
     needs_python=1
@@ -328,7 +391,11 @@ infer_update_tasks_from_diff() {
     needs_webui=1
   fi
 
-  printf 'needs_python=%s needs_webui=%s\n' "$needs_python" "$needs_webui"
+  if printf '%s\n' "$changed" | grep -Eiq '^webui/(package(-lock)?\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock)$'; then
+    needs_webui_deps=1
+  fi
+
+  printf 'needs_python=%s needs_webui=%s needs_webui_deps=%s\n' "$needs_python" "$needs_webui" "$needs_webui_deps"
 }
 
 rollback_update() {
@@ -408,6 +475,7 @@ cmd_napcat_status() {
 cmd_doctor() {
   local service_name="$DEFAULT_SERVICE_NAME"
   local timeout_seconds=8
+  local strict_mode=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -418,6 +486,10 @@ cmd_doctor() {
       --timeout-seconds)
         timeout_seconds="${2:-}"
         shift 2
+        ;;
+      --strict)
+        strict_mode=1
+        shift
         ;;
       *)
         error "Unknown option for doctor: $1"
@@ -485,6 +557,22 @@ cmd_doctor() {
     warn_count=$((warn_count + 1))
   fi
 
+  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    info "[doctor][PASS] python venv ready: $ROOT_DIR/.venv/bin/python"
+    pass_count=$((pass_count + 1))
+  else
+    warn "[doctor][WARN] python venv missing: $ROOT_DIR/.venv/bin/python"
+    warn_count=$((warn_count + 1))
+  fi
+
+  if [[ -f "$ROOT_DIR/webui/dist/index.html" ]]; then
+    info "[doctor][PASS] WebUI dist exists: $ROOT_DIR/webui/dist/index.html"
+    pass_count=$((pass_count + 1))
+  else
+    warn "[doctor][WARN] WebUI dist missing (run webui build)"
+    warn_count=$((warn_count + 1))
+  fi
+
   napcat_method="$(detect_napcat)"
   if [[ -n "$napcat_method" ]]; then
     info "[doctor][PASS] NapCat detected: $napcat_method"
@@ -503,6 +591,13 @@ cmd_doctor() {
         pass_count=$((pass_count + 1))
       else
         warn "[doctor][WARN] service not active: $service_name"
+        warn_count=$((warn_count + 1))
+      fi
+      if run_root_nonfatal systemctl is-enabled --quiet "$service_name"; then
+        info "[doctor][PASS] service enabled at boot: $service_name"
+        pass_count=$((pass_count + 1))
+      else
+        warn "[doctor][WARN] service not enabled at boot: $service_name"
         warn_count=$((warn_count + 1))
       fi
     else
@@ -541,6 +636,10 @@ cmd_doctor() {
   fi
 
   echo "[doctor] summary: pass=${pass_count} warn=${warn_count} fail=${fail_count}"
+  if (( strict_mode == 1 && warn_count > 0 )); then
+    error "[doctor] strict mode enabled: warnings are treated as failures."
+    return 1
+  fi
   if (( fail_count > 0 )); then
     return 1
   fi
@@ -791,9 +890,13 @@ Commands:
 Uninstall options:
   --service-name NAME               Service name (default: ${DEFAULT_SERVICE_NAME})
   --purge-runtime                   Remove .venv, webui/node_modules, webui/dist
-  --purge-state                     Remove storage/cache, __pycache__, .pytest_cache
+  --purge-state                     Remove caches, sandboxes, coverage and temp files
   --purge-env                       Remove .env and .env.prod
-  --purge-all                       Shortcut for --purge-runtime --purge-state --purge-env
+  --purge-data                      Remove storage/, logs/, tmp/ and generated runtime data
+  --purge-all                       Shortcut for --purge-runtime --purge-state --purge-env --purge-data
+  --backup-dir DIR                  Backup output dir before destructive purge (default: ${DEFAULT_BACKUP_DIR})
+  --backup-name PREFIX              Backup filename prefix (default: uninstall_backup)
+  --no-backup                       Skip safety backup before purge
   --keep-cli                        Keep /usr/local/bin/yukiko
   --keep-napcat                     Keep NapCat (skip NapCat uninstall)
   --yes                             No confirmation prompt
@@ -801,6 +904,7 @@ Uninstall options:
 Doctor options:
   --service-name NAME               Service name (default: ${DEFAULT_SERVICE_NAME})
   --timeout-seconds N               Health-check timeout (default: 8)
+  --strict                          Treat warnings as failures (strict acceptance)
 
 Backup options:
   --output-dir DIR                  Backup output dir (default: ${DEFAULT_BACKUP_DIR})
@@ -818,6 +922,15 @@ Update options:
   --fast                            Skip optional dependency/build steps
   --force-python                    Force Python dependency sync
   --force-webui                     Force WebUI build
+  --pip-index-url URL               Custom Python package index mirror
+  --pip-extra-index-url URL         Secondary Python package index mirror
+  --pip-find-links PATH             Local wheel dir / extra Python package source
+  --pip-cache-dir DIR               Reuse pip cache directory
+  --pip-timeout N                   pip network timeout seconds
+  --pip-retries N                   pip retry count
+  --npm-registry URL                Custom npm registry mirror
+  --npm-cache-dir DIR               Reuse npm cache directory
+  --use-uv                          Use uv for Python dependency sync when available
   --auto-rollback                   Enable rollback when health checks fail (default)
   --no-auto-rollback                Disable automatic rollback
   --hot-reload                      Restart service after update (default)
@@ -828,10 +941,12 @@ Examples:
   yukiko install --host 0.0.0.0 --port 18081
   yukiko update --check-only
   yukiko update --fast
+  yukiko update --pip-index-url https://pypi.tuna.tsinghua.edu.cn/simple --npm-registry https://registry.npmmirror.com
   yukiko update --no-auto-rollback
   yukiko update --no-hot-reload
   yukiko update --restart
   yukiko doctor
+  yukiko doctor --strict
   yukiko backup
   yukiko restore --file backups/yukiko_backup_20260101_120000.tar.gz --yes
   yukiko register --service-name yukiko --user \$USER
@@ -840,7 +955,7 @@ Examples:
   yukiko napcat-status
   yukiko set-port --port 8088 --host 0.0.0.0
   yukiko uninstall --purge-runtime --purge-env --yes
-  yukiko uninstall --purge-all --yes
+  yukiko uninstall --purge-all --backup-dir /tmp/yukiko-backups --yes
 EOF
 }
 
@@ -856,6 +971,15 @@ cmd_update() {
   local auto_rollback=1
   local force_python=0
   local force_webui=0
+  local pip_index_url="${YUKIKO_PIP_INDEX_URL:-}"
+  local pip_extra_index_url="${YUKIKO_PIP_EXTRA_INDEX_URL:-}"
+  local pip_find_links="${YUKIKO_PIP_FIND_LINKS:-}"
+  local pip_cache_dir="${YUKIKO_PIP_CACHE_DIR:-}"
+  local pip_timeout="${YUKIKO_PIP_TIMEOUT:-}"
+  local pip_retries="${YUKIKO_PIP_RETRIES:-}"
+  local npm_registry="${YUKIKO_NPM_REGISTRY:-}"
+  local npm_cache_dir="${YUKIKO_NPM_CACHE_DIR:-}"
+  local use_uv="${YUKIKO_USE_UV:-}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -903,6 +1027,42 @@ cmd_update() {
         force_webui=1
         shift
         ;;
+      --pip-index-url)
+        pip_index_url="${2:-}"
+        shift 2
+        ;;
+      --pip-extra-index-url)
+        pip_extra_index_url="${2:-}"
+        shift 2
+        ;;
+      --pip-find-links)
+        pip_find_links="${2:-}"
+        shift 2
+        ;;
+      --pip-cache-dir)
+        pip_cache_dir="${2:-}"
+        shift 2
+        ;;
+      --pip-timeout)
+        pip_timeout="${2:-}"
+        shift 2
+        ;;
+      --pip-retries)
+        pip_retries="${2:-}"
+        shift 2
+        ;;
+      --npm-registry)
+        npm_registry="${2:-}"
+        shift 2
+        ;;
+      --npm-cache-dir)
+        npm_cache_dir="${2:-}"
+        shift 2
+        ;;
+      --use-uv)
+        use_uv="auto"
+        shift
+        ;;
       --hot-reload)
         hot_reload=1
         shift
@@ -927,6 +1087,17 @@ cmd_update() {
     error "Current directory is not a git repository: $ROOT_DIR"
     exit 1
   fi
+
+  if ! validate_optional_integer "$pip_timeout"; then
+    error "Invalid --pip-timeout: $pip_timeout"
+    exit 1
+  fi
+  if ! validate_optional_integer "$pip_retries"; then
+    error "Invalid --pip-retries: $pip_retries"
+    exit 1
+  fi
+
+  apply_acceleration_env "$pip_index_url" "$pip_extra_index_url" "$pip_find_links" "$pip_cache_dir" "$pip_timeout" "$pip_retries" "$npm_registry" "$npm_cache_dir" "$use_uv"
 
   info "Fetching remote changes..."
   git -C "$ROOT_DIR" fetch --prune --tags origin
@@ -1009,16 +1180,10 @@ cmd_update() {
 
   if [[ "$need_python" -eq 1 ]]; then
     local py_cmd=""
-    if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
-      py_cmd="$ROOT_DIR/.venv/bin/python"
-    elif command_exists python3; then
-      py_cmd="python3"
-    elif command_exists python; then
-      py_cmd="python"
-    fi
+    py_cmd="$(resolve_bootstrap_python || true)"
     if [[ -n "$py_cmd" ]]; then
       info "Installing Python dependencies..."
-      "$py_cmd" -m pip install --disable-pip-version-check -r "$ROOT_DIR/requirements.txt"
+      "$py_cmd" "$ROOT_DIR/scripts/deploy.py" --ensure-requirements
     else
       warn "No python executable found, skipped Python dependency sync."
     fi
@@ -1030,15 +1195,12 @@ cmd_update() {
     if [[ -f "$ROOT_DIR/webui/package.json" ]]; then
       if command_exists npm; then
         info "Building WebUI..."
-        (
-          cd "$ROOT_DIR/webui"
-          if [[ -f package-lock.json ]]; then
-            npm ci --no-audit --no-fund || npm install --no-audit --no-fund
-          else
-            npm install --no-audit --no-fund
-          fi
-          npm run build
-        )
+        if [[ "$force_webui" -eq 1 || "$changed_hints" == *"needs_webui_deps=1"* ]]; then
+          export YUKIKO_WEBUI_FORCE_INSTALL=1
+        else
+          export YUKIKO_WEBUI_FORCE_INSTALL=0
+        fi
+        bash "$ROOT_DIR/build-webui.sh"
       else
         warn "npm not found, skipped WebUI build."
       fi
@@ -1155,6 +1317,11 @@ unregister_service() {
   local service_name="$1"
   local path
   path="$(service_path "$service_name")"
+
+  if ! command_exists systemctl; then
+    warn "systemctl not found, skipped service removal for: $service_name"
+    return 0
+  fi
 
   if service_exists "$service_name"; then
     run_root systemctl stop "$service_name" || true
@@ -1358,10 +1525,14 @@ cmd_uninstall() {
   local purge_runtime=0
   local purge_state=0
   local purge_env=0
+  local purge_data=0
   local remove_cli=1
   local remove_napcat=1
   local assume_yes=0
   local cli_path="/usr/local/bin/yukiko"
+  local backup_before_purge=1
+  local backup_dir="$DEFAULT_BACKUP_DIR"
+  local backup_name="uninstall_backup"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1381,10 +1552,27 @@ cmd_uninstall() {
         purge_env=1
         shift
         ;;
+      --purge-data)
+        purge_data=1
+        shift
+        ;;
       --purge-all)
         purge_runtime=1
         purge_state=1
         purge_env=1
+        purge_data=1
+        shift
+        ;;
+      --backup-dir)
+        backup_dir="${2:-}"
+        shift 2
+        ;;
+      --backup-name)
+        backup_name="${2:-}"
+        shift 2
+        ;;
+      --no-backup)
+        backup_before_purge=0
         shift
         ;;
       --keep-cli)
@@ -1406,6 +1594,16 @@ cmd_uninstall() {
     esac
   done
 
+  if [[ -z "$backup_dir" || -z "$backup_name" ]]; then
+    error "uninstall requires non-empty --backup-dir and --backup-name"
+    exit 1
+  fi
+
+  local destructive_purge=0
+  if [[ "$purge_runtime" -eq 1 || "$purge_state" -eq 1 || "$purge_env" -eq 1 || "$purge_data" -eq 1 ]]; then
+    destructive_purge=1
+  fi
+
   if [[ "$assume_yes" -eq 0 ]]; then
     echo "About to uninstall YuKiKo deployment bits from: $ROOT_DIR"
     echo "- service: $service_name (stop/disable/remove)"
@@ -1413,10 +1611,13 @@ cmd_uninstall() {
       echo "- purge runtime: .venv, webui/node_modules, webui/dist"
     fi
     if [[ "$purge_state" -eq 1 ]]; then
-      echo "- purge state: storage/cache, __pycache__, .pytest_cache"
+      echo "- purge state: caches, sandboxes, coverage artifacts, temp files"
     fi
     if [[ "$purge_env" -eq 1 ]]; then
       echo "- purge env: .env, .env.prod"
+    fi
+    if [[ "$purge_data" -eq 1 ]]; then
+      echo "- purge data: storage, logs, runtime and generated local data"
     fi
     if [[ "$remove_cli" -eq 1 ]]; then
       echo "- remove CLI: $cli_path (if linked to this repo)"
@@ -1426,10 +1627,24 @@ cmd_uninstall() {
     else
       echo "- keep NapCat: enabled (--keep-napcat)"
     fi
-    read -r -p "Continue uninstall? [yes/no]: " confirm
-    if [[ "${confirm,,}" != "yes" ]]; then
+    if [[ "$destructive_purge" -eq 1 && "$backup_before_purge" -eq 1 ]]; then
+      echo "- safety backup: ${backup_dir%/}/${backup_name}_<timestamp>.tar.gz"
+    elif [[ "$destructive_purge" -eq 1 ]]; then
+      echo "- safety backup: disabled (--no-backup)"
+    fi
+    if ! confirm_yes "Continue uninstall?"; then
       warn "Uninstall cancelled."
       exit 0
+    fi
+  fi
+
+  if [[ "$destructive_purge" -eq 1 && "$backup_before_purge" -eq 1 ]]; then
+    local uninstall_backup
+    uninstall_backup="$(create_backup_archive "$backup_dir" "$backup_name" || true)"
+    if [[ -n "$uninstall_backup" ]]; then
+      info "Created safety backup before uninstall: $uninstall_backup"
+    else
+      warn "Unable to create pre-uninstall backup, continuing."
     fi
   fi
 
@@ -1453,18 +1668,41 @@ cmd_uninstall() {
   fi
 
   if [[ "$purge_runtime" -eq 1 ]]; then
-    rm -rf "$ROOT_DIR/.venv" "$ROOT_DIR/webui/node_modules" "$ROOT_DIR/webui/dist"
+    rm -rf \
+      "$ROOT_DIR/.venv" \
+      "$ROOT_DIR/webui/node_modules" \
+      "$ROOT_DIR/webui/dist"
     info "Runtime artifacts removed."
   fi
 
   if [[ "$purge_state" -eq 1 ]]; then
-    rm -rf "$ROOT_DIR/storage/cache" "$ROOT_DIR/__pycache__" "$ROOT_DIR/.pytest_cache"
+    rm -rf \
+      "$ROOT_DIR/storage/cache" \
+      "$ROOT_DIR/storage/sandbox" \
+      "$ROOT_DIR/__pycache__" \
+      "$ROOT_DIR/.pytest_cache" \
+      "$ROOT_DIR/.mypy_cache" \
+      "$ROOT_DIR/.ruff_cache" \
+      "$ROOT_DIR/.hypothesis" \
+      "$ROOT_DIR/.coverage" \
+      "$ROOT_DIR/coverage.xml" \
+      "$ROOT_DIR/htmlcov" \
+      "$ROOT_DIR/tmp"
     info "Local state/cache artifacts removed."
   fi
 
   if [[ "$purge_env" -eq 1 ]]; then
     rm -f "$ROOT_DIR/.env" "$ROOT_DIR/.env.prod"
     info "Environment files removed."
+  fi
+
+  if [[ "$purge_data" -eq 1 ]]; then
+    rm -rf \
+      "$ROOT_DIR/storage" \
+      "$ROOT_DIR/logs" \
+      "$ROOT_DIR/runtime" \
+      "$ROOT_DIR/tmp"
+    info "Runtime data directories removed."
   fi
 
   info "Uninstall flow completed."

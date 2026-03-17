@@ -21,6 +21,16 @@ NAPCAT_ID_KEYS = frozenset({
     "user_id",
     "user_openid",
 })
+NAPCAT_API_ALIASES: dict[str, str] = {
+    "send_group_message": "send_group_msg",
+    "send_private_message": "send_private_msg",
+    "get_user_info": "get_stranger_info",
+    "get_message": "get_msg",
+    "delete_message": "delete_msg",
+    "get_group_notice": "_get_group_notice",
+    "send_group_notice": "_send_group_notice",
+    "set_group_sign": "send_group_sign",
+}
 _VERSION_PART_RE = re.compile(r"\d+")
 _STRING_ID_VERSION_FLOOR = (4, 8, 115)
 
@@ -68,12 +78,20 @@ def normalize_napcat_api_kwargs(api: str, kwargs: Mapping[str, Any] | None) -> d
     return _normalize_value(source)
 
 
+def resolve_napcat_api_name(api: str) -> str:
+    text = _clean_text(api)
+    if not text:
+        return ""
+    return NAPCAT_API_ALIASES.get(text, text)
+
+
 async def call_napcat_api(
     api_call: Callable[..., Awaitable[Any]],
     api: str,
     **kwargs: Any,
 ) -> Any:
-    return await api_call(api, **normalize_napcat_api_kwargs(api, kwargs))
+    resolved_api = resolve_napcat_api_name(api)
+    return await api_call(resolved_api, **normalize_napcat_api_kwargs(resolved_api, kwargs))
 
 
 async def call_napcat_bot_api(bot: Any, api: str, **kwargs: Any) -> Any:

@@ -17,7 +17,8 @@ from typing import Any
 _log = logging.getLogger("yukiko.affinity")
 
 # ── 心情枚举 ──
-MOODS = ("happy", "neutral", "tired", "annoyed", "excited", "melancholy")
+MOODS = ("happy", "neutral", "tired", "annoyed", "excited", "melancholy",
+         "curious", "playful", "shy", "proud", "lonely", "grateful")
 
 
 @dataclass
@@ -33,6 +34,9 @@ class UserAffinity:
     last_interaction: str = ""      # ISO datetime
     gifts_received: int = 0
     tags: list[str] = field(default_factory=list)  # AI 自动打的标签
+    # ── Phase 5: 用户情感记忆 ──
+    last_emotion: str = ""          # 上次对话中用户的情绪
+    special_dates: list[str] = field(default_factory=list)  # 用户提到的重要日期
 
     @property
     def level_name(self) -> str:
@@ -52,12 +56,27 @@ class BotMood:
     intensity: float = 0.5          # 0-1
     last_change: str = ""
     reason: str = ""
+
     def to_prompt_hint(self) -> str:
         mood_cn = {
             "happy": "开心", "neutral": "平静", "tired": "疲惫",
             "annoyed": "烦躁", "excited": "兴奋", "melancholy": "忧郁",
+            "curious": "好奇", "playful": "调皮", "shy": "害羞",
+            "proud": "得意", "lonely": "寂寞", "grateful": "感恩",
         }
-        return f"[bot当前心情: {mood_cn.get(self.current, self.current)}, 强度: {self.intensity:.1f}]"
+        mood_name = mood_cn.get(self.current, self.current)
+        # 根据心情强度生成更自然的描述
+        if self.intensity >= 0.8:
+            degree = "非常"
+        elif self.intensity >= 0.5:
+            degree = "有点"
+        else:
+            degree = "微微"
+        hint = f"[你现在{degree}{mood_name}"
+        if self.reason:
+            hint += f"，因为{self.reason}"
+        hint += "。让这种情绪自然地融入你的回复语气中，但不要刻意提及。]"
+        return hint
 
 
 class AffinityEngine:
@@ -205,15 +224,36 @@ class AffinityEngine:
         return self._mood
 
     def auto_mood_from_interactions(self, recent_count: int, positive_ratio: float) -> BotMood:
-        """根据最近互动自动调整心情。"""
+        """根据最近互动自动调整心情，更细腻的情绪变化。"""
         if recent_count > 20 and positive_ratio > 0.7:
             return self.update_mood("happy", "很多人在聊天，气氛不错", 0.8)
         elif recent_count > 30:
-            return self.update_mood("tired", "消息太多了", 0.6)
+            return self.update_mood("tired", "消息太多了，有点累", 0.6)
+        elif recent_count > 15 and positive_ratio > 0.5:
+            return self.update_mood("playful", "大家聊得挺开心", 0.7)
+        elif recent_count > 10 and positive_ratio > 0.8:
+            return self.update_mood("excited", "今天好热闹", 0.75)
         elif recent_count < 3:
-            return self.update_mood("melancholy", "好安静啊", 0.4)
+            return self.update_mood("lonely", "好安静啊，没人理我", 0.4)
+        elif recent_count < 5:
+            return self.update_mood("melancholy", "人好少", 0.35)
         elif positive_ratio < 0.3:
             return self.update_mood("annoyed", "怎么都在吵架", 0.5)
+        elif positive_ratio < 0.5 and recent_count > 10:
+            return self.update_mood("neutral", "平平淡淡的", 0.4)
+        return self._mood
+
+    def mood_from_user_emotion(self, user_emotion: str) -> BotMood:
+        """根据用户情绪调整 bot 心情（共情）。"""
+        emotion = user_emotion.lower().strip()
+        if emotion in ("happy", "excited", "grateful"):
+            return self.update_mood("happy", "用户心情不错，我也开心", 0.6)
+        elif emotion in ("sad", "depressed", "lonely"):
+            return self.update_mood("melancholy", "用户心情不好，有点担心", 0.5)
+        elif emotion in ("angry", "frustrated"):
+            return self.update_mood("shy", "用户在生气，小心翼翼", 0.4)
+        elif emotion in ("curious", "interested"):
+            return self.update_mood("curious", "用户对什么感兴趣呢", 0.6)
         return self._mood
 
     def mood_prompt_hint(self) -> str:
@@ -221,9 +261,59 @@ class AffinityEngine:
 
     def affinity_prompt_hint(self, user_id: str) -> str:
         user = self.get_user(user_id)
-        return (
-            f"[用户好感度: {user.affinity:.0f}/100, "
-            f"等级: Lv.{user.level} {user.level_name}, "
-            f"连续打卡: {user.daily_checkin_streak}天, "
-            f"总互动: {user.total_interactions}次]"
+        # 根据好感度等级生成拟人化的关系描述
+        tone_hint = self._affinity_tone_hint(user)
+        base = (
+            f"[与{user.nickname or '该用户'}的关系: Lv.{user.level} {user.level_name} "
+            f"(好感度{user.affinity:.0f}/100, 互动{user.total_interactions}次)]"
         )
+        if tone_hint:
+            base += f"\n{tone_hint}"
+        return base
+
+    @staticmethod
+    def _affinity_tone_hint(user: UserAffinity) -> str:
+        """根据好感度等级生成语气/行为指导。"""
+        lv = user.level
+        if lv <= 1:
+            return "对方是陌生人，保持礼貌友好，不要过于热情。"
+        elif lv <= 2:
+            return "对方是点头之交，可以轻松聊天但不要太亲密。"
+        elif lv <= 3:
+            return "对方是普通朋友，可以开玩笑、随意聊天。"
+        elif lv <= 4:
+            return "对方是好朋友，可以用昵称、分享日常、互相调侃。"
+        elif lv <= 5:
+            return "对方是密友，可以撒娇、吐槽、分享秘密、表达想念。"
+        elif lv <= 6:
+            return "对方是挚友，可以深度情感交流、主动关心、偶尔吃醋。"
+        elif lv <= 7:
+            return "对方是知己，可以无话不谈、表达依赖、用亲昵称呼。"
+        elif lv <= 8:
+            return "对方是灵魂伴侣，可以表达深层情感、撒娇卖萌、主动找话题。"
+        elif lv <= 9:
+            return "对方是命中注定的人，可以表达强烈情感、主动关心生活、记住对方的一切。"
+        else:
+            return "对方是羁绊之人，你们之间有最深的连接，可以完全真实地表达自己。"
+
+    def decay_inactive_users(self) -> int:
+        """衰减不活跃用户的好感度，返回衰减的用户数。"""
+        now = datetime.now(timezone.utc)
+        count = 0
+        for uid, user in self._users.items():
+            if not user.last_interaction:
+                continue
+            try:
+                last = datetime.fromisoformat(user.last_interaction)
+                days_inactive = (now - last).days
+                if days_inactive >= 3:
+                    decay = self._DECAY_PER_DAY * min(days_inactive, 30)
+                    if user.affinity > 10:
+                        user.affinity = max(10.0, user.affinity - decay)
+                        user.level = self._calc_level(user.affinity)
+                        count += 1
+            except Exception:
+                continue
+        if count > 0:
+            self.save()
+        return count

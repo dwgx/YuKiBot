@@ -278,6 +278,26 @@ class HybridVideoResolver:
             # fallback到yt-dlp
             return await asyncio.to_thread(self.ytdlp_resolver, url)
 
+        # 腾讯视频：yt-dlp
+        elif "v.qq.com" in host or "m.v.qq.com" in host:
+            _log.info("hybrid_resolve | platform=tencent | method=ytdlp")
+            return await asyncio.to_thread(self.ytdlp_resolver, url)
+
+        # 优酷：yt-dlp
+        elif "youku.com" in host or "v.youku.com" in host:
+            _log.info("hybrid_resolve | platform=youku | method=ytdlp")
+            return await asyncio.to_thread(self.ytdlp_resolver, url)
+
+        # 爱奇艺：yt-dlp
+        elif "iqiyi.com" in host or "iq.com" in host:
+            _log.info("hybrid_resolve | platform=iqiyi | method=ytdlp")
+            return await asyncio.to_thread(self.ytdlp_resolver, url)
+
+        # 芒果TV：yt-dlp
+        elif "mgtv.com" in host:
+            _log.info("hybrid_resolve | platform=mgtv | method=ytdlp")
+            return await asyncio.to_thread(self.ytdlp_resolver, url)
+
         # 其他平台：yt-dlp
         else:
             _log.info("hybrid_resolve | platform=other | method=ytdlp")

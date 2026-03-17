@@ -13,24 +13,20 @@
 """
 from __future__ import annotations
 
-import asyncio
-import contextlib
+import ast
 import hashlib
-import json
 import logging
-import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yaml
+from plugins.self_learning_runtime import BaseCodeExecutionBackend, create_code_execution_backend
+from utils.text import normalize_text
 
 _log = logging.getLogger("yukiko.plugin.self_learning")
 
@@ -42,6 +38,90 @@ __license__ = "MIT"
 _CONFIG_DIR = Path(__file__).resolve().parent / "config"
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "storage" / "self_created_skills"
 _SANDBOX_DIR = Path(__file__).resolve().parent.parent / "storage" / "sandbox"
+_SAFE_IMPORT_MODULES = frozenset({
+    "collections",
+    "datetime",
+    "decimal",
+    "fractions",
+    "functools",
+    "heapq",
+    "itertools",
+    "json",
+    "math",
+    "random",
+    "re",
+    "statistics",
+    "string",
+    "textwrap",
+})
+_BLOCKED_IMPORT_MODULES = frozenset({
+    "builtins",
+    "ctypes",
+    "importlib",
+    "io",
+    "os",
+    "pathlib",
+    "resource",
+    "shutil",
+    "signal",
+    "socket",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "threading",
+    "multiprocessing",
+})
+_BLOCKED_CALL_NAMES = frozenset({
+    "__import__",
+    "breakpoint",
+    "compile",
+    "delattr",
+    "eval",
+    "exec",
+    "exit",
+    "getattr",
+    "globals",
+    "help",
+    "input",
+    "locals",
+    "open",
+    "quit",
+    "setattr",
+    "vars",
+})
+_BLOCKED_ATTR_NAMES = frozenset({
+    "check_call",
+    "check_output",
+    "chmod",
+    "chown",
+    "execve",
+    "hardlink_to",
+    "kill",
+    "mkdir",
+    "open",
+    "popen",
+    "remove",
+    "rename",
+    "replace",
+    "rmdir",
+    "run",
+    "spawn",
+    "symlink_to",
+    "system",
+    "touch",
+    "unlink",
+    "write_bytes",
+    "write_text",
+})
+_BLOCKED_PATH_SNIPPETS = (
+    "..\\",
+    "../",
+    "/etc/",
+    "/proc/",
+    "/sys/",
+    "c:\\",
+    "\\\\",
+)
 
 
 def _safe_input(prompt: str, default: str = "") -> str:
@@ -55,6 +135,33 @@ def _safe_input(prompt: str, default: str = "") -> str:
         return default
     except Exception:
         return default
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        stdin = getattr(sys, "stdin", None)
+        return bool(stdin and hasattr(stdin, "isatty") and stdin.isatty())
+    except Exception:
+        return False
+
+
+def _default_plugin_config(enabled: bool = False) -> dict[str, Any]:
+    return {
+        "enabled": bool(enabled),
+        "allow_code_execution": False,
+        "acknowledge_unsafe_execution": False,
+        "execution_backend": "disabled",
+        "super_admin_only": True,
+        "sandbox_mode": "isolated",
+        "auto_test": False,
+        "devlog_broadcast": True,
+        "learning_source": "both",
+        "save_skills": False,
+        "max_learning_time_seconds": 300,
+        "max_code_lines": 500,
+        "test_timeout_seconds": 15,
+        "devlog_cooldown_seconds": 30,
+    }
 
 
 @dataclass
@@ -108,7 +215,7 @@ class Plugin:
     name = "self_learning"
     description = "Agent 自我学习系统: 让 AI 自己学习、写代码、创建技能、测试和改进。"
     agent_tool = True
-    internal_only = False
+    internal_only = True
     rules: list[str] = []
     args_schema: dict[str, str] = {}
 
@@ -117,7 +224,7 @@ class Plugin:
     @staticmethod
     def needs_setup() -> bool:
         """配置文件不存在时需要交互式初始化。"""
-        return not (_CONFIG_DIR / "self_learning.yml").exists()
+        return not (_CONFIG_DIR / "self_learning.yml").exists() and _stdin_is_tty()
 
     @staticmethod
     def interactive_setup() -> dict[str, Any]:
@@ -125,26 +232,39 @@ class Plugin:
         print("\n┌─ SelfLearning 插件配置 ─┐")
 
         # 1. 启用?
-        ans = _safe_input("  启用自我学习功能? (Y/n): ", "y").lower()
+        ans = _safe_input("  启用自我学习功能? (y/N): ", "n").lower()
         if ans in ("n", "no"):
-            cfg: dict[str, Any] = {"enabled": False}
+            cfg = _default_plugin_config(enabled=False)
             _write_plugin_config(cfg)
             print("  self_learning 已禁用。")
             return cfg
 
-        # 2. 沙盒模式
+        print("\n  [安全提示]")
+        print("    当前跨平台实现不是强隔离沙盒，不能把它当成安全边界。")
+        print("    只有在你明确理解风险、且仅执行受信任代码时才应开启代码执行。")
+        allow_code_execution = _safe_input("  允许执行自生成 Python 代码? (y/N): ", "n").lower() in ("y", "yes")
+        acknowledge_unsafe = False
+        if allow_code_execution:
+            acknowledge_unsafe = _safe_input("  我已知晓“非强隔离，仅限受信任代码”风险? (y/N): ", "n").lower() in ("y", "yes")
+            if not acknowledge_unsafe:
+                allow_code_execution = False
+                print("  未确认风险，已自动关闭代码执行。")
+
+        # 2. 沙盒模式（仅在显式允许执行代码时保留）
         print("\n  沙盒模式:")
-        print("    1. isolated - 完全隔离的沙盒环境（推荐）")
-        print("    2. restricted - 受限环境，可访问部分系统资源")
-        print("    3. full - 完全访问（危险，仅用于开发）")
+        print("    1. isolated - 最佳努力隔离（非强沙盒）")
+        print("    2. restricted - 受限运行（非强沙盒）")
+        print("    3. full - 完全访问（危险，仅用于受信任开发）")
         ans = _safe_input("  选择 [1-3，默认 1]: ", "1")
         sandbox_mode = {"1": "isolated", "2": "restricted", "3": "full"}.get(ans, "isolated")
 
         # 3. 自动测试
         print("\n  自动测试:")
         print("    开启后 Agent 编写代码会自动在沙盒中测试")
-        ans = _safe_input("  启用自动测试? (Y/n): ", "y").lower()
-        auto_test = ans not in ("n", "no")
+        ans = _safe_input("  启用自动测试? (y/N): ", "n").lower()
+        auto_test = allow_code_execution and ans in ("y", "yes")
+
+        super_admin_only = _safe_input("  危险功能仅允许 super_admin 使用? (Y/n): ", "y").lower() not in ("n", "no")
 
         # 4. DEVLOG 广播
         print("\n  DEVLOG 广播:")
@@ -163,21 +283,21 @@ class Plugin:
         # 6. 技能保存
         print("\n  技能保存:")
         print("    开启后成功的技能会自动保存并可重用")
-        ans = _safe_input("  启用技能保存? (Y/n): ", "y").lower()
-        save_skills = ans not in ("n", "no")
+        ans = _safe_input("  启用技能保存? (y/N): ", "n").lower()
+        save_skills = allow_code_execution and ans in ("y", "yes")
 
-        cfg = {
-            "enabled": True,
+        cfg = _default_plugin_config(enabled=True)
+        cfg.update({
+            "allow_code_execution": allow_code_execution,
+            "acknowledge_unsafe_execution": acknowledge_unsafe,
+            "execution_backend": "local_subprocess" if allow_code_execution and acknowledge_unsafe else "disabled",
+            "super_admin_only": super_admin_only,
             "sandbox_mode": sandbox_mode,
             "auto_test": auto_test,
             "devlog_broadcast": devlog_broadcast,
             "learning_source": learning_source,
             "save_skills": save_skills,
-            "max_learning_time_seconds": 300,
-            "max_code_lines": 500,
-            "test_timeout_seconds": 60,
-            "devlog_cooldown_seconds": 30,
-        }
+        })
         _write_plugin_config(cfg)
         print(f"  配置已保存到 plugins/config/self_learning.yml")
         print("└──────────────────────┘\n")
@@ -188,6 +308,10 @@ class Plugin:
         # 配置参数
         self._enabled: bool = False
         self._sandbox_mode: str = "isolated"
+        self._allow_code_execution: bool = False
+        self._acknowledge_unsafe_execution: bool = False
+        self._execution_backend_name: str = "disabled"
+        self._super_admin_only: bool = True
         self._auto_test: bool = True
         self._devlog_broadcast: bool = True
         self._learning_source: str = "both"
@@ -202,6 +326,10 @@ class Plugin:
         self._sessions: dict[str, LearningSession] = {}
         self._last_devlog_time: float = 0
         self._api_call: Any = None
+        self._code_runner: BaseCodeExecutionBackend = create_code_execution_backend(
+            "disabled",
+            sandbox_root=_SANDBOX_DIR,
+        )
 
         # 性能统计
         self._stats = {
@@ -218,34 +346,67 @@ class Plugin:
         self._cache_loaded: bool = False
 
     async def setup(self, config: dict[str, Any], context: Any) -> None:
-        if not config.get("enabled", True):
+        if not config.get("enabled", False):
             _log.info("self_learning disabled")
             return
 
         self._enabled = True
         self._sandbox_mode = str(config.get("sandbox_mode", "isolated"))
-        self._auto_test = bool(config.get("auto_test", True))
+        self._allow_code_execution = bool(config.get("allow_code_execution", False))
+        self._acknowledge_unsafe_execution = bool(
+            config.get("acknowledge_unsafe_execution", False)
+        )
+        backend_name = normalize_text(str(config.get("execution_backend", ""))).lower()
+        if not backend_name:
+            backend_name = (
+                "local_subprocess"
+                if self._allow_code_execution and self._acknowledge_unsafe_execution
+                else "disabled"
+            )
+        self._execution_backend_name = backend_name
+        self._super_admin_only = bool(config.get("super_admin_only", True))
+        self._auto_test = bool(config.get("auto_test", False))
         self._devlog_broadcast = bool(config.get("devlog_broadcast", True))
         self._learning_source = str(config.get("learning_source", "both"))
-        self._save_skills = bool(config.get("save_skills", True))
+        self._save_skills = bool(config.get("save_skills", False))
         self._max_learning_time = int(config.get("max_learning_time_seconds", 300))
         self._max_code_lines = int(config.get("max_code_lines", 500))
-        self._test_timeout = int(config.get("test_timeout_seconds", 60))
+        self._test_timeout = int(config.get("test_timeout_seconds", 15))
         self._devlog_cooldown = int(config.get("devlog_cooldown_seconds", 30))
 
         # 创建必要的目录
         _SKILLS_DIR.mkdir(parents=True, exist_ok=True)
         _SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
+        self._code_runner = create_code_execution_backend(
+            self._execution_backend_name,
+            sandbox_root=_SANDBOX_DIR,
+        )
 
         self._registry = getattr(context, "agent_tool_registry", None)
         if self._registry is not None:
             self._register_tools()
 
         _log.info(
-            "self_learning setup | sandbox=%s | auto_test=%s | devlog=%s",
+            "self_learning setup | sandbox=%s | allow_code_execution=%s | execution_backend=%s | super_admin_only=%s | auto_test=%s | devlog=%s",
             self._sandbox_mode,
+            self._code_execution_enabled(),
+            self._execution_backend_name,
+            self._super_admin_only,
             self._auto_test,
             self._devlog_broadcast,
+        )
+        if self._allow_code_execution and self._acknowledge_unsafe_execution and not self._code_runner.is_available:
+            _log.warning(
+                "self_learning execution backend unavailable | backend=%s | reason=%s",
+                self._execution_backend_name,
+                self._code_runner.unavailable_reason(),
+            )
+
+    def _code_execution_enabled(self) -> bool:
+        return (
+            self._allow_code_execution
+            and self._acknowledge_unsafe_execution
+            and self._code_runner.is_available
         )
 
     def _register_tools(self) -> None:
@@ -273,49 +434,47 @@ class Plugin:
             self._handle_learn_from_web,
         )
 
-        # 2. create_skill - 创建新技能
-        self._registry.register(
-            ToolSchema(
-                name="create_skill",
-                description=(
-                    "创建一个新的技能工具。Agent 可以编写代码实现新功能，"
-                    "并将其保存为可重用的技能。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "skill_name": {"type": "string", "description": "技能名称（英文，下划线分隔）"},
-                        "description": {"type": "string", "description": "技能描述"},
-                        "code": {"type": "string", "description": "技能的 Python 代码实现"},
-                        "test_code": {"type": "string", "description": "可选：测试代码"},
+        dangerous_tools_enabled = self._code_execution_enabled()
+        if dangerous_tools_enabled:
+            self._registry.register(
+                ToolSchema(
+                    name="create_skill",
+                    description=(
+                        "创建一个新的技能工具。仅限受信任代码场景，且默认只允许 super_admin。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "skill_name": {"type": "string", "description": "技能名称（英文，下划线分隔）"},
+                            "description": {"type": "string", "description": "技能描述"},
+                            "code": {"type": "string", "description": "技能的 Python 代码实现"},
+                            "test_code": {"type": "string", "description": "可选：测试代码"},
+                        },
+                        "required": ["skill_name", "description", "code"],
                     },
-                    "required": ["skill_name", "description", "code"],
-                },
-                category="learning",
-            ),
-            self._handle_create_skill,
-        )
+                    category="learning",
+                ),
+                self._handle_create_skill,
+            )
 
-        # 3. test_in_sandbox - 在沙盒测试代码
-        self._registry.register(
-            ToolSchema(
-                name="test_in_sandbox",
-                description=(
-                    "在隔离的沙盒环境中测试代码。可以安全地运行和验证代码，"
-                    "不会影响主系统。"
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "code": {"type": "string", "description": "要测试的 Python 代码"},
-                        "test_input": {"type": "string", "description": "可选：测试输入数据"},
+            self._registry.register(
+                ToolSchema(
+                    name="test_in_sandbox",
+                    description=(
+                        "最佳努力的受限代码测试，仅适用于受信任代码，不能视为强隔离沙盒。"
+                    ),
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "code": {"type": "string", "description": "要测试的 Python 代码"},
+                            "test_input": {"type": "string", "description": "可选：测试输入数据"},
+                        },
+                        "required": ["code"],
                     },
-                    "required": ["code"],
-                },
-                category="learning",
-            ),
-            self._handle_test_in_sandbox,
-        )
+                    category="learning",
+                ),
+                self._handle_test_in_sandbox,
+            )
 
         # 4. send_devlog - 发送开发日志
         self._registry.register(
@@ -352,18 +511,40 @@ class Plugin:
             self._handle_list_skills,
         )
 
+        self_learning_tools = (
+            ("learn_from_web", "send_devlog", "list_my_skills")
+            if not dangerous_tools_enabled
+            else ("learn_from_web", "create_skill", "test_in_sandbox", "send_devlog", "list_my_skills")
+        )
+
         # 注入规则提示
         self._registry.register_prompt_hint(PromptHint(
             source="self_learning",
             section="rules",
             content=(
-                "你可以通过 learn_from_web 学习新知识，create_skill 创建新技能，"
-                "test_in_sandbox 测试代码。学习和创建新功能时，记得用 send_devlog "
-                "告诉用户你的进展（用白话文，不要太技术化）。"
+                "你可以通过 learn_from_web 学习新知识。"
+                + (
+                    "如管理员已明确开启受信任代码执行，也可使用 create_skill / test_in_sandbox。"
+                    if dangerous_tools_enabled
+                    else "默认不开放任意代码执行与自建技能，请优先给出方案、文档和人工执行建议。"
+                )
+                + " 学习和改进时，记得用 send_devlog 告诉用户你的进展（用白话文，不要太技术化）。"
             ),
             priority=70,
-            tool_names=("learn_from_web", "create_skill", "test_in_sandbox", "send_devlog", "list_my_skills"),
+            tool_names=self_learning_tools,
         ))
+
+        guidance_steps = (
+            "  2. 如管理员已开启受信任代码执行，可使用 create_skill 编写功能\n"
+            "  3. 使用 test_in_sandbox 做最佳努力受限测试\n"
+            "  4. 测试通过后，使用 send_devlog 告诉用户你学会了什么\n"
+            "  5. 使用 list_my_skills 查看自己已经掌握的技能\n"
+            if dangerous_tools_enabled
+            else
+            "  2. 默认不要执行或落盘任意 Python，只输出方案/补丁建议\n"
+            "  3. 使用 send_devlog 告诉用户你学会了什么\n"
+            "  4. 使用 list_my_skills 查看自己已经掌握的技能\n"
+        )
 
         # 注入工具使用指南
         self._registry.register_prompt_hint(PromptHint(
@@ -372,17 +553,41 @@ class Plugin:
             content=(
                 "自我学习流程:\n"
                 "  1. 遇到不会的问题时，使用 learn_from_web 学习相关知识\n"
-                "  2. 学习后，使用 create_skill 编写代码实现新功能\n"
-                "  3. 使用 test_in_sandbox 测试代码是否正确\n"
-                "  4. 测试通过后，使用 send_devlog 告诉用户你学会了什么\n"
-                "  5. 使用 list_my_skills 查看自己已经掌握的技能\n"
-                "DEVLOG 要用白话文，像朋友聊天一样，例如：\n"
+                + guidance_steps
+                + "DEVLOG 要用白话文，像朋友聊天一样，例如：\n"
                 "  '我刚学会了怎么解析 JSON 数据！现在可以帮你处理 API 返回的数据了~'\n"
                 "  '测试了一下新写的图片处理代码，成功了！以后可以帮你压缩图片啦'"
             ),
             priority=10,
-            tool_names=("learn_from_web", "create_skill", "test_in_sandbox", "send_devlog", "list_my_skills"),
+            tool_names=self_learning_tools,
         ))
+        self._registry.register_context_provider(
+            "self_learning_state",
+            self._build_dynamic_context,
+            priority=35,
+            tool_names=self_learning_tools,
+        )
+
+    def _dangerous_tool_gate_error(
+        self, context: dict[str, Any], tool_name: str
+    ) -> str:
+        if not self._allow_code_execution or not self._acknowledge_unsafe_execution:
+            return (
+                f"{tool_name} 已关闭：当前配置未显式开启受信任代码执行。"
+                "如需启用，请在 self_learning 配置中同时打开 allow_code_execution 和 acknowledge_unsafe_execution。"
+            )
+        if tool_name == "test_in_sandbox" and not self._code_runner.is_available:
+            return (
+                f"{tool_name} 已关闭：{self._code_runner.unavailable_reason()}"
+                "当前项目只把本地 subprocess 视为开发用途，不视为安全边界。"
+            )
+        if self._super_admin_only:
+            permission_level = normalize_text(
+                str(context.get("permission_level", ""))
+            ).lower() or "user"
+            if permission_level != "super_admin":
+                return f"{tool_name} 仅允许 super_admin 使用。"
+        return ""
 
     async def _handle_learn_from_web(self, args: dict[str, Any], context: dict[str, Any]) -> Any:
         from core.agent_tools import ToolCallResult
@@ -402,6 +607,7 @@ class Plugin:
             status="learning",
         )
         self._sessions[session_id] = session
+        self._stats["total_sessions"] += 1
 
         # 构建学习提示
         learning_prompt = f"学习主题: {topic}\n学习目标: {goal}"
@@ -409,26 +615,46 @@ class Plugin:
             learning_prompt += f"\n背景: {ctx}"
 
         session.devlog.append(f"开始学习: {topic}")
+        session.metrics.update({
+            "goal": goal,
+            "context": ctx,
+            "learning_source": self._learning_source,
+        })
 
         # 这里应该调用搜索工具或其他学习资源
         # 简化实现：返回学习指导
+        dangerous_tools_enabled = self._code_execution_enabled()
+        plan_steps = [
+            "1. 使用 web_search 搜索相关文档和教程",
+            "2. 阅读官方文档了解 API 和用法",
+            "3. 查看示例代码理解实现方式",
+        ]
+        if dangerous_tools_enabled:
+            plan_steps.extend([
+                "4. 使用 create_skill 编写自己的实现",
+                "5. 使用 test_in_sandbox 测试代码",
+            ])
+        else:
+            plan_steps.extend([
+                "4. 先整理方案、补丁建议或人工操作步骤，不要执行任意 Python",
+                "5. 使用 send_devlog 汇报你学到了什么以及下一步建议",
+            ])
         learned = f"""
 已开始学习 '{topic}'。
 
 学习目标: {goal}
 
 建议步骤:
-1. 使用 web_search 搜索相关文档和教程
-2. 阅读官方文档了解 API 和用法
-3. 查看示例代码理解实现方式
-4. 使用 create_skill 编写自己的实现
-5. 使用 test_in_sandbox 测试代码
+{chr(10).join(plan_steps)}
 
 学习会话 ID: {session_id}
 """
 
         session.learned_content = learned
         session.devlog.append("学习资料收集完成")
+        session.status = "completed"
+        session.end_time = datetime.now()
+        session.metrics["result"] = "guidance_generated"
 
         return ToolCallResult(
             ok=True,
@@ -447,6 +673,10 @@ class Plugin:
         if not skill_name or not description or not code:
             return ToolCallResult(ok=False, display="需要提供 skill_name, description 和 code")
 
+        gate_error = self._dangerous_tool_gate_error(context, "create_skill")
+        if gate_error:
+            return ToolCallResult(ok=False, error="permission_denied", display=gate_error)
+
         # 验证技能名称
         if not re.match(r"^[a-z][a-z0-9_]*$", skill_name):
             return ToolCallResult(
@@ -462,10 +692,29 @@ class Plugin:
                 display=f"代码行数超过限制 ({code_lines} > {self._max_code_lines})",
             )
 
+        try:
+            code = self._sanitize_code(code)
+            if test_code:
+                test_code = self._sanitize_code(test_code)
+        except ValueError as exc:
+            self._stats["failed_skills"] += 1
+            return ToolCallResult(ok=False, error="unsafe_code", display=str(exc))
+
+        self._load_skill_cache()
+        is_duplicate, duplicate_name = self._is_duplicate_skill(code)
+        if is_duplicate:
+            self._stats["failed_skills"] += 1
+            return ToolCallResult(
+                ok=False,
+                error="duplicate_skill",
+                display=f"检测到重复技能：与现有技能 '{duplicate_name}' 代码相同",
+            )
+
         # 自动测试
         if self._auto_test:
             test_result = await self._test_code_in_sandbox(code, test_code)
             if not test_result["ok"]:
+                self._stats["failed_skills"] += 1
                 return ToolCallResult(
                     ok=False,
                     data={"test_failed": True, "error": test_result.get("error")},
@@ -488,12 +737,16 @@ class Plugin:
                 "description": description,
                 "created_at": datetime.now().isoformat(),
                 "test_passed": self._auto_test,
+                "code_hash": self._get_skill_hash(code),
             }
             with open(skill_meta_file, "w", encoding="utf-8") as f:
                 yaml.dump(meta, f, allow_unicode=True)
+            self._skill_cache[skill_name] = meta
+            self._cache_loaded = True
 
             _log.info("skill_created | name=%s | lines=%d", skill_name, code_lines)
 
+        self._stats["successful_skills"] += 1
         result_msg = f"技能 '{skill_name}' 创建成功！\n描述: {description}\n代码行数: {code_lines}"
         if self._auto_test:
             result_msg += "\n测试: 通过 ✓"
@@ -512,6 +765,10 @@ class Plugin:
 
         if not code:
             return ToolCallResult(ok=False, display="需要提供要测试的代码")
+
+        gate_error = self._dangerous_tool_gate_error(context, "test_in_sandbox")
+        if gate_error:
+            return ToolCallResult(ok=False, error="permission_denied", display=gate_error)
 
         result = await self._test_code_in_sandbox(code, test_input)
 
@@ -557,50 +814,57 @@ class Plugin:
 
         devlog_msg = f"{emoji} DEVLOG | {message}"
 
-        # 发送到群（如果启用）
-        if self._devlog_broadcast:
-            # 这里需要从 context 获取 api_call 和 group_id
-            api_call = context.get("api_call")
-            group_id = context.get("group_id")
+        if not self._devlog_broadcast:
+            self._last_devlog_time = now
+            self._stats["devlogs_sent"] += 1
+            return ToolCallResult(
+                ok=True,
+                data={"message": devlog_msg, "type": log_type, "broadcast": False},
+                display=f"DEVLOG 已生成（广播关闭）: {devlog_msg}",
+            )
 
-            if api_call and group_id:
-                try:
-                    await api_call("send_group_msg", group_id=group_id, message=devlog_msg)
-                    self._last_devlog_time = now
-                    _log.info("devlog_sent | type=%s | group=%s", log_type, group_id)
-                except Exception as e:
-                    _log.warning("devlog_send_failed | error=%s", e)
-                    return ToolCallResult(
-                        ok=False,
-                        display=f"DEVLOG 发送失败: {e}",
-                    )
-            else:
+        # 发送到群（如果启用）
+        # 这里需要从 context 获取 api_call 和 group_id
+        api_call = context.get("api_call")
+        group_id = context.get("group_id")
+
+        if api_call and group_id:
+            try:
+                await api_call("send_group_msg", group_id=group_id, message=devlog_msg)
+                self._last_devlog_time = now
+                self._stats["devlogs_sent"] += 1
+                _log.info("devlog_sent | type=%s | group=%s", log_type, group_id)
+            except Exception as e:
+                _log.warning("devlog_send_failed | error=%s", e)
                 return ToolCallResult(
                     ok=False,
-                    display="无法发送 DEVLOG: 缺少 API 调用或群 ID",
+                    display=f"DEVLOG 发送失败: {e}",
                 )
+        else:
+            return ToolCallResult(
+                ok=False,
+                display="无法发送 DEVLOG: 缺少 API 调用或群 ID",
+            )
 
         return ToolCallResult(
             ok=True,
-            data={"message": devlog_msg, "type": log_type},
+            data={"message": devlog_msg, "type": log_type, "broadcast": True},
             display=f"DEVLOG 已发送: {devlog_msg}",
         )
 
     async def _handle_list_skills(self, args: dict[str, Any], context: dict[str, Any]) -> Any:
         from core.agent_tools import ToolCallResult
 
-        if not _SKILLS_DIR.exists():
+        self._load_skill_cache()
+
+        if not self._skill_cache and not _SKILLS_DIR.exists():
             return ToolCallResult(ok=True, display="还没有创建任何技能")
 
-        skills = []
-        for meta_file in _SKILLS_DIR.glob("*.yml"):
-            try:
-                with open(meta_file, "r", encoding="utf-8") as f:
-                    meta = yaml.safe_load(f)
-                    if meta:
-                        skills.append(meta)
-            except Exception as e:
-                _log.warning("skill_meta_load_failed | file=%s | error=%s", meta_file, e)
+        skills = sorted(
+            self._skill_cache.values(),
+            key=lambda item: str(item.get("created_at", "")),
+            reverse=True,
+        )
 
         if not skills:
             return ToolCallResult(ok=True, display="还没有创建任何技能")
@@ -637,94 +901,55 @@ class Plugin:
             - returncode: 返回码
             - execution_time: 执行时间（秒）
         """
-        start_time = time.time()
-
-        # 创建临时测试文件
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            suffix=".py",
-            delete=False,
-            encoding="utf-8",
-        ) as f:
-            test_file = Path(f.name)
-            f.write(code)
+        if not self._allow_code_execution or not self._acknowledge_unsafe_execution:
+            return {
+                "ok": False,
+                "error": (
+                    "当前配置未开启受信任代码执行。"
+                    "请显式启用 allow_code_execution 和 acknowledge_unsafe_execution。"
+                ),
+                "execution_time": 0.0,
+            }
+        if not self._code_runner.is_available:
+            return {
+                "ok": False,
+                "error": self._code_runner.unavailable_reason(),
+                "execution_time": 0.0,
+                "backend": self._execution_backend_name,
+                "sandbox_mode": self._sandbox_mode,
+            }
 
         try:
-            # 根据沙盒模式设置环境
-            env = os.environ.copy()
-            if self._sandbox_mode == "isolated":
-                # 限制环境变量
-                env = {
-                    "PATH": env.get("PATH", ""),
-                    "PYTHONPATH": "",
-                    "PYTHONDONTWRITEBYTECODE": "1",
-                }
-
-            # 某些调用路径下 setup 尚未执行，确保沙盒目录存在（Windows 下否则会触发 WinError 267）
-            _SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
-
-            # 运行代码
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                str(test_file),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-                cwd=str(_SANDBOX_DIR),
-            )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=self._test_timeout,
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                execution_time = time.time() - start_time
-                self._stats["total_tests"] += 1
-                return {
-                    "ok": False,
-                    "error": f"测试超时 ({self._test_timeout}秒)",
-                    "execution_time": execution_time,
-                }
-
-            output = stdout.decode("utf-8", errors="replace")
-            error = stderr.decode("utf-8", errors="replace")
-            execution_time = time.time() - start_time
-
-            # 更新统计
+            code = self._sanitize_code(code)
+        except ValueError as exc:
             self._stats["total_tests"] += 1
+            return {
+                "ok": False,
+                "error": str(exc),
+                "execution_time": 0.0,
+            }
 
-            if proc.returncode == 0:
+        try:
+            result = await self._code_runner.run(
+                code=code,
+                test_input=test_input,
+                timeout_seconds=self._test_timeout,
+                sandbox_mode=self._sandbox_mode,
+            )
+            self._stats["total_tests"] += 1
+            if result.get("ok"):
                 self._stats["passed_tests"] += 1
-                return {
-                    "ok": True,
-                    "output": output,
-                    "returncode": proc.returncode,
-                    "execution_time": execution_time,
-                }
-            else:
-                return {
-                    "ok": False,
-                    "error": error or output,
-                    "returncode": proc.returncode,
-                    "execution_time": execution_time,
-                }
-
-        except Exception as e:
-            execution_time = time.time() - start_time
+            return result
+        except Exception as exc:
             self._stats["total_tests"] += 1
             _log.exception("sandbox_test_exception")
             return {
                 "ok": False,
-                "error": f"测试执行失败: {e}",
-                "execution_time": execution_time,
+                "error": f"测试执行失败: {exc}",
+                "execution_time": 0.0,
+                "backend": self._execution_backend_name,
+                "sandbox_mode": self._sandbox_mode,
             }
-        finally:
-            # 清理临时文件
-            with contextlib.suppress(Exception):
-                test_file.unlink()
 
     def _load_skill_cache(self) -> None:
         """加载技能缓存"""
@@ -765,11 +990,20 @@ class Plugin:
 
         return False, ""
 
+    def _active_sessions(self) -> list[LearningSession]:
+        active_statuses = {"learning", "testing", "running"}
+        return [
+            session
+            for session in self._sessions.values()
+            if session.end_time is None and normalize_text(session.status).lower() in active_statuses
+        ]
+
     def get_stats(self) -> dict[str, Any]:
         """获取插件统计信息"""
+        self._load_skill_cache()
         return {
             **self._stats,
-            "active_sessions": len(self._sessions),
+            "active_sessions": len(self._active_sessions()),
             "cached_skills": len(self._skill_cache),
             "success_rate": (
                 self._stats["passed_tests"] / self._stats["total_tests"]
@@ -778,26 +1012,85 @@ class Plugin:
             ),
         }
 
-    def _sanitize_code(self, code: str) -> str:
-        """清理和验证代码
-
-        移除潜在的危险操作，确保代码安全。
-        """
-        # 检查危险的导入和操作
-        dangerous_patterns = [
-            r"import\s+os\s*\.\s*system",
-            r"import\s+subprocess",
-            r"eval\s*\(",
-            r"exec\s*\(",
-            r"__import__\s*\(",
-            r"open\s*\([^)]*['\"]w['\"]",  # 写文件操作
+    def _build_dynamic_context(self, runtime_info: dict[str, Any]) -> str:
+        _ = runtime_info
+        stats = self.get_stats()
+        dangerous_tools_enabled = self._code_execution_enabled()
+        lines = [
+            "自学习状态:",
+            f"- 执行后端: {self._execution_backend_name}",
+            f"- 受信任代码执行: {'开启' if dangerous_tools_enabled else '关闭'}",
+            f"- 危险工具可用: {'是' if dangerous_tools_enabled else '否'}",
+            f"- 权限限制: {'仅 super_admin' if self._super_admin_only else '按当前用户权限开放'}",
+            f"- 学习来源: {self._learning_source}",
+            f"- 活跃学习会话: {stats['active_sessions']}",
+            f"- 累计学习会话: {stats['total_sessions']}",
+            f"- 技能产出: 成功 {stats['successful_skills']} / 失败 {stats['failed_skills']}",
+            f"- 缓存技能数: {stats['cached_skills']}",
+            f"- 沙盒测试通过率: {stats['passed_tests']}/{stats['total_tests']} ({stats['success_rate']:.0%})",
         ]
+        if dangerous_tools_enabled:
+            lines.append("- 注意: 当前本地 subprocess 仅用于受信任代码开发，不是强隔离沙盒。")
+        else:
+            lines.append("- 默认策略: 先学习、整理方案和补丁建议，不要执行任意 Python。")
 
-        for pattern in dangerous_patterns:
-            if re.search(pattern, code, re.IGNORECASE):
-                _log.warning("dangerous_code_pattern_detected | pattern=%s", pattern)
+        recent_sessions = sorted(
+            self._sessions.values(),
+            key=lambda item: item.start_time,
+            reverse=True,
+        )[:3]
+        if recent_sessions:
+            session_rows = []
+            for session in recent_sessions:
+                session_rows.append(
+                    f"- {clip_text(normalize_text(session.topic), 48)} | {session.status} | {int(session.duration())}s"
+                )
+            if session_rows:
+                lines.append("最近学习记录:\n" + "\n".join(session_rows))
+        return "\n".join(lines)
 
-        return code
+    def _sanitize_code(self, code: str) -> str:
+        """验证代码，只允许受限纯 Python 片段。"""
+        cleaned = str(code or "").strip()
+        if not cleaned:
+            raise ValueError("代码不能为空。")
+
+        for snippet in _BLOCKED_PATH_SNIPPETS:
+            if snippet in cleaned.lower():
+                _log.warning("unsafe_code_path_detected | snippet=%s", snippet)
+                raise ValueError(f"拒绝执行包含路径逃逸/系统路径片段的代码: {snippet}")
+
+        try:
+            tree = ast.parse(cleaned, mode="exec")
+        except SyntaxError as exc:
+            raise ValueError(f"代码语法错误: {exc}") from exc
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    root = alias.name.split(".", 1)[0]
+                    if root in _BLOCKED_IMPORT_MODULES or root not in _SAFE_IMPORT_MODULES:
+                        _log.warning("unsafe_code_import_detected | module=%s", alias.name)
+                        raise ValueError(f"拒绝执行包含不安全导入的代码: {alias.name}")
+            elif isinstance(node, ast.ImportFrom):
+                module = str(node.module or "").split(".", 1)[0]
+                if (
+                    any(alias.name == "*" for alias in node.names)
+                    or module in _BLOCKED_IMPORT_MODULES
+                    or module not in _SAFE_IMPORT_MODULES
+                ):
+                    _log.warning("unsafe_code_importfrom_detected | module=%s", module)
+                    raise ValueError(f"拒绝执行包含不安全导入的代码: {module or 'unknown'}")
+            elif isinstance(node, ast.Name):
+                if node.id in _BLOCKED_CALL_NAMES or node.id.startswith("__"):
+                    _log.warning("unsafe_code_name_detected | name=%s", node.id)
+                    raise ValueError(f"拒绝执行包含高风险调用的代码: {node.id}")
+            elif isinstance(node, ast.Attribute):
+                if node.attr in _BLOCKED_ATTR_NAMES or node.attr.startswith("__"):
+                    _log.warning("unsafe_code_attr_detected | attr=%s", node.attr)
+                    raise ValueError(f"拒绝执行包含高风险属性调用的代码: {node.attr}")
+
+        return cleaned
 
     async def handle(self, message: str, context: dict) -> str:
         return "此插件通过 Agent 工具使用，不支持直接调用。"

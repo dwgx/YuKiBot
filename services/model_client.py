@@ -25,6 +25,29 @@ _FATAL_ERROR_CUES = (
     "suspended", "forbidden", "unauthorized", "banned",
     "account", "disabled", "quota", "rate_limit",
 )
+_TRANSIENT_ERROR_CUES = (
+    "timeout",
+    "timed out",
+    "time out",
+    "read timed out",
+    "connect timeout",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "connection error",
+    "network error",
+    "service unavailable",
+    "temporarily unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "upstream",
+    "econnreset",
+    "econnrefused",
+    "enotfound",
+    "502",
+    "503",
+    "504",
+)
 
 
 class ModelClient:
@@ -148,6 +171,16 @@ class ModelClient:
         msg = str(exc).lower()
         return any(cue in msg for cue in _FATAL_ERROR_CUES) or "403" in msg or "401" in msg
 
+    @staticmethod
+    def _is_transient_error(exc: Exception) -> bool:
+        """判断是否为瞬时错误（超时/网络抖动，可尝试降级 provider）。"""
+        raw = str(exc or "").strip()
+        msg = raw.lower()
+        if any(cue in msg for cue in _TRANSIENT_ERROR_CUES):
+            return True
+        exc_name = type(exc).__name__.lower()
+        return any(token in exc_name for token in ("timeout", "connection", "network"))
+
     def _get_active_client(self) -> Any:
         """返回当前活跃的 client（可能已降级）。"""
         if self._active_provider != self.provider:
@@ -165,6 +198,8 @@ class ModelClient:
         raw = str(exc or "").strip()
         msg = raw.lower()
         if ModelClient._is_fatal_error(exc):
+            return True
+        if ModelClient._is_transient_error(exc):
             return True
         if "不支持" in raw:
             return True

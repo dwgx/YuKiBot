@@ -10,13 +10,13 @@ from core.trigger import TriggerEngine, TriggerInput
 
 
 class ConfigAndTriggerRegressionTests(unittest.TestCase):
-    def test_builtin_defaults_are_conservative_for_undirected_messages(self) -> None:
+    def test_builtin_defaults_enable_high_confidence_ai_listen(self) -> None:
         defaults = _built_in_config_defaults()
 
-        self.assertEqual(defaults["control"]["undirected_policy"], "mention_only")
-        self.assertFalse(defaults["bot"]["allow_non_to_me"])
-        self.assertFalse(defaults["trigger"]["ai_listen_enable"])
-        self.assertFalse(defaults["trigger"]["delegate_undirected_to_ai"])
+        self.assertEqual(defaults["control"]["undirected_policy"], "high_confidence_only")
+        self.assertTrue(defaults["bot"]["allow_non_to_me"])
+        self.assertTrue(defaults["trigger"]["ai_listen_enable"])
+        self.assertTrue(defaults["trigger"]["delegate_undirected_to_ai"])
         self.assertEqual(defaults["trigger"]["delegate_undirected_min_signal"], 1.0)
         self.assertTrue(defaults["bot"]["relationship_progressive_enable"])
         self.assertTrue(defaults["bot"]["kaomoji_enable"])
@@ -102,6 +102,20 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
             "trigger": {
                 "ai_listen_enable": True,
                 "delegate_undirected_to_ai": True,
+            },
+        }
+
+        trigger_cfg = YukikoEngine._build_effective_trigger_config(engine)
+        self.assertTrue(trigger_cfg.get("ai_listen_enable", False))
+        self.assertTrue(trigger_cfg.get("delegate_undirected_to_ai", False))
+
+    def test_high_confidence_policy_forces_ai_listen_gate(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.config = {
+            "control": {"undirected_policy": "high_confidence_only"},
+            "bot": {"allow_non_to_me": False},
+            "trigger": {
+                "ai_listen_enable": False,
             },
         }
 

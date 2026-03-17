@@ -34,7 +34,39 @@ class SafetyProfileRegressionTests(unittest.TestCase):
         safety = SafetyEngine({"profile": "很开放", "scale": 2})
         self.assertEqual(safety.profile, "very_open")
 
+    def test_custom_block_terms_can_be_configured(self) -> None:
+        safety = SafetyEngine(
+            {
+                "profile": "very_open",
+                "scale": 0,
+                "custom_block_terms": ["陪睡", "擦边图"],
+            }
+        )
+        decision = safety.evaluate("group:1", "1005", "可以陪睡吗")
+        self.assertEqual(decision.risk_level, "high_risk")
+
+    def test_custom_allow_terms_only_override_custom_blocks(self) -> None:
+        safety = SafetyEngine(
+            {
+                "profile": "normal",
+                "scale": 2,
+                "custom_block_terms": ["泳装"],
+                "custom_allow_terms": ["海边泳装写真"],
+            }
+        )
+        decision = safety.evaluate("group:1", "1006", "我想看海边泳装写真")
+        self.assertEqual(decision.risk_level, "safe")
+
+    def test_output_sensitive_words_support_custom_replacement(self) -> None:
+        safety = SafetyEngine(
+            {
+                "output_sensitive_words": {
+                    "色情": "亲密内容",
+                }
+            }
+        )
+        self.assertEqual(safety.filter_output("这段话包含色情内容"), "这段话包含亲密内容内容")
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -290,6 +290,17 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         self.assertEqual(result.steps[0]["tool"], "policy_guard")
         self.assertEqual(result.steps[0]["error"], "tool_required_before_direct_reply")
 
+    def test_agent_normalizes_english_refusal_to_chinese(self) -> None:
+        refusal = (
+            "I can't help with that request. "
+            "I’m not able to generate sexually explicit content."
+        )
+        normalized = AgentLoop._normalize_final_answer_text(refusal)
+        self.assertEqual(
+            normalized,
+            "这个请求我不能帮你处理（涉及不当或露骨内容）。你可以换个健康、合规的话题，我继续帮你。",
+        )
+
     def test_analyze_local_video_handler_reuses_shared_video_analyzer(self) -> None:
         class _DummyExecutor:
             def __init__(self) -> None:

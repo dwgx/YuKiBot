@@ -1,7 +1,7 @@
 config:
   control:
     chat_mode: balanced
-    undirected_policy: mention_only
+    undirected_policy: high_confidence_only
     knowledge_learning: aggressive
     memory_recall_level: light
     emoji_level: medium
@@ -58,7 +58,7 @@ config:
     allow_markdown: true
     allow_search: true
     allow_image: true
-    allow_non_to_me: false
+    allow_non_to_me: true
     private_chat_mode: false
     private_chat_whitelist: []
     max_reply_chars: 520
@@ -221,6 +221,10 @@ config:
   safety:
     scale: 2
     profile: normal
+    custom_block_terms: []
+    custom_allow_terms: []
+    group_profiles: {}
+    output_sensitive_words: {}
   output:
     verbosity: medium
     token_saving: false
@@ -233,10 +237,10 @@ config:
     whitelist_groups: []
     non_whitelist_mode: silent
   trigger:
-    ai_listen_enable: false
+    ai_listen_enable: true
     ai_listen_keyword_enable: true
     ai_listen_min_keyword_hits: 1
-    delegate_undirected_to_ai: false
+    delegate_undirected_to_ai: true
     delegate_undirected_min_signal: 1.0
     ai_listen_min_messages: 5
     ai_listen_min_unique_users: 2
@@ -318,11 +322,17 @@ config:
     default_model: dall-e-3
     default_size: 1024x1024
     nsfw_filter: true
+    prompt_review_enable: true
+    prompt_review_fail_closed: false
+    prompt_review_model: ''
+    prompt_review_max_tokens: 180
     post_review_enable: true
     post_review_fail_closed: true
     post_review_model: ''
     post_review_max_tokens: 260
     max_prompt_length: 1000
+    custom_block_terms: []
+    custom_allow_terms: []
     models: []
   video_analysis:
     keyframe_count: 4

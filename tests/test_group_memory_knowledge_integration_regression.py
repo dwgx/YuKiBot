@@ -153,6 +153,36 @@ class GroupMemoryAndKnowledgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(related, [])
 
+    def test_focused_runtime_group_context_prefers_current_and_target_users(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        message = EngineMessage(
+            conversation_id="group:42",
+            user_id="10001",
+            text="那他呢",
+            reply_to_user_id="20002",
+            at_other_user_ids=["30003"],
+            bot_id="99999",
+            is_private=False,
+        )
+        rows = [
+            "路人(QQ:40004): 我来围观一下",
+            "小雨(QQ:10001): 这个我再确认下",
+            "阿风(QQ:30003): 我刚才说的是饮料",
+            "可乐(QQ:20002): 我喜欢可乐",
+        ]
+
+        focused = engine._build_focused_runtime_group_context(
+            message=message,
+            rows=rows,
+            limit=3,
+        )
+
+        self.assertTrue(focused)
+        merged = "\n".join(focused)
+        self.assertIn("QQ:10001", merged)
+        self.assertIn("QQ:20002", merged)
+        self.assertNotIn("QQ:40004", merged)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import {
   LayoutDashboard, Settings, FileText, Terminal,
   RefreshCw, LogOut, ChevronLeft, ChevronRight, MoonStar, SunMedium, Database, Cookie, Puzzle, Brain, MessageSquare,
+  RotateCcw, Activity,
 } from "lucide-react";
 import { api } from "../api/client";
 import { useState } from "react";
@@ -25,6 +26,7 @@ export default function AppShell() {
   const navigate = useNavigate();
   const location = useLocation();
   const [reloading, setReloading] = useState(false);
+  const [restarting, setRestarting] = useState(false);
   const [open, setOpen] = useState(true);
   const [theme, setTheme] = useState<"dark" | "light">(
     document.documentElement.classList.contains("dark") ? "dark" : "light",
@@ -35,7 +37,22 @@ export default function AppShell() {
     try { await api.reload(); } catch {} finally { setReloading(false); }
   };
 
-  const handleLogout = () => { api.clearToken(); navigate("/login"); };
+  const handleRestart = async () => {
+    if (!confirm("确定要重启服务吗？重启期间 bot 将暂时离线。")) return;
+    setRestarting(true);
+    try {
+      await fetch("/api/webui/system/restart", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${api.getToken?.() || localStorage.getItem("webui_token") || ""}` },
+      });
+    } catch {}
+    setTimeout(() => { window.location.reload(); }, 5000);
+  };
+
+  const handleLogout = async () => {
+    await api.logout();
+    navigate("/login");
+  };
   const currentPath = location.pathname;
   const contentMaxWidth = (currentPath.startsWith("/config") || currentPath.startsWith("/database") || currentPath.startsWith("/chat"))
     || currentPath.startsWith("/memory")
@@ -161,11 +178,26 @@ export default function AppShell() {
               radius="lg"
               className={clsx(
                 "w-full justify-start gap-3 h-10 font-medium",
+                "bg-warning-50/50 hover:bg-warning-100/80 text-warning-600",
+                "shadow-sm hover:shadow-md transition-all backdrop-blur-sm",
+                !open && "justify-center px-0"
+              )}
+              isLoading={restarting}
+              onPress={handleRestart}
+            >
+              <RotateCcw size={18} className="shrink-0" />
+              {open && "重启服务"}
+            </Button>
+            <Button
+              variant="flat"
+              radius="lg"
+              className={clsx(
+                "w-full justify-start gap-3 h-10 font-medium",
                 "bg-danger-50/50 hover:bg-danger-100/80 text-danger-500",
                 "shadow-sm hover:shadow-md transition-all backdrop-blur-sm",
                 !open && "justify-center px-0"
               )}
-              onPress={handleLogout}
+              onPress={() => { void handleLogout(); }}
             >
               <LogOut size={18} className="shrink-0" />
               {open && "退出登录"}

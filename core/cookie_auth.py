@@ -45,6 +45,15 @@ def _safe_input(prompt: str) -> str:
         return ""
 
 
+def _stdin_is_tty() -> bool:
+    """当前输入流是否为交互式终端。"""
+    try:
+        stdin = getattr(sys, "stdin", None)
+        return bool(stdin and hasattr(stdin, "isatty") and stdin.isatty())
+    except Exception:
+        return False
+
+
 def _print_compact_qr(data: str) -> None:
     """用 Unicode 半块字符渲染紧凑二维码（高度减半）。
 
@@ -1987,41 +1996,49 @@ def _interactive_prepare_browser_login(platform: str, browser: str) -> bool:
 
 def interactive_bilibili_cookie() -> dict[str, str]:
     """交互式获取 B站 cookie。"""
+    if not _stdin_is_tty():
+        _log.warning("interactive_bilibili_cookie skipped: stdin is not a tty")
+        return {"sessdata": "", "bili_jct": ""}
+
     print("\n  B站 Cookie 获取方式:")
     print("    1. 扫码登录（推荐，最可靠）")
     print("    2. 从浏览器自动提取")
     print("    3. 手动输入")
     print("    4. 跳过")
 
-    choice = _safe_input("  选择 [1-4，默认 1]: ")
-    if not choice or choice == "1":
-        result = bilibili_qr_login_sync()
-        if result and result.get("sessdata"):
-            return result
-        print("  扫码登录未成功，可选择其他方式。")
-        return interactive_bilibili_cookie()
+    while True:
+        choice = _safe_input("  选择 [1-4，默认 1]: ")
+        if not choice or choice == "1":
+            result = bilibili_qr_login_sync()
+            if result and result.get("sessdata"):
+                return result
+            print("  扫码登录未成功，可选择其他方式。")
+            continue
 
-    elif choice == "2":
-        browser = _pick_browser()
-        result = extract_bilibili_cookies(browser, auto_close=False)
-        if result.get("sessdata"):
-            print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
-            return result
-        # 无关闭模式失败，询问是否关闭浏览器重试
-        auto_close = _ask_auto_close_for_running_browser(browser)
-        if auto_close:
-            result = extract_bilibili_cookies(browser, auto_close=True)
+        if choice == "2":
+            browser = _pick_browser()
+            result = extract_bilibili_cookies(browser, auto_close=False)
             if result.get("sessdata"):
                 print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
                 return result
-        print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到 B站登录信息。")
-        print("  请确保已在该浏览器中登录 bilibili.com")
-        return {"sessdata": "", "bili_jct": ""}
+            # 无关闭模式失败，询问是否关闭浏览器重试
+            auto_close = _ask_auto_close_for_running_browser(browser)
+            if auto_close:
+                result = extract_bilibili_cookies(browser, auto_close=True)
+                if result.get("sessdata"):
+                    print(f"  从 {_BROWSER_DISPLAY.get(browser, browser)} 提取成功!")
+                    return result
+            print(f"  未在 {_BROWSER_DISPLAY.get(browser, browser)} 中找到 B站登录信息。")
+            print("  请确保已在该浏览器中登录 bilibili.com")
+            return {"sessdata": "", "bili_jct": ""}
 
-    elif choice == "3":
-        sessdata = _safe_input("  SESSDATA: ")
-        bili_jct = _safe_input("  bili_jct: ")
-        return {"sessdata": sessdata, "bili_jct": bili_jct}
+        if choice == "3":
+            sessdata = _safe_input("  SESSDATA: ")
+            bili_jct = _safe_input("  bili_jct: ")
+            return {"sessdata": sessdata, "bili_jct": bili_jct}
+
+        if choice == "4":
+            return {"sessdata": "", "bili_jct": ""}
 
     return {"sessdata": "", "bili_jct": ""}
 

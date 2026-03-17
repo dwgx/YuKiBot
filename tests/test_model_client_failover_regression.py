@@ -43,6 +43,17 @@ class _BackupOKClient:
         return f"https://backup.example/{size}.png"
 
 
+class _PrimaryTimeoutClient:
+    def __init__(self, config: dict):
+        self.config = config
+        self.enabled = True
+        self.model = "primary-timeout"
+        self.base_url = "https://primary-timeout.example/v1"
+
+    async def chat_completion(self, messages, response_format=None, max_tokens=None):
+        raise TimeoutError("request timed out while waiting for upstream")
+
+
 class ModelClientFailoverRegressionTests(unittest.TestCase):
     def _build_client(self) -> ModelClient:
         cfg = {
@@ -104,6 +115,26 @@ class ModelClientFailoverRegressionTests(unittest.TestCase):
 
             result = asyncio.run(client.generate_image(prompt="draw cat", size="512x512"))
             self.assertEqual(result, "https://backup.example/512x512.png")
+            self.assertEqual(client._active_provider, "backup_test_provider")
+        finally:
+            ModelClient._CLIENTS.clear()
+            ModelClient._CLIENTS.update(original_clients)
+
+    def test_transient_timeout_can_trigger_failover(self) -> None:
+        original_clients = dict(ModelClient._CLIENTS)
+        try:
+            ModelClient._CLIENTS["primary_test_provider"] = _PrimaryTimeoutClient
+            ModelClient._CLIENTS["backup_test_provider"] = _BackupOKClient
+
+            client = self._build_client()
+
+            result = asyncio.run(
+                client.chat_text_with_retry(
+                    messages=[{"role": "user", "content": "ping"}],
+                    retries=0,
+                )
+            )
+            self.assertEqual(result, "fallback-ok")
             self.assertEqual(client._active_provider, "backup_test_provider")
         finally:
             ModelClient._CLIENTS.clear()

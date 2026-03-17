@@ -88,6 +88,8 @@ class AgentContext:
     )  # 原始 OneBot/NapCat 事件快照
     is_whitelisted_group: bool = False  # 当前群是否在白名单中
     bot_mood: str = ""  # 当前 bot 心情状态（happy/neutral/tired/...）
+    affinity_hint: str = ""  # 用户好感度提示
+    mood_hint: str = ""  # bot 心情提示
 
 
 @dataclass(slots=True)
@@ -173,9 +175,11 @@ class AgentLoop:
         model_client: ModelClient,
         tool_registry: AgentToolRegistry,
         config: dict[str, Any],
+        persona_text: str = "",
     ):
         self.model_client = model_client
         self.tool_registry = tool_registry
+        self.persona_text = persona_text
         self.config: dict[str, Any] = {}
         self.max_steps = 8
         self.max_tokens = 4096
@@ -482,8 +486,22 @@ class AgentLoop:
 
     @staticmethod
     def _build_args_signature(args: dict[str, Any]) -> str:
+        """Build a normalized signature for repeat-tool detection.
+
+        Strips whitespace from string values and lowercases them so that
+        minor LLM variations like trailing spaces or case changes are
+        treated as the same call.
+        """
+        def _norm(v: Any) -> Any:
+            if isinstance(v, str):
+                return v.strip().lower()
+            if isinstance(v, dict):
+                return {k: _norm(val) for k, val in v.items()}
+            if isinstance(v, list):
+                return [_norm(item) for item in v]
+            return v
         try:
-            return json.dumps(args or {}, ensure_ascii=False, sort_keys=True)
+            return json.dumps(_norm(args or {}), ensure_ascii=False, sort_keys=True)
         except Exception:
             return str(args or {})
 
@@ -1256,6 +1274,7 @@ class AgentLoop:
                             )
                         if not text:
                             text = _pl.get_message("no_result", "")
+                text = self._normalize_final_answer_text(text)
                 steps.append(
                     {"step": step_idx, "tool": "final_answer", "result": "done"}
                 )
@@ -1919,12 +1938,21 @@ class AgentLoop:
             context_parts.append(
                 "用户专属指令:\n" + "\n".join(f"- {d}" for d in ctx.user_directives[:5])
             )
+        # ── 好感度 & 心情注入 Agent 上下文 ──
+        if ctx.affinity_hint:
+            context_parts.append(ctx.affinity_hint)
+        if ctx.mood_hint:
+            context_parts.append(ctx.mood_hint)
         context_block = (
             "\n\n".join(context_parts) if context_parts else "(无额外上下文)"
         )
 
         prompt = (
             f"## 身份\n{identity_text}\n\n"
+        )
+        if self.persona_text:
+            prompt += f"## 人格底稿（最高优先级，定义你是谁、怎么说话、怎么互动）\n{self.persona_text}\n\n"
+        prompt += (
             f"## 输出格式\n{output_format_text}\n\n"
             f"## 规则\n{rules_text}\n"
         )
@@ -2182,6 +2210,47 @@ class AgentLoop:
             return ""
         return f"[NapCat事件锚点]\n{compact}"
 
+    @staticmethod
+    def _build_turn_target_line(ctx: AgentContext) -> str:
+        current_uid = normalize_text(str(ctx.user_id))
+        current_name = normalize_text(ctx.user_name) or (
+            f"用户{current_uid[-4:]}" if current_uid else "当前用户"
+        )
+        bot_uid = normalize_text(str(ctx.bot_id))
+        reply_uid = normalize_text(str(ctx.reply_to_user_id))
+
+        mention_ids: list[str] = []
+        for raw_uid in ctx.at_other_user_ids or []:
+            uid = normalize_text(str(raw_uid))
+            if not uid:
+                continue
+            if uid in {bot_uid, current_uid}:
+                continue
+            if uid not in mention_ids:
+                mention_ids.append(uid)
+
+        if reply_uid and reply_uid != bot_uid:
+            target_uid = reply_uid
+            target_name = normalize_text(ctx.reply_to_user_name) or normalize_text(
+                (ctx.at_other_user_names or {}).get(target_uid, "")
+            )
+            source = "reply_anchor"
+        elif mention_ids:
+            target_uid = mention_ids[0]
+            target_name = normalize_text((ctx.at_other_user_names or {}).get(target_uid, ""))
+            source = "mention"
+        else:
+            target_uid = current_uid
+            target_name = current_name
+            source = "current_speaker"
+
+        target_name = target_name or (
+            f"用户{target_uid[-4:]}" if target_uid else current_name
+        )
+        if target_uid:
+            return f"[本轮主要对象: {target_name}(QQ:{target_uid}) | 来源: {source}]"
+        return f"[本轮主要对象: {target_name} | 来源: {source}]"
+
     def _build_user_message(self, ctx: AgentContext) -> str:
         """构建用户消息。"""
         runtime_templates = _pl.get_dict("agent_runtime")
@@ -2193,6 +2262,9 @@ class AgentLoop:
         if normalize_text(ctx.sender_role):
             speaker_line = f"{speaker_line[:-1]} | role={normalize_text(ctx.sender_role)}]"
         parts = [speaker_line, ctx.message_text]
+        target_line = self._build_turn_target_line(ctx)
+        if normalize_text(target_line):
+            parts.insert(1, target_line)
         if rebuilt_query and rebuilt_query != normalize_text(ctx.message_text):
             parts.append(f"[语境补全: {rebuilt_query}]")
 
@@ -3385,6 +3457,7 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
+        compact = re.sub(r"\s+", "", t)
         direct_cues = (
             "生图",
             "生圖",
@@ -3412,7 +3485,7 @@ class AgentLoop:
         if any(cue in t for cue in direct_cues):
             return True
         subject_pattern = (
-            r"(?:图|圖|图片|圖片|照片|头像|頭像|壁纸|壁紙|插画|插畫|立绘|立繪|封面|表情包|猫娘|貓娘|二次元|anime)"
+            r"(?:图|圖|图片|圖片|照片|头像|頭像|壁纸|壁紙|插画|插畫|立绘|立繪|封面|表情包|猫娘|貓娘|二次元|anime|猫|貓|狗|风景|風景|少女|男孩|女孩)"
         )
         generation_patterns = (
             rf"(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|替我|帮忙|幫忙|来|來)?"
@@ -3421,7 +3494,64 @@ class AgentLoop:
             rf"(?:画|畫|绘|繪)(?:一张|一張|个|個|张|張|幅|一下)?[^\n。！？!?]{{0,24}}{subject_pattern}",
             rf"{subject_pattern}[^\n。！？!?]{{0,10}}(?:生成|做|整)",
         )
-        return any(re.search(pattern, t) for pattern in generation_patterns)
+        if any(re.search(pattern, t) for pattern in generation_patterns):
+            return True
+
+        concise_generation = bool(
+            re.match(
+                r"^(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|来|來|想|要)?"
+                r"(?:生成|做|整|画|畫|绘|繪)"
+                r"(?:一只|一隻|一个|一個|一张|一張|个|個|张|張|幅)?",
+                compact,
+            )
+        )
+        if not concise_generation:
+            return False
+
+        non_image_cues = (
+            "代码",
+            "程式",
+            "脚本",
+            "腳本",
+            "配置",
+            "文案",
+            "文章",
+            "作文",
+            "总结",
+            "總結",
+            "摘要",
+            "报告",
+            "報告",
+            "日报",
+            "日報",
+            "周报",
+            "週報",
+            "月报",
+            "月報",
+            "清单",
+            "清單",
+            "列表",
+            "表格",
+            "方案",
+            "计划",
+            "計劃",
+            "json",
+            "yaml",
+            "yml",
+            "sql",
+            "markdown",
+            "md文档",
+            "md文件",
+            "函数",
+            "函數",
+            "接口",
+            "指令",
+            "命令",
+            "随机数",
+        )
+        if any(cue in compact for cue in non_image_cues):
+            return False
+        return True
 
     @staticmethod
     def _infer_image_generation_prompt(text: str) -> str:
@@ -4544,6 +4674,42 @@ class AgentLoop:
     @staticmethod
     def _elapsed(t0: float) -> int:
         return int((time.monotonic() - t0) * 1000)
+
+    @staticmethod
+    def _looks_like_english_refusal_text(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        refusal_markers = (
+            "i can't",
+            "i cannot",
+            "i can’t",
+            "i'm not able",
+            "i’m not able",
+            "unable to",
+            "cannot help with that request",
+            "can't help with that request",
+            "text-based ai assistant",
+            "as an ai",
+            "adult content",
+            "sexually explicit",
+            "18+",
+            "nsfw",
+        )
+        if not any(marker in content for marker in refusal_markers):
+            return False
+        cjk_count = sum(1 for ch in content if "\u4e00" <= ch <= "\u9fff")
+        alpha_count = sum(1 for ch in content if ch.isalpha())
+        return alpha_count > 0 and cjk_count <= 2
+
+    @classmethod
+    def _normalize_final_answer_text(cls, text: str) -> str:
+        content = normalize_text(text)
+        if not content:
+            return ""
+        if cls._looks_like_english_refusal_text(content):
+            return "这个请求我不能帮你处理（涉及不当或露骨内容）。你可以换个健康、合规的话题，我继续帮你。"
+        return content
 
     async def _ai_fallback_reply(self, ctx: AgentContext, error_hint: str) -> str:
         """用一次快速 LLM 调用生成错误场景的自然回复，失败返回空字符串。"""

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import core.webui as webui
 from core.agent_tools import _napcat_api_call
-from core.napcat_compat import normalize_napcat_api_kwargs
+from core.napcat_compat import normalize_napcat_api_kwargs, resolve_napcat_api_name
 
 
 class _StubBot:
@@ -33,6 +33,12 @@ class _StubBot:
 
 
 class NapCatCompatRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_resolve_napcat_api_name_maps_legacy_aliases(self) -> None:
+        self.assertEqual(resolve_napcat_api_name("set_group_sign"), "send_group_sign")
+        self.assertEqual(resolve_napcat_api_name("get_group_notice"), "_get_group_notice")
+        self.assertEqual(resolve_napcat_api_name("send_group_message"), "send_group_msg")
+        self.assertEqual(resolve_napcat_api_name("send_group_sign"), "send_group_sign")
+
     def test_normalize_napcat_api_kwargs_stringifies_nested_ids_only(self) -> None:
         payload = normalize_napcat_api_kwargs(
             "send_private_msg",
@@ -73,6 +79,25 @@ class NapCatCompatRegressionTests(unittest.IsolatedAsyncioTestCase):
             captured["kwargs"],
             {"message_id": "12345678901234567890"},
         )
+
+    async def test_agent_tools_wrapper_maps_legacy_sign_alias_to_official_api(self) -> None:
+        captured: dict[str, object] = {}
+
+        async def fake_api_call(api: str, **kwargs):
+            captured["api"] = api
+            captured["kwargs"] = dict(kwargs)
+            return {"ok": True}
+
+        result = await _napcat_api_call(
+            {"api_call": fake_api_call},
+            "set_group_sign",
+            "ok",
+            group_id=123456,
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(captured["api"], "send_group_sign")
+        self.assertEqual(captured["kwargs"], {"group_id": "123456"})
 
     async def test_webui_calls_and_diagnostics_use_napcat_compat_layer(self) -> None:
         original_get_runtime = webui._get_onebot_runtime
