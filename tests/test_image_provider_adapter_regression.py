@@ -118,6 +118,84 @@ class ImageProviderAdapterRegressionTests(unittest.TestCase):
             result = asyncio.run(client.generate_image("draw cat"))
         self.assertEqual(result, "data:image/png;base64,YWJjZA==")
 
+    def test_gemini_native_generate_image_retries_after_503(self) -> None:
+        calls: list[str] = []
+
+        async def fake_post(_self, url, headers=None, json=None):
+            _ = (headers, json)
+            calls.append(url)
+            if len(calls) < 3:
+                return _FakeResponse(status_code=503, text="Service Unavailable")
+            return _FakeResponse(
+                json_data={
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": "YWJjZA==",
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+
+        client = GeminiClient(
+            {
+                "api_key": "gemini-key",
+                "image_model": "gemini-3.1-flash-image-preview",
+                "base_url": "https://generativelanguage.googleapis.com",
+            }
+        )
+        with patch("httpx.AsyncClient.post", new=fake_post), patch("services.gemini.asyncio.sleep", new=AsyncMock()):
+            result = asyncio.run(client.generate_image("draw cat"))
+        self.assertEqual(result, "data:image/png;base64,YWJjZA==")
+        self.assertGreaterEqual(len(calls), 3)
+
+    def test_gemini_native_generate_image_falls_back_from_31_to_25(self) -> None:
+        calls: list[str] = []
+
+        async def fake_post(_self, url, headers=None, json=None):
+            _ = (headers, json)
+            calls.append(url)
+            if "gemini-3.1-flash-image-preview" in url:
+                return _FakeResponse(status_code=503, text="Service Unavailable")
+            return _FakeResponse(
+                json_data={
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": "ZmFsbGJhY2s=",
+                                        }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            )
+
+        client = GeminiClient(
+            {
+                "api_key": "gemini-key",
+                "image_model": "gemini-3.1-flash-image-preview",
+                "base_url": "https://generativelanguage.googleapis.com",
+            }
+        )
+        with patch("httpx.AsyncClient.post", new=fake_post), patch("services.gemini.asyncio.sleep", new=AsyncMock()):
+            result = asyncio.run(client.generate_image("draw cat"))
+        self.assertEqual(result, "data:image/png;base64,ZmFsbGJhY2s=")
+        self.assertTrue(any("gemini-2.5-flash-image" in url for url in calls))
+
     def test_generate_image_with_model_config_parses_sd_webui(self) -> None:
         seen_payloads: list[dict] = []
 

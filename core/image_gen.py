@@ -508,6 +508,11 @@ def _remap_image_generation_error(*, provider: str, message: str) -> str:
             "当前图片网关暂无可用生图渠道（上游 503 distributor），不是本地配置错误。"
             "请稍后重试，或改用官方 OpenAI / 官方 Gemini / OpenRouter / SiliconFlow。"
         )
+    if provider == "gemini" and ("503" in lowered or "service unavailable" in lowered):
+        return (
+            "Gemini 图片通道当前返回 503，系统已自动重试并尝试回退稳定模型，但上游仍不可用。"
+            "这不是本地配置错误；请稍后重试，或改用 `gemini-2.5-flash-image` / 官方 Gemini Key。"
+        )
     return raw or "未知错误"
 
 

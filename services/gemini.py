@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from math import gcd
 from typing import Any
 from urllib.parse import quote
@@ -11,6 +12,19 @@ from services.base_client import BaseLLMClient
 
 class GeminiClient(BaseLLMClient):
     """Gemini 官方接口。"""
+    _RETRYABLE_IMAGE_ERROR_CUES = (
+        "503",
+        "service unavailable",
+        "temporarily unavailable",
+        "resource exhausted",
+        "rate limit",
+        "429",
+        "deadline exceeded",
+    )
+    _NATIVE_IMAGE_FALLBACKS = {
+        "gemini-3.1-flash-image": ("gemini-2.5-flash-image",),
+        "gemini-3.1-flash-image-preview": ("gemini-2.5-flash-image",),
+    }
 
     def __init__(self, config: dict[str, Any]):
         super().__init__(
@@ -183,31 +197,66 @@ class GeminiClient(BaseLLMClient):
             if version and version not in versions:
                 versions.append(version)
 
+        model_candidates = self._native_image_model_candidates(model_name)
         last_error: Exception | None = None
         async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
-            for version in versions:
-                url = f"{base}/{version}/models/{quote(model_name, safe='-_.')}:generateContent?key={self.api_key}"
-                try:
-                    response = await client.post(
-                        url,
-                        headers={"Content-Type": "application/json"},
-                        json=payload,
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    if not isinstance(data, dict):
-                        raise RuntimeError("Gemini 返回格式异常")
-                    inline = self._extract_inline_image_data(data)
-                    if inline:
-                        return f"data:image/png;base64,{inline}"
-                    text = self._extract_text(data)
-                    raise RuntimeError(text or "Gemini 未返回图片数据")
-                except Exception as exc:
-                    last_error = exc
+            for candidate_model in model_candidates:
+                candidate_error: Exception | None = None
+                for version in versions:
+                    url = f"{base}/{version}/models/{quote(candidate_model, safe='-_.')}:generateContent?key={self.api_key}"
+                    attempt_error: Exception | None = None
+                    for attempt in range(3):
+                        try:
+                            response = await client.post(
+                                url,
+                                headers={"Content-Type": "application/json"},
+                                json=payload,
+                            )
+                            response.raise_for_status()
+                            data = response.json()
+                            if not isinstance(data, dict):
+                                raise RuntimeError("Gemini 返回格式异常")
+                            inline = self._extract_inline_image_data(data)
+                            if inline:
+                                return f"data:image/png;base64,{inline}"
+                            text = self._extract_text(data)
+                            raise RuntimeError(text or "Gemini 未返回图片数据")
+                        except Exception as exc:
+                            attempt_error = exc
+                            last_error = exc
+                            if attempt < 2 and self._is_retryable_image_error(exc):
+                                await asyncio.sleep(1.0 + attempt)
+                                continue
+                            break
+                    if attempt_error is not None:
+                        candidate_error = attempt_error
+                        if self._is_retryable_image_error(attempt_error):
+                            continue
+                        raise attempt_error
+                if candidate_error is not None:
+                    last_error = candidate_error
+                    if self._is_retryable_image_error(candidate_error):
+                        continue
+                    raise candidate_error
 
         if last_error is not None:
             raise last_error
         return None
+
+    @classmethod
+    def _is_retryable_image_error(cls, exc: Exception) -> bool:
+        message = str(exc or "").strip().lower()
+        return any(token in message for token in cls._RETRYABLE_IMAGE_ERROR_CUES)
+
+    @classmethod
+    def _native_image_model_candidates(cls, model_name: str) -> list[str]:
+        raw = str(model_name or "").strip()
+        lowered = raw.lower()
+        candidates = [raw]
+        for fallback in cls._NATIVE_IMAGE_FALLBACKS.get(lowered, ()):
+            if fallback and fallback not in candidates:
+                candidates.append(fallback)
+        return candidates
 
     @staticmethod
     def _extract_inline_image_data(data: dict[str, Any]) -> str:
