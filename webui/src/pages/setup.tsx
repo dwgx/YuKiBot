@@ -248,6 +248,7 @@ export default function SetupPage() {
   const [baseUrl, setBaseUrl] = useState("");
   const [testingApi, setTestingApi] = useState(false);
   const [testApiResult, setTestApiResult] = useState<{ ok: boolean; msg: string; latencyMs?: number } | null>(null);
+  const [showApiAdvanced, setShowApiAdvanced] = useState(false);
 
   // Step 2: Features
   const [botName, setBotName] = useState("YuKiKo");
@@ -259,6 +260,7 @@ export default function SetupPage() {
   const [superAdmin, setSuperAdmin] = useState("");
   const [verbosity, setVerbosity] = useState("medium");
   const [tokenSaving, setTokenSaving] = useState(false);
+  const [showOutputAdvanced, setShowOutputAdvanced] = useState(false);
 
   // Step 4: Music
   const [musicEnable, setMusicEnable] = useState(true);
@@ -273,6 +275,7 @@ export default function SetupPage() {
   const [imageGenSize, setImageGenSize] = useState("1024x1024");
   const [testingImageGen, setTestingImageGen] = useState(false);
   const [testImageGenResult, setTestImageGenResult] = useState<{ ok: boolean; msg: string; imageUrl?: string } | null>(null);
+  const [showImageGenAdvanced, setShowImageGenAdvanced] = useState(false);
 
   // Step 5: Cookies
   const [biliSessdata, setBiliSessdata] = useState("");
@@ -295,6 +298,8 @@ export default function SetupPage() {
   const [biliQrUrl, setBiliQrUrl] = useState("");
   const [biliQrStatus, setBiliQrStatus] = useState("");
   const [biliQrLoading, setBiliQrLoading] = useState(false);
+  const [showCookieManualEditors, setShowCookieManualEditors] = useState(false);
+  const [showCookieAdvanced, setShowCookieAdvanced] = useState(false);
 
   // Auto-poll smart extraction results
   const pollSmartResult = useCallback(async () => {
@@ -874,6 +879,10 @@ export default function SetupPage() {
           {/* Step 1: API */}
           {step === 0 && (
             <div className="space-y-4">
+              <div className="rounded-xl border border-primary/15 bg-primary/5 p-3">
+                <p className="text-sm font-medium">先完成基础连接</p>
+                <p className="text-xs text-default-500">大多数情况下只需要「提供商 + 模型 + API Key」。端点类型和 Base URL 属于高级兼容项。</p>
+              </div>
               <Select
                 label="API 提供商"
                 selectedKeys={[provider]}
@@ -885,19 +894,6 @@ export default function SetupPage() {
               >
                 {PROVIDERS.map((p) => (
                   <SelectItem key={p.value}>{p.label}</SelectItem>
-                ))}
-              </Select>
-              <Select
-                label="端点类型"
-                selectedKeys={[endpointType]}
-                onSelectionChange={(keys) => {
-                  const v = Array.from(keys)[0];
-                  if (v) setEndpointType(String(v));
-                }}
-                classNames={{ trigger: "bg-content2" }}
-              >
-                {ENDPOINT_TYPE_OPTIONS.map((ep) => (
-                  <SelectItem key={ep.value}>{ep.label}</SelectItem>
                 ))}
               </Select>
               <Select
@@ -927,13 +923,6 @@ export default function SetupPage() {
                 onValueChange={setApiKey}
                 classNames={{ inputWrapper: "bg-content2" }}
               />
-              <Input
-                label="Base URL（可选，自定义端点）"
-                placeholder="留空使用默认"
-                value={baseUrl}
-                onValueChange={setBaseUrl}
-                classNames={{ inputWrapper: "bg-content2" }}
-              />
               <div className="flex items-center justify-between gap-3 rounded-lg border border-default-200/50 bg-content2/40 px-3 py-2">
                 <div className="min-w-0">
                   <p className="text-xs text-default-500">连通性检测</p>
@@ -943,6 +932,35 @@ export default function SetupPage() {
                   检测
                 </Button>
               </div>
+              <div className="flex justify-end">
+                <Button size="sm" variant="light" onPress={() => setShowApiAdvanced((prev) => !prev)}>
+                  {showApiAdvanced ? "收起高级 API 选项" : "展开高级 API 选项"}
+                </Button>
+              </div>
+              {showApiAdvanced && (
+                <div className="space-y-3 rounded-xl border border-warning/20 bg-warning/5 p-3">
+                  <Select
+                    label="端点类型"
+                    selectedKeys={[endpointType]}
+                    onSelectionChange={(keys) => {
+                      const v = Array.from(keys)[0];
+                      if (v) setEndpointType(String(v));
+                    }}
+                    classNames={{ trigger: "bg-content2" }}
+                  >
+                    {ENDPOINT_TYPE_OPTIONS.map((ep) => (
+                      <SelectItem key={ep.value}>{ep.label}</SelectItem>
+                    ))}
+                  </Select>
+                  <Input
+                    label="Base URL（可选，自定义端点）"
+                    placeholder="留空使用默认"
+                    value={baseUrl}
+                    onValueChange={setBaseUrl}
+                    classNames={{ inputWrapper: "bg-content2" }}
+                  />
+                </div>
+              )}
               {testApiResult && (
                 <Chip size="sm" variant="flat" color={testApiResult.ok ? "success" : "danger"}>
                   {testApiResult.msg}{typeof testApiResult.latencyMs === "number" ? ` (${testApiResult.latencyMs}ms)` : ""}
@@ -1010,13 +1028,20 @@ export default function SetupPage() {
                 <SelectItem key="brief">简洁 — 抓重点不展开</SelectItem>
                 <SelectItem key="minimal">极简 — 一两句话概括</SelectItem>
               </Select>
-              <div className="flex items-center justify-between p-3 rounded-lg bg-content2">
-                <div>
-                  <p className="text-sm font-medium">省 Token 模式</p>
-                  <p className="text-xs text-default-400">压缩上下文降低 API 成本，可能影响回复质量</p>
-                </div>
-                <Switch isSelected={tokenSaving} onValueChange={setTokenSaving} />
+              <div className="flex justify-end">
+                <Button size="sm" variant="light" onPress={() => setShowOutputAdvanced((prev) => !prev)}>
+                  {showOutputAdvanced ? "收起高级输出选项" : "展开高级输出选项"}
+                </Button>
               </div>
+              {showOutputAdvanced && (
+                <div className="flex items-center justify-between p-3 rounded-lg bg-content2">
+                  <div>
+                    <p className="text-sm font-medium">省 Token 模式</p>
+                    <p className="text-xs text-default-400">压缩上下文降低 API 成本，可能影响回复质量</p>
+                  </div>
+                  <Switch isSelected={tokenSaving} onValueChange={setTokenSaving} />
+                </div>
+              )}
             </div>
           )}
 
@@ -1084,28 +1109,6 @@ export default function SetupPage() {
                     placeholder="gpt-image-1"
                     classNames={{ inputWrapper: "bg-content2" }}
                   />
-                  <Input
-                    label="API Key"
-                    description={`留空则从环境变量 ${IMAGE_GEN_DEFAULTS[imageGenProvider]?.env || "API_KEY"} 读取`}
-                    type="password"
-                    value={imageGenApiKey}
-                    onValueChange={setImageGenApiKey}
-                    classNames={{ inputWrapper: "bg-content2" }}
-                  />
-                  <Input
-                    label="Base URL（可选）"
-                    placeholder={IMAGE_GEN_DEFAULTS[imageGenProvider]?.baseUrl || "留空使用默认"}
-                    value={imageGenBaseUrl}
-                    onValueChange={setImageGenBaseUrl}
-                    classNames={{ inputWrapper: "bg-content2" }}
-                  />
-                  <Input
-                    label="默认图片尺寸"
-                    value={imageGenSize}
-                    onValueChange={setImageGenSize}
-                    placeholder="1024x1024"
-                    classNames={{ inputWrapper: "bg-content2" }}
-                  />
                   <div className="flex items-center justify-between gap-3 rounded-lg border border-default-200/50 bg-content2/40 px-3 py-2">
                     <div className="min-w-0">
                       <p className="text-xs text-default-500">测试生成</p>
@@ -1125,6 +1128,37 @@ export default function SetupPage() {
                           <img src={testImageGenResult.imageUrl} alt="测试生成" className="w-full h-auto" />
                         </div>
                       )}
+                    </div>
+                  )}
+                  <div className="flex justify-end">
+                    <Button size="sm" variant="light" onPress={() => setShowImageGenAdvanced((prev) => !prev)}>
+                      {showImageGenAdvanced ? "收起高级图片通道选项" : "展开高级图片通道选项"}
+                    </Button>
+                  </div>
+                  {showImageGenAdvanced && (
+                    <div className="space-y-3 rounded-xl border border-warning/20 bg-warning/5 p-3">
+                      <Input
+                        label="API Key"
+                        description={`留空则从环境变量 ${IMAGE_GEN_DEFAULTS[imageGenProvider]?.env || "API_KEY"} 读取`}
+                        type="password"
+                        value={imageGenApiKey}
+                        onValueChange={setImageGenApiKey}
+                        classNames={{ inputWrapper: "bg-content2" }}
+                      />
+                      <Input
+                        label="Base URL（可选）"
+                        placeholder={IMAGE_GEN_DEFAULTS[imageGenProvider]?.baseUrl || "留空使用默认"}
+                        value={imageGenBaseUrl}
+                        onValueChange={setImageGenBaseUrl}
+                        classNames={{ inputWrapper: "bg-content2" }}
+                      />
+                      <Input
+                        label="默认图片尺寸"
+                        value={imageGenSize}
+                        onValueChange={setImageGenSize}
+                        placeholder="1024x1024"
+                        classNames={{ inputWrapper: "bg-content2" }}
+                      />
                     </div>
                   )}
                 </>
@@ -1196,23 +1230,33 @@ export default function SetupPage() {
                 <p className="text-xs text-default-400">
                   或单独提取（优先无关闭策略，失败后再考虑管理员/自动关闭重试）
                 </p>
-                <Button
-                  size="sm" variant="flat" color="default" radius="full"
-                  startContent={<Download size={14} />}
-                  isLoading={extracting !== null}
-                  onPress={async () => {
-                    for (const p of ["bilibili", "douyin", "kuaishou", "qzone"]) {
-                      await extractCookie(p);
-                    }
-                  }}
-                >
-                  逐个尝试
-                </Button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button size="sm" variant="light" onPress={() => setShowCookieAdvanced((prev) => !prev)}>
+                    {showCookieAdvanced ? "收起提取策略" : "展开提取策略"}
+                  </Button>
+                  <Button size="sm" variant="light" onPress={() => setShowCookieManualEditors((prev) => !prev)}>
+                    {showCookieManualEditors ? "收起手动编辑" : "展开手动编辑"}
+                  </Button>
+                  <Button
+                    size="sm" variant="flat" color="default" radius="full"
+                    startContent={<Download size={14} />}
+                    isLoading={extracting !== null}
+                    onPress={async () => {
+                      for (const p of ["bilibili", "douyin", "kuaishou", "qzone"]) {
+                        await extractCookie(p);
+                      }
+                    }}
+                  >
+                    逐个尝试
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-center justify-end gap-2">
-                <span className="text-xs text-default-400">失败时允许自动关闭浏览器重试</span>
-                <Switch size="sm" isSelected={cookieAllowClose} onValueChange={setCookieAllowClose} />
-              </div>
+              {showCookieAdvanced && (
+                <div className="flex items-center justify-end gap-2 rounded-xl border border-warning/20 bg-warning/5 px-3 py-2">
+                  <span className="text-xs text-default-400">失败时允许自动关闭浏览器重试</span>
+                  <Switch size="sm" isSelected={cookieAllowClose} onValueChange={setCookieAllowClose} />
+                </div>
+              )}
 
               {/* Bilibili */}
               <div className="space-y-2 rounded-xl bg-content2/50 p-3">
@@ -1269,22 +1313,26 @@ export default function SetupPage() {
                     )}
                   </div>
                 )}
-                <Input
-                  label="SESSDATA"
-                  size="sm"
-                  value={biliSessdata}
-                  onValueChange={setBiliSessdata}
-                  placeholder="Auto fill or paste manually"
-                  classNames={{ inputWrapper: "bg-content1" }}
-                />
-                <Input
-                  label="bili_jct"
-                  size="sm"
-                  value={biliBiliJct}
-                  onValueChange={setBiliBiliJct}
-                  placeholder="Auto fill or paste manually"
-                  classNames={{ inputWrapper: "bg-content1" }}
-                />
+                {showCookieManualEditors && (
+                  <>
+                    <Input
+                      label="SESSDATA"
+                      size="sm"
+                      value={biliSessdata}
+                      onValueChange={setBiliSessdata}
+                      placeholder="Auto fill or paste manually"
+                      classNames={{ inputWrapper: "bg-content1" }}
+                    />
+                    <Input
+                      label="bili_jct"
+                      size="sm"
+                      value={biliBiliJct}
+                      onValueChange={setBiliBiliJct}
+                      placeholder="Auto fill or paste manually"
+                      classNames={{ inputWrapper: "bg-content1" }}
+                    />
+                  </>
+                )}
               </div>
 
               {/* Douyin */}
@@ -1324,16 +1372,18 @@ export default function SetupPage() {
                   </div>
                 </div>
                 {renderCookieLoginGuide("douyin", "Open Douyin's official login page, finish scan login, then come back here to extract cookies from the same browser.")}
-                <Textarea
-                  label="Cookie"
-                  size="sm"
-                  minRows={1}
-                  maxRows={2}
-                  value={douyinCookie}
-                  onValueChange={setDouyinCookie}
-                  placeholder="Auto fill or paste manually"
-                  classNames={{ inputWrapper: "bg-content1" }}
-                />
+                {showCookieManualEditors && (
+                  <Textarea
+                    label="Cookie"
+                    size="sm"
+                    minRows={1}
+                    maxRows={2}
+                    value={douyinCookie}
+                    onValueChange={setDouyinCookie}
+                    placeholder="Auto fill or paste manually"
+                    classNames={{ inputWrapper: "bg-content1" }}
+                  />
+                )}
               </div>
 
               {/* Kuaishou */}
@@ -1373,16 +1423,18 @@ export default function SetupPage() {
                   </div>
                 </div>
                 {renderCookieLoginGuide("kuaishou", "Open Kuaishou's official login page, finish scan login, then come back here to extract cookies from the same browser.")}
-                <Textarea
-                  label="Cookie"
-                  size="sm"
-                  minRows={1}
-                  maxRows={2}
-                  value={kuaishouCookie}
-                  onValueChange={setKuaishouCookie}
-                  placeholder="Auto fill or paste manually"
-                  classNames={{ inputWrapper: "bg-content1" }}
-                />
+                {showCookieManualEditors && (
+                  <Textarea
+                    label="Cookie"
+                    size="sm"
+                    minRows={1}
+                    maxRows={2}
+                    value={kuaishouCookie}
+                    onValueChange={setKuaishouCookie}
+                    placeholder="Auto fill or paste manually"
+                    classNames={{ inputWrapper: "bg-content1" }}
+                  />
+                )}
               </div>
 
               {/* QZone */}
@@ -1422,16 +1474,18 @@ export default function SetupPage() {
                   </div>
                 </div>
                 {renderCookieLoginGuide("qzone", "Open QZone's official login page, finish scan login, confirm the browser reaches your own QZone home page, then extract cookies.")}
-                <Textarea
-                  label="Cookie"
-                  size="sm"
-                  minRows={1}
-                  maxRows={2}
-                  value={qzoneCookie}
-                  onValueChange={setQzoneCookie}
-                  placeholder="p_skey=xxx; uin=xxx; skey=xxx"
-                  classNames={{ inputWrapper: "bg-content1" }}
-                />
+                {showCookieManualEditors && (
+                  <Textarea
+                    label="Cookie"
+                    size="sm"
+                    minRows={1}
+                    maxRows={2}
+                    value={qzoneCookie}
+                    onValueChange={setQzoneCookie}
+                    placeholder="p_skey=xxx; uin=xxx; skey=xxx"
+                    classNames={{ inputWrapper: "bg-content1" }}
+                  />
+                )}
               </div>
             </div>
           )}

@@ -14,6 +14,7 @@ type FieldType = "text" | "password" | "number" | "switch" | "select" | "slider"
 type EnvDraftMap = Record<string, string>;
 interface FieldDef { path: string; label: string; type: FieldType; options?: { value: string; label: string }[]; min?: number; max?: number; step?: number; rows?: number; }
 interface SectionDef { key: string; label: string; fields: FieldDef[]; }
+type SectionMeta = { description: string; essentials?: string[] };
 
 const DEFAULT_CONFIG: Cfg = {};
 
@@ -306,6 +307,203 @@ const SECTIONS: SectionDef[] = [
   ]},
 ];
 
+const SECTION_META: Record<string, SectionMeta> = {
+  control: {
+    description: "这里决定机器人的整体性格、活跃度和默认行为，适合先改这里。",
+    essentials: [
+      "control.chat_mode",
+      "control.undirected_policy",
+      "control.knowledge_learning",
+      "control.memory_recall_level",
+      "control.emoji_level",
+      "control.send_rate_profile",
+    ],
+  },
+  boundary: {
+    description: "控制机器人在群聊和私聊里什么场景该说话、什么场景保持安静。",
+    essentials: [
+      "bot.allow_non_to_me",
+      "bot.private_chat_mode",
+      "bot.private_chat_whitelist",
+      "trigger.ai_listen_enable",
+      "control.undirected_policy",
+    ],
+  },
+  agent: {
+    description: "这是 Agent 的核心运行参数，日常只需关心开关、步数和上下文保留。",
+    essentials: [
+      "agent.enable",
+      "agent.max_steps",
+      "agent.max_tokens",
+      "agent.context_retention",
+      "agent.high_risk_control.enable",
+    ],
+  },
+  knowledge_update: {
+    description: "控制自学习与热搜更新的节奏；不折腾自学习时通常只改开关。",
+    essentials: [
+      "knowledge_update.llm_extractor_enable",
+      "knowledge_update.trend_fetch_enable",
+      "knowledge_update.trend_fetch_interval_seconds",
+    ],
+  },
+  bot: {
+    description: "这里是最像“机器人定义”的部分：名字、可用能力、回复长度和输出习惯。",
+    essentials: [
+      "bot.name",
+      "bot.nicknames",
+      "bot.language",
+      "bot.allow_markdown",
+      "bot.allow_search",
+      "bot.allow_image",
+      "bot.reply_with_quote",
+      "bot.max_reply_chars",
+      "bot.multi_reply_enable",
+    ],
+  },
+  api: {
+    description: "主模型通道配置。一般只需提供商、模型、Key；其余属于高级兼容项。",
+    essentials: [
+      "api.provider",
+      "api.endpoint_type",
+      "api.model",
+      "api.api_key",
+      "api.base_url",
+    ],
+  },
+  search: {
+    description: "控制联网搜索与网页抓取。日常先看启用状态、结果数和超时。",
+    essentials: [
+      "search.enable",
+      "search.max_results",
+      "search.max_image_results",
+      "search.timeout_seconds",
+    ],
+  },
+  video: {
+    description: "短视频解析和发送策略，通常只需要限制大小和时长。",
+    essentials: [
+      "search.video_resolver.enable",
+      "search.video_resolver.download_max_mb",
+      "search.video_resolver.search_send_max_duration_seconds",
+    ],
+  },
+  vision: {
+    description: "图片识图模型配置，建议只保留开关、超时和 token 上限。",
+    essentials: [
+      "search.vision.enable",
+      "search.vision.timeout_seconds",
+      "search.vision.max_tokens",
+    ],
+  },
+  music: {
+    description: "点歌与语音播放相关设置，普通使用主要改 API 地址和时长限制。",
+    essentials: [
+      "music.enable",
+      "music.api_base",
+      "music.max_voice_duration_seconds",
+      "music.break_limit_enable",
+    ],
+  },
+  image_gen: {
+    description: "图片生成主配置。默认模型、尺寸和审核开关属于常用，其它高级规则可按需展开。",
+    essentials: [
+      "image_gen.enable",
+      "image_gen.default_model",
+      "image_gen.default_size",
+      "image_gen.nsfw_filter",
+      "image_gen.prompt_review_enable",
+      "image_gen.post_review_enable",
+      "image_gen.max_prompt_length",
+    ],
+  },
+  affinity: {
+    description: "签到和互动带来的好感度变化，通常只需要总开关和奖励倍率。",
+    essentials: [
+      "affinity.enable",
+      "affinity.checkin_base_reward",
+      "affinity.interaction_reward",
+    ],
+  },
+  emotion: {
+    description: "机器人的情绪和惩罚阈值设定，建议先保守调整。",
+    essentials: [
+      "emotion.enable",
+      "emotion.emoji_probability",
+      "emotion.warn_threshold",
+      "emotion.strike_threshold",
+    ],
+  },
+  safety: {
+    description: "全局安全尺度和敏感词替换，和平台底线直接相关。",
+    essentials: [
+      "safety.profile",
+      "safety.scale",
+      "safety.custom_block_terms",
+      "safety.output_sensitive_words",
+    ],
+  },
+  output: {
+    description: "统一控制输出长短和写作风格，群聊覆盖规则放在高级里。",
+    essentials: [
+      "output.verbosity",
+      "output.token_saving",
+      "output.style_instruction",
+    ],
+  },
+  admin: {
+    description: "权限和群白名单配置。一般只需超级管理员和白名单群。",
+    essentials: [
+      "admin.super_admin_qq",
+      "admin.super_users",
+      "admin.whitelist_groups",
+      "admin.non_whitelist_mode",
+    ],
+  },
+  trigger: {
+    description: "决定机器人什么时候接话、什么时候追问。",
+    essentials: [
+      "trigger.ai_listen_enable",
+      "trigger.ai_listen_keyword_enable",
+      "trigger.ai_listen_min_keyword_hits",
+      "trigger.followup_reply_window_seconds",
+    ],
+  },
+  routing: {
+    description: "AI 判定接话门槛；多数情况下只调整模式和主阈值即可。",
+    essentials: [
+      "routing.mode",
+      "routing.trust_ai_fully",
+      "routing.min_confidence",
+      "routing.followup_min_confidence",
+    ],
+  },
+  self_check: {
+    description: "防止误触发和串台的最后一道护栏，建议保持开启。",
+    essentials: [
+      "self_check.enable",
+      "self_check.block_at_other",
+      "self_check.non_direct_reply_min_confidence",
+    ],
+  },
+  queue: {
+    description: "并发、打断和会话隔离策略；普通场景只需要少量核心开关。",
+    essentials: [
+      "queue.group_concurrency",
+      "queue.single_inflight_per_conversation",
+      "queue.cancel_previous_on_new",
+      "queue.smart_interrupt_enable",
+    ],
+  },
+  prompt_control: {
+    description: "Prompt 注入和人设覆盖。默认仅保留开关和人设覆盖入口。",
+    essentials: [
+      "prompt_control.enable",
+      "prompt_control.persona_override",
+    ],
+  },
+};
+
 const INPUT_CLASSES = {
   label: "text-default-500 text-xs",
   base: "bg-transparent",
@@ -560,7 +758,10 @@ export default function ConfigPage() {
   const [saving, setSaving] = useState(false);
   const [msg, setMsg] = useState("");
   const [activeSection, setActiveSection] = useState("control");
+  const [compactMode, setCompactMode] = useState(true);
+  const [advancedOpenSections, setAdvancedOpenSections] = useState<Record<string, boolean>>({});
   const [jsonMode, setJsonMode] = useState<"sections" | "raw">("sections");
+  const [jsonPanelOpen, setJsonPanelOpen] = useState(false);
   const [jsonSectionKey, setJsonSectionKey] = useState("control");
   const [jsonSectionText, setJsonSectionText] = useState("");
   const [imageGenTestPrompt, setImageGenTestPrompt] = useState("一只可爱的猫娘女仆，二次元插画，精致细节");
@@ -575,6 +776,22 @@ export default function ConfigPage() {
 
   const activeIndex = useMemo(() => Math.max(0, SECTIONS.findIndex((s) => s.key === activeSection)), [activeSection]);
   const active = SECTIONS[activeIndex];
+  const activeMeta = SECTION_META[active?.key || ""] || { description: "这里是当前配置分区。", essentials: [] };
+  const activeEssentialPaths = useMemo(() => {
+    if (!active) return new Set<string>();
+    const essentials = activeMeta.essentials || [];
+    if (essentials.length > 0) return new Set(essentials);
+    return new Set(active.fields.slice(0, Math.min(active.fields.length, 4)).map((field) => field.path));
+  }, [active, activeMeta]);
+  const activeEssentialFields = useMemo(
+    () => active.fields.filter((field) => !compactMode || activeEssentialPaths.has(field.path)),
+    [active, compactMode, activeEssentialPaths],
+  );
+  const activeAdvancedFields = useMemo(
+    () => compactMode ? active.fields.filter((field) => !activeEssentialPaths.has(field.path)) : [],
+    [active, compactMode, activeEssentialPaths],
+  );
+  const activeAdvancedOpen = !!advancedOpenSections[active.key];
   const topLevelJsonKeys = useMemo(() => {
     return Object.keys(config).filter((k) => typeof k === "string" && k.trim()).sort();
   }, [config]);
@@ -977,6 +1194,10 @@ export default function ConfigPage() {
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2"><h2 className="text-xl font-bold">配置编辑</h2><Chip size="sm" variant="flat" color="primary">{active.label}</Chip></div>
         <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 rounded-full border border-default-300/40 bg-content1/60 px-3 py-1.5">
+            <span className="text-xs text-default-500">精简视图</span>
+            <Switch size="sm" isSelected={compactMode} onValueChange={setCompactMode} />
+          </div>
           {undoSnapshotRef.current && (
             <Button variant="flat" startContent={<Undo2 size={16} />} onPress={handleUndo} isLoading={saving}>撤销</Button>
           )}
@@ -992,11 +1213,40 @@ export default function ConfigPage() {
       </div>
 
       <Card className="border border-default-400/35 bg-content1/40 backdrop-blur-md">
-        <CardHeader>
-          <div className="font-semibold">{active.label}</div>
+        <CardHeader className="flex flex-wrap items-start justify-between gap-3">
+          <div className="space-y-1">
+            <div className="font-semibold">{active.label}</div>
+            <p className="text-sm text-default-500">{activeMeta.description}</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Chip size="sm" variant="flat" color="primary">常用 {activeEssentialFields.length}</Chip>
+              {compactMode && activeAdvancedFields.length > 0 && (
+                <Chip size="sm" variant="flat" color="warning">高级 {activeAdvancedFields.length}</Chip>
+              )}
+            </div>
+          </div>
+          {compactMode && activeAdvancedFields.length > 0 && (
+            <Button
+              variant="flat"
+              onPress={() => setAdvancedOpenSections((prev) => ({ ...prev, [active.key]: !prev[active.key] }))}
+            >
+              {activeAdvancedOpen ? "收起高级参数" : "展开高级参数"}
+            </Button>
+          )}
         </CardHeader>
         <CardBody>
-          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">{active.fields.map(renderField)}</div>
+          <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">{activeEssentialFields.map(renderField)}</div>
+          {compactMode && activeAdvancedFields.length > 0 && activeAdvancedOpen && (
+            <div className="mt-4 space-y-3 rounded-2xl border border-warning/20 bg-warning/5 p-4">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="font-medium">高级参数</div>
+                  <p className="text-xs text-default-500">低频兼容项、细粒度阈值和实验性开关都放在这里。</p>
+                </div>
+                <Chip size="sm" variant="flat" color="warning">{activeAdvancedFields.length} 项</Chip>
+              </div>
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">{activeAdvancedFields.map(renderField)}</div>
+            </div>
+          )}
         </CardBody>
       </Card>
 
@@ -1155,21 +1405,35 @@ export default function ConfigPage() {
 
       <Card className="border border-default-400/35 bg-content1/35 backdrop-blur-sm">
         <CardHeader className="flex flex-wrap items-center justify-between gap-2">
-          <div className="font-semibold">JSON编辑区</div>
-          <Tabs
-            selectedKey={jsonMode}
-            onSelectionChange={(key) => setJsonMode(String(key) as "sections" | "raw")}
-            size="sm"
-            color="primary"
-            variant="bordered"
-            className="max-w-full"
-          >
-            <Tab key="sections" title="结构浏览/片段编辑" />
-            <Tab key="raw" title="全量原始 JSON" />
-          </Tabs>
+          <div className="space-y-1">
+            <div className="font-semibold">JSON编辑区</div>
+            <p className="text-xs text-default-500">普通调整建议优先用上面的表单；这里保留给高级排查和整段复制。</p>
+          </div>
+          <div className="flex items-center gap-2">
+            {jsonPanelOpen && (
+              <Tabs
+                selectedKey={jsonMode}
+                onSelectionChange={(key) => setJsonMode(String(key) as "sections" | "raw")}
+                size="sm"
+                color="primary"
+                variant="bordered"
+                className="max-w-full"
+              >
+                <Tab key="sections" title="结构浏览/片段编辑" />
+                <Tab key="raw" title="全量原始 JSON" />
+              </Tabs>
+            )}
+            <Button variant="flat" onPress={() => setJsonPanelOpen((prev) => !prev)}>
+              {jsonPanelOpen ? "收起 JSON 编辑区" : "展开 JSON 编辑区"}
+            </Button>
+          </div>
         </CardHeader>
         <CardBody>
-          {jsonMode === "sections" ? (
+          {!jsonPanelOpen ? (
+            <p className="text-sm text-default-500">
+              JSON 编辑区默认折叠，避免和常用参数表单混在一起。需要排查底层配置时再展开即可。
+            </p>
+          ) : jsonMode === "sections" ? (
             <div className="grid grid-cols-1 lg:grid-cols-[240px_1fr] gap-3">
               <div className="rounded-xl border border-default-400/30 bg-content2/40 p-2 max-h-[420px] overflow-auto">
                 <div className="text-xs text-default-500 px-2 py-1">顶级 JSON 段</div>
