@@ -6349,7 +6349,9 @@ async def _handle_config_update(args: dict[str, Any], context: dict[str, Any]) -
 
 async def _handle_music_search(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     """搜索歌曲，返回结果列表。"""
-    keyword = normalize_matching_text(str(args.get("keyword", "")))
+    raw_keyword = str(args.get("keyword", "")).strip()
+    is_url = bool(re.search(r"https?://", raw_keyword))
+    keyword = raw_keyword if is_url else normalize_matching_text(raw_keyword)
     title = normalize_matching_text(str(args.get("title", "")))
     artist = normalize_matching_text(str(args.get("artist", "")))
     if not keyword and title:
@@ -6522,7 +6524,10 @@ async def _handle_music_play(args: dict[str, Any], context: dict[str, Any]) -> T
     不在此处直接发送语音，避免与 app.py 发送层重复发送。
     音频文件路径通过 data 字段传递，由 engine → app.py 的 send_response 统一处理。
     """
-    keyword = normalize_matching_text(str(args.get("keyword", "")))
+    raw_keyword = str(args.get("keyword", "")).strip()
+    # URL 不能被 normalize（会破坏协议和路径），检测到 URL 时保留原始值
+    is_url = bool(re.search(r"https?://", raw_keyword))
+    keyword = raw_keyword if is_url else normalize_matching_text(raw_keyword)
     title = normalize_matching_text(str(args.get("title", "")))
     artist = normalize_matching_text(str(args.get("artist", "")))
     if not keyword and title:

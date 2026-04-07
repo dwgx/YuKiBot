@@ -240,6 +240,7 @@ class KnowledgeBase:
         try:
             old_extra = json.loads(old_extra_raw)
         except Exception:
+            _log.warning("knowledge_parse_extra_error | kid=%s", row[0], exc_info=True)
             old_extra = {}
 
         merged_extra = self._merge_extra(old_extra, payload_extra)
@@ -405,10 +406,12 @@ class KnowledgeBase:
         try:
             tags_val = json.loads(row[5]) if row[5] else []
         except Exception:
+            _log.warning("knowledge_parse_tags_error | row_id=%s", row[0], exc_info=True)
             tags_val = []
         try:
             extra_val = json.loads(row[8]) if row[8] else {}
         except Exception:
+            _log.warning("knowledge_parse_extra_json_error | row_id=%s", row[0], exc_info=True)
             extra_val = {}
         return KnowledgeEntry(
             id=row[0],
@@ -514,5 +517,5 @@ class KnowledgeBase:
             if isinstance(raw, dict):
                 return raw
         except Exception:
-            pass
+            _log.warning("knowledge_safe_json_dict_error", exc_info=True)
         return {}

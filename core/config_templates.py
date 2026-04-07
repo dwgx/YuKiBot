@@ -395,25 +395,14 @@ def _built_in_prompts_defaults() -> dict[str, Any]:
                 "- 下载任务先官方来源；若需切到第三方来源，必须先征求用户同意。未同意时不要执行第三方下载（allow_third_party=false）。\n"
                 "- 下载链接必须是可直接下载的文件直链；拿到 HTML 网页壳时继续提取直链或明确说明失败原因。"
             ),
-            "network_flow": (
-                "外部事实/联网问题默认流程：\n"
-                "1. 先用 web_search（query 要具体，可带关键词限定）。\n"
-                "2. 若结果已足够，直接 final_answer。\n"
-                "3. 若证据不足，再补一次 fetch_webpage 或 scrape_extract（只补一次）。\n"
-                "4. 立即 final_answer，结论优先，附 1-2 条关键依据。"
-            ),
-            "reply_style": "中文自然、直接、短句优先。默认先结论后依据；除非用户要求，不写长段废话。根据用户当前语气与上下文自适应风格，自动识别同义表达与相近语气，不要依赖固定关键词词表做机械匹配。",
-            "tool_usage": (
-                "- 搜索事实：web_search\n"
-                "- 打开页面：fetch_webpage\n"
-                "- 智能提取：scrape_extract / scrape_summarize / scrape_structured\n"
-                "- 图片理解：analyze_image\n"
-                "- 语音转写：analyze_voice\n"
-                "- 本地/引用视频理解：analyze_local_video\n"
-                "- 视频链接分析：analyze_video\n"
-                "- 视频解析/切片：parse_video / split_video\n"
-                "- 结束输出：final_answer\n"
-                "要求：\n"
+            "tools": (
+                "工具使用规则：\n"
+                "- 能直接从工具结果得出结论时，不要反复换工具。\n"
+                "- 不要伪造已联网、已查看图片；没调工具就别装作看过。\n"
+                "- 找不到结果时明确说没拿到，不要编。\n"
+                "- 下载任务优先提取真实文件链接后再 smart_download。\n"
+                "- smart_download 失败后继续给可执行替代，不能只复述错误。\n"
+                "- 点歌时优先识别 title / artist，music_search 失败则尝试 B站音频提取。\n"
                 "- 工具参数必须最小且正确，不传空参数。\n"
                 "- 媒体链接必须来自“用户输入或工具结果”，不要编造 URL。\n"
                 "- 对于可直接回答的问题，不要强行调用工具。"
@@ -470,6 +459,7 @@ def _read_yaml_dict(path: Path) -> dict[str, Any]:
     try:
         loaded = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
+        _log.warning("yaml_read_error | path=%s", path, exc_info=True)
         return {}
     return loaded if isinstance(loaded, dict) else {}
 

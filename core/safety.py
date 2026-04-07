@@ -100,8 +100,8 @@ class SafetyEngine:
         )
 
         self._user_cooldown_until: dict[str, datetime] = {}
-        self._user_violation_count: dict[str, int] = {}
-        self._user_last_violation_at: dict[str, datetime] = {}
+        self._user_violation_timestamps: dict[str, list[datetime]] = {}  # 滑动窗口
+        self._violation_window = timedelta(minutes=60)  # 60 分钟滑动窗口
 
         # ── 输出敏感词表（可通过指令动态增删）──
         self._output_sensitive: dict[str, str] = dict(_DEFAULT_OUTPUT_SENSITIVE)
@@ -393,12 +393,13 @@ class SafetyEngine:
         return True
 
     def _record_violation(self, key: str, now: datetime) -> int:
-        last = self._user_last_violation_at.get(key)
-        if isinstance(last, datetime) and now - last > timedelta(minutes=20):
-            self._user_violation_count[key] = 0
-        self._user_last_violation_at[key] = now
-        self._user_violation_count[key] = int(self._user_violation_count.get(key, 0)) + 1
-        return self._user_violation_count[key]
+        # 滑动窗口：只统计最近 60 分钟内的违规次数
+        timestamps = self._user_violation_timestamps.setdefault(key, [])
+        cutoff = now - self._violation_window
+        # 清理窗口外的旧记录
+        self._user_violation_timestamps[key] = [t for t in timestamps if t > cutoff]
+        self._user_violation_timestamps[key].append(now)
+        return len(self._user_violation_timestamps[key])
 
     @staticmethod
     def _looks_like_tech_or_compliance(content: str) -> bool:

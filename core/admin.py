@@ -157,7 +157,7 @@ class AdminEngine:
             try:
                 self._white.add(int(x))
             except Exception:
-                pass
+                _log.warning("whitelist_parse_group_id_error | raw=%s", x, exc_info=True)
         self._load_white()
 
         self._ignore_path = self.storage_dir / "ignored_users.json"
@@ -206,6 +206,7 @@ class AdminEngine:
         try:
             gid = int(group_id)
         except Exception:
+            _log.warning("whitelist_check_invalid_group_id | raw=%s", group_id, exc_info=True)
             return False
         if gid <= 0:
             return False
@@ -641,6 +642,7 @@ class AdminEngine:
                     try:
                         status_raw = normalize_text(str(status_fn()))
                     except Exception:
+                        _log.warning("plugin_status_call_error", exc_info=True)
                         continue
                     if not status_raw:
                         continue
@@ -773,7 +775,7 @@ class AdminEngine:
             try:
                 await proc.wait()
             except Exception:
-                pass
+                _log.warning("update_proc_wait_after_kill_error", exc_info=True)
             return False, f"更新命令超时（>{timeout_sec}s）"
 
         text = ""
@@ -1045,6 +1047,7 @@ class AdminEngine:
         try:
             level = int(arg)
         except Exception:
+            _log.warning("scale_parse_int_fallback | arg=%s", arg, exc_info=True)
             setter = getattr(engine.safety, "set_profile", None)
             if callable(setter):
                 result = setter(arg)
@@ -1089,6 +1092,7 @@ class AdminEngine:
                 try:
                     await api_call("group_poke", group_id=gid, user_id=int(target))
                 except Exception:
+                    _log.warning("group_poke_fallback | gid=%s target=%s", gid, target, exc_info=True)
                     await api_call("send_group_msg", group_id=gid, message=[{"type": "poke", "data": {"type": "1", "id": "-1"}}])
             else:
                 await api_call("send_private_msg", user_id=int(target), message=[{"type": "poke", "data": {"type": "1", "id": "-1"}}])
@@ -1224,7 +1228,7 @@ class AdminEngine:
                 if 2 < len(text) < 30:
                     return text
             except Exception:
-                pass
+                _log.warning("anchor_quote_llm_error", exc_info=True)
         return random.choice(local_pool)
 
     async def _act_json_card(self, **kwargs: Any) -> str | None:
@@ -1428,7 +1432,7 @@ class AdminEngine:
                     try:
                         self._white.add(int(x))
                     except Exception:
-                        pass
+                        _log.warning("whitelist_load_parse_error | raw=%s", x, exc_info=True)
         except Exception as exc:
             _log.debug("load_whitelist_fail | %s", exc)
 
@@ -1464,6 +1468,7 @@ class AdminEngine:
                 try:
                     gid = int(raw_gid)
                 except Exception:
+                    _log.warning("ignored_users_parse_gid_error | raw=%s", raw_gid, exc_info=True)
                     continue
                 if gid <= 0 or not isinstance(rows, list):
                     continue
@@ -1507,6 +1512,7 @@ class AdminEngine:
                 try:
                     gid = int(raw_gid)
                 except Exception:
+                    _log.warning("runtime_policy_parse_gid_error | raw=%s", raw_gid, exc_info=True)
                     continue
                 if gid <= 0 or not isinstance(raw_required, bool):
                     continue

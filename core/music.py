@@ -96,7 +96,7 @@ class MusicEngine:
         self._cache_dir = Path(music_cfg.get("cache_dir", "storage/cache/music"))
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-        self._timeout = float(music_cfg.get("timeout_seconds", 15))
+        self._timeout = float(music_cfg.get("timeout_seconds", 10))
         self._ffmpeg = shutil.which("ffmpeg") or self._find_bundled_ffmpeg() or ""
         self._pilk_available = self._check_pilk()
 
@@ -172,6 +172,52 @@ class MusicEngine:
         """Compatibility hook."""
         return None
 
+    # ── URL 直链检测 ──────────────────────────────────────────────
+    _URL_PLATFORM_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+        ("soundcloud", re.compile(r"https?://(?:www\.)?soundcloud\.com/", re.I)),
+        ("youtube", re.compile(r"https?://(?:www\.|m\.|music\.)?youtu(?:be\.com|\.be)/", re.I)),
+        ("spotify", re.compile(r"https?://(?:open\.)?spotify\.com/", re.I)),
+        ("bandcamp", re.compile(r"https?://[a-z0-9\-]+\.bandcamp\.com/", re.I)),
+    ]
+
+    @staticmethod
+    def _detect_url_platform(text: str) -> tuple[str, str]:
+        """如果 text 含外链，返回 (platform, url)；否则 ("", "")。"""
+        url_match = re.search(r"(https?://[^\s<>\"']+)", text)
+        if not url_match:
+            return "", ""
+        url = url_match.group(1)
+        for platform, pattern in MusicEngine._URL_PLATFORM_PATTERNS:
+            if pattern.search(url):
+                return platform, url
+        return "", ""
+
+    async def _resolve_url_as_search_result(self, platform: str, url: str) -> list[MusicSearchResult]:
+        """将外链直接解析为 MusicSearchResult，跳过关键词搜索。"""
+        if platform == "soundcloud":
+            try:
+                audio = await self._soundcloud_client.resolve_page_audio(url)
+                if audio and (audio.audio_url or audio.page_url):
+                    return [MusicSearchResult(
+                        song_id=audio.track_id or 0,
+                        name=audio.title or "SoundCloud Track",
+                        artist=audio.artist or "",
+                        duration_ms=0,
+                        source="soundcloud",
+                        source_url=audio.page_url or url,
+                    )]
+            except Exception as exc:
+                _log.warning("url_resolve_soundcloud_fail | url=%s | %s", url[:160], exc)
+        # YouTube / Spotify / Bandcamp / 其他：构造占位结果，让 _play_song 走 yt-dlp
+        return [MusicSearchResult(
+            song_id=0,
+            name=f"{platform} track",
+            artist="",
+            duration_ms=0,
+            source=platform,
+            source_url=url,
+        )]
+
     async def search(
         self,
         keyword: str,
@@ -181,12 +227,22 @@ class MusicEngine:
         artist: str = "",
     ) -> list[MusicSearchResult]:
         """Search songs with exact-title preference and Alger-first query variants."""
+        # ── URL 短路：必须在 normalize 之前检测（normalize 会破坏 URL 结构） ──
+        raw_keyword = str(keyword or "").strip()
+        platform, url = self._detect_url_platform(raw_keyword)
+        if platform:
+            _log.info("music_search_url_shortcut | platform=%s | url=%s", platform, url[:160])
+            results = await self._resolve_url_as_search_result(platform, url)
+            if results:
+                return results[:limit]
+
         keyword = normalize_matching_text(keyword)
         title = normalize_matching_text(title)
         artist = normalize_matching_text(artist)
         query = build_music_keyword(keyword, title, artist)
         if not self._enable or not (query or keyword or title or artist):
             return []
+
         intent = self._build_keyword_intent(keyword=keyword, title=title, artist=artist)
         query_variants = self._build_search_queries(keyword=keyword, title=title, artist=artist, intent=intent)
         fetch_limit = max(limit * 3, 20)
@@ -1055,12 +1111,15 @@ class MusicEngine:
         title: str = "",
         artist: str = "",
     ) -> MusicPlayResult:
+        raw_keyword = str(keyword or "").strip()
         keyword = normalize_matching_text(keyword)
         title = normalize_matching_text(title)
         artist = normalize_matching_text(artist)
         query = build_music_keyword(keyword, title, artist)
         intent = self._build_keyword_intent(keyword=keyword, title=title, artist=artist)
-        results = await self.search(query, limit=12, title=title, artist=artist)
+        # 传原始 keyword 给 search，确保 URL 短路检测能在 normalize 前生效
+        search_keyword = raw_keyword if self._detect_url_platform(raw_keyword)[0] else query
+        results = await self.search(search_keyword, limit=12, title=title, artist=artist)
         if not results:
             return MusicPlayResult(ok=False, message="没找到相关歌曲", error="no_results")
 
@@ -1186,6 +1245,86 @@ class MusicEngine:
             error=(last_error.error if last_error else "") or "play_failed",
         )
 
+    async def _play_via_ytdlp(self, song: MusicSearchResult, *, as_voice: bool = True) -> MusicPlayResult:
+        """使用 yt-dlp 从外链直接下载音频（YouTube / Spotify / Bandcamp 等）。"""
+        try:
+            from yt_dlp import YoutubeDL
+        except ImportError:
+            return MusicPlayResult(ok=False, song=song, error="ytdlp_missing",
+                                   message="当前环境缺少 yt-dlp 依赖，无法解析外链音乐。")
+
+        import hashlib
+        url = song.source_url
+        digest = hashlib.sha1(url.encode("utf-8", errors="ignore")).hexdigest()[:12]
+        mp3_path = self._cache_dir / f"ytdlp_{digest}.mp3"
+
+        if not mp3_path.exists() or mp3_path.stat().st_size < 64 * 1024:
+            mp3_path.unlink(missing_ok=True)
+            opts = {
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": str(mp3_path.with_suffix(".%(ext)s")),
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "socket_timeout": 20,
+                "retries": 1,
+            }
+            if self._ffmpeg:
+                opts["ffmpeg_location"] = self._ffmpeg
+                opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}]
+
+            def _download() -> dict[str, Any] | None:
+                with YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=True)
+
+            try:
+                meta = await asyncio.to_thread(_download)
+            except Exception as exc:
+                _log.warning("ytdlp_music_download_fail | url=%s | %s", url[:160], exc)
+                return MusicPlayResult(ok=False, song=song, error="ytdlp_download_failed",
+                                       message=f"从 {song.source} 下载音频失败: {str(exc)[:120]}")
+
+            # yt-dlp 可能输出不同扩展名，找到实际文件
+            if not mp3_path.exists():
+                for ext in ("mp3", "m4a", "opus", "webm", "ogg", "wav"):
+                    candidate = mp3_path.with_suffix(f".{ext}")
+                    if candidate.exists() and candidate.stat().st_size > 1024:
+                        mp3_path = candidate
+                        break
+
+            # 更新 song 元数据
+            if meta and isinstance(meta, dict):
+                song.name = normalize_text(str(meta.get("title", ""))) or song.name
+                song.artist = normalize_text(str(meta.get("uploader", "") or meta.get("artist", ""))) or song.artist
+                song.duration_ms = int(float(meta.get("duration", 0) or 0) * 1000)
+
+        if not mp3_path.exists() or mp3_path.stat().st_size < 1024:
+            return MusicPlayResult(ok=False, song=song, error="ytdlp_no_audio",
+                                   message="yt-dlp 下载完成但未获取到有效音频文件。")
+
+        _log.info("ytdlp_music_ok | source=%s | song=%s - %s | path=%s",
+                   song.source, song.name, song.artist, mp3_path.name)
+
+        result = MusicPlayResult(
+            ok=True, song=song,
+            audio_path=str(mp3_path),
+            message=f"{song.name} - {song.artist} QWQ",
+        )
+
+        if as_voice and self._ffmpeg and self._pilk_available:
+            silk_path = await self._convert_to_silk(mp3_path)
+            if silk_path:
+                try:
+                    silk_bytes = silk_path.read_bytes()
+                except Exception:
+                    silk_bytes = b""
+                if len(silk_bytes) >= 256:
+                    result.silk_path = str(silk_path)
+                    result.silk_b64 = base64.b64encode(silk_bytes).decode("ascii")
+
+        self._evict_cache()
+        return result
+
     async def _play_song(
         self,
         song: MusicSearchResult,
@@ -1193,7 +1332,13 @@ class MusicEngine:
         *,
         require_verified_original: bool = False,
     ) -> MusicPlayResult:
-        if normalize_text(song.source).lower() == "soundcloud":
+        source_lower = normalize_text(song.source).lower()
+
+        # ── 外链平台：用 yt-dlp 直接下载音频 ──
+        if source_lower in {"youtube", "spotify", "bandcamp"} and song.source_url:
+            return await self._play_via_ytdlp(song, as_voice=as_voice)
+
+        if source_lower == "soundcloud":
             play_url = await self._get_soundcloud_play_url(song)
         else:
             play_url = await self._get_play_url_with_alternative(

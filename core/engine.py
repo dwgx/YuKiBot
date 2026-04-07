@@ -2573,11 +2573,11 @@ class YukikoEngine:
             try:
                 affinity_hint = self.affinity.affinity_prompt_hint(message.user_id)
             except Exception:
-                pass
+                self.logger.debug("affinity_hint_error | user=%s", message.user_id, exc_info=True)
             try:
                 mood_hint = self.affinity.mood_prompt_hint()
             except Exception:
-                pass
+                self.logger.debug("mood_hint_error", exc_info=True)
 
         user_policies = (
             self.memory.get_agent_policies(message.user_id)
@@ -2801,6 +2801,8 @@ class YukikoEngine:
                     user_directives=user_directives,
                     runtime_admin_policy=runtime_admin_policy,
                     at_other_user_names=at_other_user_names,
+                    affinity_hint=affinity_hint,
+                    mood_hint=mood_hint,
                 )
 
                 if agent_result is not None:
@@ -2991,6 +2993,12 @@ class YukikoEngine:
             )
 
             return EngineResponse(action="ignore", reason=short_reason)
+
+        # 路由确认 should_handle 后才消耗 followup turn，避免被过滤时白白浪费回合
+        if getattr(trigger, "followup_candidate", False):
+            await self.trigger_engine.consume_followup_turn(
+                message.conversation_id, message.user_id
+            )
 
         if decision.action == "moderate":
 
@@ -3639,6 +3647,8 @@ class YukikoEngine:
         user_directives: list[str] | None = None,
         runtime_admin_policy: dict[str, Any] | None = None,
         at_other_user_names: dict[str, str] | None = None,
+        affinity_hint: str = "",
+        mood_hint: str = "",
     ) -> EngineResponse | None:
         """尝试走 Agent 循环处理消息。成功返回 EngineResponse，失败返回 None 回退旧管线。"""
 
@@ -4152,11 +4162,10 @@ class YukikoEngine:
 
         except Exception as exc:
 
-            self.logger.warning(
+            self.logger.exception(
                 "agent_error | trace=%s | %s | 回退旧管线",
                 message.trace_id,
                 exc,
-                exc_info=True,
             )
 
             return None
@@ -6910,7 +6919,7 @@ class YukikoEngine:
                         }
                         cache_names = latest_names
                 except Exception:
-                    pass
+                    self.logger.debug("group_member_name_resolve_error", exc_info=True)
             unresolved = [uid for uid in normalized_ids if uid not in names]
 
         if unresolved and group_num > 0 and api_call:

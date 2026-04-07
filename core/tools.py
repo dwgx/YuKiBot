@@ -243,6 +243,9 @@ class ToolExecutor:
                 "Chrome/123.0.0.0 Safari/537.36"
             )
         }
+        # Shared httpx.AsyncClient instances (lazy-init, reused across calls)
+        self._shared_http_client: httpx.AsyncClient | None = None
+        self._shared_github_client: httpx.AsyncClient | None = None
         self._recent_image_sources: dict[str, list[str]] = {}
         self._last_search_query: dict[str, str] = {}
         self._recent_media_cache_ttl_seconds = max(
@@ -599,6 +602,49 @@ class ToolExecutor:
             "18禁",
         }
         self._ai_method_schemas = self._build_ai_method_schemas()
+
+    # ------------------------------------------------------------------
+    # Shared httpx.AsyncClient accessors (lazy init, connection reuse)
+    # ------------------------------------------------------------------
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        """Return a shared AsyncClient for general HTTP requests.
+
+        Uses ``self._http_timeout`` and ``self._http_headers``.  The client
+        is created on first access and reused for subsequent calls to avoid
+        the overhead of creating a new connection pool on every request.
+        """
+        if self._shared_http_client is None or self._shared_http_client.is_closed:
+            self._shared_http_client = httpx.AsyncClient(
+                timeout=self._http_timeout,
+                follow_redirects=True,
+                headers=self._http_headers,
+            )
+        return self._shared_http_client
+
+    def _get_github_client(self) -> httpx.AsyncClient:
+        """Return a shared AsyncClient for GitHub API requests.
+
+        Uses ``self._http_timeout`` and ``self._github_headers``.
+        """
+        if self._shared_github_client is None or self._shared_github_client.is_closed:
+            self._shared_github_client = httpx.AsyncClient(
+                timeout=self._http_timeout,
+                follow_redirects=True,
+                headers=self._github_headers,
+            )
+        return self._shared_github_client
+
+    async def close(self) -> None:
+        """Close shared HTTP clients.  Safe to call multiple times."""
+        for client in (self._shared_http_client, self._shared_github_client):
+            if client is not None and not client.is_closed:
+                try:
+                    await client.aclose()
+                except Exception:
+                    pass
+        self._shared_http_client = None
+        self._shared_github_client = None
 
     def get_ai_method_schemas(self) -> list[dict[str, Any]]:
         return [dict(item) for item in self._ai_method_schemas]
@@ -1054,12 +1100,7 @@ class ToolExecutor:
         if self._is_blocked_image_url(url):
             return False
         try:
-            async with httpx.AsyncClient(
-                timeout=self._http_timeout,
-                follow_redirects=True,
-                headers=self._http_headers,
-            ) as client:
-                response = await client.get(url)
+            response = await self._get_http_client().get(url)
         except Exception:
             return False
         if response.status_code != 200:
@@ -1874,12 +1915,7 @@ class ToolExecutor:
 
         endpoint = f"{self._github_api_base}/search/repositories"
         try:
-            async with httpx.AsyncClient(
-                timeout=self._http_timeout,
-                follow_redirects=True,
-                headers=self._github_headers,
-            ) as client:
-                response = await client.get(endpoint, params=params)
+            response = await self._get_github_client().get(endpoint, params=params)
         except Exception as exc:
             return await self._github_search_web_fallback(
                 method_name=method_name,
@@ -1921,12 +1957,7 @@ class ToolExecutor:
                 alt_params = dict(params)
                 alt_params["q"] = alt_query
                 try:
-                    async with httpx.AsyncClient(
-                        timeout=self._http_timeout,
-                        follow_redirects=True,
-                        headers=self._github_headers,
-                    ) as client:
-                        alt_resp = await client.get(endpoint, params=alt_params)
+                    alt_resp = await self._get_github_client().get(endpoint, params=alt_params)
                     if alt_resp.status_code < 400:
                         alt_data = alt_resp.json()
                         alt_items = (
@@ -2223,13 +2254,9 @@ class ToolExecutor:
         repo_resp = None
         readme_resp = None
         try:
-            async with httpx.AsyncClient(
-                timeout=self._http_timeout,
-                follow_redirects=True,
-                headers=self._github_headers,
-            ) as client:
-                repo_resp = await client.get(repo_endpoint)
-                readme_resp = await client.get(readme_endpoint)
+            gh = self._get_github_client()
+            repo_resp = await gh.get(repo_endpoint)
+            readme_resp = await gh.get(readme_endpoint)
         except Exception as exc:
             return ToolResult(
                 ok=False,
@@ -6404,7 +6431,9 @@ class ToolExecutor:
     async def _music_search(
         self, tool_args: dict[str, Any], message_text: str
     ) -> ToolResult:
-        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        raw_keyword = str(tool_args.get("keyword", "")).strip()
+        _is_url = bool(re.search(r"https?://", raw_keyword))
+        keyword = raw_keyword if _is_url else normalize_matching_text(raw_keyword)
         title = normalize_matching_text(str(tool_args.get("title", "")))
         artist = normalize_matching_text(str(tool_args.get("artist", "")))
         if not keyword and title:
@@ -6619,7 +6648,9 @@ class ToolExecutor:
         api_call: Callable[..., Awaitable[Any]] | None,
         group_id: int,
     ) -> ToolResult:
-        keyword = normalize_matching_text(str(tool_args.get("keyword", "")))
+        raw_keyword = str(tool_args.get("keyword", "")).strip()
+        _is_url = bool(re.search(r"https?://", raw_keyword))
+        keyword = raw_keyword if _is_url else normalize_matching_text(raw_keyword)
         title = normalize_matching_text(str(tool_args.get("title", "")))
         artist = normalize_matching_text(str(tool_args.get("artist", "")))
         if not keyword and title:

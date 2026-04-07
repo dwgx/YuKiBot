@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import sqlite3
+
+_log = logging.getLogger("yukiko.memory")
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -247,8 +250,18 @@ class MemoryEngine:
         """实际写入用户画像到磁盘（由 write_daily_snapshot 或外部定时调用）。"""
         if not getattr(self, "_user_profiles_dirty", False):
             return
+        # 限制 profile 总量，按 last_seen 淘汰最旧的
+        max_profiles = int(getattr(self, "_max_user_profiles", 10000))
+        if len(self._user_profiles) > max_profiles:
+            sorted_uids = sorted(
+                self._user_profiles.keys(),
+                key=lambda uid: self._user_profiles[uid].get("last_seen", ""),
+            )
+            to_remove = sorted_uids[: len(self._user_profiles) - max_profiles]
+            for uid in to_remove:
+                self._user_profiles.pop(uid, None)
+            _log.info("user_profiles_pruned | removed=%d | remaining=%d", len(to_remove), len(self._user_profiles))
         try:
-            import tempfile
             tmp_path = self.user_profiles_path.with_suffix(".tmp")
             tmp_path.write_text(
                 json.dumps(self._user_profiles, ensure_ascii=False, indent=2),
@@ -257,7 +270,7 @@ class MemoryEngine:
             tmp_path.replace(self.user_profiles_path)
             self._user_profiles_dirty = False
         except Exception:
-            pass
+            _log.warning("user_profiles_flush_error", exc_info=True)
 
     def _load_thread_state(self) -> dict[str, dict[str, Any]]:
         if not self.thread_state_path.exists():

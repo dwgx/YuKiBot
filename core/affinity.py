@@ -313,6 +313,7 @@ class AffinityEngine:
                         user.level = self._calc_level(user.affinity)
                         count += 1
             except Exception:
+                _log.warning("affinity_decay_parse_error | user=%s", uid, exc_info=True)
                 continue
         if count > 0:
             self.save()

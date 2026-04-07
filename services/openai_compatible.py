@@ -535,16 +535,44 @@ class OpenAICompatibleClient(BaseLLMClient):
         return aliases.get(raw, raw or "openai")
 
     @staticmethod
-    def _messages_to_responses_input(messages: list[dict[str, str]]) -> list[dict[str, Any]]:
+    def _messages_to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         inputs: list[dict[str, Any]] = []
         for msg in messages:
             role = str(msg.get("role", "user")).strip().lower()
-            content = str(msg.get("content", "")).strip()
+            raw_content = msg.get("content", "")
+            normalized_role = role if role in {"user", "assistant", "system", "developer"} else "user"
+            is_assistant = normalized_role == "assistant"
+
+            # Multimodal content: list of {type, text/image_url} blocks
+            if isinstance(raw_content, list):
+                parts: list[dict[str, Any]] = []
+                for block in raw_content:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = str(block.get("type", "")).strip().lower()
+                    if block_type == "text":
+                        text = str(block.get("text", "")).strip()
+                        if text:
+                            ct = "output_text" if is_assistant else "input_text"
+                            parts.append({"type": ct, "text": text})
+                    elif block_type == "image_url":
+                        image_url_obj = block.get("image_url", {})
+                        url = ""
+                        if isinstance(image_url_obj, dict):
+                            url = str(image_url_obj.get("url", "")).strip()
+                        elif isinstance(image_url_obj, str):
+                            url = image_url_obj.strip()
+                        if url:
+                            parts.append({"type": "input_image", "image_url": url})
+                if parts:
+                    inputs.append({"role": normalized_role, "content": parts})
+                continue
+
+            # Plain text content
+            content = str(raw_content).strip()
             if not content:
                 continue
-            normalized_role = role if role in {"user", "assistant", "system", "developer"} else "user"
-            # Responses API: assistant 历史消息应使用 output_text；其余角色使用 input_text。
-            content_type = "output_text" if normalized_role == "assistant" else "input_text"
+            content_type = "output_text" if is_assistant else "input_text"
             inputs.append(
                 {
                     "role": normalized_role,

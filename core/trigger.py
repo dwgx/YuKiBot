@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+import asyncio
+
 from collections import Counter, defaultdict, deque
 
 from dataclasses import dataclass, field
@@ -194,6 +196,8 @@ class TriggerEngine:
         self._last_overload_notice_at: dict[str, datetime] = {}
 
         self._last_ai_probe_at: dict[str, datetime] = {}
+
+        self._followup_lock = asyncio.Lock()
 
     def _session_key(self, conversation_id: str, user_id: str, is_private: bool) -> str:
 
@@ -402,13 +406,8 @@ class TriggerEngine:
 
         if followup_candidate:
 
-            # 仅在用户消息真正命中 followup 窗口时才消费回合，
-
-            # 避免“机器人刚发出就把 followup 回合耗尽”。
-
-            self.consume_followup_turn(
-                payload.conversation_id, payload.user_id, now=now
-            )
+            # followup 回合的消费延迟到 engine 路由确认后再执行，
+            # 避免 router 低置信度拒绝时白白浪费 followup turn。
 
             return TriggerResult(
                 should_handle=True,
@@ -958,69 +957,69 @@ class TriggerEngine:
 
         return True
 
-    def consume_followup_turn(
+    async def consume_followup_turn(
         self, conversation_id: str, user_id: str, now: datetime | None = None
     ) -> None:
         """在消息成功发出后消费一次 followup 回合。"""
+        async with self._followup_lock:
+            ts = now or datetime.now(timezone.utc)
 
-        ts = now or datetime.now(timezone.utc)
+            targets = self._last_reply_targets.get(conversation_id)
 
-        targets = self._last_reply_targets.get(conversation_id)
+            if not isinstance(targets, dict):
 
-        if not isinstance(targets, dict):
+                return
 
-            return
+            uid = str(user_id)
 
-        uid = str(user_id)
+            state = targets.get(uid)
 
-        state = targets.get(uid)
+            if not isinstance(state, dict):
 
-        if not isinstance(state, dict):
+                return
 
-            return
+            last_ts = state.get("ts")
 
-        last_ts = state.get("ts")
+            if (
+                not isinstance(last_ts, datetime)
+                or ts - last_ts > self.followup_reply_window
+            ):
 
-        if (
-            not isinstance(last_ts, datetime)
-            or ts - last_ts > self.followup_reply_window
-        ):
+                targets.pop(uid, None)
 
-            targets.pop(uid, None)
+                if not targets:
+
+                    self._last_reply_targets.pop(conversation_id, None)
+
+                return
+
+            remaining = int(state.get("remaining_turns", 0))
+
+            if remaining <= 0:
+
+                targets.pop(uid, None)
+
+                if not targets:
+
+                    self._last_reply_targets.pop(conversation_id, None)
+
+                return
+
+            state["remaining_turns"] = remaining - 1
+
+            state["ts"] = ts
+
+            if int(state.get("remaining_turns", 0)) <= 0:
+
+                targets.pop(uid, None)
+
+            else:
+
+                targets[uid] = state
 
             if not targets:
 
                 self._last_reply_targets.pop(conversation_id, None)
-
-            return
-
-        remaining = int(state.get("remaining_turns", 0))
-
-        if remaining <= 0:
-
-            targets.pop(uid, None)
-
-            if not targets:
-
-                self._last_reply_targets.pop(conversation_id, None)
-
-            return
-
-        state["remaining_turns"] = remaining - 1
-
-        state["ts"] = ts
-
-        if int(state.get("remaining_turns", 0)) <= 0:
-
-            targets.pop(uid, None)
-
-        else:
-
-            targets[uid] = state
-
-        if not targets:
-
-            self._last_reply_targets.pop(conversation_id, None)
 
     def _update_followup_state(
         self, conversation_id: str, user_id: str, now: datetime

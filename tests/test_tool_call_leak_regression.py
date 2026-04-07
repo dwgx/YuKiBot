@@ -245,26 +245,24 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
         )
         ctx = self._make_ctx(message_text="帮我生成一张猫娘图片，眼睛里有爱心")
         forced = loop._select_forced_media_tool(ctx)
-        self.assertEqual(
-            forced,
-            ("generate_image_enhanced", {"prompt": "猫娘图片，眼睛里有爱心"}),
-        )
+        # 图片生成不再通过本地关键词强制触发，交由 AI 自主决定
+        self.assertIsNone(forced)
 
     def test_agent_falls_back_to_basic_image_generation_tool(self) -> None:
         loop = AgentLoop.__new__(AgentLoop)
         loop.tool_registry = self._StubRegistry({"generate_image"})
         ctx = self._make_ctx(message_text="画个猫娘")
         forced = loop._select_forced_media_tool(ctx)
-        self.assertEqual(forced, ("generate_image", {"prompt": "猫娘"}))
+        # 图片生成不再通过本地关键词强制触发
+        self.assertIsNone(forced)
 
-    def test_agent_blocks_direct_refusal_and_recovers_with_image_tool(self) -> None:
+    def test_agent_direct_reply_without_forced_image_tool(self) -> None:
+        """当 AI 模型直接返回文本拒绝时，不再通过关键词强制触发 generate_image。"""
         registry = self._RunnableRegistry({"generate_image"})
         loop = AgentLoop(
             model_client=self._SequencedModelClient(
                 [
                     "I'm a text-based AI assistant and cannot generate images directly.",
-                    '{"tool":"generate_image","args":{}}',
-                    '{"tool":"final_answer","args":{"text":"好了，已经帮你生成。"}}',
                 ]
             ),
             tool_registry=registry,
@@ -280,15 +278,8 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
             loop.run(self._make_ctx(message_text="帮我生成一张猫娘图片，眼睛里有爱心"))
         )
 
-        self.assertEqual(result.reason, "agent_final_answer")
-        self.assertEqual(result.reply_text, "好了，已经帮你生成。")
-        self.assertEqual(result.tool_calls_made, 1)
-        self.assertEqual(
-            registry.calls,
-            [("generate_image", {"prompt": "猫娘图片，眼睛里有爱心"})],
-        )
-        self.assertEqual(result.steps[0]["tool"], "policy_guard")
-        self.assertEqual(result.steps[0]["error"], "tool_required_before_direct_reply")
+        # AI 应自行决定是否调用工具；如果直接返回文本则以 direct_reply 结束
+        self.assertIn(result.reason, {"agent_direct_reply", "agent_final_answer"})
 
     def test_agent_normalizes_english_refusal_to_chinese(self) -> None:
         refusal = (

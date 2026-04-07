@@ -31,6 +31,31 @@ from utils.text import clip_text, normalize_text
 
 _log = logging.getLogger("yukiko.agent")
 
+# ---------------------------------------------------------------------------
+# Pre-compiled regex patterns (constant patterns used across the module)
+# ---------------------------------------------------------------------------
+_RE_WHITESPACE = re.compile(r"\s+")
+_RE_WHITESPACE_2PLUS = re.compile(r"\s{2,}")
+_RE_URL_EXTRACT = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_RE_URL_STRIP = re.compile(r"https?://\S+", re.IGNORECASE)
+_RE_URL_SCHEME = re.compile(r"https?://")
+_RE_IMAGE_EXT = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?:\?|$)")
+_RE_VIDEO_EXT = re.compile(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)")
+_RE_QQ_NUMBER = re.compile(r"(?<!\d)([1-9]\d{5,11})(?!\d)")
+_RE_PUNCTUATION_CJK = re.compile(r"[，。,.!?！？:：;；\[\]()（）\"'`]+")
+_RE_SLASH_IMAGE = re.compile(r"(?:^|\s)/image(?:\s|$)")
+_RE_SLASH_VIDEO = re.compile(r"(?:^|\s)/(?:video|vid)(?:\s|$)")
+_RE_DOWNLOAD_EXT = re.compile(r"\.(apk|exe|msi|zip|7z|rar|ipa|dmg)(?:\?|#|$)")
+_RE_THINKING_TAG = re.compile(r"</?thinking>", re.IGNORECASE)
+_RE_THINKING_BLOCK = re.compile(r"<thinking>.*?</thinking>", re.DOTALL | re.IGNORECASE)
+_RE_TOOL_CALL_TAG = re.compile(r"</?tool_call>", re.IGNORECASE)
+_RE_TOOL_USE_TAG = re.compile(r"</?tool_use>", re.IGNORECASE)
+_RE_CODE_BLOCK = re.compile(r"```(?:json)?\s*\n?(.*?)\n?```", re.DOTALL)
+_RE_FINAL_ANSWER_KEY = re.compile(r'"(?:tool|name)"\s*:\s*"final_answer"')
+_RE_TEXT_KEY = re.compile(r'"text"\s*:\s*"')
+_RE_ASCII_LETTER = re.compile(r"[A-Za-z]")
+_RE_CJK_CHAR = re.compile(r"[\u4e00-\u9fff]")
+
 
 @dataclass(slots=True)
 class AgentContext:
@@ -769,7 +794,11 @@ class AgentLoop:
         total_timeout = self._resolve_total_timeout_seconds(ctx, has_media)
         deadline_ts = t0 + total_timeout
 
-        for step_idx in range(self.max_steps):
+        # 工具超时不计入步骤预算（最多 3 次免费），避免慢工具浪费推理机会
+        _tool_timeout_free_budget = 3
+        step_idx = -1
+        while step_idx < self.max_steps - 1:
+            step_idx += 1
             # 总超时保护
             elapsed = time.monotonic() - t0
             remaining = deadline_ts - time.monotonic()
@@ -1643,6 +1672,14 @@ class AgentLoop:
                     error=f"tool_timeout:{tool_name}",
                     data={},
                 )
+                _log.warning(
+                    "agent_tool_timeout | trace=%s | step=%d | tool=%s | timeout=%.1fs",
+                    ctx.trace_id, step_idx, tool_name, tool_timeout,
+                )
+                # 工具超时不消耗步骤预算（有免费额度时回退 step_idx）
+                if _tool_timeout_free_budget > 0:
+                    _tool_timeout_free_budget -= 1
+                    step_idx -= 1
             tool_calls_made += 1
             if not result.display and result.error:
                 result.display = f"{tool_name} 失败: {result.error}"
@@ -1849,8 +1886,9 @@ class AgentLoop:
         identity_text = template.get("identity", "")
         output_format_text = template.get("output_format", "")
         rules_text = template.get("rules", "")
+        # 兼容旧 key: reply_style/tool_usage/tool_priority/network_flow 已合并到 rules/tools
         reply_style_text = template.get("reply_style", "")
-        tool_usage_text = template.get("tool_usage", "")
+        tools_text = template.get("tools", "") or template.get("tool_usage", "")
         tool_priority_text = template.get("tool_priority", "")
         context_rules_text = template.get("context_rules", "")
         network_flow_text = template.get("network_flow", "")
@@ -1954,16 +1992,15 @@ class AgentLoop:
             prompt += f"## 人格底稿（最高优先级，定义你是谁、怎么说话、怎么互动）\n{self.persona_text}\n\n"
         prompt += (
             f"## 输出格式\n{output_format_text}\n\n"
-            f"## 规则\n{rules_text}\n"
+            f"## 规则\n{rules_text}\n\n"
         )
+        if reply_style_text:
+            prompt += f"## 回复风格\n{reply_style_text}\n\n"
         if network_flow_text:
-            prompt += f"## 联网任务流程（必须遵守）\n{network_flow_text}\n"
-        prompt += (
-            f"## 回复风格（极其重要）\n{reply_style_text}\n\n"
-            f"## 工具使用\n{tool_usage_text}{sticker_hint}\n\n"
-        )
+            prompt += f"## 联网任务流程\n{network_flow_text}\n\n"
+        prompt += f"## 工具使用\n{tools_text}{sticker_hint}\n\n"
         if normalize_text(tool_priority_text):
-            prompt += f"## 工具优先级（必须遵守）\n{tool_priority_text}\n\n"
+            prompt += f"## 工具优先级\n{tool_priority_text}\n\n"
         if selected_tool_hints:
             prompt += (
                 "## 工具细粒度提示（按本轮可用工具）\n"
@@ -2761,7 +2798,7 @@ class AgentLoop:
 
     @staticmethod
     def _extract_first_url(text: str) -> str:
-        m = re.search(r"https?://[^\s<>\"]+", text or "", flags=re.IGNORECASE)
+        m = _RE_URL_EXTRACT.search(text or "")
         if not m:
             return ""
         return m.group(0).strip().rstrip(").,，。!?！？")
@@ -2773,7 +2810,7 @@ class AgentLoop:
             return False
         if target.startswith("data:image/"):
             return True
-        if re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?:\?|$)", target):
+        if _RE_IMAGE_EXT.search(target):
             return True
         # QQ/NT 常见图片下载链接没有文件后缀
         if "multimedia.nt.qq.com.cn/download" in target:
@@ -2795,7 +2832,7 @@ class AgentLoop:
         target = normalize_text(url).lower()
         if not target:
             return False
-        if re.search(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)", target):
+        if _RE_VIDEO_EXT.search(target):
             return True
         return any(
             host in target
@@ -2850,7 +2887,7 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         explicit_tokens = (
             "/source",
             "source=previous",
@@ -2932,7 +2969,7 @@ class AgentLoop:
 
         # 3) 最后才回退到正文数字（避免截断数字抢占）
         text = normalize_text(ctx.message_text)
-        m = re.search(r"(?<!\d)([1-9]\d{5,11})(?!\d)", text)
+        m = _RE_QQ_NUMBER.search(text)
         if m:
             try:
                 return int(m.group(1))
@@ -2947,21 +2984,21 @@ class AgentLoop:
             return ""
         t = re.sub(r"^(?i:/(?:lookup|wiki))\s*", "", t)
         t = re.sub(r"^(?i:keyword)\s*=\s*", "", t)
-        t = re.sub(r"[，。,.!?！？:：;；\[\]()（）\"'`]+", " ", t)
-        t = re.sub(r"\s+", " ", t).strip()
+        t = _RE_PUNCTUATION_CJK.sub(" ", t)
+        t = _RE_WHITESPACE.sub(" ", t).strip()
         return t[:80]
 
     @staticmethod
     def _infer_search_mode(text: str) -> str:
         t = normalize_text(text).lower()
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         if "mode=image" in plain:
             return "image"
         if "mode=video" in plain:
             return "video"
-        if re.search(r"(?:^|\s)/image(?:\s|$)", t):
+        if _RE_SLASH_IMAGE.search(t):
             return "image"
-        if re.search(r"(?:^|\s)/(?:video|vid)(?:\s|$)", t):
+        if _RE_SLASH_VIDEO.search(t):
             return "video"
         if re.search(
             r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$",
@@ -2973,18 +3010,18 @@ class AgentLoop:
     @staticmethod
     def _infer_media_type(text: str) -> str:
         t = normalize_text(text).lower()
-        if "type=gif" in re.sub(r"\s+", "", t):
+        if "type=gif" in _RE_WHITESPACE.sub("", t):
             return "gif"
-        if "type=video" in re.sub(r"\s+", "", t):
+        if "type=video" in _RE_WHITESPACE.sub("", t):
             return "video"
-        if "type=image" in re.sub(r"\s+", "", t):
+        if "type=image" in _RE_WHITESPACE.sub("", t):
             return "image"
         return ""
 
     @staticmethod
     def _infer_resource_file_type(text: str) -> str:
         t = normalize_text(text).lower()
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         if "prefer_ext=apk" in plain or re.search(r"\.apk(?:\?|#|$)", t):
             return "apk"
         if "prefer_ext=ipa" in plain or re.search(r"\.ipa(?:\?|#|$)", t):
@@ -3008,7 +3045,7 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return ""
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         if "mode=audio" in plain:
             return "audio"
         if "mode=cover" in plain:
@@ -3121,7 +3158,7 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         explicit_tokens = ("/next", "next=1", "continue=1", "context=continue")
         if any(token in plain for token in explicit_tokens):
             return True
@@ -3170,7 +3207,7 @@ class AgentLoop:
         text = normalize_text(reply_text)
         if not text:
             return ""
-        text = re.sub(r"https?://\S+", " ", text, flags=re.IGNORECASE)
+        text = _RE_URL_STRIP.sub(" ", text)
         text = normalize_text(text)
         if not text:
             return ""
@@ -3348,7 +3385,7 @@ class AgentLoop:
             t,
             flags=re.IGNORECASE,
         )
-        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        cleaned = _RE_WHITESPACE.sub(" ", cleaned).strip()
         if cleaned:
             return cleaned[:40]
         return "随机"
@@ -3371,7 +3408,7 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         explicit_tokens = (
             "/upload",
             "upload=1",
@@ -3386,10 +3423,10 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        plain = re.sub(r"\s+", "", t)
+        plain = _RE_WHITESPACE.sub("", t)
         if any(token in plain for token in ("/download", "download=1", "prefer_ext=")):
             return True
-        return bool(re.search(r"\.(apk|exe|msi|zip|7z|rar|ipa|dmg)(?:\?|#|$)", t))
+        return bool(_RE_DOWNLOAD_EXT.search(t))
 
     def _rewrite_download_tool_if_needed(
         self,
@@ -3457,7 +3494,7 @@ class AgentLoop:
         t = normalize_text(text).lower()
         if not t:
             return False
-        compact = re.sub(r"\s+", "", t)
+        compact = _RE_WHITESPACE.sub("", t)
         direct_cues = (
             "生图",
             "生圖",
@@ -3616,7 +3653,7 @@ class AgentLoop:
             return True
 
         # 任何外链默认工具优先（解析/抓取/校验）
-        if re.search(r"https?://", text):
+        if _RE_URL_SCHEME.search(text):
             return True
 
         # 明确搜索/查证请求（需要外部信息）
@@ -3867,20 +3904,7 @@ class AgentLoop:
     def _select_forced_media_tool(
         self, ctx: AgentContext
     ) -> tuple[str, dict[str, Any]] | None:
-        if self._looks_like_image_generation_request(ctx.message_text):
-            prompt = self._infer_image_generation_prompt(ctx.message_text)
-            tool_name = ""
-            registry = getattr(self, "tool_registry", None)
-            if registry is not None and hasattr(registry, "has_tool"):
-                if registry.has_tool("generate_image_enhanced"):
-                    tool_name = "generate_image_enhanced"
-                elif registry.has_tool("generate_image"):
-                    tool_name = "generate_image"
-            if tool_name:
-                forced_args: dict[str, Any] = {}
-                if prompt:
-                    forced_args["prompt"] = prompt
-                return tool_name, forced_args
+        # 图片生成不再通过本地关键词强制触发，完全交给 AI Agent 根据上下文自主决定是否调用工具。
 
         if self._should_force_image_tool_first(ctx):
             forced_args: dict[str, Any] = {}
@@ -3961,12 +3985,10 @@ class AgentLoop:
         clean = text.strip()
 
         # 先剥离 <thinking>...</thinking> 块（LLM 可能在 tool call 前输出思考）
-        clean = re.sub(
-            r"<thinking>.*?</thinking>", "", clean, flags=re.DOTALL | re.IGNORECASE
-        )
-        clean = re.sub(r"</?thinking>", "", clean, flags=re.IGNORECASE)
+        clean = _RE_THINKING_BLOCK.sub("", clean)
+        clean = _RE_THINKING_TAG.sub("", clean)
         # 剥离 <tool_call>...</tool_call> 包裹（保留内部 JSON）
-        clean = re.sub(r"</?tool_call>", "", clean, flags=re.IGNORECASE)
+        clean = _RE_TOOL_CALL_TAG.sub("", clean)
 
         # 兼容 <tool_use> tool_name {"arg":"val"} </tool_use> 格式
         tool_use_match = re.search(
@@ -3983,7 +4005,7 @@ class AgentLoop:
             except (json.JSONDecodeError, ValueError):
                 pass
         # 剥离残留的 <tool_use> 标签
-        clean = re.sub(r"</?tool_use>", "", clean, flags=re.IGNORECASE)
+        clean = _RE_TOOL_USE_TAG.sub("", clean)
 
         # 兼容 [tool_use: tool_name] key: value 格式
         bracket_match = re.search(
@@ -4052,7 +4074,7 @@ class AgentLoop:
                     pass
 
         # 尝试从 markdown code block 中提取
-        code_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", clean, re.DOTALL)
+        code_match = _RE_CODE_BLOCK.search(clean)
         if code_match:
             code_content = code_match.group(1).strip()
             try:
@@ -4191,10 +4213,10 @@ class AgentLoop:
             pass
 
         # 2. 对 final_answer 用正则提取 text 内容，兼容 {"tool":...} / {"name":...}
-        m = re.search(r'"(?:tool|name)"\s*:\s*"final_answer"', text)
+        m = _RE_FINAL_ANSWER_KEY.search(text)
         if m:
             # 找到 "text" : " 之后的所有内容，去掉尾部的 "}} 等
-            tm = re.search(r'"text"\s*:\s*"', text)
+            tm = _RE_TEXT_KEY.search(text)
             if tm:
                 start = tm.end()
                 content = self._trim_recovered_final_answer_text(text[start:])
@@ -4462,8 +4484,8 @@ class AgentLoop:
         if tool in cls._FALLBACK_RAW_DISPLAY_SKIP_TOOLS:
             return True
         # 中间提取结果经常是英文长段，直接透传会污染群聊体验。
-        letters = len(re.findall(r"[A-Za-z]", content))
-        cjk = len(re.findall(r"[\u4e00-\u9fff]", content))
+        letters = len(_RE_ASCII_LETTER.findall(content))
+        cjk = len(_RE_CJK_CHAR.findall(content))
         if letters >= 40 and cjk <= 6:
             return True
         lower = content.lower()
@@ -4668,7 +4690,7 @@ class AgentLoop:
             content,
             flags=re.IGNORECASE,
         )
-        content = re.sub(r"\s{2,}", " ", content).strip()
+        content = _RE_WHITESPACE_2PLUS.sub(" ", content).strip()
         return content
 
     @staticmethod

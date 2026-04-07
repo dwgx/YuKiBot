@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from typing import Any
 
 from services.anthropic import AnthropicClient
@@ -129,6 +130,9 @@ class ModelClient:
         self._fallback_providers: list[str] = []
         self._fallback_clients: dict[str, Any] = {}
         self._active_provider = provider  # 当前实际使用的 provider
+        self._primary_provider = provider  # 永远记住主 provider
+        self._failover_at: float = 0.0  # 降级发生的时间戳
+        self._recovery_interval: float = float(raw.get("recovery_interval_seconds", 300))  # 5分钟后尝试回切
         self._init_fallbacks(raw)
 
     @property
@@ -212,6 +216,28 @@ class ModelClient:
         return False
 
     async def _invoke_with_failover(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        # 自动回切：如果当前在 fallback 且距降级已超过回切间隔，尝试恢复主 provider
+        if (
+            self._active_provider != self._primary_provider
+            and self._failover_at > 0
+            and time.monotonic() - self._failover_at >= self._recovery_interval
+        ):
+            primary_client = self._fallback_clients.get(self._primary_provider) or self.client
+            if self._supports_method(primary_client, method_name):
+                try:
+                    result = await getattr(primary_client, method_name)(*args, **kwargs)
+                    _log.info(
+                        "provider_recovery_ok | %s -> %s | method=%s",
+                        self._active_provider, self._primary_provider, method_name,
+                    )
+                    self._active_provider = self._primary_provider
+                    self._failover_at = 0.0
+                    return result
+                except Exception:
+                    # 主 provider 仍不可用，重置计时器继续使用 fallback
+                    self._failover_at = time.monotonic()
+                    _log.debug("provider_recovery_failed | %s still unavailable", self._primary_provider)
+
         active_provider = self._active_provider
         active_client = self._get_active_client()
         if not self._supports_method(active_client, method_name):
@@ -252,6 +278,7 @@ class ModelClient:
                     method_name,
                 )
                 self._active_provider = prov
+                self._failover_at = time.monotonic()
                 return result
             except Exception as fb_exc:
                 _log.warning(
@@ -371,6 +398,7 @@ class ModelClient:
             "gpt-4o",
             "gpt-4.1",
             "gpt-4.5",
+            "gpt-5",
             "o1",
             "o3",
             "o4",
@@ -384,6 +412,7 @@ class ModelClient:
             "glm-4v",
             "llava",
             "minicpm-v",
+            "codex",
         )
         if any(cue in name for cue in vision_cues):
             return True

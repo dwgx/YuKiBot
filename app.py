@@ -1426,10 +1426,14 @@ def register_handlers(engine: YukikoEngine) -> None:
             return
         _recent_msg_hashes[_dedup_key] = (_dedup_hash, _dedup_now)
         # 清理过期条目（惰性清理，避免内存泄漏）
-        if len(_recent_msg_hashes) > 500:
-            expired = [k for k, v in _recent_msg_hashes.items() if _dedup_now - v[1] > 30]
+        if len(_recent_msg_hashes) > 2000:
+            expired = [k for k, v in _recent_msg_hashes.items() if _dedup_now - v[1] > 10]
             for k in expired:
                 _recent_msg_hashes.pop(k, None)
+            if len(_recent_msg_hashes) > 2000:
+                sorted_keys = sorted(_recent_msg_hashes, key=lambda k: _recent_msg_hashes[k][1])
+                for k in sorted_keys[:len(_recent_msg_hashes) - 1500]:
+                    _recent_msg_hashes.pop(k, None)
 
         conversation_id = _dedup_conv
         at_targets = _extract_at_targets(event)
@@ -1449,7 +1453,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                         if scoped_conversation != conversation_id:
                             remember_media(scoped_conversation, raw_segments)
             except Exception as exc:
-                _log.debug("pre_gate_media_cache_failed | conv=%s | err=%s", conversation_id, exc)
+                _log.warning("pre_gate_media_cache_failed | conv=%s | err=%s", conversation_id, exc)
 
         allow_non_to_me_rt, runtime_bot_cfg, _, _ = _resolve_runtime_matcher_flags()
         raw_text = _extract_text_segments(raw_segments) or event.get_plaintext().strip()

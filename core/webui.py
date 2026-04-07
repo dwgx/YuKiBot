@@ -57,6 +57,23 @@ from utils.text import clip_text, normalize_text
 _log = logging.getLogger("yukiko.webui")
 router = APIRouter(prefix="/api/webui", tags=["webui"])
 
+
+def _safe_write_yaml(filepath: Path, data: dict[str, Any]) -> None:
+    """写入 YAML 前先备份，使用原子写入防止数据损坏。"""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    if filepath.exists():
+        bak = filepath.with_suffix(filepath.suffix + ".bak")
+        shutil.copy2(filepath, bak)
+    tmp = filepath.with_suffix(filepath.suffix + ".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        os.replace(tmp, filepath)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
+
 _engine: Any = None
 _start_time: float = time.time()
 _LOG_SPLIT_RE = re.compile(r'(?=(?:\d{4}-\d{2}-\d{2}|(?<!\d{4}-)\d{2}-\d{2}) \d{2}:\d{2}:\d{2} (?:\||\[))')
@@ -4369,9 +4386,7 @@ async def put_image_gen(request: Request):
     current_config["image_gen"] = merged_image_cfg
 
     # 写入文件
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_file, "w", encoding="utf-8") as f:
-        yaml.safe_dump(current_config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    _safe_write_yaml(config_file, current_config)
 
     # 热重载
     try:
@@ -4528,9 +4543,7 @@ async def add_image_gen_model(request: Request):
     current_config["image_gen"]["models"].append(model_cfg)
 
     # 写入文件
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-    with open(config_file, "w", encoding="utf-8") as f:
-        yaml.safe_dump(current_config, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    _safe_write_yaml(config_file, current_config)
 
     # 热重载
     try:

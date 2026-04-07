@@ -57,8 +57,18 @@ class GroupQueueDispatcher:
         self.cancel_previous_on_new = bool(config.get("cancel_previous_on_new", True))
 
         self.max_pending_per_group = max(1, int(config.get("max_pending_per_group", 80)))
-        self.message_ttl = timedelta(seconds=max(1, int(config.get("message_ttl_seconds", 35))))
-        self.process_timeout_seconds = max(1, int(config.get("process_timeout_seconds", 120)))
+        ttl_s = max(1, int(config.get("message_ttl_seconds", 90)))
+        timeout_s = max(1, int(config.get("process_timeout_seconds", 120)))
+        # TTL 必须 >= timeout + 裕度，否则消息在处理中过期被丢弃
+        min_ttl = timeout_s + 15
+        if ttl_s < min_ttl:
+            _logger.warning(
+                "queue_ttl_auto_adjust | ttl=%ds < timeout=%ds+15 | adjusted_to=%ds",
+                ttl_s, timeout_s, min_ttl,
+            )
+            ttl_s = min_ttl
+        self.message_ttl = timedelta(seconds=ttl_s)
+        self.process_timeout_seconds = timeout_s
         self.overload_notice_cooldown = timedelta(
             seconds=max(5, int(config.get("overload_notice_cooldown_seconds", 30)))
         )
@@ -179,6 +189,10 @@ class GroupQueueDispatcher:
 
         if not high_priority and state.pending_count >= self.max_pending_per_group:
             notice_sent = await self._try_send_overload_notice(state, send_overload_notice)
+            _logger.warning(
+                "queue_overload_drop | conversation=%s | seq=%d | pending=%d | max=%d | notice_sent=%s | trace=%s",
+                conversation_id, seq, state.pending_count, self.max_pending_per_group, notice_sent, trace_id,
+            )
             dropped = QueueDispatchResult(
                 status="cancelled",
                 reason="queue_overload_notice" if notice_sent else "queue_overload",
@@ -364,6 +378,13 @@ class GroupQueueDispatcher:
                 raise asyncio.CancelledError
             if self._is_expired(item.created_at):
                 reason = "message_ttl_expired"
+                _logger.warning(
+                    "message_ttl_expired | conversation=%s | seq=%d | age=%.1fs | ttl=%.0fs | trace=%s",
+                    conversation_id, item.seq,
+                    (datetime.now(timezone.utc) - item.created_at).total_seconds(),
+                    self.message_ttl.total_seconds(),
+                    item.trace_id,
+                )
                 raise asyncio.CancelledError
 
             async def _execute_process() -> Any:
@@ -466,6 +487,7 @@ class GroupQueueDispatcher:
             await sender(self.overload_notice_text)
             return True
         except Exception:
+            _logger.warning("overload_notice_send_failed", exc_info=True)
             return False
 
     def _state(self, conversation_id: str) -> _GroupState:

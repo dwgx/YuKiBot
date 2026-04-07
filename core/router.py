@@ -70,14 +70,7 @@ class RouterEngine:
         routing_cfg = config.get("routing", {}) if isinstance(config, dict) else {}
         bot_cfg = config.get("bot", {}) if isinstance(config, dict) else {}
         self.mode = str(routing_cfg.get("mode", "ai_full")).strip() or "ai_full"
-        self.min_confidence = float(routing_cfg.get("min_confidence", 0.58))
         self.max_tool_hops = max(1, int(routing_cfg.get("max_tool_hops", 1)))
-        self.failover_mode = str(
-            routing_cfg.get("failover_mode", "mention_or_private_only")
-        ).strip()
-        self.trust_ai_fully = bool(
-            routing_cfg.get("trust_ai_fully", True)
-        )  # 默认完全信任 AI
         self.followup_fast_path_enable = bool(
             routing_cfg.get("followup_fast_path_enable", False)
         )  # 禁用快速路径
@@ -499,22 +492,6 @@ class RouterEngine:
                 tool_args["query"] = normalize_text(media_user_text) or "分析这张图"
 
         # 关键词覆盖路径已移除：路由结果完全以模型判定为准。
-
-        if (
-            payload.at_other_user_only
-            and not payload.mentioned
-            and should_handle
-            and action != "ignore"
-        ):
-            if not self._looks_like_bot_address(user_text):
-                return RouterDecision(
-                    should_handle=False,
-                    action="ignore",
-                    reason="at_other_not_for_bot",
-                    reason_code="at_other_not_for_bot",
-                    confidence=max(confidence, 0.9),
-                    reply_style="short",
-                )
 
         if not target_user_id:
             reply_target = normalize_text(payload.reply_to_user_id)
