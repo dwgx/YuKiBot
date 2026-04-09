@@ -60,3 +60,11 @@ webui/node_modules/
 webui/dist/
 webui/.vite/
 webui/*.tsbuildinfo
+
+# 数据库备份
+*.db.bak
+*.sqlite3
+
+# coverage
+htmlcov/
+.coverage
