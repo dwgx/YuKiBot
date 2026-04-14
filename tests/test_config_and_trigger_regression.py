@@ -94,7 +94,8 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
         self.assertTrue(result.should_handle)
         self.assertEqual(result.reason, "ai_listen_probe_memory_keyword")
 
-    def test_explicit_ai_listen_enables_non_directed_gate_under_mention_only(self) -> None:
+    def test_mention_only_not_overridden_by_ai_listen(self) -> None:
+        """mention_only policy must NOT be auto-upgraded even when ai_listen_enable is True."""
         engine = YukikoEngine.__new__(YukikoEngine)
         engine.config = {
             "control": {"undirected_policy": "mention_only"},
@@ -106,8 +107,8 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
         }
 
         trigger_cfg = YukikoEngine._build_effective_trigger_config(engine)
-        self.assertTrue(trigger_cfg.get("ai_listen_enable", False))
-        self.assertTrue(trigger_cfg.get("delegate_undirected_to_ai", False))
+        self.assertFalse(trigger_cfg.get("ai_listen_enable", False))
+        self.assertFalse(trigger_cfg.get("allow_non_to_me", False))
 
     def test_high_confidence_policy_forces_ai_listen_gate(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)

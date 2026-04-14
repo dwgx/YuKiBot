@@ -390,7 +390,7 @@ class GroupQueueDispatcher:
             async def _execute_process() -> Any:
                 item.state = "running"
                 item.process_task = asyncio.create_task(process())
-                return await asyncio.wait_for(asyncio.shield(item.process_task), timeout=timeout_seconds)
+                return await asyncio.wait_for(item.process_task, timeout=timeout_seconds)
 
             if self._global_semaphore is not None:
                 async with self._global_semaphore:

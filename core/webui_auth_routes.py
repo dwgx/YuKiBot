@@ -17,8 +17,23 @@ def build_auth_status_router(ctx: WebUIRouteContext) -> APIRouter:
     async def health():
         return {"status": "ok"}
 
+    _auth_attempts: dict[str, list[float]] = {}
+    _AUTH_MAX_ATTEMPTS = 10
+    _AUTH_WINDOW_SECONDS = 300
+
     @router.post("/auth")
     async def auth(request: Request):
+        import hmac
+        client_ip = request.client.host if request.client else "unknown"
+        now = time.time()
+
+        # 速率限制：每 IP 5 分钟内最多 10 次
+        attempts = _auth_attempts.setdefault(client_ip, [])
+        attempts[:] = [t for t in attempts if now - t < _AUTH_WINDOW_SECONDS]
+        if len(attempts) >= _AUTH_MAX_ATTEMPTS:
+            raise HTTPException(429, "登录尝试过于频繁，请稍后再试")
+        attempts.append(now)
+
         body = await request.json()
         token = str(body.get("token", ""))
         expected = ctx.get_token()
@@ -26,7 +41,7 @@ def build_auth_status_router(ctx: WebUIRouteContext) -> APIRouter:
         if not expected:
             raise HTTPException(403, "WEBUI_TOKEN 未配置")
 
-        if token != expected:
+        if not hmac.compare_digest(token, expected):
             raise HTTPException(401, "Token 错误")
 
         response = JSONResponse({"ok": True})

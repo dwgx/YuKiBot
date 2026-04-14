@@ -1679,7 +1679,8 @@ class AgentLoop:
                 # 工具超时不消耗步骤预算（有免费额度时回退 step_idx）
                 if _tool_timeout_free_budget > 0:
                     _tool_timeout_free_budget -= 1
-                    step_idx -= 1
+                    if step_idx > 0:
+                        step_idx -= 1
             tool_calls_made += 1
             if not result.display and result.error:
                 result.display = f"{tool_name} 失败: {result.error}"

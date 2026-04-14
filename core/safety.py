@@ -303,13 +303,16 @@ class SafetyEngine:
             "防止", "预防", "应对", "响应", "监控", "告警",
         )
         for term in terms:
-            idx = content.find(term)
-            if idx < 0:
-                continue
-            after = content[idx + len(term):idx + len(term) + 4]
-            if any(after.startswith(suffix) for suffix in _tech_suffixes):
-                continue
-            return True
+            start = 0
+            while True:
+                idx = content.find(term, start)
+                if idx < 0:
+                    break
+                after = content[idx + len(term):idx + len(term) + 4]
+                if any(after.startswith(suffix) for suffix in _tech_suffixes):
+                    start = idx + len(term)
+                    continue
+                return True
         return False
 
     # ── 输出过滤（QQ 安全）──────────────────────────────────

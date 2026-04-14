@@ -2307,20 +2307,22 @@ def register_handlers(engine: YukikoEngine) -> None:
                             await send_msg(tip)
                             delivered = True
 
+                    # 合并多图到单条消息（OneBot V11 支持多 image 段）
+                    combined_msg = Message()
+                    if not prefixed_sent:
+                        combined_msg += prefix
+                        prefixed_sent = True
+                    failed_count = 0
                     for idx, item_url in enumerate(image_urls[:send_count], 1):
                         seg = await _build_image_segment(item_url)
-                        msg = Message()
-                        if not prefixed_sent:
-                            msg += prefix
-                            prefixed_sent = True
                         if seg is not None:
-                            msg += seg
+                            combined_msg += seg
                         else:
-                            msg += Message(f"第 {idx} 张图片发送失败，链接受限。")
-                        await send_msg(msg)
-                        delivered = True
-                        if idx < send_count and multi_image_interval_ms > 0:
-                            await asyncio.sleep(multi_image_interval_ms / 1000)
+                            failed_count += 1
+                    if failed_count > 0:
+                        combined_msg += Message(f"\n（{failed_count} 张图片发送失败，链接受限）")
+                    await send_msg(combined_msg)
+                    delivered = True
 
                     if len(image_urls) > send_count:
                         tip_more = Message()
@@ -2658,10 +2660,18 @@ def register_handlers(engine: YukikoEngine) -> None:
     @request_router.handle()
     async def handle_request(bot: Bot, event: Event) -> None:
         _log_qq_generic_event(kind="qq_request", event=event, bot_id=str(bot.self_id))
-        # 自动同意好友请求
         payload = _event_to_dict(event)
         request_type = normalize_text(str(payload.get("request_type", ""))).lower()
-        if request_type == "friend":
+
+        # 从配置读取自动接受开关
+        request_cfg = {}
+        if engine and isinstance(getattr(engine, "config", None), dict):
+            request_cfg = engine.config.get("request", {}) or {}
+        auto_accept_friend = bool(request_cfg.get("auto_accept_friend", True))
+        auto_accept_group_invite = bool(request_cfg.get("auto_accept_group_invite", False))
+
+        # 自动同意好友请求（可配置）
+        if request_type == "friend" and auto_accept_friend:
             flag = str(payload.get("flag", "")).strip()
             user_id = str(payload.get("user_id", "")).strip()
             if flag:
@@ -2676,8 +2686,8 @@ def register_handlers(engine: YukikoEngine) -> None:
                         "auto_accept_friend_failed | bot=%s | user=%s | error=%s",
                         bot.self_id, user_id, str(exc)[:120],
                     )
-        # 自动同意加群邀请（invite 类型）
-        if request_type == "group":
+        # 自动同意加群邀请（默认关闭，需手动开启）
+        if request_type == "group" and auto_accept_group_invite:
             flag = str(payload.get("flag", "")).strip()
             sub_type = normalize_text(str(payload.get("sub_type", ""))).lower()
             group_id = str(payload.get("group_id", "")).strip()

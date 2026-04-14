@@ -221,7 +221,7 @@ export default function MemoryPage() {
 
       <Card>
         <CardHeader className="pb-1">筛选与查询</CardHeader>
-        <CardBody className="grid gap-3 md:grid-cols-6">
+        <CardBody className="grid gap-3 grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
           <Input label="会话ID（高级）" value={conversationId} onValueChange={setConversationId} />
           <Input label="QQ号（高级）" value={userId} onValueChange={setUserId} />
           <Select

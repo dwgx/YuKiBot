@@ -7918,6 +7918,166 @@ def _register_crawler_tools(registry: AgentToolRegistry) -> None:
         _handle_learn_knowledge,
     )
 
+    async def _handle_remember_user_fact(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        user_id = normalize_text(str(args.get("user_id", ""))) or normalize_text(str(context.get("user_id", "")))
+        fact = normalize_text(str(args.get("fact", "")))
+        if not user_id or not fact:
+            return ToolCallResult(ok=False, error="missing_user_id_or_fact")
+        conversation_id = normalize_text(str(context.get("conversation_id", "")))
+        ok = memory.add_user_fact(user_id, fact, conversation_id)
+        if ok:
+            return ToolCallResult(ok=True, display=f"已记住: {fact[:80]}", data={"user_id": user_id, "fact": fact})
+        return ToolCallResult(ok=False, error="save_failed")
+
+    registry.register(
+        ToolSchema(
+            name="remember_user_fact",
+            description=(
+                "记住关于用户的事实信息。\n"
+                "使用场景: 从图片分析、对话中学到用户身份/偏好/特征时主动存储。\n"
+                "例如: 用户的用户名、常用工具、职业、兴趣等。\n"
+                "存储后下次对话可直接回忆，无需重新分析。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "用户ID（留空则用当前对话用户）"},
+                    "fact": {"type": "string", "description": "要记住的事实（如: Claude用户名=dwgx1337）"},
+                },
+                "required": ["fact"],
+            },
+            category="search",
+        ),
+        _handle_remember_user_fact,
+    )
+
+    async def _handle_recall_about_user(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        """综合回忆关于用户的所有已知信息。"""
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        user_id = normalize_text(str(args.get("user_id", ""))) or normalize_text(str(context.get("user_id", "")))
+        if not user_id:
+            return ToolCallResult(ok=False, error="missing_user_id")
+
+        lines: list[str] = []
+
+        # 1. 用户画像
+        profile_summary = memory.get_user_profile_summary(user_id)
+        if profile_summary:
+            lines.append(f"[画像] {profile_summary}")
+
+        # 2. 显式记忆事实
+        facts = memory.get_explicit_facts(user_id, limit=10)
+        if facts:
+            lines.append(f"[记忆事实] " + "；".join(f[:60] for f in facts))
+
+        # 3. 知识库中关于此用户的记录
+        kb = context.get("knowledge_base")
+        if kb is not None:
+            try:
+                kb_results = kb.search(f"user:{user_id}", category="learned", limit=8)
+                if kb_results:
+                    kb_items = []
+                    for entry in kb_results:
+                        title = normalize_text(str(getattr(entry, "title", "")))
+                        content = normalize_text(str(getattr(entry, "content", "")))
+                        if content:
+                            kb_items.append(f"{title}: {content[:60]}" if title else content[:60])
+                    if kb_items:
+                        lines.append(f"[知识库] " + "；".join(kb_items))
+            except Exception:
+                pass
+
+        # 4. 知识图谱 (knowledge_store)
+        if hasattr(memory, "knowledge_get_user_summary"):
+            try:
+                ks_summary = memory.knowledge_get_user_summary(user_id, limit=10)
+                if ks_summary:
+                    lines.append(f"[知识图谱] {ks_summary}")
+            except Exception:
+                pass
+
+        # 5. Agent policies
+        policies = memory.get_agent_policies(user_id) if hasattr(memory, "get_agent_policies") else []
+        if policies:
+            lines.append(f"[偏好指令] " + "；".join(str(p)[:40] for p in policies[:5]))
+
+        if not lines:
+            return ToolCallResult(ok=True, display=f"暂无关于用户 {user_id} 的记录", data={"user_id": user_id})
+
+        display = "\n".join(lines)
+        return ToolCallResult(ok=True, display=display, data={"user_id": user_id, "items": len(lines)})
+
+    registry.register(
+        ToolSchema(
+            name="recall_about_user",
+            description=(
+                "回忆关于某用户的所有已知信息。\n"
+                "综合查询: 用户画像、记忆事实、知识库记录、偏好指令。\n"
+                "当用户问'你记得我吗'、'你知道我是谁'时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "user_id": {"type": "string", "description": "用户ID（留空则用当前对话用户）"},
+                },
+                "required": [],
+            },
+            category="search",
+        ),
+        _handle_recall_about_user,
+    )
+
+    async def _handle_summarize_conversation(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        """主动生成当前对话摘要并存入归档。"""
+        memory = context.get("memory_engine")
+        if memory is None:
+            return ToolCallResult(ok=False, error="memory_engine_unavailable")
+        conversation_id = normalize_text(str(context.get("conversation_id", "")))
+        if not conversation_id:
+            return ToolCallResult(ok=False, error="no_conversation")
+        limit = max(10, min(50, int(args.get("message_count", 20) or 20)))
+        recent = memory.get_recent_texts(conversation_id, limit=limit)
+        if not recent:
+            return ToolCallResult(ok=True, display="对话为空，无需摘要")
+        excerpt = "\n".join(recent)[:2000]
+        summary = normalize_text(str(args.get("summary", "")))
+        if not summary:
+            summary = f"最近 {len(recent)} 条消息摘要（用户可通过对话补充）"
+        key_facts = [normalize_text(str(f)) for f in (args.get("key_facts", []) or []) if normalize_text(str(f))]
+        record_id = memory.save_conversation_summary(
+            conversation_id, summary, key_facts=key_facts, message_range=f"last_{limit}"
+        )
+        if record_id:
+            return ToolCallResult(ok=True, display=f"已保存对话摘要 (#{record_id})", data={"id": record_id})
+        return ToolCallResult(ok=False, error="save_failed")
+
+    registry.register(
+        ToolSchema(
+            name="summarize_conversation",
+            description=(
+                "生成并保存当前对话的摘要。\n"
+                "用于长对话中保留关键信息，防止上下文丢失。\n"
+                "摘要会在后续对话中作为历史背景注入。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "手动摘要文本（留空则自动标注）"},
+                    "key_facts": {"type": "array", "items": {"type": "string"}, "description": "关键事实列表"},
+                    "message_count": {"type": "integer", "description": "要摘要的消息数（默认20）"},
+                },
+                "required": [],
+            },
+            category="search",
+        ),
+        _handle_summarize_conversation,
+    )
+
 
 async def _handle_get_hot_trends(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     crawler_hub = context.get("crawler_hub")

@@ -965,8 +965,10 @@ class YukikoEngine:
         )
 
         self._group_member_name_cache: dict[int, dict[str, Any]] = {}
+        self._group_member_name_cache_max = 200
 
         self._agent_conversation_locks: dict[str, asyncio.Lock] = {}
+        self._agent_conversation_locks_max = 500
 
         # 媒体 artifact 索引: message_id -> [{"type": "...", "url": str, "file_id": str, "data_uri": str}]
 
@@ -1171,13 +1173,11 @@ class YukikoEngine:
             ai_listen_enable = False
             delegate_undirected = False
         elif policy in {"mention_only", "directed_only"}:
-            if explicit_ai_listen_on:
-                # 显式开启旁听时，自动切到高置信非指向模式，避免“开了开关但完全不触发”。
-                policy = "high_confidence_only"
-            else:
-                allow_non_to_me = False
-                ai_listen_enable = False
-                delegate_undirected = False
+            # 用户明确选择 mention_only 时，严格遵守：仅 @/私聊/明确指向 才触发。
+            # 不再因 ai_listen_enable 自动升级为 high_confidence_only。
+            allow_non_to_me = False
+            ai_listen_enable = False
+            delegate_undirected = False
         elif policy == "high_confidence_only":
             # high_confidence_only 语义上就表示“允许非指向进入高置信门控”。
             allow_non_to_me = True
@@ -1185,7 +1185,7 @@ class YukikoEngine:
             if not delegate_defined:
                 delegate_undirected = True
 
-        if explicit_ai_listen_on and policy not in {"off", "disabled"}:
+        if explicit_ai_listen_on and policy not in {"off", "disabled", "mention_only", "directed_only"}:
             allow_non_to_me = True
             ai_listen_enable = True
 
@@ -2511,13 +2511,13 @@ class YukikoEngine:
             if not memory_context:
 
                 memory_context = self.memory.get_recent_texts(
-                    message.conversation_id, limit=8
+                    message.conversation_id, limit=20
                 )
 
         else:
 
             memory_context = (
-                self.memory.get_recent_texts(message.conversation_id, limit=16)
+                self.memory.get_recent_texts(message.conversation_id, limit=24)
                 if allow_memory
                 else []
             )
@@ -2555,6 +2555,32 @@ class YukikoEngine:
             if allow_memory
             else ""
         )
+
+        # 知识库中关于此用户的已学知识
+        if allow_memory and hasattr(self, "knowledge_base") and message.user_id:
+            try:
+                user_kb = self.knowledge_base.search(
+                    f"user:{message.user_id}", category="learned", limit=5
+                )
+                if user_kb:
+                    facts = []
+                    for entry in user_kb[:5]:
+                        content = normalize_text(str(getattr(entry, "content", "")))
+                        if content:
+                            facts.append(content[:80])
+                    if facts:
+                        user_profile_summary += f" 知识库记录: {'；'.join(facts)}。"
+            except Exception:
+                pass
+
+        # 知识图谱中关于此用户的结构化知识 (knowledge_store)
+        if allow_memory and hasattr(self.memory, "knowledge_get_user_summary") and message.user_id:
+            try:
+                ks_summary = self.memory.knowledge_get_user_summary(message.user_id, limit=10)
+                if ks_summary:
+                    user_profile_summary += f" {ks_summary}"
+            except Exception:
+                pass
 
         preferred_name = (
             self.memory.get_preferred_name(message.user_id) if allow_memory else ""
@@ -2686,6 +2712,34 @@ class YukikoEngine:
         if alias_call_hint:
 
             memory_context = (memory_context + [f"[调用提示]{alias_call_hint}"])[-20:]
+
+        # ── 知识库注入：自动检索与当前消息相关的已学知识 ──
+        if allow_memory and hasattr(self, "knowledge_base") and text:
+            try:
+                kb_results = self.knowledge_base.search(text, category="learned", limit=5)
+                if kb_results:
+                    kb_lines: list[str] = []
+                    for entry in kb_results[:3]:
+                        title = normalize_text(str(getattr(entry, "title", "")))
+                        content = normalize_text(str(getattr(entry, "content", "")))
+                        if title and content:
+                            kb_lines.append(f"[已知] {title}: {content[:100]}")
+                    if kb_lines:
+                        memory_context = (memory_context + kb_lines)[-24:]
+            except Exception:
+                pass
+
+        # ── 对话摘要注入：提供更长时间跨度的记忆 ──
+        if allow_memory and hasattr(self.memory, "get_conversation_summaries"):
+            try:
+                summaries = self.memory.get_conversation_summaries(message.conversation_id, limit=2)
+                if summaries:
+                    for s in summaries[-1:]:
+                        summary_text = normalize_text(str(s.get("summary", "")))
+                        if summary_text:
+                            memory_context = (memory_context + [f"[历史摘要] {summary_text[:200]}"])[-26:]
+            except Exception:
+                pass
 
         memory_context, related_memories = self._prune_memory_context_for_current_turn(
             message=message,
@@ -2996,7 +3050,7 @@ class YukikoEngine:
 
         # 路由确认 should_handle 后才消耗 followup turn，避免被过滤时白白浪费回合
         if getattr(trigger, "followup_candidate", False):
-            await self.trigger_engine.consume_followup_turn(
+            await self.trigger.consume_followup_turn(
                 message.conversation_id, message.user_id
             )
 
@@ -5609,6 +5663,30 @@ class YukikoEngine:
         if len(self._recent_search_cache) > 100:
 
             self._recent_search_cache.clear()
+
+        # 清理群成员名称缓存（淘汰过期条目）
+        if len(self._group_member_name_cache) > self._group_member_name_cache_max:
+            now_ts = time.time()
+            expired = [
+                gid for gid, info in self._group_member_name_cache.items()
+                if isinstance(info, dict) and now_ts > info.get("expires_at", 0)
+            ]
+            for gid in expired:
+                self._group_member_name_cache.pop(gid, None)
+            # 如果仍超限，移除最旧的一半
+            if len(self._group_member_name_cache) > self._group_member_name_cache_max:
+                keys = list(self._group_member_name_cache.keys())
+                for k in keys[:len(keys) // 2]:
+                    self._group_member_name_cache.pop(k, None)
+
+        # 清理 agent 对话锁（移除未持有的多余锁）
+        if len(self._agent_conversation_locks) > self._agent_conversation_locks_max:
+            unlocked = [
+                k for k, lock in self._agent_conversation_locks.items()
+                if not lock.locked()
+            ]
+            for k in unlocked[:len(unlocked) // 2]:
+                self._agent_conversation_locks.pop(k, None)
 
     def should_interrupt_previous_task(
         self,
@@ -8396,6 +8474,43 @@ class YukikoEngine:
 
             loop.run_in_executor(None, self.memory.write_daily_snapshot)
 
+        # ── 对话摘要归档 (MemGPT archival): 每 N 条消息生成摘要 ──
+        if bool(self.config.get("bot", {}).get("allow_memory", True)):
+            try:
+                history = self.memory.get_recent_messages(message.conversation_id)
+                summary_interval = max(20, int(self.config.get("memory", {}).get("summary_every_n_messages", 30)))
+                if len(history) >= summary_interval and len(history) % summary_interval < 2:
+                    recent_texts = self.memory.get_recent_texts(message.conversation_id, limit=summary_interval)
+                    if recent_texts and hasattr(self, "model_client"):
+                        async def _generate_summary() -> None:
+                            try:
+                                excerpt = "\n".join(recent_texts[-summary_interval:])[:2000]
+                                result = await asyncio.wait_for(
+                                    self.model_client.chat_json([
+                                        {"role": "system", "content": (
+                                            "将以下对话摘要为简洁的中文段落（100-200字）。"
+                                            "提取关键事实、用户偏好、重要决定。"
+                                            '输出JSON: {"summary":"...","key_facts":["fact1","fact2"]}'
+                                        )},
+                                        {"role": "user", "content": excerpt},
+                                    ]),
+                                    timeout=20.0,
+                                )
+                                if isinstance(result, dict):
+                                    summary = normalize_text(str(result.get("summary", "")))
+                                    facts = result.get("key_facts", [])
+                                    if summary:
+                                        self.memory.save_conversation_summary(
+                                            message.conversation_id, summary,
+                                            key_facts=facts if isinstance(facts, list) else [],
+                                            message_range=f"last_{summary_interval}",
+                                        )
+                            except Exception:
+                                pass
+                        asyncio.create_task(_generate_summary())
+            except Exception:
+                pass
+
         # 激进自动学习：异步提取候选事实并入知识库，冲突时自动版本化更新。
 
         updater = getattr(self, "knowledge_updater", None)
@@ -8624,6 +8739,7 @@ class YukikoEngine:
             "set_msg_emoji_like",
             "generate_image",
             "web_search",
+            "analyze_image",
         }
     )
 
@@ -8708,6 +8824,12 @@ class YukikoEngine:
                 elif tool == "set_msg_emoji_like":
 
                     parts.append(f"[对消息做了表情回应]")
+
+                elif tool == "analyze_image":
+
+                    parts.append(
+                        f"[分析了图片] {display[:200]}" if display else "[分析了图片]"
+                    )
 
                 else:
 

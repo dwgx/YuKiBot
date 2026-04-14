@@ -20,6 +20,26 @@ function fmtTs(ts: number): string {
   if (!ts || Number.isNaN(ts)) return "-";
   const d = new Date(ts * 1000);
   if (Number.isNaN(d.getTime())) return "-";
+  const now = new Date();
+  const diffMs = now.getTime() - d.getTime();
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "刚刚";
+  if (diffMin < 60) return `${diffMin}分钟前`;
+  const isToday = d.toDateString() === now.toDateString();
+  const yesterday = new Date(now);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const isYesterday = d.toDateString() === yesterday.toDateString();
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (isToday) return time;
+  if (isYesterday) return `昨天 ${time}`;
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffDays < 7) {
+    const weekdays = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+    return `${weekdays[d.getDay()]} ${time}`;
+  }
+  if (d.getFullYear() === now.getFullYear()) {
+    return `${d.getMonth() + 1}/${d.getDate()} ${time}`;
+  }
   return d.toLocaleString();
 }
 
@@ -1660,7 +1680,7 @@ export default function ChatPage() {
   }, [retargetConversation, retargeting, thinkingDraft]);
 
   return (
-    <section className="stapxs-chat-shell h-[calc(100vh-96px)] min-h-0 flex flex-col gap-2 overflow-hidden">
+    <section className="stapxs-chat-shell h-[calc(100dvh-96px)] md:h-[calc(100dvh-96px)] min-h-0 flex flex-col gap-2 overflow-hidden">
       <div className="stapxs-chat-toolbar flex items-center justify-between gap-1.5">
         <div className="flex items-center gap-2">
           <MessageSquare size={18} />
@@ -2423,7 +2443,7 @@ export default function ChatPage() {
       {contextMenu.open && contextMenu.message && (
         <div
           data-chat-context-menu="1"
-          className="stapxs-context-menu fixed z-[70] w-[220px] rounded-xl border border-default-400/45 bg-content1/95 backdrop-blur p-1 shadow-xl"
+          className="stapxs-context-menu fixed z-[70] w-[200px] sm:w-[220px] max-w-[calc(100vw-2rem)] rounded-xl border border-default-400/45 bg-content1/95 backdrop-blur p-1 shadow-xl"
           style={{ left: contextMenu.x, top: contextMenu.y }}
         >
           {contextEgg && (

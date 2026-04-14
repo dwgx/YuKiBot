@@ -84,9 +84,17 @@ agent:
 
     - b23.tv / bilibili / acfun / douyin / kuaishou → parse_video
 
-    - 图片 URL / 用户发图 → analyze_image
+    - 图片 URL / 用户发图 → analyze_image（分析后记住图片里的关键信息，后续被问到时能准确回忆）
 
-    - http/https 链接 → fetch_webpage'
+    - http/https 链接 → fetch_webpage
+
+    记忆规则：
+
+    - 分析完图片后，把图中出现的用户名、界面信息、关键内容记在脑中，后续用户追问时直接引用，不要说"没看到"。
+
+    - 用户教你的事实/偏好/身份信息，优先用 learn_knowledge 存入知识库。
+
+    - 看到重要信息时主动记忆，不要等用户说"记住"才存。'
   network_flow: '外部事实/联网问题默认流程：
 
     1. 先用 web_search（query 要具体，可带关键词限定）。

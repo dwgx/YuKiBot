@@ -470,10 +470,11 @@ def _extract_websocket_auth_token(ws: WebSocket) -> str:
 
 
 def _is_valid_auth_token(candidate: str, expected: str | None = None) -> bool:
+    import hmac
     token = str(expected or _get_token() or "").strip()
     if not token:
         return False
-    return normalize_text(candidate) == token
+    return hmac.compare_digest(normalize_text(candidate), token)
 
 
 def _auth_cookie_secure_from_scheme(scheme: str) -> bool:
@@ -549,29 +550,34 @@ def _mask_sensitive(data: dict) -> dict:
     result = copy.deepcopy(data)
     for dotpath in _SENSITIVE_PATHS:
         keys = dotpath.split(".")
-        node = result
-        for k in keys[:-1]:
-            if k == "*":
-                # 通配符：遍历所有子字典
-                if isinstance(node, dict):
-                    for sub in node.values():
-                        if isinstance(sub, dict):
-                            # 递归处理
-                            pass
-                break
-            else:
-                if isinstance(node, dict) and k in node:
-                    node = node[k]
-                else:
-                    break
-        else:
-            # 到达最后一个 key
-            last = keys[-1]
-            if isinstance(node, dict) and last in node:
-                val = node[last]
-                if isinstance(val, str) and val.strip():
-                    node[last] = "***"
+        _mask_sensitive_walk(result, keys, 0)
     return result
+
+
+def _mask_sensitive_walk(node: Any, keys: list[str], idx: int) -> None:
+    """递归遍历 keys 路径并遮蔽叶子值，支持通配符 *。"""
+    if not isinstance(node, dict) or idx >= len(keys):
+        return
+    k = keys[idx]
+    if idx == len(keys) - 1:
+        # 叶子层：执行遮蔽
+        if k == "*":
+            for sub_key in node:
+                val = node[sub_key]
+                if isinstance(val, str) and val.strip():
+                    node[sub_key] = "***"
+        elif k in node:
+            val = node[k]
+            if isinstance(val, str) and val.strip():
+                node[k] = "***"
+    else:
+        # 中间层：继续递归
+        if k == "*":
+            for sub in node.values():
+                if isinstance(sub, dict):
+                    _mask_sensitive_walk(sub, keys, idx + 1)
+        elif k in node:
+            _mask_sensitive_walk(node[k], keys, idx + 1)
 
 
 def _deep_merge(base: dict, patch: dict, sensitive_paths: set[str], prefix: str = "") -> dict:
@@ -707,6 +713,9 @@ def _split_log_chunks(raw_line: str) -> list[str]:
 def _resolve_webui_db_path(db_name: str) -> Path:
     """解析数据库名称到实际路径。"""
     raw_name = db_name.strip()
+    # 路径穿越防护：拒绝 .. 段和绝对路径
+    if ".." in raw_name or raw_name.startswith("/") or raw_name.startswith("\\") or ":" in raw_name:
+        raise HTTPException(400, "数据库名称包含非法字符")
     db_name = raw_name.lower()
     storage_dir = _ROOT_DIR / "storage"
 
@@ -2206,12 +2215,9 @@ async def put_config(request: Request):
     template = load_config_template()
     merged = _deep_merge_template(template, new_config)
 
-    # 写入文件
+    # 写入文件（原子操作）
     config_file = _ROOT_DIR / "config" / "config.yml"
-    config_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(config_file, "w", encoding="utf-8") as f:
-        yaml.safe_dump(merged, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    _safe_write_yaml(config_file, merged)
 
     # 热重载
     try:
@@ -2763,12 +2769,18 @@ async def db_import(db_name: str, file: UploadFile = File(...)):
     temp_path = Path(temp_path_obj.name)
     temp_path_obj.close()
 
+    _DB_IMPORT_MAX_SIZE = 512 * 1024 * 1024  # 512 MB
+
     try:
+        total_written = 0
         with temp_path.open("wb") as fh:
             while True:
                 chunk = await file.read(1024 * 1024)
                 if not chunk:
                     break
+                total_written += len(chunk)
+                if total_written > _DB_IMPORT_MAX_SIZE:
+                    raise HTTPException(413, f"上传文件过大，最大允许 {_DB_IMPORT_MAX_SIZE // (1024*1024)} MB")
                 fh.write(chunk)
 
         ok, tables, error = _validate_sqlite_upload(temp_path)
@@ -3343,6 +3355,21 @@ def _guess_media_type_from_hint(hint: str, fallback: str = "application/octet-st
     return guessed or fallback
 
 
+def _is_private_ip(hostname: str) -> bool:
+    """检查 hostname 是否指向私有/内网地址，防止 SSRF。"""
+    import ipaddress
+    import socket
+    try:
+        for info in socket.getaddrinfo(hostname, None, socket.AF_UNSPEC, socket.SOCK_STREAM):
+            addr = info[4][0]
+            ip = ipaddress.ip_address(addr)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                return True
+    except (socket.gaierror, ValueError):
+        return True  # 无法解析时拒绝
+    return False
+
+
 async def _download_image_bytes(url: str) -> tuple[bytes | None, str]:
     target = normalize_text(url)
     if not target:
@@ -3354,26 +3381,30 @@ async def _download_image_bytes(url: str) -> tuple[bytes | None, str]:
             return blob, "base64"
         return None, "invalid_base64"
 
-    local_candidate = _resolve_local_path_from_file_uri(target)
-    if local_candidate is not None and (target.lower().startswith("file://") or local_candidate.exists()):
-        with contextlib.suppress(Exception):
-            data = local_candidate.read_bytes()
-            if data:
-                return data, "local_file"
+    # 仅允许 http/https，禁止 file:// 和本地路径读取
+    if not (target.startswith("http://") or target.startswith("https://")):
+        return None, "unsupported_url"
 
-    if target.startswith("http://") or target.startswith("https://"):
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
-                resp = await client.get(target)
-            if resp.status_code >= 400:
-                return None, f"http_{resp.status_code}"
-            if resp.content:
-                return resp.content, "http"
-            return None, "empty_http_body"
-        except Exception as exc:
-            return None, f"http_error:{normalize_text(str(exc))}"
+    # SSRF 防护：拒绝私有 IP
+    try:
+        parsed = urlparse(target)
+        hostname = parsed.hostname or ""
+        if _is_private_ip(hostname):
+            _log.warning("SSRF blocked: %s", target)
+            return None, "ssrf_blocked"
+    except Exception:
+        return None, "invalid_url"
 
-    return None, "unsupported_url"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0), follow_redirects=True) as client:
+            resp = await client.get(target)
+        if resp.status_code >= 400:
+            return None, f"http_{resp.status_code}"
+        if resp.content:
+            return resp.content, "http"
+        return None, "empty_http_body"
+    except Exception as exc:
+        return None, f"http_error:{normalize_text(str(exc))}"
 
 
 async def _resolve_image_preview_bytes(

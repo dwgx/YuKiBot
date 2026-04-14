@@ -223,7 +223,12 @@ export default function DashboardPage() {
   }, [allowDirty, danger, fetchUpdateStatus, info, pollUpdateTask]);
 
   if (statusError && !data) {
-    return <p className="text-danger">{statusError}</p>;
+    return (
+      <div className="flex flex-col items-center gap-4 py-20">
+        <p className="text-danger text-center">{statusError}</p>
+        <Button color="primary" variant="flat" onPress={() => void fetchStatus()}>重试</Button>
+      </div>
+    );
   }
   if (!data) {
     return <div className="flex justify-center py-20"><Spinner size="lg" /></div>;

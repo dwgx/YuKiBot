@@ -98,10 +98,11 @@ class OpenAICompatibleClient(BaseLLMClient):
                     model_name=model_name,
                 )
             except Exception as exc:
-                if not self.allow_response_fallback_to_chat:
+                # responses 返回为空时总是回退到 chat/completions（常见于 SkiAPI 等代理）
+                is_empty = "返回为空" in str(exc)
+                if not is_empty and not self.allow_response_fallback_to_chat:
                     raise
-                # 仅在显式允许时回退，默认保持 responses 错误原样暴露，便于定位网关问题。
-                if not self._is_responses_fallback_worthy(exc):
+                if not is_empty and not self._is_responses_fallback_worthy(exc):
                     raise
 
         stream_enabled = self.stream_chat_completions
@@ -172,7 +173,8 @@ class OpenAICompatibleClient(BaseLLMClient):
             )
         content = self._extract_text_from_responses(data)
         if not content:
-            raise RuntimeError("responses 返回为空")
+            # /responses 返回为空时，自动回退到 /chat/completions
+            raise RuntimeError("responses 返回为空，将回退到 chat/completions")
         return {
             "id": str(data.get("id", "")),
             "object": "chat.completion",

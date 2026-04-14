@@ -1046,7 +1046,7 @@ class ToolExecutor:
                 tool_name="search_qq_avatar",
                 payload={
                     "mode": "image",
-                    "query": f"qq澶村儚 {target}",
+                    "query": f"qq头像 {target}",
                     "text": text,
                     "image_url": image_url,
                 },
@@ -1346,7 +1346,7 @@ class ToolExecutor:
             return await self._method_local_media_from_path(name, method_args)
         if name == "media.qq_avatar":
             qq = normalize_text(str(method_args.get("qq", "")))
-            avatar_query = f"qq澶村儚 {qq}" if qq else query
+            avatar_query = f"qq头像 {qq}" if qq else query
             return await self._search_qq_avatar(
                 query=avatar_query,
                 message_text=message_text,

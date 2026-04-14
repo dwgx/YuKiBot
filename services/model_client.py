@@ -24,7 +24,8 @@ _log = logging.getLogger("yukiko.model_client")
 # 触发 provider 降级的错误关键词
 _FATAL_ERROR_CUES = (
     "suspended", "forbidden", "unauthorized", "banned",
-    "account", "disabled", "quota", "rate_limit",
+    "account suspended", "account banned", "account disabled",
+    "disabled", "quota", "rate_limit",
 )
 _TRANSIENT_ERROR_CUES = (
     "timeout",
@@ -222,7 +223,7 @@ class ModelClient:
             and self._failover_at > 0
             and time.monotonic() - self._failover_at >= self._recovery_interval
         ):
-            primary_client = self._fallback_clients.get(self._primary_provider) or self.client
+            primary_client = self.client
             if self._supports_method(primary_client, method_name):
                 try:
                     result = await getattr(primary_client, method_name)(*args, **kwargs)
@@ -443,6 +444,18 @@ class ModelClient:
             except Exception:
                 return False
         return False
+
+    async def close(self) -> None:
+        """关闭所有 LLM 客户端的 HTTP 连接。"""
+        for client in [self.client] + list(self._fallback_clients.values()):
+            close_fn = getattr(client, "close", None)
+            if callable(close_fn):
+                try:
+                    result = close_fn()
+                    if hasattr(result, "__await__"):
+                        await result
+                except Exception:
+                    pass
 
     @classmethod
     def _normalize_provider(cls, provider: str) -> str:

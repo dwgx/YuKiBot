@@ -327,7 +327,7 @@ class MemoryEngine:
 
     def _connect(self) -> sqlite3.Connection:
         if not hasattr(self, "_db_conn") or self._db_conn is None:
-            self._db_conn = sqlite3.connect(self.db_path)
+            self._db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self._db_conn.execute("PRAGMA journal_mode=WAL;")
         return self._db_conn
 
@@ -398,6 +398,299 @@ class MemoryEngine:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_media_memory_created_at ON media_memory(created_at);"
             )
+            # ── 知识存储（融合 Mem0 自动提取 + Graphiti 时序 + Memoripy 衰减） ──
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS knowledge_store (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    entity TEXT NOT NULL,
+                    relation TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'fact',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    access_count INTEGER NOT NULL DEFAULT 0,
+                    source TEXT NOT NULL DEFAULT 'conversation',
+                    conversation_id TEXT,
+                    valid_from TEXT NOT NULL,
+                    valid_until TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    embedding TEXT
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ks_user_id ON knowledge_store(user_id);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ks_entity ON knowledge_store(entity);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ks_category ON knowledge_store(category);"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_ks_updated_at ON knowledge_store(updated_at);"
+            )
+            # ── 对话摘要（融合 MemGPT 归档层） ──
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_summaries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    summary TEXT NOT NULL,
+                    message_range TEXT,
+                    key_facts TEXT,
+                    created_at TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cs_conversation_id ON conversation_summaries(conversation_id);"
+            )
+
+    # ── 知识存储 CRUD ──
+
+    def knowledge_upsert(
+        self,
+        *,
+        user_id: str,
+        entity: str,
+        relation: str,
+        value: str,
+        category: str = "fact",
+        confidence: float = 1.0,
+        source: str = "conversation",
+        conversation_id: str = "",
+    ) -> int:
+        """插入或更新知识条目。同一 (user_id, entity, relation) 去重更新。"""
+        uid = normalize_text(str(user_id))
+        ent = normalize_text(str(entity))
+        rel = normalize_text(str(relation))
+        val = normalize_text(str(value))
+        if not uid or not ent or not val:
+            return 0
+        if not rel:
+            rel = "is"
+        cat = normalize_text(str(category)).lower() or "fact"
+        conf = max(0.0, min(1.0, float(confidence)))
+        now = datetime.now(timezone.utc).isoformat()
+        emb = json.dumps(self._embed(f"{ent} {rel} {val}"), ensure_ascii=False)
+        try:
+            with self._connect() as conn:
+                existing = conn.execute(
+                    "SELECT id, value, access_count FROM knowledge_store WHERE user_id=? AND entity=? AND relation=?",
+                    (uid, ent, rel),
+                ).fetchone()
+                if existing:
+                    record_id = int(existing[0])
+                    old_access = int(existing[2] or 0)
+                    conn.execute(
+                        """UPDATE knowledge_store SET value=?, confidence=?, source=?,
+                           conversation_id=?, updated_at=?, embedding=?, access_count=?
+                           WHERE id=?""",
+                        (val, conf, normalize_text(source), normalize_text(conversation_id),
+                         now, emb, old_access + 1, record_id),
+                    )
+                    return record_id
+                else:
+                    cursor = conn.execute(
+                        """INSERT INTO knowledge_store
+                           (user_id, entity, relation, value, category, confidence, access_count,
+                            source, conversation_id, valid_from, created_at, updated_at, embedding)
+                           VALUES (?,?,?,?,?,?,0,?,?,?,?,?,?)""",
+                        (uid, ent, rel, val, cat, conf, normalize_text(source),
+                         normalize_text(conversation_id), now, now, now, emb),
+                    )
+                    return int(cursor.lastrowid or 0)
+        except Exception:
+            _log.warning("knowledge_upsert_error", exc_info=True)
+            return 0
+
+    def knowledge_search(
+        self,
+        *,
+        user_id: str = "",
+        query: str = "",
+        category: str = "",
+        limit: int = 10,
+    ) -> list[dict[str, Any]]:
+        """语义搜索知识库。结合向量相似度和关键词匹配。"""
+        limit = max(1, min(50, int(limit)))
+        try:
+            with self._connect() as conn:
+                clauses: list[str] = []
+                params: list[Any] = []
+                uid = normalize_text(user_id)
+                if uid:
+                    clauses.append("user_id = ?")
+                    params.append(uid)
+                cat = normalize_text(category).lower()
+                if cat:
+                    clauses.append("category = ?")
+                    params.append(cat)
+                where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+                rows = conn.execute(
+                    f"""SELECT id, user_id, entity, relation, value, category,
+                               confidence, access_count, source, conversation_id,
+                               valid_from, valid_until, created_at, updated_at, embedding
+                        FROM knowledge_store {where_sql}
+                        ORDER BY updated_at DESC LIMIT ?""",
+                    tuple(params + [min(200, limit * 10)]),
+                ).fetchall()
+        except Exception:
+            return []
+        q = normalize_text(query)
+        q_emb = self._embed(q) if q else None
+        results: list[tuple[float, dict[str, Any]]] = []
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            item = {
+                "id": int(row[0]), "user_id": str(row[1] or ""),
+                "entity": str(row[2] or ""), "relation": str(row[3] or ""),
+                "value": str(row[4] or ""), "category": str(row[5] or ""),
+                "confidence": float(row[6] or 1.0),
+                "access_count": int(row[7] or 0),
+                "source": str(row[8] or ""), "conversation_id": str(row[9] or ""),
+                "valid_from": str(row[10] or ""), "valid_until": str(row[11] or ""),
+                "created_at": str(row[12] or ""), "updated_at": str(row[13] or ""),
+            }
+            # 衰减计算 (Memoripy): 未访问的记忆随时间衰减
+            try:
+                updated = datetime.fromisoformat(item["updated_at"])
+                days_old = (now - updated).total_seconds() / 86400
+            except Exception:
+                days_old = 0
+            decay = max(0.1, 1.0 - days_old * 0.005)  # 200天衰减到0.1
+            reinforcement = min(2.0, 1.0 + item["access_count"] * 0.1)
+            effective_score = item["confidence"] * decay * reinforcement
+            # 向量相似度
+            if q_emb and row[14]:
+                try:
+                    stored_emb = json.loads(row[14])
+                    sim = self._cosine(q_emb, stored_emb)
+                except Exception:
+                    sim = 0.0
+                effective_score *= (1.0 + sim)
+            # 关键词加成
+            if q:
+                text = f"{item['entity']} {item['relation']} {item['value']}".lower()
+                if q.lower() in text:
+                    effective_score *= 2.0
+            item["_score"] = effective_score
+            results.append((effective_score, item))
+        results.sort(key=lambda x: x[0], reverse=True)
+        return [item for _, item in results[:limit]]
+
+    def knowledge_invalidate(self, *, record_id: int) -> bool:
+        """标记知识条目过期（Graphiti 时序失效）。"""
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE knowledge_store SET valid_until=?, updated_at=? WHERE id=?",
+                    (now, now, int(record_id)),
+                )
+            return True
+        except Exception:
+            return False
+
+    def knowledge_reinforce(self, *, record_id: int) -> bool:
+        """强化知识条目（Memoripy 强化学习）。"""
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE knowledge_store SET access_count=access_count+1, updated_at=? WHERE id=?",
+                    (now, int(record_id)),
+                )
+            return True
+        except Exception:
+            return False
+
+    def knowledge_get_user_summary(self, user_id: str, limit: int = 15) -> str:
+        """获取用户的知识摘要，注入 Agent 上下文。"""
+        items = self.knowledge_search(user_id=user_id, limit=limit)
+        if not items:
+            return ""
+        lines: list[str] = []
+        for item in items:
+            if item.get("valid_until"):
+                continue
+            ent = item.get("entity", "")
+            rel = item.get("relation", "")
+            val = item.get("value", "")
+            if rel in ("is", "是"):
+                lines.append(f"{ent}: {val}")
+            else:
+                lines.append(f"{ent} {rel} {val}")
+        if not lines:
+            return ""
+        return "已知信息: " + "; ".join(lines[:10])
+
+    def knowledge_count(self, user_id: str = "") -> int:
+        try:
+            with self._connect() as conn:
+                if user_id:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM knowledge_store WHERE user_id=?",
+                        (normalize_text(user_id),),
+                    ).fetchone()
+                else:
+                    row = conn.execute("SELECT COUNT(*) FROM knowledge_store").fetchone()
+                return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    # ── 对话摘要 (MemGPT 归档层) ──
+
+    def save_conversation_summary(
+        self, conversation_id: str, summary: str, key_facts: list[str] | None = None, message_range: str = ""
+    ) -> int:
+        conv = normalize_text(conversation_id)
+        text = normalize_text(summary)
+        if not conv or not text:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        facts_json = json.dumps(key_facts or [], ensure_ascii=False)
+        try:
+            with self._connect() as conn:
+                cursor = conn.execute(
+                    """INSERT INTO conversation_summaries
+                       (conversation_id, summary, message_range, key_facts, created_at)
+                       VALUES (?,?,?,?,?)""",
+                    (conv, text, normalize_text(message_range), facts_json, now),
+                )
+                return int(cursor.lastrowid or 0)
+        except Exception:
+            return 0
+
+    def get_conversation_summaries(self, conversation_id: str, limit: int = 5) -> list[dict[str, Any]]:
+        conv = normalize_text(conversation_id)
+        if not conv:
+            return []
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    """SELECT id, summary, message_range, key_facts, created_at
+                       FROM conversation_summaries WHERE conversation_id=?
+                       ORDER BY id DESC LIMIT ?""",
+                    (conv, max(1, min(20, limit))),
+                ).fetchall()
+            results: list[dict[str, Any]] = []
+            for row in rows:
+                try:
+                    facts = json.loads(row[3]) if row[3] else []
+                except Exception:
+                    facts = []
+                results.append({
+                    "id": int(row[0]), "summary": str(row[1] or ""),
+                    "message_range": str(row[2] or ""),
+                    "key_facts": facts, "created_at": str(row[4] or ""),
+                })
+            return list(reversed(results))
+        except Exception:
+            return []
 
     def _embed(self, text: str) -> list[float]:
         vec = [0.0] * self.vector_dim
@@ -1144,11 +1437,11 @@ class MemoryEngine:
         if preferred_name and preferred_name != display_name:
             style_hints.insert(0, f"偏好称呼“{preferred_name}”")
 
-        explicit_facts = self.get_explicit_facts(user_id, limit=3)
+        explicit_facts = self.get_explicit_facts(user_id, limit=8)
         facts_text = ""
         if explicit_facts:
-            clipped = [row[:60] for row in explicit_facts]
-            facts_text = f" 用户明确记住：{'；'.join(clipped)}。"
+            clipped = [row[:80] for row in explicit_facts]
+            facts_text = f" 已知事实：{'；'.join(clipped)}。"
 
         return (
             f"{display_name}（{user_id}）累计消息 {message_count} 条，"
@@ -1293,6 +1586,40 @@ class MemoryEngine:
         for fact in facts:
             clean_directives.append(f"用户明确记忆: {fact}")
         return clean_directives[-20:]
+
+    def add_user_fact(self, user_id: str, fact: str, conversation_id: str = "") -> bool:
+        """Agent 主动为用户记录事实（如图片分析结果、用户身份信息等）。"""
+        uid = normalize_text(str(user_id))
+        fact_text = normalize_text(str(fact))
+        if not uid or not fact_text or len(fact_text) < 2:
+            return False
+        if len(fact_text) > 200:
+            fact_text = fact_text[:200]
+        profile = self._user_profiles.get(uid, {})
+        if not isinstance(profile, dict):
+            profile = {}
+        explicit_facts = profile.get("explicit_facts", [])
+        if not isinstance(explicit_facts, list):
+            explicit_facts = []
+        fact_key = self._normalize_fact_key(fact_text)
+        dedup: list[dict[str, Any]] = []
+        for row in explicit_facts:
+            if isinstance(row, dict):
+                existing = self._normalize_fact_key(str(row.get("fact", "")))
+            else:
+                existing = self._normalize_fact_key(str(row))
+            if existing and existing == fact_key:
+                continue
+            dedup.append(row if isinstance(row, dict) else {"fact": str(row)})
+        dedup.append({
+            "fact": fact_text,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "conversation_id": normalize_text(conversation_id),
+        })
+        profile["explicit_facts"] = dedup[-30:]
+        self._user_profiles[uid] = profile
+        self._save_user_profiles_immediate()
+        return True
 
     def get_explicit_facts(self, user_id: str, limit: int = 8) -> list[str]:
         profile = self._user_profiles.get(str(user_id), {})
