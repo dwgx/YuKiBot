@@ -305,10 +305,29 @@ class AgentToolRegistry:
                 "function": {
                     "name": schema.name,
                     "description": schema.description,
-                    "parameters": schema.parameters if schema.parameters else {"type": "object", "properties": {}},
+                    "parameters": self._normalize_native_parameters(schema.parameters),
                 }
             })
         return out
+
+    @classmethod
+    def _normalize_native_parameters(cls, parameters: dict[str, Any] | None) -> dict[str, Any]:
+        """Return an OpenAI-compatible JSON schema for native function calling."""
+        if not isinstance(parameters, dict) or not parameters:
+            return {"type": "object", "properties": {}}
+        return cls._normalize_native_schema_node(parameters)
+
+    @classmethod
+    def _normalize_native_schema_node(cls, node: Any) -> Any:
+        if isinstance(node, list):
+            return [cls._normalize_native_schema_node(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        normalized = {str(key): cls._normalize_native_schema_node(value) for key, value in node.items()}
+        if normalized.get("type") == "array" and "items" not in normalized:
+            normalized["items"] = {"type": "string"}
+        return normalized
 
     def has_tool(self, name: str) -> bool:
         return name in self._handlers

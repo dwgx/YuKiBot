@@ -169,6 +169,32 @@ class ToolSchemaIntegrityTests(unittest.TestCase):
                     orphan_required.append(f"{name}.{req_field}")
         self.assertEqual(orphan_required, [], f"Required fields not in properties: {orphan_required}")
 
+    def test_native_tool_array_fields_have_items(self):
+        """OpenAI/NewAPI 原生 tools 中 array 参数必须带 items。"""
+        tool_names = list(self.schemas.keys())
+        native_tools = self.registry.get_schemas_for_native_tools(tool_names)
+        missing_items: list[str] = []
+
+        def visit(node: object, path: str) -> None:
+            if isinstance(node, list):
+                for index, item in enumerate(node):
+                    visit(item, f"{path}[{index}]")
+                return
+            if not isinstance(node, dict):
+                return
+            if node.get("type") == "array" and "items" not in node:
+                missing_items.append(path)
+            for key, value in node.items():
+                visit(value, f"{path}.{key}")
+
+        for tool in native_tools:
+            function = tool.get("function", {}) if isinstance(tool, dict) else {}
+            name = function.get("name", "?") if isinstance(function, dict) else "?"
+            parameters = function.get("parameters", {}) if isinstance(function, dict) else {}
+            visit(parameters, str(name))
+
+        self.assertEqual(missing_items, [], f"Native array schemas missing items: {missing_items}")
+
     def test_no_duplicate_tool_names(self):
         """工具名不应有大小写冲突。"""
         lower_map: dict[str, list[str]] = {}
