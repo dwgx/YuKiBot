@@ -1245,93 +1245,106 @@ class AgentLoop:
                     and tool_calls_made == 0
                     and not intentional_silence
                 ):
-                    _log.info(
-                        "agent_force_tool_first | trace=%s | step=%d | text=%s",
-                        ctx.trace_id,
-                        step_idx,
-                        clip_text(ctx.message_text, 120),
-                    )
-                    steps.append(
-                        {
-                            "step": step_idx,
-                            "tool": "policy_guard",
-                            "error": "tool_required_before_final",
-                        }
-                    )
-                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
-                                        "tool": "policy_guard",
-                                        "ok": False,
-                                        "error": "这是工具型请求，必须先调用最合适的工具，再输出 final_answer。",
-                                    })
-                    continue
-                # 某些模型会把真正的工具调用 JSON 包在 final_answer.text 里，尝试恢复。
-                recovered = None
-                if text and not image_url and not video_url and not audio_file:
-                    recovered = self._extract_embedded_tool_call_from_text(text)
-                if recovered:
-                    recovered_tool = str(recovered.get("tool", "")).strip()
-                    recovered_args = recovered.get("args", {})
-                    if recovered_tool == "final_answer":
-                        recovered_text = ""
-                        if isinstance(recovered_args, dict):
-                            recovered_text = normalize_text(
-                                str(recovered_args.get("text", ""))
-                            )
-                        if recovered_text:
-                            _log.info(
-                                "agent_final_answer_embedded_final_unwrapped | trace=%s | step=%d",
-                                ctx.trace_id,
-                                step_idx,
-                            )
-                            text = recovered_text
-                    elif recovered_tool and self.tool_registry.has_tool(recovered_tool):
-                        _log.warning(
-                            "agent_final_answer_embedded_tool_recovered | trace=%s | step=%d | tool=%s",
+                    if forced_media_tool:
+                        forced_name, forced_args = forced_media_tool
+                        _log.info(
+                            "agent_force_media_tool_first | trace=%s | step=%d | from=final_answer | to=%s",
                             ctx.trace_id,
                             step_idx,
-                            recovered_tool,
+                            forced_name,
                         )
-                        tool_name = recovered_tool
-                        tool_args = (
-                            recovered_args if isinstance(recovered_args, dict) else {}
+                        tool_name = forced_name
+                        tool_args = self._normalize_tool_args(
+                            forced_name, dict(forced_args), ctx
                         )
+                        text = ""
+                        image_url = ""
+                        image_urls = []
+                        video_url = ""
+                        audio_file = ""
                     else:
+                        _log.info(
+                            "agent_force_tool_first | trace=%s | step=%d | text=%s",
+                            ctx.trace_id,
+                            step_idx,
+                            clip_text(ctx.message_text, 120),
+                        )
+                        steps.append(
+                            {
+                                "step": step_idx,
+                                "tool": "policy_guard",
+                                "error": "tool_required_before_final",
+                            }
+                        )
+                        self._append_tool_result(messages, parsed, assistant_msg, response_text, {
+                                            "tool": "policy_guard",
+                                            "ok": False,
+                                            "error": "这是工具型请求，必须先调用最合适的工具，再输出 final_answer。",
+                                        })
+                        continue
+                if tool_name == "final_answer":
+                    # 某些模型会把真正的工具调用 JSON 包在 final_answer.text 里，尝试恢复。
+                    recovered = None
+                    if text and not image_url and not video_url and not audio_file:
+                        recovered = self._extract_embedded_tool_call_from_text(text)
+                    if recovered:
+                        recovered_tool = str(recovered.get("tool", "")).strip()
+                        recovered_args = recovered.get("args", {})
+                        if recovered_tool == "final_answer":
+                            recovered_text = ""
+                            if isinstance(recovered_args, dict):
+                                recovered_text = normalize_text(
+                                    str(recovered_args.get("text", ""))
+                                )
+                            if recovered_text:
+                                _log.info(
+                                    "agent_final_answer_embedded_final_unwrapped | trace=%s | step=%d",
+                                    ctx.trace_id,
+                                    step_idx,
+                                )
+                                text = recovered_text
+                        elif recovered_tool and self.tool_registry.has_tool(recovered_tool):
+                            _log.warning(
+                                "agent_final_answer_embedded_tool_recovered | trace=%s | step=%d | tool=%s",
+                                ctx.trace_id,
+                                step_idx,
+                                recovered_tool,
+                            )
+                            tool_name = recovered_tool
+                            tool_args = (
+                                recovered_args if isinstance(recovered_args, dict) else {}
+                            )
+                        else:
+                            text = _pl.get_message(
+                                "tool_payload_leaked",
+                                "检测到模型输出了工具调用格式，我已自动重试处理。",
+                            )
+                    elif self._looks_like_embedded_tool_payload_text(text):
+                        _log.warning(
+                            "agent_final_answer_embedded_tool_payload_blocked | trace=%s | step=%d",
+                            ctx.trace_id,
+                            step_idx,
+                        )
                         text = _pl.get_message(
                             "tool_payload_leaked",
-                            "检测到模型输出了工具调用格式，我已自动重试处理。",
+                            "检测到模型输出了工具调用格式，我已自动拦截。",
                         )
-                elif self._looks_like_embedded_tool_payload_text(text):
-                    _log.warning(
-                        "agent_final_answer_embedded_tool_payload_blocked | trace=%s | step=%d",
-                        ctx.trace_id,
-                        step_idx,
-                    )
-                    text = _pl.get_message(
-                        "tool_payload_leaked",
-                        "检测到模型输出了工具调用格式，我已自动拦截。",
-                    )
-                if (
-                    tool_name == "final_answer"
-                    and not text
-                    and not image_url
-                    and not video_url
-                    and not audio_file
-                ):
-                    # bot 用 think 推理后决定不回复 → 保持空文本（intentional silence）
-                    # 其他情况（没 think 过就空 final_answer）→ AI 生成兜底
-                    if not intentional_silence:
-                        text = self._last_success_display(steps)
-                        if not text:
-                            text = await self._ai_fallback_reply(
-                                ctx, "处理完了但没有拿到有效结果"
-                            )
-                        if not text:
-                            text = _pl.get_message("no_result", "")
-                text = self._normalize_final_answer_text(text)
-                steps.append(
-                    {"step": step_idx, "tool": "final_answer", "result": "done"}
-                )
                 if tool_name == "final_answer":
+                    if not text and not image_url and not video_url and not audio_file:
+                        # bot 用 think 推理后决定不回复 → 保持空文本（intentional silence）
+                        # 其他情况（没 think 过就空 final_answer）→ AI 生成兜底
+                        if not intentional_silence:
+                            text = self._last_success_display(steps)
+                            if not text:
+                                text = await self._ai_fallback_reply(
+                                    ctx, "处理完了但没有拿到有效结果"
+                                )
+                            if not text:
+                                text = _pl.get_message("no_result", "")
+                    text = self._normalize_final_answer_text(text)
+                    steps.append(
+                        {"step": step_idx, "tool": "final_answer", "result": "done"}
+                    )
                     user_media_refs = self._extract_media_refs_from_segments(
                         ctx.raw_segments
                     )
@@ -3922,7 +3935,7 @@ class AgentLoop:
     ) -> tuple[str, dict[str, Any]] | None:
         # 图片生成不再通过本地关键词强制触发，完全交给 AI Agent 根据上下文自主决定是否调用工具。
 
-        if self._should_force_image_tool_first(ctx):
+        if self._has_image_media(ctx):
             forced_args: dict[str, Any] = {}
             first_url = self._extract_first_url(ctx.message_text)
             if first_url and self._looks_like_image_url(first_url):

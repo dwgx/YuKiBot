@@ -111,6 +111,21 @@ class _SequencedModelClient:
             }
 
 
+class _RecordingRegistry(_StubRegistry):
+    def __init__(self, names: set[str] | None = None):
+        super().__init__(names or {"analyze_image", "final_answer", "think"})
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call(self, name: str, args: dict, context: dict) -> ToolCallResult:
+        _ = context
+        self.calls.append((name, dict(args)))
+        return ToolCallResult(
+            ok=True,
+            data={},
+            display="图片里是一只白色猫，背景是室内。",
+        )
+
+
 def _make_ctx(**overrides) -> AgentContext:
     base = AgentContext(
         conversation_id="group:1:user:2",
@@ -280,6 +295,27 @@ class AgentLoopSmokeTests(unittest.TestCase):
         result = asyncio.run(loop.run(_make_ctx(message_text="搜索python")))
         self.assertEqual(result.reason, "agent_final_answer")
         self.assertIn("搜索完成", result.reply_text)
+        self.assertEqual(result.tool_calls_made, 1)
+
+    def test_forced_image_tool_replaces_wrong_final_answer(self):
+        """图片消息下模型若先 final_answer，应被改写为图片工具调用。"""
+        registry = _RecordingRegistry()
+        loop = _make_loop(
+            [
+                '{"tool":"final_answer","args":{"text":"我看看这张。"}}',
+            ],
+            registry=registry,
+        )
+
+        result = asyncio.run(loop.run(_make_ctx(
+            message_text="MULTIMODAL_EVENT user sent multimodal message: image:[image]",
+            media_summary=["image:https://example.com/a.png"],
+            raw_segments=[{"type": "image", "data": {"url": "https://example.com/a.png"}}],
+        )))
+
+        self.assertEqual(registry.calls[0][0], "analyze_image")
+        self.assertEqual(result.reason, "agent_fallback_llm_error")
+        self.assertIn("白色猫", result.reply_text)
         self.assertEqual(result.tool_calls_made, 1)
 
     def test_unknown_tool_notifies_model(self):
