@@ -1,13 +1,132 @@
 from __future__ import annotations
 
+import ipaddress
 import inspect
+import json
+import os
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from core.webui_route_context import WebUIRouteContext
+
+
+class _AuthAttemptStore:
+    def __init__(self, path: Path, *, max_attempts: int, window_seconds: int) -> None:
+        self._path = path
+        self._max_attempts = max_attempts
+        self._window_seconds = window_seconds
+        self._lock = threading.Lock()
+        self._memory_data: dict[str, list[float]] = {}
+        self._warned_storage_error = False
+
+    def _prune(self, data: dict[str, list[float]], now: float) -> dict[str, list[float]]:
+        cutoff = now - float(self._window_seconds)
+        pruned: dict[str, list[float]] = {}
+        for key, values in data.items():
+            kept = [float(item) for item in values if float(item) >= cutoff]
+            if kept:
+                pruned[str(key)] = kept
+        return pruned
+
+    def _load_locked(self, now: float) -> dict[str, list[float]]:
+        try:
+            raw = json.loads(self._path.read_text(encoding="utf-8")) if self._path.exists() else {}
+        except Exception as exc:
+            self._warn_storage_error("load", exc)
+            return self._prune(dict(self._memory_data), now)
+        data: dict[str, list[float]] = {}
+        if isinstance(raw, dict):
+            for key, values in raw.items():
+                if not isinstance(values, list):
+                    continue
+                valid: list[float] = []
+                for item in values:
+                    try:
+                        valid.append(float(item))
+                    except Exception:
+                        continue
+                if valid:
+                    data[str(key)] = valid
+        pruned = self._prune(data, now)
+        self._memory_data = pruned
+        return pruned
+
+    def _save_locked(self, data: dict[str, list[float]]) -> None:
+        self._memory_data = {str(key): list(values) for key, values in data.items()}
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            os.replace(tmp, self._path)
+        except OSError as exc:
+            self._warn_storage_error("save", exc)
+
+    def _warn_storage_error(self, action: str, exc: Exception) -> None:
+        if self._warned_storage_error:
+            return
+        self._warned_storage_error = True
+        print(f"[WebUI Auth] attempt store {action} failed, using memory fallback: {exc}", flush=True)
+
+    def is_limited(self, key: str, now: float) -> bool:
+        with self._lock:
+            data = self._load_locked(now)
+            limited = len(data.get(key, [])) >= self._max_attempts
+            self._save_locked(data)
+            return limited
+
+    def record_failure(self, key: str, now: float) -> int:
+        with self._lock:
+            data = self._load_locked(now)
+            attempts = data.setdefault(key, [])
+            attempts.append(now)
+            self._save_locked(data)
+            return len(attempts)
+
+    def clear(self, key: str, now: float) -> None:
+        with self._lock:
+            data = self._load_locked(now)
+            if key in data:
+                data.pop(key, None)
+                self._save_locked(data)
+            elif self._path.exists():
+                self._save_locked(data)
+
+
+def _normalize_ip(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return ""
+
+
+def _truthy_env(name: str) -> bool:
+    return str(os.environ.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _extract_client_ip(request: Request) -> str:
+    fallback = _normalize_ip(request.client.host if request.client else "") or "unknown"
+    if not _truthy_env("WEBUI_TRUST_PROXY_HEADERS"):
+        return fallback
+
+    x_forwarded_for = str(request.headers.get("X-Forwarded-For", "")).strip()
+    if x_forwarded_for:
+        for part in x_forwarded_for.split(","):
+            candidate = _normalize_ip(part)
+            if candidate:
+                return candidate
+
+    x_real_ip = _normalize_ip(request.headers.get("X-Real-IP", ""))
+    if x_real_ip:
+        return x_real_ip
+    return fallback
 
 
 def build_auth_status_router(ctx: WebUIRouteContext) -> APIRouter:
@@ -17,22 +136,23 @@ def build_auth_status_router(ctx: WebUIRouteContext) -> APIRouter:
     async def health():
         return {"status": "ok"}
 
-    _auth_attempts: dict[str, list[float]] = {}
     _AUTH_MAX_ATTEMPTS = 10
     _AUTH_WINDOW_SECONDS = 300
+    _attempt_store = _AuthAttemptStore(
+        ctx.resolve_auth_attempt_store_path(),
+        max_attempts=_AUTH_MAX_ATTEMPTS,
+        window_seconds=_AUTH_WINDOW_SECONDS,
+    )
 
     @router.post("/auth")
     async def auth(request: Request):
         import hmac
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = _extract_client_ip(request)
         now = time.time()
 
-        # 速率限制：每 IP 5 分钟内最多 10 次
-        attempts = _auth_attempts.setdefault(client_ip, [])
-        attempts[:] = [t for t in attempts if now - t < _AUTH_WINDOW_SECONDS]
-        if len(attempts) >= _AUTH_MAX_ATTEMPTS:
+        # 速率限制：失败登录按来源地址持久化计数，重启不清零。
+        if _attempt_store.is_limited(client_ip, now):
             raise HTTPException(429, "登录尝试过于频繁，请稍后再试")
-        attempts.append(now)
 
         body = await request.json()
         token = str(body.get("token", ""))
@@ -42,11 +162,18 @@ def build_auth_status_router(ctx: WebUIRouteContext) -> APIRouter:
             raise HTTPException(403, "WEBUI_TOKEN 未配置")
 
         if not hmac.compare_digest(token, expected):
+            _attempt_store.record_failure(client_ip, now)
             raise HTTPException(401, "Token 错误")
 
+        _attempt_store.clear(client_ip, now)
         response = JSONResponse({"ok": True})
         ctx.set_auth_cookie(response, request, expected)
         return response
+
+    @router.get("/auth/session")
+    async def auth_session(request: Request):
+        await ctx.check_auth(request)
+        return {"ok": True}
 
     @router.post("/auth/logout")
     async def auth_logout():

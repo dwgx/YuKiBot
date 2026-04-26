@@ -29,9 +29,8 @@ type LoginGuide = {
   notes?: string[];
 };
 
-const authHeaders = () => ({
+const jsonHeaders = () => ({
   "Content-Type": "application/json",
-  Authorization: `Bearer ${api.getToken()}`,
 });
 
 export default function CookiesPage() {
@@ -53,7 +52,7 @@ export default function CookiesPage() {
 
   const loadCapabilities = useCallback(async () => {
     try {
-      const res = await fetch("/api/webui/cookies/capabilities", { headers: { Authorization: `Bearer ${api.getToken()}` } });
+      const res = await fetch("/api/webui/cookies/capabilities");
       const data = await res.json().catch(() => ({} as Record<string, unknown>));
       if (res.ok && data?.data) {
         const capability = data.data as CookieCapabilities;
@@ -80,7 +79,7 @@ export default function CookiesPage() {
     try {
       const res = await fetch("/api/webui/cookies/extract", {
         method: "POST",
-        headers: authHeaders(),
+        headers: jsonHeaders(),
         body: JSON.stringify({ platform, browser, allow_close: allowClose }),
       });
       const data = await res.json().catch(() => ({} as Record<string, unknown>));
@@ -108,7 +107,7 @@ export default function CookiesPage() {
     try {
       const res = await fetch("/api/webui/cookies/prepare-login", {
         method: "POST",
-        headers: authHeaders(),
+        headers: jsonHeaders(),
         body: JSON.stringify({ platform, browser }),
       });
       const data = await res.json().catch(() => ({} as Record<string, unknown>));
@@ -137,7 +136,7 @@ export default function CookiesPage() {
     try {
       const res = await fetch("/api/webui/cookies/save", {
         method: "POST",
-        headers: authHeaders(),
+        headers: jsonHeaders(),
         body: JSON.stringify({ platform, cookie }),
       });
       const data = await res.json().catch(() => ({} as Record<string, unknown>));
@@ -164,13 +163,13 @@ export default function CookiesPage() {
       if (biliQrSessionId) {
         await fetch("/api/webui/cookies/bilibili-qr/cancel", {
           method: "POST",
-          headers: authHeaders(),
+          headers: jsonHeaders(),
           body: JSON.stringify({ session_id: biliQrSessionId }),
         }).catch(() => undefined);
       }
       const res = await fetch("/api/webui/cookies/bilibili-qr/start", {
         method: "POST",
-        headers: authHeaders(),
+        headers: jsonHeaders(),
       });
       const data = await res.json().catch(() => ({} as Record<string, unknown>));
       if (!res.ok || !data?.ok) {
@@ -197,9 +196,7 @@ export default function CookiesPage() {
 
     const poll = async () => {
       try {
-        const res = await fetch(`/api/webui/cookies/bilibili-qr/status?session_id=${encodeURIComponent(biliQrSessionId)}`, {
-          headers: { Authorization: `Bearer ${api.getToken()}` },
-        });
+        const res = await fetch(`/api/webui/cookies/bilibili-qr/status?session_id=${encodeURIComponent(biliQrSessionId)}`);
         const data = await res.json().catch(() => ({} as Record<string, unknown>));
         const status = String(data?.status || "");
         if (status === "done" && data?.data) {
@@ -232,7 +229,7 @@ export default function CookiesPage() {
     if (!biliQrSessionId) return;
     fetch("/api/webui/cookies/bilibili-qr/cancel", {
       method: "POST",
-      headers: authHeaders(),
+      headers: jsonHeaders(),
       body: JSON.stringify({ session_id: biliQrSessionId }),
     }).catch(() => undefined);
   }, [biliQrSessionId]);

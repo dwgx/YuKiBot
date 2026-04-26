@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hmac
 import json
 import os
+import secrets
 import time
 import uuid
 from pathlib import Path
@@ -11,7 +13,7 @@ from typing import Any, Callable
 
 import httpx
 import yaml
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from core.config_templates import (
@@ -24,6 +26,9 @@ from utils.text import normalize_text
 
 
 class WebUISetupSupport:
+    _SETUP_AUTH_HEADER = "X-Yukiko-Setup-Token"
+    _SETUP_AUTH_COOKIE = "yukiko_setup_session"
+    _SETUP_AUTH_COOKIE_MAX_AGE = 30 * 60
     _SETUP_COOKIE_PLATFORM_DOMAINS: dict[str, list[str]] = {
         "bilibili": [".bilibili.com"],
         "douyin": [".douyin.com"],
@@ -118,8 +123,60 @@ class WebUISetupSupport:
         self._smart_extract_meta: dict[str, Any] | None = None
         self._smart_extract_status = "idle"
         self._smart_extract_error = ""
-        self.router = APIRouter(prefix="/api/webui/setup", tags=["setup"])
+        self._setup_access_token = secrets.token_urlsafe(32)
+        self.router = APIRouter(
+            prefix="/api/webui/setup",
+            tags=["setup"],
+            dependencies=[Depends(self._check_setup_auth)],
+        )
         self._register_routes()
+
+    def _extract_setup_token(self, request: Request) -> str:
+        header_token = normalize_text(request.headers.get(self._SETUP_AUTH_HEADER, ""))
+        if header_token:
+            return header_token
+        query_token = normalize_text(request.query_params.get("setup_token", ""))
+        if query_token:
+            return query_token
+        return normalize_text(request.cookies.get(self._SETUP_AUTH_COOKIE, ""))
+
+    def _is_valid_setup_token(self, candidate: str) -> bool:
+        expected = normalize_text(self._setup_access_token)
+        current = normalize_text(candidate)
+        if not expected or not current:
+            return False
+        return hmac.compare_digest(current, expected)
+
+    async def _check_setup_auth(self, request: Request) -> None:
+        if not self._is_valid_setup_token(self._extract_setup_token(request)):
+            raise HTTPException(401, "Setup 认证失败")
+
+    def _set_setup_cookie(self, response: Any, request: Request, token: str) -> None:
+        response.set_cookie(
+            key=self._SETUP_AUTH_COOKIE,
+            value=str(token),
+            httponly=True,
+            samesite="strict",
+            secure=str(request.url.scheme or "").lower() == "https",
+            max_age=self._SETUP_AUTH_COOKIE_MAX_AGE,
+            path="/",
+        )
+
+    def _authorize_setup_request(self, request: Request) -> str:
+        token = self._extract_setup_token(request)
+        if not self._is_valid_setup_token(token):
+            raise HTTPException(401, "Setup 认证失败")
+        return token
+
+    def _finalize_setup_response(self, request: Request, response: Any, token: str) -> Any:
+        cookie_token = normalize_text(request.cookies.get(self._SETUP_AUTH_COOKIE, ""))
+        if not self._is_valid_setup_token(cookie_token):
+            self._set_setup_cookie(response, request, token)
+        return response
+
+    def _build_setup_url(self, request: Request) -> str:
+        base = str(request.base_url).rstrip("/")
+        return f"{base}/webui/setup?setup_token={self._setup_access_token}"
 
     def _register_routes(self) -> None:
         @self.router.get("/health")
@@ -191,17 +248,16 @@ class WebUISetupSupport:
     def defaults_payload(self) -> dict[str, Any]:
         providers = []
         for key in [
-            "skiapi", "openai", "anthropic", "gemini", "deepseek", "newapi",
+            "newapi", "openai", "anthropic", "gemini", "deepseek",
             "openrouter", "xai", "qwen", "moonshot", "mistral", "zhipu", "siliconflow",
         ]:
             default_item = self._SETUP_PROVIDER_DEFAULTS.get(key, {})
             label = {
-                "skiapi": "SKIAPI",
+                "newapi": "NEWAPI",
                 "openai": "OpenAI",
                 "anthropic": "Anthropic",
                 "gemini": "Gemini",
                 "deepseek": "DeepSeek",
-                "newapi": "NEWAPI",
                 "openrouter": "OpenRouter",
                 "xai": "xAI (Grok)",
                 "qwen": "Qwen",
@@ -512,9 +568,46 @@ class WebUISetupSupport:
                 return merged
         return ""
 
+    @staticmethod
+    def _remap_setup_api_error_message(*, endpoint_type: str, base_url: str, message: str) -> str:
+        raw = normalize_text(message)
+        lowered = raw.lower()
+        base = normalize_text(base_url).rstrip("/")
+        if not raw:
+            return raw
+        custom_gateway = bool(base) and not any(
+            host in base.lower()
+            for host in (
+                "api.openai.com",
+                "api.anthropic.com",
+                "generativelanguage.googleapis.com",
+                "api.deepseek.com",
+                "openrouter.ai",
+                "api.x.ai",
+                "dashscope.aliyuncs.com",
+                "api.moonshot.cn",
+                "api.mistral.ai",
+                "open.bigmodel.cn",
+                "api.siliconflow.cn",
+            )
+        )
+        if "http 429" in lowered or " 429:" in lowered or " 429 " in lowered:
+            hint = "对端已收到请求，但把这次调用按限流/余额/配额/模型权限拦下了，不是本地 Base URL 拼错。"
+            if custom_gateway and endpoint_type == "openai_response":
+                hint += " 如果你用的是 aixj.vip 这类 OpenAI 兼容网关，优先把端点类型改成 OpenAI，或直接选 NEWAPI 后再填自定义 Base URL。"
+            elif custom_gateway:
+                hint += " 如果你用的是 aixj.vip 这类 OpenAI 兼容网关，建议确认网关侧余额、模型权限和频率限制。"
+            return f"{raw}；{hint}"
+        if custom_gateway and endpoint_type == "openai_response" and ("http 404" in lowered or "http 405" in lowered):
+            return (
+                f"{raw}；这个网关大概率只支持 Chat Completions，"
+                "请把端点类型改成 OpenAI，或直接选 NEWAPI 后再填自定义 Base URL。"
+            )
+        return raw
+
     def build_config_from_legacy_payload(self, body: dict[str, Any]) -> dict[str, Any]:
-        provider = normalize_text(str(body.get("provider", "skiapi"))).lower() or "skiapi"
-        defaults = self._SETUP_PROVIDER_DEFAULTS.get(provider, self._SETUP_PROVIDER_DEFAULTS["skiapi"])
+        provider = normalize_text(str(body.get("provider", "newapi"))).lower() or "newapi"
+        defaults = self._SETUP_PROVIDER_DEFAULTS.get(provider, self._SETUP_PROVIDER_DEFAULTS["newapi"])
         model = normalize_text(str(body.get("model", ""))) or defaults.get("model", "")
         base_url = normalize_text(str(body.get("base_url", "")))
         endpoint_type = self._setup_normalize_endpoint_type(str(body.get("endpoint_type", "")), provider)
@@ -617,8 +710,8 @@ class WebUISetupSupport:
 
     async def test_api(self, request: Request) -> dict[str, Any]:
         body = await request.json()
-        provider = normalize_text(str(body.get("provider", "skiapi"))).lower() or "skiapi"
-        defaults = self._SETUP_PROVIDER_DEFAULTS.get(provider, self._SETUP_PROVIDER_DEFAULTS["skiapi"])
+        provider = normalize_text(str(body.get("provider", "newapi"))).lower() or "newapi"
+        defaults = self._SETUP_PROVIDER_DEFAULTS.get(provider, self._SETUP_PROVIDER_DEFAULTS["newapi"])
         endpoint_type = self._setup_normalize_endpoint_type(str(body.get("endpoint_type", "")), provider)
         model = normalize_text(str(body.get("model", ""))) or defaults.get("model", "")
         base_url = normalize_text(str(body.get("base_url", ""))) or defaults.get("base_url", "")
@@ -802,7 +895,15 @@ class WebUISetupSupport:
                 return {"ok": False, "message": f"不支持的端点类型: {endpoint_type}"}
         except Exception as exc:
             return {"ok": False, "message": str(exc)}
-        tail = " | ".join(errors[-2:]) if errors else "未知错误"
+        remapped_errors = [
+            self._remap_setup_api_error_message(
+                endpoint_type=endpoint_type,
+                base_url=base_url,
+                message=item,
+            )
+            for item in errors
+        ]
+        tail = " | ".join(remapped_errors[-2:]) if remapped_errors else "未知错误"
         return {"ok": False, "message": f"连通性检测失败: {tail}", "latency_ms": int((time.perf_counter() - started) * 1000)}
 
     async def test_image_gen(self, request: Request) -> dict[str, Any]:
@@ -988,7 +1089,7 @@ class WebUISetupSupport:
         body = await request.json()
         browser = str(body.get("browser", "edge"))
         allow_close = bool(body.get("allow_close", False))
-        setup_url = str(request.base_url).rstrip("/") + "/webui/setup"
+        setup_url = self._build_setup_url(request)
         self._smart_extract_status = "running"
         self._smart_extract_result = None
         self._smart_extract_meta = None
@@ -1131,50 +1232,67 @@ class WebUISetupSupport:
     def _make_spa_app(self, dist_dir: Path, api_router: APIRouter):
         from fastapi import FastAPI
         from starlette.responses import FileResponse, Response
-        from starlette.staticfiles import StaticFiles
 
         app = FastAPI()
         app.include_router(api_router)
         if dist_dir.exists():
             index_file = dist_dir / "index.html"
-            assets_dir = dist_dir / "assets"
-            if assets_dir.exists():
-                app.mount("/webui/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
             @app.get("/webui/{path:path}")
-            async def spa_handler(path: str):
+            async def spa_handler(path: str, request: Request):
+                token = self._authorize_setup_request(request)
                 if path.lower().startswith("setup"):
                     if index_file.exists():
-                        return FileResponse(index_file)
-                file_path = dist_dir / path
-                if file_path.is_file() and ".." not in path:
-                    return FileResponse(file_path)
+                        return self._finalize_setup_response(request, FileResponse(index_file), token)
+                # 安全: 使用 resolve() + 前缀验证防止路径穿越
+                try:
+                    file_path = (dist_dir / path).resolve()
+                except (ValueError, OSError):
+                    return Response("Not found", status_code=404)
+                dist_resolved = dist_dir.resolve()
+                if file_path.is_file() and file_path.is_relative_to(dist_resolved):
+                    return self._finalize_setup_response(request, FileResponse(file_path), token)
                 if index_file.exists():
-                    return FileResponse(index_file)
+                    return self._finalize_setup_response(request, FileResponse(index_file), token)
                 return Response("Not found", status_code=404)
 
             @app.get("/webui")
-            async def spa_root():
+            async def spa_root(request: Request):
+                token = self._authorize_setup_request(request)
                 if index_file.exists():
-                    return FileResponse(index_file)
+                    return self._finalize_setup_response(request, FileResponse(index_file), token)
                 return Response("Not found", status_code=404)
 
             @app.get("/")
-            async def root_redirect():
+            async def root_redirect(request: Request):
                 from starlette.responses import RedirectResponse
 
-                return RedirectResponse(url="/webui/setup", status_code=307)
+                token = self._authorize_setup_request(request)
+                return self._finalize_setup_response(
+                    request,
+                    RedirectResponse(url="/webui/setup", status_code=307),
+                    token,
+                )
         return app
 
     def run_setup_server(self, host: str = "127.0.0.1", port: int = 8081):
         import uvicorn
 
+        # 安全: Setup 向导不应暴露到公网，强制绑定 localhost
+        safe_host = host
+        if safe_host in ("0.0.0.0", "::"):
+            self._log.warning(
+                "security | Setup 向导拒绝绑定 %s — 已回退到 127.0.0.1 (无认证服务不应暴露到网络)",
+                host,
+            )
+            safe_host = "127.0.0.1"
+
         webui_dist = self._root_dir / "webui" / "dist"
         app = self._make_spa_app(webui_dist, api_router=self.router)
         print(f"\n  YuKiKo 首次运行配置向导")
-        print(f"  请在浏览器打开: http://{host}:{port}/webui/setup\n")
+        print(f"  请在浏览器打开: http://{safe_host}:{port}/webui/setup?setup_token={self._setup_access_token}\n")
 
-        config = uvicorn.Config(app, host=host, port=port, log_level="warning")
+        config = uvicorn.Config(app, host=safe_host, port=port, log_level="warning")
         server = uvicorn.Server(config)
         self._setup_uvicorn_server = server
         try:

@@ -252,28 +252,7 @@ def _register_image_gen_tools(registry: AgentToolRegistry, image_gen: ImageGenEn
 def _register_enhanced_napcat_tools(registry: AgentToolRegistry) -> None:
     """注册利用 NapCat 高级 API 的工具。"""
 
-    async def _handle_send_ai_voice(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
-        """发送 AI 语音合成消息。"""
-        api_call = context.get("api_call")
-        if not api_call:
-            return ToolCallResult(ok=False, error="no_api_call_available")
-        group_id = int(args.get("group_id", context.get("group_id", 0)))
-        character = str(args.get("character", ""))
-        text = str(args.get("text", ""))
-        if not group_id or not text:
-            return ToolCallResult(ok=False, error="缺少 group_id 或 text")
-        try:
-            # 如果没指定角色，先获取可用角色列表
-            if not character:
-                chars = await api_call("get_ai_characters", group_id=group_id)
-                if isinstance(chars, list) and chars:
-                    character = chars[0].get("character_id", chars[0].get("id", ""))
-            if not character:
-                return ToolCallResult(ok=False, error="无可用 AI 语音角色")
-            result = await api_call("send_group_ai_record", group_id=group_id, character=character, text=text)
-            return ToolCallResult(ok=True, data=result if isinstance(result, dict) else {}, display=f"已发送AI语音: {text[:30]}...")
-        except Exception as exc:
-            return ToolCallResult(ok=False, error=str(exc))
+
 
     async def _handle_set_input_status(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         """设置输入状态（正在输入...）。"""
@@ -306,16 +285,7 @@ def _register_enhanced_napcat_tools(registry: AgentToolRegistry) -> None:
         except Exception as exc:
             return ToolCallResult(ok=False, error=str(exc))
 
-    registry.register(ToolSchema(
-        name="send_ai_voice",
-        description="发送AI语音合成消息到群聊。\n使用场景: 用户要求bot用语音说话、朗读文字时使用",
-        parameters={"type": "object", "properties": {
-            "group_id": {"type": "integer", "description": "群号(可选，默认当前群)"},
-            "character": {"type": "string", "description": "AI语音角色ID(可选，自动选择)"},
-            "text": {"type": "string", "description": "要转为语音的文本"},
-        }, "required": ["text"]},
-        category="napcat", group="messaging",
-    ), _handle_send_ai_voice)
+
 
     registry.register(ToolSchema(
         name="set_input_status",

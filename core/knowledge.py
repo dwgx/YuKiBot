@@ -12,15 +12,18 @@
 from __future__ import annotations
 
 import json
-import logging
 import sqlite3
+import threading
 import time
+
+_db_local = threading.local()
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from utils.text import clip_text, normalize_text
 
+import logging
 _log = logging.getLogger("yukiko.knowledge")
 
 
@@ -66,11 +69,11 @@ class KnowledgeBase:
         self._init_db()
 
     def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
-            self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-        return self._conn
+        if not hasattr(_db_local, "conn") or _db_local.conn is None:
+            _db_local.conn = sqlite3.connect(str(self._db_path), timeout=30.0)
+            _db_local.conn.execute("PRAGMA journal_mode=WAL")
+            _db_local.conn.execute("PRAGMA synchronous=NORMAL")
+        return _db_local.conn
 
     def _init_db(self) -> None:
         conn = self._get_conn()
@@ -395,9 +398,10 @@ class KnowledgeBase:
         return added
 
     def close(self) -> None:
-        if self._conn:
-            self._conn.close()
-            self._conn = None
+        conn = getattr(_db_local, "conn", None)
+        if conn:
+            conn.close()
+            _db_local.conn = None
 
     # ── 内部方法 ──
 

@@ -200,6 +200,8 @@ class ContextAwareConfirmation:
 
         # 记录当前操作
         if key not in self._recent_operations:
+            if len(self._recent_operations) > 5000:
+                self._recent_operations.clear()
             self._recent_operations[key] = []
 
         self._recent_operations[key].append({

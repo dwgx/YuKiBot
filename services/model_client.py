@@ -291,12 +291,44 @@ class ModelClient:
 
         raise RuntimeError("所有 provider 均不可用")
 
+    @staticmethod
+    def _prune_tools_schema(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """当工具数量庞大时，对 Schema 进行智能降维压缩，防止 Token 爆炸或弱模型幻觉。"""
+        if not tools or len(tools) <= 10:
+            return tools
+        pruned = []
+        for t in tools:
+            new_t = dict(t)
+            if "function" in new_t and isinstance(new_t["function"], dict):
+                func = dict(new_t["function"])
+                # 压缩整体 description
+                desc = str(func.get("description", ""))
+                if len(desc) > 100:
+                    func["description"] = desc[:100] + "..."
+                # 压缩 properties 描述
+                if "parameters" in func and isinstance(func["parameters"], dict):
+                    params = dict(func["parameters"])
+                    if "properties" in params and isinstance(params["properties"], dict):
+                        props = dict(params["properties"])
+                        for k, v in props.items():
+                            if isinstance(v, dict) and "description" in v:
+                                p_desc = str(v["description"])
+                                if len(p_desc) > 60:
+                                    v["description"] = p_desc[:60] + "..."
+                        params["properties"] = props
+                    func["parameters"] = params
+                new_t["function"] = func
+            pruned.append(new_t)
+        return pruned
+
     async def chat_completion(
         self,
         messages: list[dict[str, Any]],
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
         model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "messages": messages,
@@ -305,7 +337,41 @@ class ModelClient:
         }
         if str(model or "").strip():
             kwargs["model"] = str(model).strip()
+        if tools is not None:
+            kwargs["tools"] = self._prune_tools_schema(tools)
+        if tool_choice is not None:
+            kwargs["tool_choice"] = tool_choice
         return await self._invoke_with_failover("chat_completion", **kwargs)
+
+    async def chat_completion_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        response_format: dict[str, str] | None = None,
+        max_tokens: int | None = None,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        retries: int = 2,
+        backoff: float = 1.0,
+    ) -> dict[str, Any]:
+        import asyncio as _aio
+
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return await self.chat_completion(
+                    messages=messages,
+                    response_format=response_format,
+                    max_tokens=max_tokens,
+                    model=model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    await _aio.sleep(backoff * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
 
     async def chat_text(self, messages: list[dict[str, Any]], max_tokens: int | None = None) -> str:
         data = await self.chat_completion(messages=messages, max_tokens=max_tokens)
@@ -355,6 +421,11 @@ class ModelClient:
         if style is not None:
             kwargs["style"] = style
         return await self._invoke_with_failover("generate_image", **kwargs)
+
+    def supports_native_tool_calling(self) -> bool:
+        """判断当前活跃 provider 是否实现了原生工具调用。"""
+        active = self._get_active_client()
+        return bool(getattr(active, "supports_native_tools", False))
 
     def supports_vision_input(self, model: str | None = None) -> bool:
         """判断当前模型是否支持图片输入（自动启发式，可被配置覆盖）。"""

@@ -17,7 +17,6 @@ export default function LoginPage() {
     setError("");
     try {
       await api.auth(token.trim());
-      api.setToken(token.trim());
       navigate("/", { replace: true });
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : "认证失败");

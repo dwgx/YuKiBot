@@ -29,7 +29,10 @@ NAPCAT_API_ALIASES: dict[str, str] = {
     "delete_message": "delete_msg",
     "get_group_notice": "_get_group_notice",
     "send_group_notice": "_send_group_notice",
+    "delete_group_notice": "_del_group_notice",
     "set_group_sign": "send_group_sign",
+    # NapCat 统一戳一戳 API（group_poke / friend_poke → send_poke）
+    # 注意: 旧版 group_poke / friend_poke 仍然可用，但推荐用 send_poke
 }
 _VERSION_PART_RE = re.compile(r"\d+")
 _STRING_ID_VERSION_FLOOR = (4, 8, 115)

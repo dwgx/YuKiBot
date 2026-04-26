@@ -16,35 +16,30 @@ import PluginsPage from "./pages/plugins";
 import ChatPage from "./pages/chat";
 
 function AuthGuard({ children }: { children: React.ReactNode }) {
-  const token = api.getToken();
-  const [ready, setReady] = useState(false);
+  const [state, setState] = useState<"loading" | "authed" | "guest">("loading");
 
   useEffect(() => {
     let alive = true;
-    if (!token) {
-      setReady(true);
-      return () => {
-        alive = false;
-      };
-    }
-    api.ensureSessionCookie()
-      .catch(() => {})
-      .finally(() => {
-        if (alive) setReady(true);
+    api.hasSession()
+      .then((ok) => {
+        if (alive) setState(ok ? "authed" : "guest");
+      })
+      .catch(() => {
+        if (alive) setState("guest");
       });
     return () => {
       alive = false;
     };
-  }, [token]);
+  }, []);
 
-  if (!token) return <Navigate to="/login" replace />;
-  if (!ready) {
+  if (state === "loading") {
     return (
       <div className="flex min-h-screen items-center justify-center">
         <Spinner size="lg" />
       </div>
     );
   }
+  if (state !== "authed") return <Navigate to="/login" replace />;
   return <>{children}</>;
 }
 

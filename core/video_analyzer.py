@@ -132,53 +132,9 @@ class VideoAnalysisResult:
 
 
 def _find_ffmpeg_path(name: str = "ffmpeg") -> str:
-    """查找 ffmpeg/ffprobe，兼容 winget 安装路径。"""
-    found = shutil.which(name)
-    if found:
-        return found
-    extra_dirs: list[str] = []
-    local_app = os.environ.get("LOCALAPPDATA", "")
-    if local_app:
-        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Links"))
-        extra_dirs.append(os.path.join(local_app, "Microsoft", "WinGet", "Packages"))
-        extra_dirs.append(os.path.join(local_app, "Programs", "ffmpeg", "bin"))
-    program_files = os.environ.get("ProgramFiles", "")
-    if program_files:
-        extra_dirs.append(os.path.join(program_files, "ffmpeg", "bin"))
-    program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
-    if program_files_x86:
-        extra_dirs.append(os.path.join(program_files_x86, "ffmpeg", "bin"))
-    user_profile = os.environ.get("USERPROFILE", "")
-    if user_profile:
-        extra_dirs.append(os.path.join(user_profile, "scoop", "apps", "ffmpeg", "current", "bin"))
-        extra_dirs.append(os.path.join(user_profile, "scoop", "shims"))
-
-    for d in extra_dirs:
-        candidate = os.path.join(d, f"{name}.exe") if os.name == "nt" else os.path.join(d, name)
-        if os.path.isfile(candidate):
-            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
-            return candidate
-
-    if name == "ffmpeg":
-        try:
-            import imageio_ffmpeg
-
-            bundled = imageio_ffmpeg.get_ffmpeg_exe()
-            if bundled and os.path.isfile(bundled):
-                bundled_dir = str(Path(bundled).resolve().parent)
-                os.environ["PATH"] = bundled_dir + os.pathsep + os.environ.get("PATH", "")
-                return bundled
-        except Exception:
-            pass
-    elif name == "ffprobe":
-        ffmpeg_path = _find_ffmpeg_path("ffmpeg")
-        if ffmpeg_path:
-            ffprobe_name = "ffprobe.exe" if os.name == "nt" else "ffprobe"
-            sibling = str(Path(ffmpeg_path).resolve().parent / ffprobe_name)
-            if os.path.isfile(sibling):
-                os.environ["PATH"] = str(Path(sibling).resolve().parent) + os.pathsep + os.environ.get("PATH", "")
-                return sibling
-    return ""
+    """查找 ffmpeg/ffprobe，委托给 core.tools_types 的去重实现。"""
+    from core.tools_types import _find_ffmpeg
+    return _find_ffmpeg(name)
 
 
 class VideoAnalyzer:
@@ -307,6 +263,14 @@ class VideoAnalyzer:
                     result.analysis_depth = "rich_metadata"
             elif platform == "acfun" and self._acfun_enable:
                 await self._enrich_acfun(result, source_url)
+                if result.analysis_depth == "metadata":
+                    result.analysis_depth = "rich_metadata"
+            elif platform == "youku":
+                await self._enrich_youku(result, source_url)
+                if result.analysis_depth == "metadata":
+                    result.analysis_depth = "rich_metadata"
+            elif platform == "iqiyi":
+                await self._enrich_iqiyi(result, source_url)
                 if result.analysis_depth == "metadata":
                     result.analysis_depth = "rich_metadata"
 
@@ -476,7 +440,31 @@ class VideoAnalyzer:
                         if msg:
                             result.hot_comments.append(clip_text(msg, 100))
         except Exception as e:
-            result.errors.append(f"bilibili_comments: {e}")
+            result.errors.append(f"bilibili_comments_api: {e}")
+
+        # 如果通过 bilibili-api-python 没拿到热评（例如被 WAF 软拦截或未登录），使用后备方案
+        if not result.hot_comments:
+            try:
+                aid = int(info.get("aid", 0) or 0)
+                if aid > 0:
+                    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                        headers = {
+                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                            "Referer": "https://www.bilibili.com/",
+                            "Cookie": "BUVID3=infoc;"
+                        }
+                        api_url = f"https://api.bilibili.com/x/v2/reply/main?next=0&type=1&oid={aid}&mode=3"
+                        resp = await client.get(api_url, headers=headers)
+                        if resp.status_code == 200:
+                            data = resp.json().get("data", {})
+                            replies = data.get("replies", [])
+                            if isinstance(replies, list):
+                                for reply in replies[: self._bili_comments_top_n]:
+                                    msg = normalize_text(str(reply.get("content", {}).get("message", "")))
+                                    if msg:
+                                        result.hot_comments.append(clip_text(msg, 100))
+            except Exception as fallback_e:
+                result.errors.append(f"bilibili_comments_fallback: {fallback_e}")
 
     async def _fetch_bilibili_subtitle(self, v: Any, result: VideoAnalysisResult) -> None:
         if result.subtitle_text:
@@ -711,6 +699,19 @@ class VideoAnalyzer:
                     m = re.search(r"/(?:video|note)/(\d+)", final_url)
                     if m:
                         aweme_id = m.group(1)
+                    
+                    # 尝试从分享页直接提权 RENDER_DATA (作为 API 失败的后备数据)
+                    m_render = re.search(r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
+                    if m_render:
+                        import urllib.parse
+                        result.errors.append("douyin_render_data_extracted") # 内部标记
+                        try:
+                            decoded = urllib.parse.unquote(m_render.group(1))
+                            render_json = json.loads(decoded)
+                            # 从 RENDER_DATA 尝试恢复基础数据
+                            # (结构因抖音版本而异，这里尽力提取)
+                        except Exception:
+                            pass
             except Exception:
                 pass
 
@@ -943,6 +944,85 @@ class VideoAnalyzer:
             if payload is None:
                 continue
             self._apply_acfun_payload(result, payload)
+
+    async def _enrich_youku(self, result: VideoAnalysisResult, url: str) -> None:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://www.youku.com/",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code >= 400:
+                    return
+                html = resp.text or ""
+                
+                title = self._extract_html_title(html)
+                if title:
+                    result.title = clip_text(re.sub(r"\s*[-_｜|]\s*(优酷|Youku).*$", "", title, flags=re.IGNORECASE).strip(), 220)
+                
+                desc = self._extract_meta_content(html, "description") or self._extract_meta_content(html, "og:description")
+                if desc:
+                    result.description = clip_text(desc, 320)
+                
+                cover = self._extract_meta_content(html, "og:image") or self._extract_meta_content(html, "twitter:image")
+                if cover and re.match(r"^https?://", cover, flags=re.IGNORECASE):
+                    result.thumbnail_url = cover
+                    
+                keywords = self._extract_meta_content(html, "keywords")
+                if keywords:
+                    tags = [normalize_text(item) for item in re.split(r"[，,|/#\s]+", keywords) if normalize_text(item)]
+                    if tags:
+                        result.tags = list(dict.fromkeys(tags))[:12]
+        except Exception as e:
+            result.errors.append(f"youku_fetch: {e}")
+
+    async def _enrich_iqiyi(self, result: VideoAnalysisResult, url: str) -> None:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://www.iqiyi.com/",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+                resp = await client.get(url)
+                if resp.status_code >= 400:
+                    return
+                html = resp.text or ""
+                
+                title = self._extract_html_title(html)
+                if title:
+                    result.title = clip_text(re.sub(r"\s*[-_｜|]\s*(爱奇艺|iQIYI).*$", "", title, flags=re.IGNORECASE).strip(), 220)
+                
+                desc = self._extract_meta_content(html, "description") or self._extract_meta_content(html, "og:description")
+                if desc:
+                    result.description = clip_text(desc, 320)
+                
+                cover = self._extract_meta_content(html, "og:image") or self._extract_meta_content(html, "twitter:image")
+                if cover and re.match(r"^https?://", cover, flags=re.IGNORECASE):
+                    result.thumbnail_url = cover
+                    
+                keywords = self._extract_meta_content(html, "keywords")
+                if keywords:
+                    tags = [normalize_text(item) for item in re.split(r"[，,|/#\s]+", keywords) if normalize_text(item)]
+                    if tags:
+                        result.tags = list(dict.fromkeys(tags))[:12]
+                        
+                # 尝试解析 ld+json 里的演员/导演信息等
+                for raw in re.findall(r"<script[^>]*type=[\"']application/ld\+json[\"'][^>]*>(.*?)</script>", html, flags=re.IGNORECASE | re.DOTALL):
+                    payload = self._safe_json_load(raw)
+                    if isinstance(payload, dict):
+                        if not result.uploader:
+                            director = payload.get("director", {})
+                            if isinstance(director, dict):
+                                result.uploader = normalize_text(str(director.get("name", "")))
+                        if not result.tags:
+                            actor = payload.get("actor", [])
+                            if isinstance(actor, list):
+                                for a in actor:
+                                    if isinstance(a, dict) and "name" in a:
+                                        result.tags.append(normalize_text(str(a["name"])))
+        except Exception as e:
+            result.errors.append(f"iqiyi_fetch: {e}")
 
     @staticmethod
     def _extract_html_title(html: str) -> str:

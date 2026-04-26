@@ -95,6 +95,14 @@ class TriggerEngine:
 
         self.bot_aliases = aliases
 
+        self.alias_patterns: list[tuple[str, re.Pattern | None]] = []
+        for alias in self.bot_aliases:
+            if len(alias) == 1 and "\u4e00" <= alias <= "\u9fff":
+                pattern = re.compile(rf"(?<![a-z0-9\u4e00-\u9fff]){re.escape(alias)}(?![a-z0-9\u4e00-\u9fff])")
+                self.alias_patterns.append((alias, pattern))
+            else:
+                self.alias_patterns.append((alias, None))
+
         self.session_timeout = timedelta(
             minutes=float(trigger_config.get("active_session_timeout_minutes", 8))
         )
@@ -487,26 +495,14 @@ class TriggerEngine:
 
         # 对多字符别名保持原有宽松匹配
 
-        for alias in self.bot_aliases:
-
+        for alias, pattern in self.alias_patterns:
             if not alias:
-
                 continue
-
-            if len(alias) == 1 and "\u4e00" <= alias <= "\u9fff":
-
-                # 单字符中文别名: 要求前后不是中文/字母/数字
-
-                pattern = rf"(?<![a-z0-9\u4e00-\u9fff]){re.escape(alias)}(?![a-z0-9\u4e00-\u9fff])"
-
-                if re.search(pattern, content):
-
+            if pattern is not None:
+                if pattern.search(content):
                     return True
-
                 continue
-
             if alias in content:
-
                 return True
 
         compacted = re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", content)

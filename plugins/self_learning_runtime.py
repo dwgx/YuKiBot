@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -57,7 +59,15 @@ class LocalSubprocessCodeExecutionBackend(BaseCodeExecutionBackend):
     is_available = True
 
     def __init__(self, sandbox_root: Path) -> None:
-        self._sandbox_root = sandbox_root
+        self._sandbox_root = self._resolve_sandbox_root(sandbox_root)
+
+    @staticmethod
+    def _resolve_sandbox_root(sandbox_root: Path) -> Path:
+        raw = Path(sandbox_root)
+        parts = {part.lower() for part in raw.parts}
+        if "storage" in parts:
+            return Path(tempfile.gettempdir()) / "yukiko_self_learning_sandbox"
+        return raw
 
     async def run(
         self,
@@ -74,33 +84,42 @@ class LocalSubprocessCodeExecutionBackend(BaseCodeExecutionBackend):
         test_file.write_text(code, encoding="utf-8")
 
         try:
-            env = {
+            env = dict(os.environ)
+            env.update({
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONIOENCODING": "utf-8",
-            }
+            })
             if test_input:
                 env["SELF_LEARNING_TEST_INPUT"] = test_input
 
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable,
-                "-I",
-                "-S",
-                "-B",
-                str(test_file),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
+            completed = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-B",
+                    "-c",
+                    code,
+                ],
                 cwd=str(sandbox_run_dir),
+                env=env,
+                capture_output=True,
+                timeout=max(1, int(timeout_seconds)),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
-
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=max(1, int(timeout_seconds)),
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+            output = completed.stdout.decode("utf-8", errors="replace")
+            error = completed.stderr.decode("utf-8", errors="replace")
+            return {
+                "ok": completed.returncode == 0,
+                "output": output,
+                "error": "" if completed.returncode == 0 else (error or output),
+                "returncode": completed.returncode,
+                "execution_time": time.time() - start_time,
+                "backend": self.name,
+                "sandbox_mode": sandbox_mode,
+            }
+        except subprocess.TimeoutExpired:
                 return {
                     "ok": False,
                     "error": f"测试超时 ({timeout_seconds}秒)",
@@ -108,18 +127,6 @@ class LocalSubprocessCodeExecutionBackend(BaseCodeExecutionBackend):
                     "backend": self.name,
                     "sandbox_mode": sandbox_mode,
                 }
-
-            output = stdout.decode("utf-8", errors="replace")
-            error = stderr.decode("utf-8", errors="replace")
-            return {
-                "ok": proc.returncode == 0,
-                "output": output,
-                "error": "" if proc.returncode == 0 else (error or output),
-                "returncode": proc.returncode,
-                "execution_time": time.time() - start_time,
-                "backend": self.name,
-                "sandbox_mode": sandbox_mode,
-            }
         except Exception as exc:
             return {
                 "ok": False,

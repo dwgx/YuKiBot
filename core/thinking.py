@@ -65,10 +65,10 @@ class ThinkingEngine:
     }
 
     _VERBOSITY_INSTRUCTIONS = {
-        "verbose": "\u56de\u590d\u53ef\u4ee5\u8be6\u7ec6\u5c55\u5f00\uff0c\u7ed9\u51fa\u5b8c\u6574\u7684\u5206\u6790\u548c\u89e3\u91ca\u3002",
+        "verbose": "回复可以详细展开，给出完整的分析和解释。",
         "medium": "",
-        "brief": "\u56de\u590d\u7b80\u77ed\u7cbe\u70bc\uff0c\u6293\u91cd\u70b9\uff0c\u4e0d\u8981\u5c55\u5f00\u3002",
-        "minimal": "\u7528\u4e00\u4e24\u53e5\u8bdd\u6982\u62ec\uff0c\u6781\u7b80\u56de\u590d\u3002",
+        "brief": "回复简短精炼，抓重点，不要展开。",
+        "minimal": "用一两句话概括，极简回复。",
     }
 
     async def generate_reply(
@@ -117,10 +117,10 @@ class ThinkingEngine:
                 extra_rules = SystemPromptRelay.thinking_extra_rules()
                 verbosity_instruction = self._VERBOSITY_INSTRUCTIONS.get(verbosity, "")
                 if verbosity_instruction:
-                    extra_rules += "\n\u8f93\u51fa\u8be6\u7ec6\u5ea6\u8981\u6c42: " + verbosity_instruction
+                    extra_rules += "\n输出详细度要求: " + verbosity_instruction
                 output_style_instruction = clip_text(normalize_text(output_style_instruction), 320)
                 if output_style_instruction:
-                    extra_rules += "\n\u8f93\u51fa\u98ce\u683c\u9644\u52a0\u8981\u6c42: " + output_style_instruction
+                    extra_rules += "\n输出风格附加要求: " + output_style_instruction
                 verbosity_max_tokens = self._VERBOSITY_MAX_TOKENS.get(verbosity, 4096)
                 messages = [
                     {
@@ -187,12 +187,12 @@ class ThinkingEngine:
         now_label = now_local.strftime("%Y-%m-%d %H:%M:%S %z")
         tz_name = now_local.tzname() or "local"
         blocks: list[str] = [
-            "\u7528\u6237\u6d88\u606f:\n" + user_text,
-            "\u573a\u666f: " + scene_tag,
-            "\u7cfb\u7edf\u65f6\u95f4: " + now_label + " (" + tz_name + ")",
+            "用户消息:\n" + user_text,
+            "场景: " + scene_tag,
+            "系统时间: " + now_label + " (" + tz_name + ")",
         ]
         if trigger_reason:
-            blocks.append("\u89e6\u53d1\u4fe1\u606f: " + trigger_reason)
+            blocks.append("触发信息: " + trigger_reason)
 
         # Affinity & mood injection
         emotion_parts: list[str] = []
@@ -202,27 +202,27 @@ class ThinkingEngine:
             emotion_parts.append(affinity_hint)
         if emotion_parts:
             blocks.append(
-                "\u3010\u60c5\u611f\u72b6\u6001\u3011\n"
+                "【情感状态】\n"
                 + "\n".join(emotion_parts)
-                + "\n\u6839\u636e\u597d\u611f\u5ea6\u7b49\u7ea7\u81ea\u7136\u8c03\u6574\u8bed\u6c14\u4eb2\u5bc6\u5ea6\uff1a"
-                "\u964c\u751f\u4eba\u2192\u793c\u8c8c\u53cb\u597d\uff1b"
-                "\u666e\u901a\u670b\u53cb\u2192\u8f7b\u677e\u968f\u610f\uff1b"
-                "\u5bc6\u53cb/\u631a\u53cb\u2192\u4eb2\u6635\u6492\u5a07\u53ef\u5e26\u6635\u79f0\uff1b"
-                "\u77e5\u5df1\u4ee5\u4e0a\u2192\u53ef\u4ee5\u4e3b\u52a8\u5173\u5fc3\u3001\u6492\u5a07\u3001\u5403\u918b\u7b49\u6df1\u5c42\u60c5\u611f\u8868\u8fbe\u3002\n"
-                "\u6839\u636e\u5f53\u524d\u5fc3\u60c5\u5fae\u8c03\u56de\u590d\u60c5\u7eea\u8272\u5f69\uff0c\u4f46\u4e0d\u8981\u523b\u610f\u63d0\u53ca\u5fc3\u60c5\u672c\u8eab\u3002"
+                + "\n根据好感度等级自然调整语气亲密度："
+                "陌生人→礼貌友好；"
+                "普通朋友→轻松随意；"
+                "密友/挚友→亲昵撒娇可带昵称；"
+                "知己以上→可以主动关心、撒娇、吃醋等深层情感表达。\n"
+                "根据当前心情微调回复情绪色彩，但不要刻意提及心情本身。"
             )
 
         safe_profile = self._sanitize_profile_summary(user_profile_summary)
         if safe_profile:
-            who = current_user_name or "\u5f53\u524d\u7528\u6237"
+            who = current_user_name or "当前用户"
             profile_block = (
-                "\u7528\u6237\u753b\u50cf\uff08" + who
-                + "\uff0c\u4ec5\u6b64\u4eba\uff0c\u7981\u6b62\u6df7\u6dc6\u5230\u5176\u4ed6\u7fa4\u6210\u5458\uff09:\n"
+                "用户画像（" + who
+                + "，仅此人，禁止混淆到其他群成员）:\n"
                 + clip_text(safe_profile, 400)
             )
             style_guide = self._adaptive_style_hint(safe_profile)
             if style_guide:
-                profile_block += "\n\u56de\u590d\u98ce\u683c\u5efa\u8bae: " + style_guide
+                profile_block += "\n回复风格建议: " + style_guide
             blocks.append(profile_block)
         compat_block = normalize_text(compat_context)
         if compat_block:
@@ -255,7 +255,7 @@ class ThinkingEngine:
                 rows.append("- " + clip_text(cleaned, 100))
             if rows:
                 blocks.append(
-                    "\u6700\u8fd1\u5bf9\u8bdd\uff08\u6ce8\u610f\u533a\u5206\u6bcf\u6761\u6d88\u606f\u7684\u53d1\u8a00\u4eba\uff09:\n"
+                    "最近对话（注意区分每条消息的发言人）:\n"
                     + "\n".join(rows)
                 )
 
@@ -267,43 +267,43 @@ class ThinkingEngine:
             ]
             if rows2:
                 blocks.append(
-                    "\u76f8\u5173\u957f\u671f\u8bb0\u5fc6:\n" + "\n".join(rows2)
+                    "相关长期记忆:\n" + "\n".join(rows2)
                 )
                 if self.memory_recall_level != "off":
                     blocks.append(
-                        "\u5f53\u76f8\u5173\u4e14\u786e\u5b9a\u65f6\uff0c\u53ef\u81ea\u7136\u5f15\u7528\uff1a"
-                        "\u4f60\u4e0a\u6b21\u63d0\u5230\u2026\uff1b\u4e0d\u8981\u8de8\u7528\u6237\u6df7\u7528\u8bb0\u5fc6\u3002"
+                        "当相关且确定时，可自然引用："
+                        "你上次提到…；不要跨用户混用记忆。"
                     )
         blocks.append(
-            "\u53ea\u6709\u5f53\u201c\u6700\u8fd1\u5bf9\u8bdd/\u76f8\u5173\u957f\u671f\u8bb0\u5fc6\u201d"
-            "\u91cc\u6709\u660e\u786e\u539f\u6587\u8bc1\u636e\u65f6\uff0c\u624d\u5141\u8bb8\u8bf4\u201c\u4f60\u4e4b\u524d\u63d0\u5230\u8fc7\u2026\u201d\u3002"
-            "\u6ca1\u6709\u8bc1\u636e\u4e25\u7981\u7f16\u9020\u7528\u6237\u5386\u53f2\u504f\u597d\u3001\u5386\u53f2\u63d0\u95ee\u6216\u5386\u53f2\u7ed3\u8bba\u3002"
+            "只有当“最近对话/相关长期记忆”"
+            "里有明确原文证据时，才允许说“你之前提到过…”。"
+            "没有证据严禁编造用户历史偏好、历史提问或历史结论。"
         )
         if search_summary:
             is_video = (
-                "\u5173\u952e\u5e27\u5185\u5bb9\u63cf\u8ff0:" in search_summary
-                or "\u5f39\u5e55\u70ed\u8bcd:" in search_summary
+                "关键帧内容描述:" in search_summary
+                or "弹幕热词:" in search_summary
             )
             is_rich_search = (
-                search_summary.count("\u6807\u9898:") >= 2
-                or search_summary.count("\u6458\u8981:") >= 2
+                search_summary.count("标题:") >= 2
+                or search_summary.count("摘要:") >= 2
             )
             if is_video:
                 max_summary = 2400
-                label = "\u5de5\u5177\u7ed3\u679c(\u89c6\u9891\u5206\u6790)"
+                label = "工具结果(视频分析)"
             elif is_rich_search:
                 max_summary = 1600
-                label = "\u5de5\u5177\u7ed3\u679c(\u641c\u7d22 \u2014 \u8bf7\u4ece\u4ee5\u4e0b\u591a\u6761\u7ed3\u679c\u4e2d\u7b5b\u9009\u6700\u76f8\u5173\u7684\u4fe1\u606f\u7efc\u5408\u56de\u7b54)"
+                label = "工具结果(搜索 — 请从以下多条结果中筛选最相关的信息综合回答)"
             else:
                 max_summary = 1200
-                label = "\u5de5\u5177\u7ed3\u679c(\u641c\u7d22)"
+                label = "工具结果(搜索)"
             blocks.append(label + ":\n" + clip_text(search_summary, max_summary))
         if sensitive_context:
             blocks.append(
-                "\u98ce\u9669\u4e0a\u4e0b\u6587:\n" + clip_text(sensitive_context, 300)
+                "风险上下文:\n" + clip_text(sensitive_context, 300)
             )
         blocks.append(
-            "\u8bf7\u53ea\u8f93\u51fa\u6700\u7ec8\u56de\u590d\u6b63\u6587\uff0c\u4e0d\u8981\u8f93\u51fa JSON\u3002"
+            "请只输出最终回复正文，不要输出 JSON。"
         )
         return "\n\n".join(blocks)
 
@@ -311,23 +311,23 @@ class ThinkingEngine:
     def _adaptive_style_hint(profile_summary: str) -> str:
         hints: list[str] = []
         lower = profile_summary.lower()
-        if "\u7f51\u7edc\u7528\u8bed\u591a" in lower:
-            hints.append("\u53ef\u4ee5\u7528\u7f51\u7edc\u6897\u548c\u7f29\u5199\u56de\u590d\uff0c\u8bed\u6c14\u8f7b\u677e\u6d3b\u6cfc")
-        elif "\u8868\u8fbe\u504f\u6b63\u5f0f" in lower:
-            hints.append("\u56de\u590d\u8bed\u6c14\u7a0d\u6b63\u5f0f\uff0c\u907f\u514d\u8fc7\u591a\u7f51\u7edc\u7528\u8bed")
-        if "\u504f\u77ed\u53e5" in lower:
-            hints.append("\u56de\u590d\u5c3d\u91cf\u7b80\u77ed\u7cbe\u70bc")
-        elif "\u63cf\u8ff0\u504f\u8be6\u7ec6" in lower:
-            hints.append("\u53ef\u4ee5\u9002\u5f53\u5c55\u5f00\u56de\u590d")
-        if "\u6280\u672f" in lower:
-            hints.append("\u5bf9\u65b9\u53ef\u80fd\u61c2\u6280\u672f\uff0c\u53ef\u4ee5\u7528\u4e13\u4e1a\u672f\u8bed")
-        if "\u6e38\u620f" in lower:
-            hints.append("\u5bf9\u65b9\u662f\u6e38\u620f\u73a9\u5bb6\uff0c\u53ef\u4ee5\u804a\u6e38\u620f\u76f8\u5173\u8bdd\u9898")
-        if "\u52a8\u6f2b" in lower or "\u4e8c\u6b21\u5143" in lower:
-            hints.append("\u5bf9\u65b9\u559c\u6b22\u4e8c\u6b21\u5143\uff0c\u53ef\u4ee5\u7528\u76f8\u5173\u6897")
-        if "\u60c5\u7eea\u504f\u6d88\u6781" in lower or "\u60c5\u7eea\u504f\u7126\u8651" in lower:
-            hints.append("\u6ce8\u610f\u8bed\u6c14\u6e29\u548c\uff0c\u591a\u7ed9\u9f13\u52b1")
-        return "\uff1b".join(hints) if hints else ""
+        if "网络用语多" in lower:
+            hints.append("可以用网络梗和缩写回复，语气轻松活泼")
+        elif "表达偏正式" in lower:
+            hints.append("回复语气稍正式，避免过多网络用语")
+        if "偏短句" in lower:
+            hints.append("回复尽量简短精炼")
+        elif "描述偏详细" in lower:
+            hints.append("可以适当展开回复")
+        if "技术" in lower:
+            hints.append("对方可能懂技术，可以用专业术语")
+        if "游戏" in lower:
+            hints.append("对方是游戏玩家，可以聊游戏相关话题")
+        if "动漫" in lower or "二次元" in lower:
+            hints.append("对方喜欢二次元，可以用相关梗")
+        if "情绪偏消极" in lower or "情绪偏焦虑" in lower:
+            hints.append("注意语气温和，多给鼓励")
+        return "；".join(hints) if hints else ""
 
     # PLACEHOLDER_SANITIZE
 
@@ -337,7 +337,7 @@ class ThinkingEngine:
         if not content:
             return ""
         content = re.sub(
-            r"(?:QQ\u53f7|qq\u53f7|\u6d88\u606f\u6570|\u53d1\u8a00\u6570|\u53d1\u4e86\d+\u6761\u6d88\u606f|\u51cc\u6668\d+\u70b9(?:\u5de6\u53f3)?\u6d3b\u8dc3|\u6d3b\u8dc3\u65f6\u6bb5|\u4f5c\u606f\u89c4\u5f8b)[^\u3002\uff1b;\n]*[\u3002\uff1b;]?",
+            r"(?:QQ号|qq号|消息数|发言数|发了\d+条消息|凌晨\d+点(?:左右)?活跃|活跃时段|作息规律)[^。；;\n]*[。；;]?",
             "",
             content,
             flags=re.IGNORECASE,
@@ -359,14 +359,14 @@ class ThinkingEngine:
             return clip_text(search_summary, 220)
         if llm_failed:
             return normalize_text(
-                _pl.get_message("llm_error_fallback", "666 \u51fa\u95ee\u9898\u4e86\u54e5")
-            ) or "666 \u51fa\u95ee\u9898\u4e86\u54e5"
+                _pl.get_message("llm_error_fallback", "666 出问题了哥")
+            ) or "666 出问题了哥"
         if scene_tag == "conflict_mediation":
-            return "\u5148\u51b7\u9759\u4e00\u4e0b\uff0c\u628a\u5206\u6b67\u70b9\u8bf4\u6e05\u695a\uff0c\u6211\u5e2e\u4f60\u4eec\u62c6\u5f00\u770b\u3002"
+            return "先冷静一下，把分歧点说清楚，我帮你们拆开看。"
         if scene_tag == "emotion_support":
-            return "\u6211\u5728\uff0c\u4f60\u53ef\u4ee5\u5148\u8bf4\u6700\u5361\u4f60\u7684\u90a3\u4e00\u70b9\u3002"
+            return "我在，你可以先说最卡你的那一点。"
         if style == "short":
-            return "\u6211\u5728\uff0c\u4f60\u7ee7\u7eed\u8bf4\u3002"
+            return "我在，你继续说。"
         if style == "serious":
-            return "\u5148\u7ed9\u6211\u76ee\u6807\u3001\u73af\u5883\u548c\u62a5\u9519\u4fe1\u606f\uff0c\u6211\u6309\u6b65\u9aa4\u5e2e\u4f60\u5b9a\u4f4d\u3002"
-        return "\u6536\u5230\uff0c\u6211\u5728\u542c\u3002"
+            return "先给我目标、环境和报错信息，我按步骤帮你定位。"
+        return "收到，我在听。"

@@ -43,6 +43,20 @@ class WebuiAuthRegressionTests(unittest.TestCase):
             status_res = client.get("/api/webui/status")
             self.assertEqual(status_res.status_code, 503)
 
+    def test_auth_session_requires_auth(self) -> None:
+        with self._make_client() as client:
+            response = client.get("/api/webui/auth/session")
+        self.assertEqual(response.status_code, 401)
+
+    def test_auth_session_accepts_cookie_session(self) -> None:
+        with self._make_client() as client:
+            auth_res = client.post("/api/webui/auth", json={"token": "test-token"})
+            self.assertEqual(auth_res.status_code, 200)
+
+            session_res = client.get("/api/webui/auth/session")
+            self.assertEqual(session_res.status_code, 200)
+            self.assertEqual(session_res.json(), {"ok": True})
+
     def test_chat_media_query_token_no_longer_grants_access(self) -> None:
         with self._make_client() as client:
             response = client.get(

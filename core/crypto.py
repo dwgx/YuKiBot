@@ -24,6 +24,10 @@ _ENC_PREFIX = "ENC("
 _ENC_SUFFIX = ")"
 
 
+class DecryptionError(RuntimeError):
+    """ENC() 配置值无法解密。"""
+
+
 class SecretManager:
     """管理本地加密密钥，提供 encrypt / decrypt / 递归解密 config dict。"""
 
@@ -47,18 +51,29 @@ class SecretManager:
         if not self.is_encrypted(value):
             return value
         if not self._fernet:
-            _log.error("发现 ENC() 加密值但 cryptography 未安装，请 pip install cryptography")
-            return ""
+            msg = "发现 ENC() 加密值但 cryptography 未安装，请 pip install cryptography"
+            _log.error(msg)
+            raise DecryptionError(msg)
         inner = value[len(_ENC_PREFIX):-len(_ENC_SUFFIX)]
         # 新格式: inner 直接是 Fernet token (gAAAAA... 开头)
         # 旧格式: inner 是 base64(Fernet token)，需要先 decode 一层
-        for candidate in (inner.encode("ascii"), base64.urlsafe_b64decode(inner.encode("ascii"))):
+        candidates: list[bytes] = []
+        try:
+            candidates.append(inner.encode("ascii"))
+        except UnicodeEncodeError:
+            candidates = []
+        try:
+            candidates.append(base64.urlsafe_b64decode(inner.encode("ascii")))
+        except Exception:
+            pass
+        for candidate in candidates:
             try:
                 return self._fernet.decrypt(candidate).decode("utf-8")
             except (InvalidToken, Exception):
                 continue
-        _log.error("ENC() 解密失败: 新旧格式均无法解密")
-        return ""
+        msg = f"ENC() 解密失败，请检查密钥文件是否变更: {self._key_file}"
+        _log.error(msg)
+        raise DecryptionError(msg)
 
     @staticmethod
     def is_encrypted(value: object) -> bool:
@@ -87,6 +102,6 @@ class SecretManager:
         try:
             os.chmod(self._key_file, 0o600)
         except OSError:
-            pass
+            _log.warning("secret_key_permission_hardening_failed | path=%s", self._key_file)
         _log.info("已生成加密密钥: %s", self._key_file)
         return key

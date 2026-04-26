@@ -2,31 +2,36 @@ const BASE = "/api/webui";
 
 class ApiClient {
   private token = "";
-  private sessionReady = false;
 
   setToken(t: string) {
-    this.token = t;
-    this.sessionReady = false;
-    localStorage.setItem("webui_token", t);
+    this.token = String(t || "").trim();
   }
 
   getToken(): string {
-    if (!this.token) {
-      this.token = localStorage.getItem("webui_token") || "";
-    }
     return this.token;
   }
 
   clearToken() {
     this.token = "";
-    this.sessionReady = false;
-    localStorage.removeItem("webui_token");
+    try { sessionStorage.removeItem("webui_token"); } catch { /* ignore */ }
+    try { localStorage.removeItem("webui_token"); } catch { /* ignore */ }
+  }
+
+  async hasSession(): Promise<boolean> {
+    const res = await fetch(`${BASE}/auth/session`, {
+      credentials: "same-origin",
+    });
+    if (res.status === 401 || res.status === 403) return false;
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `HTTP ${res.status}`);
+    }
+    return true;
   }
 
   async ensureSessionCookie(): Promise<boolean> {
     const token = this.getToken().trim();
-    if (!token) return false;
-    if (this.sessionReady) return true;
+    if (!token) return this.hasSession();
     const res = await fetch(`${BASE}/auth`, {
       method: "POST",
       headers: {
@@ -44,13 +49,15 @@ class ApiClient {
       const text = await res.text();
       throw new Error(text || `HTTP ${res.status}`);
     }
-    this.sessionReady = true;
     return true;
   }
 
   private async fetchWithAuth(path: string, opts?: RequestInit): Promise<Response> {
     const headers = new Headers(opts?.headers || {});
-    headers.set("Authorization", `Bearer ${this.getToken()}`);
+    const token = this.getToken().trim();
+    if (token) {
+      headers.set("Authorization", `Bearer ${token}`);
+    }
     if (!(opts?.body instanceof FormData) && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
@@ -83,9 +90,17 @@ class ApiClient {
   }
 
   auth(token: string) {
-    return this.request<{ ok: boolean }>("/auth", {
+    return fetch(`${BASE}/auth`, {
       method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "same-origin",
       body: JSON.stringify({ token }),
+    }).then(async (res) => {
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `HTTP ${res.status}`);
+      }
+      return res.json() as Promise<{ ok: boolean }>;
     });
   }
 
@@ -93,9 +108,6 @@ class ApiClient {
     try {
       await fetch(`${BASE}/auth/logout`, {
         method: "POST",
-        headers: this.getToken()
-          ? { Authorization: `Bearer ${this.getToken()}` }
-          : undefined,
         credentials: "same-origin",
       });
     } finally {

@@ -16,6 +16,9 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
 
         def has_tool(self, name: str) -> bool:
             return name in self._names
+            
+        def get_schemas_for_native_tools(self, tool_names: list[str]) -> list[dict]:
+            return [{"type": "function", "function": {"name": n, "description": "", "parameters": {"type": "object", "properties": {}}}} for n in tool_names]
 
     class _SequencedModelClient:
         def __init__(self, responses: list[str]):
@@ -28,6 +31,41 @@ class ToolCallLeakRegressionTests(unittest.TestCase):
             if not self._responses:
                 raise AssertionError("No more model responses prepared for test")
             return self._responses.pop(0)
+
+        async def chat_completion_with_retry(self, messages, max_tokens=0, tools=None, retries=0, backoff=0.0):
+            _ = (messages, max_tokens, tools, retries, backoff)
+            if not self._responses:
+                raise AssertionError("No more model responses prepared for test")
+            resp = self._responses.pop(0)
+            
+            try:
+                import json
+                parsed = json.loads(resp)
+                return {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": parsed.get("tool", "unknown"),
+                                    "arguments": json.dumps(parsed.get("args", {}))
+                                }
+                            }]
+                        }
+                    }]
+                }
+            except:
+                return {
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": resp
+                        }
+                    }]
+                }
 
     class _RunnableRegistry(_StubRegistry):
         def __init__(self, names: set[str]):

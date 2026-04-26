@@ -383,6 +383,7 @@ class ImageProviderAdapterRegressionTests(unittest.TestCase):
                 with TestClient(app) as client:
                     response = client.post(
                         "/api/webui/setup/test-image-gen",
+                        headers={support._SETUP_AUTH_HEADER: support._setup_access_token},
                         json={
                             "provider": "gemini",
                             "model": "gemini-2.5-flash-image",

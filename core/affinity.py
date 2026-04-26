@@ -37,6 +37,7 @@ class UserAffinity:
     # ── Phase 5: 用户情感记忆 ──
     last_emotion: str = ""          # 上次对话中用户的情绪
     special_dates: list[str] = field(default_factory=list)  # 用户提到的重要日期
+    last_decay_date: str = ""       # YYYY-MM-DD
 
     @property
     def level_name(self) -> str:
@@ -94,6 +95,9 @@ class AffinityEngine:
         self._dir.mkdir(parents=True, exist_ok=True)
         self._users: dict[str, UserAffinity] = {}
         self._mood = BotMood()
+        import time
+        self._last_flush = time.monotonic()
+        self._dirty = False
         self._load()
 
     # ── 持久化 ──
@@ -122,6 +126,17 @@ class AffinityEngine:
                 _log.warning("mood_load_error", exc_info=True)
 
     def save(self) -> None:
+        self._dirty = True
+        import time
+        if time.monotonic() - self._last_flush > 180.0:
+            self.flush()
+
+    def flush(self) -> None:
+        if not getattr(self, "_dirty", False):
+            return
+        import time
+        self._last_flush = time.monotonic()
+        self._dirty = False
         try:
             users_file = self._dir / "users.json"
             users_file.write_text(
@@ -137,6 +152,7 @@ class AffinityEngine:
                 encoding="utf-8",
             )
         except Exception:
+            self._dirty = True # restore dirty flag if save fails
             _log.warning("affinity_save_error", exc_info=True)
 
     # ── 好感度操作 ──
@@ -299,22 +315,26 @@ class AffinityEngine:
     def decay_inactive_users(self) -> int:
         """衰减不活跃用户的好感度，返回衰减的用户数。"""
         now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
         count = 0
         for uid, user in self._users.items():
             if not user.last_interaction:
+                continue
+            if getattr(user, "last_decay_date", "") == today:
                 continue
             try:
                 last = datetime.fromisoformat(user.last_interaction)
                 days_inactive = (now - last).days
                 if days_inactive >= 3:
-                    decay = self._DECAY_PER_DAY * min(days_inactive, 30)
+                    decay = self._DECAY_PER_DAY
                     if user.affinity > 10:
                         user.affinity = max(10.0, user.affinity - decay)
                         user.level = self._calc_level(user.affinity)
+                        user.last_decay_date = today
                         count += 1
             except Exception:
                 _log.warning("affinity_decay_parse_error | user=%s", uid, exc_info=True)
                 continue
         if count > 0:
-            self.save()
+            self.flush()
         return count

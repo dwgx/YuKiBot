@@ -27,6 +27,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             default_env_key=default_env_key,
         )
         self.prefer_v1 = bool(config.get("prefer_v1", prefer_v1))
+        self.supports_native_tools = True
         # NEWAPI/Codex 等部分代理在非 stream 下兼容性较差，默认开启流式聚合。
         self.stream_chat_completions = self._as_bool(
             config.get("stream_chat_completions", config.get("stream", provider == "newapi"))
@@ -67,6 +68,8 @@ class OpenAICompatibleClient(BaseLLMClient):
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
         model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not self.enabled:
             raise RuntimeError(f"缺少密钥，请配置 {self.default_env_key}")
@@ -81,7 +84,16 @@ class OpenAICompatibleClient(BaseLLMClient):
         }
         if response_format:
             payload["response_format"] = response_format
-        if self.stream_chat_completions:
+        if tools is not None:
+            payload["tools"] = tools
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+        
+        stream_enabled = self.stream_chat_completions
+        if tools is not None:
+            stream_enabled = False
+            
+        if stream_enabled:
             payload["stream"] = True
 
         headers = {
@@ -98,14 +110,12 @@ class OpenAICompatibleClient(BaseLLMClient):
                     model_name=model_name,
                 )
             except Exception as exc:
-                # responses 返回为空时总是回退到 chat/completions（常见于 SkiAPI 等代理）
                 is_empty = "返回为空" in str(exc)
                 if not is_empty and not self.allow_response_fallback_to_chat:
                     raise
                 if not is_empty and not self._is_responses_fallback_worthy(exc):
                     raise
 
-        stream_enabled = self.stream_chat_completions
         try:
             data = await self._post_with_base_candidates(
                 endpoint="/chat/completions",

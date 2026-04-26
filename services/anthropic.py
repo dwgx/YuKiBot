@@ -26,8 +26,10 @@ class AnthropicClient(BaseLLMClient):
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
         model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        _ = response_format
+        _ = (response_format, tools, tool_choice)
         if not self.enabled:
             raise RuntimeError("缺少密钥，请配置 ANTHROPIC_API_KEY")
 

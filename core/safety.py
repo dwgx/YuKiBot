@@ -397,6 +397,10 @@ class SafetyEngine:
 
     def _record_violation(self, key: str, now: datetime) -> int:
         # 滑动窗口：只统计最近 60 分钟内的违规次数
+        if len(self._user_violation_timestamps) > 5000:
+            self._user_violation_timestamps.clear()
+            self._user_cooldown_until.clear()
+            
         timestamps = self._user_violation_timestamps.setdefault(key, [])
         cutoff = now - self._violation_window
         # 清理窗口外的旧记录

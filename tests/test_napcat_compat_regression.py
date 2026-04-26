@@ -100,16 +100,17 @@ class NapCatCompatRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["kwargs"], {"group_id": "123456"})
 
     async def test_webui_calls_and_diagnostics_use_napcat_compat_layer(self) -> None:
-        original_get_runtime = webui._get_onebot_runtime
-        original_engine = webui._engine
+        import core.webui_chat_helpers as chat_helpers
+        original_get_runtime = chat_helpers._get_onebot_runtime
+        original_engine = chat_helpers._engine
         bot = _StubBot()
 
         async def fake_get_runtime(bot_id: str = ""):
             self.assertEqual(bot_id, "bot-a")
             return bot
 
-        webui._get_onebot_runtime = fake_get_runtime
-        webui._engine = SimpleNamespace(
+        chat_helpers._get_onebot_runtime = fake_get_runtime
+        chat_helpers._engine = SimpleNamespace(
             agent_tool_registry=SimpleNamespace(
                 _schemas={
                     "send_private_msg": SimpleNamespace(category="napcat"),
@@ -119,16 +120,16 @@ class NapCatCompatRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         try:
-            send_result = await webui._onebot_call(
+            send_result = await chat_helpers._onebot_call(
                 "send_private_msg",
                 bot_id="bot-a",
                 user_id=778899,
                 message="hello",
             )
-            diagnostics = await webui._collect_napcat_status(bot_id="bot-a")
+            diagnostics = await chat_helpers._collect_napcat_status(bot_id="bot-a")
         finally:
-            webui._get_onebot_runtime = original_get_runtime
-            webui._engine = original_engine
+            chat_helpers._get_onebot_runtime = original_get_runtime
+            chat_helpers._engine = original_engine
 
         self.assertEqual(send_result, {"message_id": "10001"})
         self.assertEqual(bot.calls[0][0], "send_private_msg")

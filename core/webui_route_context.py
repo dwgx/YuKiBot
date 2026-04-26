@@ -19,6 +19,7 @@ class WebUIRouteContext:
     count_registered_napcat_tools: Callable[[], int]
     collect_napcat_status: Callable[[str], Awaitable[dict[str, Any]]]
     resolve_log_file_path: Callable[[], Path]
+    resolve_auth_attempt_store_path: Callable[[], Path]
     read_log_tail: Callable[[Path, int], list[str]]
     split_log_chunks: Callable[[str], list[str]]
     cookie_capabilities_payload: Callable[[], dict[str, Any]]

@@ -1,0 +1,44 @@
+[project]
+name = "yukiko-bot"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+# 只检查新拆分的模块文件，逐步扩大
+src = ["core", "utils", "services", "plugins", "tests"]
+
+[tool.ruff.lint]
+# 宽松起步：只开启最关键的规则
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "W",    # pycodestyle warnings
+    "I",    # isort
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",   # line too long — 暂时不管
+    "E402",   # module level import not at top — re-export hub 需要
+    "F401",   # imported but unused — re-export hub 需要
+    "E741",   # ambiguous variable name (e, l, etc.)
+    "W291",   # trailing whitespace — 量太大，等 format 修
+    "W293",   # whitespace before ':'
+    "E303",   # too many blank lines — engine.py 双倍空行
+    "E302",   # expected 2 blank lines
+    "E301",   # expected 1 blank line
+    "E711",   # comparison to None
+    "E712",   # comparison to True
+]
+
+[tool.ruff.lint.per-file-ignores]
+"core/agent_tools.py" = ["F401", "E402"]
+"core/engine.py" = ["F401", "E402", "E303"]
+"app_helpers.py" = ["F821"]  # runtime-resolved via `from app_helpers import *` in app.py
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

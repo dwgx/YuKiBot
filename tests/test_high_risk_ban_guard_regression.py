@@ -111,7 +111,7 @@ class GroupBanTargetGuardRegressionTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "ok", "retcode": 0, "data": {}}
 
         with patch(
-            "core.agent_tools._verify_group_ban_applied",
+            "core.agent_tools_napcat._verify_group_ban_applied",
             return_value=(True, {"shut_up_timestamp": 9999999999}),
         ):
             result = await _handle_set_group_ban(
@@ -183,7 +183,7 @@ class GroupBanTargetGuardRegressionTests(unittest.IsolatedAsyncioTestCase):
             return {"status": "ok", "retcode": 0, "data": {}}
 
         with patch(
-            "core.agent_tools._verify_group_ban_applied",
+            "core.agent_tools_napcat._verify_group_ban_applied",
             return_value=(True, {"shut_up_timestamp": 9999999999}),
         ):
             result = await _handle_set_group_ban(
@@ -240,7 +240,7 @@ class GroupBanTargetGuardRegressionTests(unittest.IsolatedAsyncioTestCase):
             calls.append((api, dict(kwargs)))
             return {"status": "ok", "retcode": 0, "data": {}}
 
-        with patch("core.agent_tools._verify_group_ban_applied", return_value=(False, {})):
+        with patch("core.agent_tools_napcat._verify_group_ban_applied", return_value=(False, {})):
             result = await _handle_set_group_ban(
                 {"group_id": 1075046273, "user_id": 3862205188, "duration": 60},
                 {

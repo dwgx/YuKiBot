@@ -10,6 +10,7 @@ Agent 接收用户消息后，进入 think → act → observe 循环：
 from __future__ import annotations
 
 import asyncio
+import copy
 from datetime import datetime
 import json
 import logging
@@ -42,7 +43,8 @@ _RE_URL_SCHEME = re.compile(r"https?://")
 _RE_IMAGE_EXT = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?:\?|$)")
 _RE_VIDEO_EXT = re.compile(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)")
 _RE_QQ_NUMBER = re.compile(r"(?<!\d)([1-9]\d{5,11})(?!\d)")
-_RE_PUNCTUATION_CJK = re.compile(r"[，。,.!?！？:：;；\[\]()（）\"'`]+")
+# 弱模型防护用的宽范围 CJK 标点匹配（见下方 L59）
+# 注意: 旧的窄范围定义已移除，统一使用下方宽范围版本
 _RE_SLASH_IMAGE = re.compile(r"(?:^|\s)/image(?:\s|$)")
 _RE_SLASH_VIDEO = re.compile(r"(?:^|\s)/(?:video|vid)(?:\s|$)")
 _RE_DOWNLOAD_EXT = re.compile(r"\.(apk|exe|msi|zip|7z|rar|ipa|dmg)(?:\?|#|$)")
@@ -55,6 +57,11 @@ _RE_FINAL_ANSWER_KEY = re.compile(r'"(?:tool|name)"\s*:\s*"final_answer"')
 _RE_TEXT_KEY = re.compile(r'"text"\s*:\s*"')
 _RE_ASCII_LETTER = re.compile(r"[A-Za-z]")
 _RE_CJK_CHAR = re.compile(r"[\u4e00-\u9fff]")
+# 弱模型防护: 匹配所有标点/符号/空白 (用于检测纯标点垃圾)
+_RE_PUNCTUATION_CJK = re.compile(
+    r"[\s\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65"
+    r"\u2000-\u206f\u2e00-\u2e7f!-/:-@\[-`{-~。，、；：？！…—·''""〈〉《》「」『』【】〔〕〖〗]+"
+)
 
 
 @dataclass(slots=True)
@@ -92,6 +99,7 @@ class AgentContext:
     trace_id: str = ""
     memory_context: list[str] = field(default_factory=list)
     related_memories: list[str] = field(default_factory=list)
+    native_tools: list[str] = field(default_factory=list)
     user_profile_summary: str = ""
     preferred_name: str = ""
     recent_speakers: list[tuple[str, str, str]] = field(default_factory=list)
@@ -171,8 +179,8 @@ class AgentLoop:
             "search_download_resources",
             "douyin_search",
             "scrape_extract",
-            "extract_structured",
-            "extract_links_and_content",
+            "scrape_structured",
+            "scrape_follow_links",
         }
     )
     _FALLBACK_RAW_DISPLAY_SKIP_TOOLS = frozenset(
@@ -180,8 +188,7 @@ class AgentLoop:
             "scrape_extract",
             "scrape_summarize",
             "scrape_structured",
-            "extract_structured",
-            "extract_links_and_content",
+            "scrape_follow_links",
             "fetch_webpage",
         }
     )
@@ -190,8 +197,7 @@ class AgentLoop:
             "scrape_extract",
             "scrape_summarize",
             "scrape_structured",
-            "extract_structured",
-            "extract_links_and_content",
+            "scrape_follow_links",
         }
     )
 
@@ -754,7 +760,7 @@ class AgentLoop:
         prompt, confirm_token, cancel_token = self._build_high_risk_confirm_prompt(
             tool_name, tool_args
         )
-        import copy
+
 
         self._pending_high_risk_actions[key] = {
             "tool_name": tool_name,
@@ -774,9 +780,13 @@ class AgentLoop:
         steps: list[dict[str, Any]] = []
         forced_media_tool = self._select_forced_media_tool(ctx)
         force_tool_first = self._should_force_tool_first(ctx)
+        model_client = getattr(self, "model_client", None)
+        native_tool_calling = bool(
+            getattr(model_client, "supports_native_tool_calling", lambda: False)()
+        )
 
         system_prompt = self._build_system_prompt(ctx)
-        messages: list[dict[str, str]] = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": self._build_user_message(ctx)},
         ]
@@ -786,6 +796,7 @@ class AgentLoop:
         successful_external_fact_tools = 0
         seen_external_fact_signatures: set[str] = set()
         repeated_tool_counts: dict[str, int] = {}
+        consecutive_tool_errors: dict[str, int] = {}
         consecutive_think_count = 0
         # 追踪工具已发送的媒体（避免 final_answer 重复发送）
         tool_sent_media: set[str] = set()
@@ -816,19 +827,37 @@ class AgentLoop:
             llm_budget = float(self.llm_step_timeout_seconds)
             if tool_calls_made > 0:
                 llm_budget = max(
-                    llm_budget, float(self.llm_step_timeout_seconds_after_tool)
-                )
+                llm_budget, float(self.llm_step_timeout_seconds_after_tool)
+            )
             llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
-            try:
-                raw_response = await asyncio.wait_for(
-                    self.model_client.chat_text_with_retry(
-                        messages,
-                        max_tokens=self.max_tokens,
-                        retries=1,
-                        backoff=1.0,
-                    ),
-                    timeout=llm_timeout,
+            schemas: list[dict[str, Any]] = []
+            if native_tool_calling and ctx.native_tools:
+                schemas = self.tool_registry.get_schemas_for_native_tools(
+                    ctx.native_tools
                 )
+
+            try:
+                if native_tool_calling:
+                    raw_response = await asyncio.wait_for(
+                        self.model_client.chat_completion_with_retry(
+                            messages,
+                            max_tokens=self.max_tokens,
+                            tools=schemas if schemas else None,
+                            retries=1,
+                            backoff=1.0,
+                        ),
+                        timeout=llm_timeout,
+                    )
+                else:
+                    raw_response = await asyncio.wait_for(
+                        self.model_client.chat_text_with_retry(
+                            messages,
+                            max_tokens=self.max_tokens,
+                            retries=1,
+                            backoff=1.0,
+                        ),
+                        timeout=llm_timeout,
+                    )
             except asyncio.TimeoutError:
                 _log.warning(
                     "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs",
@@ -900,14 +929,60 @@ class AgentLoop:
                     total_time_ms=self._elapsed(t0),
                 )
 
-            response_text = normalize_text(raw_response)
-            if not response_text:
-                break
+            assistant_msg: dict[str, Any] = {}
+            response_text = ""
+            parsed = None
+            if native_tool_calling:
+                assistant_msg = (
+                    raw_response.get("choices", [{}])[0].get("message", {})
+                    if isinstance(raw_response, dict)
+                    else {}
+                )
+                response_text = normalize_text(assistant_msg.get("content", ""))
+                tool_calls = assistant_msg.get("tool_calls", [])
+                if tool_calls:
+                    for tc in tool_calls:
+                        if tc.get("type") == "function":
+                            func = tc.get("function", {})
+                            try:
+                                args = json.loads(func.get("arguments", "{}"))
+                            except (json.JSONDecodeError, TypeError, ValueError):
+                                args = {}
+                            parsed = {
+                                "tool": func.get("name"),
+                                "args": args,
+                                "id": tc.get("id"),
+                            }
+                            # 仅处理第一个 tool_call，后续的被丢弃（记录日志）
+                            remaining_tcs = [
+                                t for t in tool_calls
+                                if t.get("type") == "function" and t is not tc
+                            ]
+                            if remaining_tcs:
+                                _log.info(
+                                    "agent_dropped_parallel_tool_calls | trace=%s | step=%d | dropped=%d | names=%s",
+                                    ctx.trace_id,
+                                    step_idx,
+                                    len(remaining_tcs),
+                                    ",".join(
+                                        str(t.get("function", {}).get("name", "?"))
+                                        for t in remaining_tcs[:3]
+                                    ),
+                                )
+                            break
 
-            # 解析 LLM 输出: 期望 JSON tool_call 或纯文本回复
-            parsed = self._parse_llm_output(response_text)
-
+                if parsed is None:
+                    # Fallback to parse text just in case model ignores native tools
+                    parsed = self._parse_llm_output(response_text)
+            else:
+                response_text = normalize_text(raw_response)
+                if not response_text:
+                    break
+                parsed = self._parse_llm_output(response_text)
+                
             if parsed is None:
+                if not response_text:
+                    break
                 # 无法解析为 tool_call
                 # 安全检查：如果内容看起来像 JSON，不要当作回复发出去
                 if response_text.strip().startswith("{"):
@@ -931,22 +1006,11 @@ class AgentLoop:
                             "error": "tool_required_before_direct_reply",
                         }
                     )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": "policy_guard",
                                         "ok": False,
                                         "error": "这是工具型请求，不能直接自然语言作答，必须先调用最合适的工具。",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     continue
                 _log.info(
                     "agent_direct_reply | trace=%s | step=%d", ctx.trace_id, step_idx
@@ -1019,23 +1083,12 @@ class AgentLoop:
                         total_time_ms=self._elapsed(t0),
                         steps=steps,
                     )
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tool_result": {
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": tool_name,
                                     "ok": False,
                                     "error": f"工具 {tool_name} 缺少必填参数: {miss_text}",
                                     "display": f"{tool_name} 缺少参数({miss_text})，请补全后重试。",
-                                }
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
+                                })
                 continue
 
             # final_answer 特殊处理 — 直接返回
@@ -1094,22 +1147,11 @@ class AgentLoop:
                             "error": "invalid_media_url_placeholder",
                         }
                     )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": "policy_guard",
                                         "ok": False,
                                         "error": "final_answer 里出现了占位媒体链接（如 example.com）。请先调用工具获取真实 URL 再 final_answer。",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     continue
                 media_candidates = [
                     normalize_text(url)
@@ -1172,22 +1214,15 @@ class AgentLoop:
                                     "error": "media_url_not_from_tool_chain",
                                 }
                             )
-                            messages.append(
-                                {"role": "assistant", "content": response_text}
-                            )
-                            messages.append(
+                            self._append_tool_result(
+                                messages,
+                                parsed,
+                                assistant_msg,
+                                response_text,
                                 {
-                                    "role": "user",
-                                    "content": json.dumps(
-                                        {
-                                            "tool_result": {
-                                                "tool": "policy_guard",
-                                                "ok": False,
-                                                "error": "final_answer 的媒体链接必须来自本轮工具结果或用户原始消息。请先调用工具获取真实可发送链接，再 final_answer。",
-                                            }
-                                        },
-                                        ensure_ascii=False,
-                                    ),
+                                    "tool": "policy_guard",
+                                    "ok": False,
+                                    "error": "final_answer 的媒体链接必须来自本轮工具结果或用户原始消息。请先调用工具获取真实可发送链接，再 final_answer。",
                                 }
                             )
                             continue
@@ -1223,22 +1258,11 @@ class AgentLoop:
                             "error": "tool_required_before_final",
                         }
                     )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": "policy_guard",
                                         "ok": False,
                                         "error": "这是工具型请求，必须先调用最合适的工具，再输出 final_answer。",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     continue
                 # 某些模型会把真正的工具调用 JSON 包在 final_answer.text 里，尝试恢复。
                 recovered = None
@@ -1411,22 +1435,11 @@ class AgentLoop:
                             total_time_ms=self._elapsed(t0),
                             steps=steps,
                         )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": "think",
                                         "ok": False,
                                         "error": "think 连续过多，请直接调用具体工具或 final_answer。",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     continue
                 thought = str(tool_args.get("thought", ""))
                 steps.append(
@@ -1436,24 +1449,13 @@ class AgentLoop:
                         "thought": clip_text(thought, 200),
                     }
                 )
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tool_result": {
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": "think",
                                     "ok": True,
                                     "display": _pl.get_message(
                                         "think_done", "思考完成，请继续"
                                     ),
-                                }
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
+                                })
                 continue
             else:
                 consecutive_think_count = 0
@@ -1464,22 +1466,11 @@ class AgentLoop:
                 steps.append(
                     {"step": step_idx, "tool": tool_name, "blocked": "need_super_admin"}
                 )
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tool_result": {
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": tool_name,
                                     "ok": False,
                                     "error": "权限不足，该操作仅超级管理员可执行",
-                                }
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
+                                })
                 continue
             if tool_name in self._group_admin_tools and perm_level not in (
                 "super_admin",
@@ -1489,22 +1480,11 @@ class AgentLoop:
                     steps.append(
                         {"step": step_idx, "tool": tool_name, "blocked": "need_group_admin"}
                     )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": tool_name,
                                         "ok": False,
                                         "error": "权限不足，该操作需要群管理员或超级管理员权限",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     continue
             if (
                 tool_name in self._group_admin_tools
@@ -1517,22 +1497,11 @@ class AgentLoop:
                         "blocked": "explicit_bot_address_required",
                     }
                 )
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tool_result": {
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": tool_name,
                                     "ok": False,
                                     "error": "执行群管理操作前，需要明确点名机器人（@我或直接叫YUKI）",
-                                }
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
+                                })
                 continue
 
             # 检查工具是否存在
@@ -1540,22 +1509,11 @@ class AgentLoop:
                 steps.append(
                     {"step": step_idx, "tool": tool_name, "error": "unknown_tool"}
                 )
-                messages.append({"role": "assistant", "content": response_text})
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "tool_result": {
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                     "tool": tool_name,
                                     "ok": False,
                                     "error": f"工具 {tool_name} 不存在，请检查工具名",
-                                }
-                            },
-                            ensure_ascii=False,
-                        ),
-                    }
-                )
+                                })
                 continue
 
             high_risk_guard_reply = self._guard_high_risk_tool_call(
@@ -1597,22 +1555,11 @@ class AgentLoop:
                             "error": f"repeated_tool_call:{repeat_count}",
                         }
                     )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": tool_name,
                                         "ok": False,
                                         "error": "同一工具和参数重复过多，请换工具策略或直接 final_answer。",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     if repeat_count >= self.max_same_tool_call + 2:
                         return await self._build_fallback_result(
                             ctx, steps, tool_calls_made, t0, "repeated_tool_call"
@@ -1631,23 +1578,29 @@ class AgentLoop:
                             "error": "duplicate_external_fact_query",
                         }
                     )
-                    messages.append({"role": "assistant", "content": response_text})
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": json.dumps(
-                                {
-                                    "tool_result": {
+                    self._append_tool_result(messages, parsed, assistant_msg, response_text, {
                                         "tool": tool_name,
                                         "ok": False,
                                         "error": "这个外部查询之前已经成功执行过，请基于已有结果继续。",
-                                    }
-                                },
-                                ensure_ascii=False,
-                            ),
-                        }
-                    )
+                                    })
                     continue
+
+            # 致命级循环拦截：如果某个工具连续抛错超过 2 次，强行熔断
+            if consecutive_tool_errors.get(tool_name, 0) >= 2:
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": tool_name,
+                        "ok": False,
+                        "error": "consecutive_crashes_guard",
+                    }
+                )
+                self._append_tool_result(messages, parsed, assistant_msg, response_text, {
+                    "tool": tool_name,
+                    "ok": False,
+                    "error": "该工具已连续崩溃或报错，底层拒绝执行。请立即挂起或切换其他工具策略，禁止再次调用！",
+                })
+                continue
 
             # 执行工具
             tool_context = self._build_tool_context(ctx, perm_level)
@@ -1676,11 +1629,9 @@ class AgentLoop:
                     "agent_tool_timeout | trace=%s | step=%d | tool=%s | timeout=%.1fs",
                     ctx.trace_id, step_idx, tool_name, tool_timeout,
                 )
-                # 工具超时不消耗步骤预算（有免费额度时回退 step_idx）
+                # 工具超时同样消耗步骤预算，防止在失败工具上无限重试
                 if _tool_timeout_free_budget > 0:
                     _tool_timeout_free_budget -= 1
-                    if step_idx > 0:
-                        step_idx -= 1
             tool_calls_made += 1
             if not result.display and result.error:
                 result.display = f"{tool_name} 失败: {result.error}"
@@ -1732,6 +1683,11 @@ class AgentLoop:
             if result.ok and ext_sig:
                 seen_external_fact_signatures.add(ext_sig)
                 successful_external_fact_tools += 1
+
+            if result.ok:
+                consecutive_tool_errors[result_tool_name] = 0
+            else:
+                consecutive_tool_errors[result_tool_name] = consecutive_tool_errors.get(result_tool_name, 0) + 1
 
             # 记录 side-effect 发送工具已发送的媒体 URL
             if result.ok and result_tool_name in self._SIDE_EFFECT_SEND_TOOLS:
@@ -1786,7 +1742,6 @@ class AgentLoop:
             if compact_data:
                 tool_result_msg["tool_result"]["data"] = compact_data
 
-            messages.append({"role": "assistant", "content": response_text})
             # 终端工具完成后，强制 LLM 直接 final_answer，不再调用其他工具
             if result.ok and result_tool_name in self._TERMINAL_TOOLS:
                 tool_result_msg["tool_result"]["hint"] = (
@@ -1797,11 +1752,13 @@ class AgentLoop:
                     "agent_terminal_tool_hint | trace=%s | step=%d | tool=%s",
                     ctx.trace_id, step_idx, result_tool_name,
                 )
-            messages.append(
-                {
-                    "role": "user",
-                    "content": json.dumps(tool_result_msg, ensure_ascii=False),
-                }
+                
+            self._append_tool_result(
+                messages,
+                parsed,
+                assistant_msg,
+                response_text,
+                tool_result_msg["tool_result"]
             )
 
         # 达到 max_steps，用最后的信息兜底
@@ -1885,11 +1842,24 @@ class AgentLoop:
         template = _pl.get_dict("agent")
 
         identity_text = template.get("identity", "")
-        output_format_text = template.get("output_format", "")
         rules_text = template.get("rules", "")
-        # 兼容旧 key: reply_style/tool_usage/tool_priority/network_flow 已合并到 rules/tools
         reply_style_text = template.get("reply_style", "")
-        tools_text = template.get("tools", "") or template.get("tool_usage", "")
+        model_client = getattr(self, "model_client", None)
+        native_tool_calling = bool(
+            getattr(model_client, "supports_native_tool_calling", lambda: False)()
+        )
+        if native_tool_calling:
+            output_format_text = (
+                "你可以直接回复自然语言与用户交互。\n"
+                "当你需要执行特定操作（如搜索、发图、控制群等）时，请调用注入的 tools (函数调用)。\n"
+                "可以按需多次调用工具，直到获得足够信息后再给出最终自然语言回复。"
+            )
+            tools_text = (
+                "可用工具已经通过 function call 机制传入，无需输出 JSON，直接调用对应函数即可。"
+            )
+        else:
+            output_format_text = template.get("output_format", "")
+            tools_text = template.get("tools", "") or template.get("tool_usage", "")
         tool_priority_text = template.get("tool_priority", "")
         context_rules_text = template.get("context_rules", "")
         network_flow_text = template.get("network_flow", "")
@@ -1900,10 +1870,12 @@ class AgentLoop:
             ctx.message_text,
             perm_level,
         )
-        tool_docs = self.tool_registry.get_schemas_for_prompt_filtered(selected_tools)
-        total_tools = self.tool_registry.tool_count
-        if len(selected_tools) < total_tools:
-            tool_docs += f"\n\n(已根据意图筛选 {len(selected_tools)}/{total_tools} 个工具，如需其他工具请说明)"
+        ctx.native_tools = selected_tools
+        tool_docs = (
+            ""
+            if native_tool_calling
+            else self.tool_registry.get_schemas_for_prompt_filtered(selected_tools)
+        )
         tool_hints_map = _pl.get_dict("tool_hints")
         selected_tool_hints: list[str] = []
         if tool_hints_map and selected_tools:
@@ -2289,7 +2261,7 @@ class AgentLoop:
             return f"[本轮主要对象: {target_name}(QQ:{target_uid}) | 来源: {source}]"
         return f"[本轮主要对象: {target_name} | 来源: {source}]"
 
-    def _build_user_message(self, ctx: AgentContext) -> str:
+    def _build_user_message(self, ctx: AgentContext) -> str | list[dict[str, Any]]:
         """构建用户消息。"""
         runtime_templates = _pl.get_dict("agent_runtime")
         rebuilt_query = self._rebuild_query_with_context(ctx.message_text, ctx)
@@ -2606,7 +2578,49 @@ class AgentLoop:
                 )
                 if normalize_text(line):
                     parts.append(line)
-        return "\n".join(parts)
+        
+        text_content = "\n".join(parts)
+        
+        config_obj = getattr(self, "config", None)
+        agent_cfg = config_obj.get("agent", {}) if isinstance(config_obj, dict) else {}
+        vision_enabled = False
+        if isinstance(agent_cfg, dict):
+            vision_enabled = bool(agent_cfg.get("vision_enabled", False))
+            
+        if vision_enabled:
+            vision_blocks: list[dict[str, Any]] = []
+            
+            # Extract images from ctx.raw_segments
+            for seg in (ctx.raw_segments or []):
+                if isinstance(seg, dict) and seg.get("type") == "image":
+                    url = (seg.get("data") or {}).get("url", "")
+                    if url and url.startswith("http"):
+                        vision_blocks.append({"type": "image_url", "image_url": {"url": url}})
+                        
+            # Extract images from ctx.reply_media_segments
+            for seg in (ctx.reply_media_segments or []):
+                if isinstance(seg, dict) and seg.get("type") == "image":
+                    url = (seg.get("data") or {}).get("url", "")
+                    if url and url.startswith("http"):
+                        vision_blocks.append({"type": "image_url", "image_url": {"url": url}})
+            
+            # Deduplicate and limit to max 4 images
+            seen_urls = set()
+            unique_blocks = []
+            for block in vision_blocks:
+                url = block["image_url"]["url"]
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    unique_blocks.append(block)
+                    if len(unique_blocks) >= 4:
+                        break
+                        
+            if unique_blocks:
+                final_content: list[dict[str, Any]] = [{"type": "text", "text": text_content}]
+                final_content.extend(unique_blocks)
+                return final_content
+
+        return text_content
 
     @staticmethod
     def _has_animated_image_summary(rows: list[str] | None) -> bool:
@@ -3275,8 +3289,9 @@ class AgentLoop:
             "smart_download",
             "analyze_image",
             "scrape_extract",
-            "extract_structured",
-            "extract_links_and_content",
+            "scrape_summarize",
+            "scrape_structured",
+            "scrape_follow_links",
             "music_play",
             "music_play_by_id",
             "bilibili_audio_extract",
@@ -3981,6 +3996,61 @@ class AgentLoop:
             cue in content for cue in action_cues
         )
 
+
+    def _append_tool_result(
+        self,
+        messages: list[dict[str, Any]],
+        parsed: dict[str, Any] | None,
+        assistant_msg: dict[str, Any],
+        response_text: str,
+        tool_result: dict[str, Any],
+    ) -> None:
+        # 安全截断，避免返回数据撑爆 Context Window
+        safe_result = dict(tool_result)
+        if "display" in safe_result and isinstance(safe_result["display"], str):
+            display_text = safe_result["display"]
+            # 针对爬虫等重型数据返回放宽截断限制
+            max_len = 12000 if "scrape" in str(safe_result.get("tool", "")) else 3000
+            if len(display_text) > max_len:
+                safe_result["display"] = display_text[:max_len] + f"\n\n...[已强制截断 {len(display_text) - max_len} 字符，防止 Token 超限]"
+        if "error" in safe_result and isinstance(safe_result["error"], str):
+            error_text = safe_result["error"]
+            if len(error_text) > 1000:
+                safe_result["error"] = error_text[:1000] + "...[错误信息过长已截断]"
+        if parsed and "id" in parsed:
+            if not messages or messages[-1] is not assistant_msg:
+                messages.append(assistant_msg)
+            
+            # Handle the primary parsed tool call
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": parsed["id"],
+                    "content": json.dumps({"tool_result": safe_result}, ensure_ascii=False),
+                }
+            )
+            
+            # Handle any extra ignored tool calls to satisfy OpenAI API requirement
+            tool_calls = assistant_msg.get("tool_calls", [])
+            for tc in tool_calls:
+                tc_id = tc.get("id")
+                if tc_id and tc_id != parsed["id"]:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": tc_id,
+                            "content": json.dumps({"error": "ignored_extra_tool_call"}, ensure_ascii=False),
+                        }
+                    )
+        else:
+            messages.append({"role": "assistant", "content": response_text})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": json.dumps({"tool_result": safe_result}, ensure_ascii=False),
+                }
+            )
+
     def _parse_llm_output(self, text: str) -> dict[str, Any] | None:
         """解析 LLM 输出为 tool_call dict，失败返回 None。"""
         clean = text.strip()
@@ -4125,7 +4195,14 @@ class AgentLoop:
 
     @staticmethod
     def _normalize_tool_call(data: Any) -> dict[str, Any] | None:
-        """将不同格式的 tool call 统一为 {"tool": ..., "args": ...}。"""
+        """将不同格式的 tool call 统一为 {"tool": ..., "args": ...}。
+
+        支持的格式:
+        - 标准: {"tool": "...", "args": {...}}
+        - OpenAI: {"name": "...", "arguments": {...}}
+        - 弱模型: {"function": "...", "parameters": {...}}
+        - 弱模型: {"action": "...", "input": {...}}
+        """
         if not isinstance(data, dict):
             return None
         if "tool" in data:
@@ -4134,7 +4211,19 @@ class AgentLoop:
         if "name" in data:
             return {
                 "tool": data["name"],
-                "args": data.get("arguments", data.get("args", {})),
+                "args": data.get("arguments", data.get("args", data.get("parameters", {}))),
+            }
+        # 弱模型常见: {"function": "tool", "parameters": {...}}
+        if "function" in data and isinstance(data["function"], str):
+            return {
+                "tool": data["function"],
+                "args": data.get("parameters", data.get("arguments", data.get("args", {}))),
+            }
+        # 弱模型常见: {"action": "tool", "input": {...}}
+        if "action" in data and isinstance(data["action"], str):
+            return {
+                "tool": data["action"],
+                "args": data.get("input", data.get("parameters", data.get("args", {}))),
             }
         return None
 
@@ -4727,18 +4816,42 @@ class AgentLoop:
 
     @classmethod
     def _normalize_final_answer_text(cls, text: str) -> str:
+        """校验并归一化 final_answer 的文本质量。
+
+        弱模型防护:
+        - 英文拒绝归一化
+        - 控制字符/乱码检测
+        - 纯标点/空白检测
+        - 回显工具格式检测
+        """
         content = normalize_text(text)
         if not content:
             return ""
         if cls._looks_like_english_refusal_text(content):
             return "这个请求我不能帮你处理（涉及不当或露骨内容）。你可以换个健康、合规的话题，我继续帮你。"
+        # 弱模型防护: 纯标点/空白检测（去掉所有标点和空白后为空）
+        stripped = _RE_PUNCTUATION_CJK.sub("", content).strip()
+        if not stripped:
+            return ""
+        # 弱模型防护: 控制字符/乱码比例过高
+        control_count = sum(1 for c in content if ord(c) < 32 and c not in ('\n', '\r', '\t'))
+        if len(content) > 0 and control_count / len(content) > 0.3:
+            return ""
+        # 弱模型防护: 回显了工具调用格式到最终回复（不应发给用户）
+        trimmed = content.strip()
+        if (
+            trimmed.startswith("{")
+            and trimmed.endswith("}")
+            and ('"tool"' in trimmed or '"function"' in trimmed or '"name"' in trimmed)
+        ):
+            return ""
         return content
 
     async def _ai_fallback_reply(self, ctx: AgentContext, error_hint: str) -> str:
         """用一次快速 LLM 调用生成错误场景的自然回复，失败返回空字符串。"""
         try:
             system = (
-                "你是 YuKiKo。YuKiKo 在 SKIAPI 上班。"
+                "你是 YuKiKo。"
                 "现在你在处理用户请求时遇到了问题，需要用简短自然的语气回复用户。"
                 "不要用'抱歉'开头，不要太正式，像朋友聊天一样说。一句话就够了。"
                 "必须使用简体中文，不要输出英文段落。"

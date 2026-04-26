@@ -879,6 +879,8 @@ class SearchEngine:
             match = re.search(pattern, html)
             if match:
                 return match.group(1).strip()
+        
+        _log.error("search_ddg_vqd_extract_failed | Unable to extract vqd token, DDG anti-bot active or front-end changed.")
         return ""
 
     @staticmethod

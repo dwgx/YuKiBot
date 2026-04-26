@@ -276,26 +276,30 @@ _whisper_model: Any = None
 _whisper_lock = asyncio.Lock()
 
 
-async def transcribe_audio(
+async def transcribe_audio_enhanced(
     audio_path: str | Path,
     *,
     model_size: str = "base",
     language: str | None = None,
-    timeout: float = 120.0,
-) -> str:
-    """使用 OpenAI Whisper 本地模型转录音频为文字。
-
-    首次调用会自动下载模型。返回转录文本，失败返回空字符串。
+    timeout: float = 180.0,
+) -> dict[str, Any]:
+    """魔改版多轮语音识别系统。
+    
+    采用多次解析和加权计分的机制：
+    - Pass 1: 零温度带束搜索 (求稳)
+    - Pass 2: 温度回退降级 + 无前置上下文干扰 (防幻觉)
+    - Pass 3: 专属二次元/网络提词引导 (懂梗)
+    最终按平均 logprob 和非语音概率计分，选取最优解，并自带分段排版。
     """
     audio_path = Path(audio_path)
     if not audio_path.is_file():
-        return ""
+        return {"text": "", "score": -999, "pass": "none"}
 
     try:
         import whisper  # type: ignore
     except ImportError:
         _log.warning("whisper not installed, run: pip install openai-whisper")
-        return ""
+        return {"text": "", "score": -999, "pass": "error"}
 
     global _whisper_model
     async with _whisper_lock:
@@ -309,27 +313,127 @@ async def transcribe_audio(
 
     model = _whisper_model
     loop = asyncio.get_running_loop()
+
+    def _score_result(res: dict[str, Any]) -> float:
+        segments = res.get("segments", [])
+        if not segments:
+            return -999.0
+        avg_logprob = sum(s.get("avg_logprob", -1.0) for s in segments) / len(segments)
+        avg_no_speech = sum(s.get("no_speech_prob", 1.0) for s in segments) / len(segments)
+        
+        # 分数计算公式 (logprob 越接近0越好，no_speech越小越好)
+        return float(avg_logprob * 0.7 - avg_no_speech * 0.3)
+
+    def _format_segments(res: dict[str, Any]) -> str:
+        texts = []
+        for s in res.get("segments", []):
+            start = f"{s.get('start', 0):.1f}s"
+            end = f"{s.get('end', 0):.1f}s"
+            txt = s.get("text", "").strip()
+            if txt:
+                texts.append(f"[{start} - {end}] {txt}")
+        if not texts:
+            return res.get("text", "").strip()
+        return "\n".join(texts)
+
+    def _do_transcribes() -> list[dict[str, Any]]:
+        results = []
+        
+        # =======================================================
+        # Pass 1: 零温度带束搜索 (标准最优路径) 
+        # =======================================================
+        try:
+            r1 = model.transcribe(
+                str(audio_path), language=language, fp16=False,
+                temperature=0.0, beam_size=5
+            )
+            r1["_pass"] = "Pass-1-BeamSearch"
+            r1["_score"] = _score_result(r1)
+            results.append(r1)
+        except Exception as e:
+            _log.warning("transcribe pass 1 error: %s", e)
+
+        # 优化短路：如果第一次效果极好，直接返回不跑后面的了，省点算力
+        if results and results[0].get("_score", -999.0) > -0.3:
+            return results
+
+        # =======================================================
+        # Pass 2: 防止幻觉和复读机的回退模式
+        # =======================================================
+        try:
+            r2 = model.transcribe(
+                str(audio_path), language=language, fp16=False,
+                temperature=(0.2, 0.4, 0.6), # 允许 Whisper 自动回退寻找稳定态
+                condition_on_previous_text=False # 切断上下文关联，防止复读机幻觉
+            )
+            r2["_pass"] = "Pass-2-NoContext"
+            r2["_score"] = _score_result(r2)
+            results.append(r2)
+        except Exception as e:
+            pass
+
+        # =======================================================
+        # Pass 3: 二次元/日常梗的 Prompt 增强引导
+        # =======================================================
+        try:
+            r3 = model.transcribe(
+                str(audio_path), language=language, fp16=False,
+                temperature=0.0,
+                initial_prompt="这是一段日常群聊语音，包含二次元、原神、游戏、技术梗等网络常用语。"
+            )
+            r3["_pass"] = "Pass-3-PromptGuided"
+            r3["_score"] = _score_result(r3)
+            results.append(r3)
+        except Exception as e:
+            pass
+
+        return results
+
     try:
-        result = await asyncio.wait_for(
-            loop.run_in_executor(
-                None,
-                lambda: model.transcribe(
-                    str(audio_path),
-                    language=language,
-                    fp16=False,
-                ),
-            ),
+        all_results = await asyncio.wait_for(
+            loop.run_in_executor(None, _do_transcribes),
             timeout=timeout,
         )
-        text = result.get("text", "").strip()
-        _log.info("whisper_transcribed | file=%s | chars=%d", audio_path.name, len(text))
-        return text
+        if not all_results:
+            return {"text": "", "score": -999, "pass": "error"}
+
+        # 排序：分数从高到低
+        all_results.sort(key=lambda x: x.get("_score", -999.0), reverse=True)
+        best = all_results[0]
+        
+        best_text = best.get("text", "").strip()
+        formatted_text = _format_segments(best)
+        score = best.get("_score", -999.0)
+        pass_name = best.get("_pass", "unknown")
+
+        _log.info("whisper_enhanced_transcribed | file=%s | chars=%d | best_pass=%s | score=%.2f", 
+                  audio_path.name, len(best_text), pass_name, score)
+        
+        return {
+            "text": best_text,
+            "formatted_text": formatted_text,
+            "score": score,
+            "pass": pass_name,
+            "raw_segments": best.get("segments", [])
+        }
+        
     except asyncio.TimeoutError:
         _log.warning("whisper_timeout | file=%s", audio_path.name)
-        return ""
+        return {"text": "", "score": -999, "pass": "timeout"}
     except Exception as exc:
         _log.warning("whisper_error | file=%s | %s", audio_path.name, exc)
-        return ""
+        return {"text": "", "score": -999, "pass": "error"}
+
+async def transcribe_audio(
+    audio_path: str | Path,
+    *,
+    model_size: str = "base",
+    language: str | None = None,
+    timeout: float = 120.0,
+) -> str:
+    """（向后兼容层）使用 OpenAI Whisper 本地模型转录音频为文字。"""
+    res = await transcribe_audio_enhanced(audio_path, model_size=model_size, language=language, timeout=timeout)
+    return res.get("text", "")
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +458,7 @@ async def download_file(
 
     try:
         async with httpx.AsyncClient(
-            timeout=timeout, follow_redirects=True, verify=False
+            timeout=timeout, follow_redirects=True, verify=True
         ) as client:
             async with client.stream("GET", url, headers=headers) as resp:
                 resp.raise_for_status()

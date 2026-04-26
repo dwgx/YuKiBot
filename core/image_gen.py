@@ -61,7 +61,8 @@ _QQ_BAN_RISK_REGEX_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:成人|色情|黄色)\s*(?:图|图片|插画|写真|内容|漫画|视频)"),
     re.compile(r"(?:未成年|幼女|儿童)[^\n。！？!?]{0,10}(?:色情|性|裸|r[\W_]*1[\W_]*8|porn)"),
     re.compile(r"(?:porn|adult)\s*(?:image|art|photo|anime|content|girl|boy)s?", re.IGNORECASE),
-    re.compile(r"(?<![a-z0-9])a[\W_]*v(?![a-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![a-z0-9])j[\W_]*a[\W_]*v(?![a-z0-9])", re.IGNORECASE),
+    re.compile(r"(?<![a-z0-9])a[\W_]*v[\W_]*(?:女优|男优|无码|破解)", re.IGNORECASE),
 )
 _QQ_BAN_RISK_SLANG_REGEX_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:奶|乃)\s*(?:子|孑|仔|籽|崽)"),
@@ -128,8 +129,6 @@ def detect_qq_ban_risk_reason(prompt: str) -> str:
     for kw in _QQ_BAN_RISK_TERMS_EN:
         if _contains_english_term(lowered, compact, kw):
             return kw
-    if _contains_english_term(lowered, compact, "av"):
-        return "av"
     return ""
 
 

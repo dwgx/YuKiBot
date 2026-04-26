@@ -125,9 +125,7 @@ export default function PluginsPage() {
   const loadPlugins = async () => {
     setLoading(true);
     try {
-      const res = await fetch("/api/webui/plugins", {
-        headers: { Authorization: `Bearer ${api.getToken()}` },
-      });
+      const res = await fetch("/api/webui/plugins");
       const data = await res.json();
       const nextPlugins = Array.isArray(data.plugins) ? data.plugins : [];
       setPlugins(nextPlugins);
@@ -244,7 +242,6 @@ export default function PluginsPage() {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${api.getToken()}`,
         },
         body: JSON.stringify({ config: nextConfig, enabled: plugin.enabled, reload: true }),
       });

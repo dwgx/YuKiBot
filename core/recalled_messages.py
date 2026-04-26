@@ -13,50 +13,64 @@ from utils.text import normalize_text
 _LOCK = threading.Lock()
 _ROOT_DIR = Path(__file__).resolve().parents[1]
 _DB_PATH = _ROOT_DIR / "storage" / "chat_recall.db"
+_DB_INITIALIZED = False
+_db_local = threading.local()
 
+def _init_db(conn: sqlite3.Connection) -> None:
+    global _DB_INITIALIZED
+    if _DB_INITIALIZED:
+        return
+    with _LOCK:
+        if _DB_INITIALIZED:
+            return
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recalled_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id TEXT NOT NULL,
+                chat_type TEXT NOT NULL,
+                peer_id TEXT NOT NULL,
+                bot_id TEXT DEFAULT '',
+                message_id TEXT NOT NULL,
+                seq TEXT DEFAULT '',
+                timestamp INTEGER DEFAULT 0,
+                sender_id TEXT DEFAULT '',
+                sender_name TEXT DEFAULT '',
+                sender_role TEXT DEFAULT '',
+                is_self INTEGER DEFAULT 0,
+                text TEXT DEFAULT '',
+                segments_json TEXT DEFAULT '[]',
+                operator_id TEXT DEFAULT '',
+                operator_name TEXT DEFAULT '',
+                source TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                recalled_at INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_recalled_messages_conv_mid
+            ON recalled_messages (conversation_id, message_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_recalled_messages_conv_ts
+            ON recalled_messages (conversation_id, timestamp, recalled_at)
+            """
+        )
+        _DB_INITIALIZED = True
 
 def _connect() -> sqlite3.Connection:
-    _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH))
-    conn.row_factory = sqlite3.Row
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS recalled_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            conversation_id TEXT NOT NULL,
-            chat_type TEXT NOT NULL,
-            peer_id TEXT NOT NULL,
-            bot_id TEXT DEFAULT '',
-            message_id TEXT NOT NULL,
-            seq TEXT DEFAULT '',
-            timestamp INTEGER DEFAULT 0,
-            sender_id TEXT DEFAULT '',
-            sender_name TEXT DEFAULT '',
-            sender_role TEXT DEFAULT '',
-            is_self INTEGER DEFAULT 0,
-            text TEXT DEFAULT '',
-            segments_json TEXT DEFAULT '[]',
-            operator_id TEXT DEFAULT '',
-            operator_name TEXT DEFAULT '',
-            source TEXT DEFAULT '',
-            note TEXT DEFAULT '',
-            recalled_at INTEGER NOT NULL
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_recalled_messages_conv_mid
-        ON recalled_messages (conversation_id, message_id)
-        """
-    )
-    conn.execute(
-        """
-        CREATE INDEX IF NOT EXISTS idx_recalled_messages_conv_ts
-        ON recalled_messages (conversation_id, timestamp, recalled_at)
-        """
-    )
-    return conn
+    if not hasattr(_db_local, "conn") or _db_local.conn is None:
+        _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(_DB_PATH), timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        _init_db(conn)
+        _db_local.conn = conn
+    return _db_local.conn
 
 
 def _safe_segments(segments: Any) -> list[dict[str, Any]]:
@@ -115,41 +129,40 @@ def record_recalled_message(payload: dict[str, Any]) -> dict[str, Any]:
         "recalled_at": int(payload.get("recalled_at", 0) or time.time()),
     }
 
-    with _LOCK:
-        conn = _connect()
-        try:
-            conn.execute(
-                """
-                INSERT INTO recalled_messages (
-                    conversation_id, chat_type, peer_id, bot_id, message_id, seq, timestamp,
-                    sender_id, sender_name, sender_role, is_self, text, segments_json,
-                    operator_id, operator_name, source, note, recalled_at
-                )
-                VALUES (
-                    :conversation_id, :chat_type, :peer_id, :bot_id, :message_id, :seq, :timestamp,
-                    :sender_id, :sender_name, :sender_role, :is_self, :text, :segments_json,
-                    :operator_id, :operator_name, :source, :note, :recalled_at
-                )
-                ON CONFLICT(conversation_id, message_id) DO UPDATE SET
-                    seq=excluded.seq,
-                    timestamp=excluded.timestamp,
-                    sender_id=excluded.sender_id,
-                    sender_name=excluded.sender_name,
-                    sender_role=excluded.sender_role,
-                    is_self=excluded.is_self,
-                    text=excluded.text,
-                    segments_json=excluded.segments_json,
-                    operator_id=excluded.operator_id,
-                    operator_name=excluded.operator_name,
-                    source=excluded.source,
-                    note=excluded.note,
-                    recalled_at=excluded.recalled_at
-                """,
-                row,
+    conn = _connect()
+    try:
+        conn.execute(
+            """
+            INSERT INTO recalled_messages (
+                conversation_id, chat_type, peer_id, bot_id, message_id, seq, timestamp,
+                sender_id, sender_name, sender_role, is_self, text, segments_json,
+                operator_id, operator_name, source, note, recalled_at
             )
-            conn.commit()
-        finally:
-            conn.close()
+            VALUES (
+                :conversation_id, :chat_type, :peer_id, :bot_id, :message_id, :seq, :timestamp,
+                :sender_id, :sender_name, :sender_role, :is_self, :text, :segments_json,
+                :operator_id, :operator_name, :source, :note, :recalled_at
+            )
+            ON CONFLICT(conversation_id, message_id) DO UPDATE SET
+                seq=excluded.seq,
+                timestamp=excluded.timestamp,
+                sender_id=excluded.sender_id,
+                sender_name=excluded.sender_name,
+                sender_role=excluded.sender_role,
+                is_self=excluded.is_self,
+                text=excluded.text,
+                segments_json=excluded.segments_json,
+                operator_id=excluded.operator_id,
+                operator_name=excluded.operator_name,
+                source=excluded.source,
+                note=excluded.note,
+                recalled_at=excluded.recalled_at
+            """,
+            row,
+        )
+        conn.commit()
+    except Exception:
+        pass
     return row
 
 
@@ -157,21 +170,20 @@ def list_recalled_messages(conversation_id: str, *, limit: int = 200) -> list[di
     conv = normalize_text(conversation_id)
     if not conv:
         return []
-    with _LOCK:
-        conn = _connect()
-        try:
-            rows = conn.execute(
-                """
-                SELECT *
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT *
                 FROM recalled_messages
                 WHERE conversation_id = ?
                 ORDER BY timestamp ASC, recalled_at ASC, id ASC
                 LIMIT ?
                 """,
-                (conv, max(1, int(limit))),
-            ).fetchall()
-        finally:
-            conn.close()
+            (conv, max(1, int(limit))),
+        ).fetchall()
+    except Exception:
+        rows = []
 
     items: list[dict[str, Any]] = []
     for row in rows:

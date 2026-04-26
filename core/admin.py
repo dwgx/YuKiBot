@@ -723,20 +723,12 @@ class AdminEngine:
                 continue
             passthrough.append(raw)
 
-        if first in check_alias:
-            check_only = True
-        elif first in restart_alias:
-            restart_mode = True
-        elif first not in run_alias and first.startswith("--"):
-            # 允许直接传 flags：/yuki update --check-only ...
-            pass
-
-        if check_only:
-            cmd_args.append("--check-only")
-        if restart_mode:
-            cmd_args.append("--restart")
-        if allow_dirty:
-            cmd_args.append("--allow-dirty")
+        # 安全: 白名单过滤 passthrough 参数，防止向底层脚本注入任意 flags
+        _ALLOWED_PASSTHROUGH = frozenset({
+            "--no-webui", "--no-python", "--no-hot-reload",
+            "--check-only", "--force", "--verbose",
+        })
+        passthrough = [t for t in passthrough if t in _ALLOWED_PASSTHROUGH]
         cmd_args.extend(passthrough)
 
         if self._update_lock.locked():

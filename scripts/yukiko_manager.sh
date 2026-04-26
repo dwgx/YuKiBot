@@ -472,6 +472,56 @@ cmd_napcat_status() {
   return 1
 }
 
+cmd_napcat_inject() {
+  local dry_run=0
+  local extra_args=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --port|--token|--host)
+        extra_args+=("$1" "${2:-}")
+        shift 2
+        ;;
+      *)
+        error "Unknown option for napcat-inject: $1"
+        exit 1
+        ;;
+    esac
+  done
+
+  local py_cmd=""
+  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    py_cmd="$ROOT_DIR/.venv/bin/python"
+  else
+    py_cmd="$(resolve_bootstrap_python || true)"
+  fi
+  if [[ -z "$py_cmd" ]]; then
+    error "No python executable found. Run install first."
+    exit 1
+  fi
+
+  local helper_script="$ROOT_DIR/scripts/napcat_config_helper.py"
+  if [[ ! -f "$helper_script" ]]; then
+    error "napcat_config_helper.py not found: $helper_script"
+    exit 1
+  fi
+
+  local cmd_args=("$py_cmd" "$helper_script" "--inject")
+  if [[ "$dry_run" -eq 1 ]]; then
+    cmd_args+=("--dry-run")
+  fi
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    cmd_args+=("${extra_args[@]}")
+  fi
+
+  info "Running: ${cmd_args[*]}"
+  "${cmd_args[@]}"
+}
+
 cmd_doctor() {
   local service_name="$DEFAULT_SERVICE_NAME"
   local timeout_seconds=8
@@ -534,16 +584,26 @@ cmd_doctor() {
   fi
 
   if [[ -n "$webui_token" ]]; then
-    info "[doctor][PASS] WEBUI_TOKEN configured"
-    pass_count=$((pass_count + 1))
+    if [[ "$webui_token" == "change_me"* || "$webui_token" == "replace_with_"* ]]; then
+      warn "[doctor][WARN] WEBUI_TOKEN still has placeholder value — change it to a random string"
+      warn_count=$((warn_count + 1))
+    else
+      info "[doctor][PASS] WEBUI_TOKEN configured"
+      pass_count=$((pass_count + 1))
+    fi
   else
     error "[doctor][FAIL] WEBUI_TOKEN is empty"
     fail_count=$((fail_count + 1))
   fi
 
   if [[ -n "$onebot_token" ]]; then
-    info "[doctor][PASS] ONEBOT_ACCESS_TOKEN configured"
-    pass_count=$((pass_count + 1))
+    if [[ "$onebot_token" == "replace_with_"* || "$onebot_token" == "change_me"* ]]; then
+      warn "[doctor][WARN] ONEBOT_ACCESS_TOKEN still has placeholder value — set a real token"
+      warn_count=$((warn_count + 1))
+    else
+      info "[doctor][PASS] ONEBOT_ACCESS_TOKEN configured"
+      pass_count=$((pass_count + 1))
+    fi
   else
     error "[doctor][FAIL] ONEBOT_ACCESS_TOKEN is empty"
     fail_count=$((fail_count + 1))
@@ -554,6 +614,14 @@ cmd_doctor() {
     pass_count=$((pass_count + 1))
   else
     warn "[doctor][WARN] ffmpeg not found"
+    warn_count=$((warn_count + 1))
+  fi
+
+  if command_exists ffprobe; then
+    info "[doctor][PASS] ffprobe available"
+    pass_count=$((pass_count + 1))
+  else
+    warn "[doctor][WARN] ffprobe not found (video/audio features limited)"
     warn_count=$((warn_count + 1))
   fi
 
@@ -580,6 +648,19 @@ cmd_doctor() {
   else
     warn "[doctor][WARN] NapCat not detected"
     warn_count=$((warn_count + 1))
+  fi
+
+  # NapCat systemd service 活跃状态
+  if command_exists systemctl; then
+    local napcat_svc=""
+    napcat_svc="$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null | awk '{print $1}' | grep -Ei 'napcat' | head -1 || true)"
+    if [[ -n "$napcat_svc" ]]; then
+      info "[doctor][PASS] NapCat systemd service active: $napcat_svc"
+      pass_count=$((pass_count + 1))
+    elif [[ -n "$napcat_method" ]]; then
+      # NapCat detected but not via systemd
+      info "[doctor][INFO] NapCat found ($napcat_method) but not as systemd service"
+    fi
   fi
 
   if command_exists systemctl; then
@@ -884,6 +965,7 @@ Commands:
   restore --file FILE [options]     Restore backup archive
   napcat-status [--method-only|--quiet]
                                     Detect NapCat installation status
+  napcat-inject [--dry-run]         Auto-inject YuKiKo connection into NapCat config
   set-port --port N [--host H]      Update HOST/PORT in .env
   uninstall [options]               Perfect uninstall helper
 
@@ -953,6 +1035,8 @@ Examples:
   yukiko start
   yukiko logs --lines 200
   yukiko napcat-status
+  yukiko napcat-inject
+  yukiko napcat-inject --dry-run
   yukiko set-port --port 8088 --host 0.0.0.0
   yukiko uninstall --purge-runtime --purge-env --yes
   yukiko uninstall --purge-all --backup-dir /tmp/yukiko-backups --yes
@@ -1751,6 +1835,9 @@ main() {
       ;;
     napcat-status)
       cmd_napcat_status "$@"
+      ;;
+    napcat-inject)
+      cmd_napcat_inject "$@"
       ;;
     set-port)
       cmd_set_port "$@"

@@ -10,9 +10,28 @@ WorkingDirectory={{WORKDIR}}
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/env bash {{WORKDIR}}/start.sh
 Restart=always
-RestartSec=3
+RestartSec=5
 KillSignal=SIGINT
 TimeoutStopSec=30
+
+# ── 崩溃保护 ──
+# 5 分钟内最多重启 5 次，超出后等待 60 秒
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+# ── 资源限制 ──
+# 高并发 WebSocket/HTTP 场景下的文件描述符上限
+LimitNOFILE=65536
+# OOM 保护：降低被 OOM Killer 选中的优先级
+OOMScoreAdjust=-100
+
+# ── 安全隔离 ──
+# 禁止子进程获取新特权
+NoNewPrivileges=true
+# 使 /usr /boot /etc 只读（不影响 WorkingDirectory）
+ProtectSystem=full
+# 使用独立的 /tmp，防止与其他服务共享临时文件
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

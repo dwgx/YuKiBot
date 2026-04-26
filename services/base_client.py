@@ -30,6 +30,7 @@ class BaseLLMClient:
         self.timeout_seconds = int(self.config.get("timeout_seconds", 60))
         self.image_model = str(self.config.get("image_model", "gpt-image-1"))
         self.supports_multimodal_messages = False
+        self.supports_native_tools = False
 
         self.api_key = self._resolve_api_key()
 
@@ -43,6 +44,8 @@ class BaseLLMClient:
         response_format: dict[str, str] | None = None,
         max_tokens: int | None = None,
         model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         raise NotImplementedError
 
@@ -61,6 +64,35 @@ class BaseLLMClient:
                     parts.append(str(item.get("text", "")))
             return "".join(parts)
         return str(content)
+
+    async def chat_completion_with_retry(
+        self,
+        messages: list[dict[str, Any]],
+        response_format: dict[str, str] | None = None,
+        max_tokens: int | None = None,
+        model: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | dict[str, Any] | None = None,
+        retries: int = 2,
+        backoff: float = 1.0,
+    ) -> dict[str, Any]:
+        import asyncio as _aio
+        last_exc: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                return await self.chat_completion(
+                    messages=messages,
+                    response_format=response_format,
+                    max_tokens=max_tokens,
+                    model=model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if attempt < retries:
+                    await _aio.sleep(backoff * (attempt + 1))
+        raise last_exc  # type: ignore[misc]
 
     async def chat_text_with_retry(
         self,

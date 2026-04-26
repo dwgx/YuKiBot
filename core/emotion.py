@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import time
 from typing import Any, Callable
 
 from utils.text import normalize_text
@@ -21,6 +22,7 @@ class EmotionDecision:
 class _EmotionState:
     score: float = 0.0
     last_update: datetime | None = None
+    last_update_mono: float | None = None
     last_warn_at: datetime | None = None
     strike_until: datetime | None = None
     warned_since_last_strike: bool = False
@@ -259,13 +261,16 @@ class EmotionEngine:
         return count - self.burst_trigger_count + 1
 
     def _decay_state(self, state: _EmotionState, now: datetime) -> None:
-        if state.last_update is None:
+        mono_now = time.monotonic()
+        if state.last_update_mono is None:
             state.last_update = now
+            state.last_update_mono = mono_now
             return
-        elapsed = max(0.0, (now - state.last_update).total_seconds())
+        elapsed = max(0.0, mono_now - state.last_update_mono)
         if elapsed > 0 and self.decay_per_second > 0:
             state.score = max(0.0, state.score - elapsed * self.decay_per_second)
         state.last_update = now
+        state.last_update_mono = mono_now
         if isinstance(state.strike_until, datetime) and now >= state.strike_until:
             state.strike_until = None
 
@@ -284,21 +289,25 @@ class EmotionEngine:
                 if not isinstance(state.last_update, datetime):
                     stale_states.append(key)
                     continue
-                if (now - state.last_update).total_seconds() > max_idle and state.score <= 0.1:
+                idle = (now - state.last_update).total_seconds()
+                if idle > max_idle and state.score < self.warn_threshold * 0.2:
                     stale_states.append(key)
             for key in stale_states:
                 self._states.pop(key, None)
 
         if self._user_events:
-            stale_users: list[str] = []
-            expire_at = now - timedelta(seconds=max(self.burst_window_seconds * 2, 30))
-            for key, rows in self._user_events.items():
-                while rows and rows[0] < expire_at:
-                    rows.popleft()
-                if not rows:
-                    stale_users.append(key)
-            for key in stale_users:
-                self._user_events.pop(key, None)
+            if len(self._user_events) > 5000:
+                self._user_events.clear()
+            else:
+                stale_users: list[str] = []
+                expire_at = now - timedelta(seconds=max(self.burst_window_seconds * 2, 30))
+                for key, rows in self._user_events.items():
+                    while rows and rows[0] < expire_at:
+                        rows.popleft()
+                    if not rows:
+                        stale_users.append(key)
+                for key in stale_users:
+                    self._user_events.pop(key, None)
 
     @staticmethod
     def _normalize_messages(value: Any, default: list[str]) -> list[str]:

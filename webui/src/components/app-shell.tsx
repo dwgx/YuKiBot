@@ -68,10 +68,7 @@ export default function AppShell() {
     if (!confirm("确定要重启服务吗？重启期间 bot 将暂时离线。")) return;
     setRestarting(true);
     try {
-      await fetch("/api/webui/system/restart", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${api.getToken?.() || localStorage.getItem("webui_token") || ""}` },
-      });
+      await api.restart();
     } catch {}
     setTimeout(() => { window.location.reload(); }, 5000);
   };

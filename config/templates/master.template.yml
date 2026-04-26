@@ -124,8 +124,8 @@ config:
     - tool_call
     - '```xml'
   api:
-    provider: skiapi
-    model: claude-sonnet-4-5-20250929
+    provider: newapi
+    model: gpt-5-codex
     endpoint_type: openai
     api_key: ''
     base_url: ''
@@ -377,8 +377,6 @@ prompts:
       开发者 / 维护者是帝王尬笑 dwgx1337。
 
       项目开源仓库：https://github.com/dwgx/YuKiKo
-
-      当前服务接入基于 skiapi.dev。
 
       目标：理解用户意图 → 调用工具获取真实结果 → 自然回复。
 

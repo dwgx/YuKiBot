@@ -126,6 +126,26 @@ apply_acceleration_env() {
   fi
 }
 
+auto_detect_china_mirror() {
+  # 如果用户已显式指定镜像，跳过自动检测
+  if [[ -n "$PIP_INDEX_URL_INPUT" || -n "$NPM_REGISTRY_INPUT" ]]; then
+    return
+  fi
+  # curl 不存在则跳过
+  if ! command_exists curl; then
+    return
+  fi
+  # 快速探测 pypi.org 连通性（3 秒超时）
+  if curl -fsS --connect-timeout 3 --max-time 5 https://pypi.org/simple/ >/dev/null 2>&1; then
+    return
+  fi
+  info "Detected slow connection to pypi.org, auto-applying China mirrors."
+  info "  pip: https://pypi.tuna.tsinghua.edu.cn/simple"
+  info "  npm: https://registry.npmmirror.com"
+  PIP_INDEX_URL_INPUT="https://pypi.tuna.tsinghua.edu.cn/simple"
+  NPM_REGISTRY_INPUT="https://registry.npmmirror.com"
+}
+
 normalize_health_host() {
   local host="$1"
   if [[ -z "$host" || "$host" == "0.0.0.0" || "$host" == "::" || "$host" == "*" ]]; then
@@ -531,6 +551,33 @@ print_napcat_manual_hint() {
   warn "  curl -o napcat.sh $NAPCAT_INSTALLER_URL && bash napcat.sh"
 }
 
+print_napcat_connection_guide() {
+  local port="$1"
+  local token="$2"
+  local token_preview="${token:0:8}..."
+  if [[ ${#token} -le 8 ]]; then
+    token_preview="$token"
+  fi
+  echo ""
+  echo "╔══════════════════════════════════════════════════════════╗"
+  echo "║  NapCat OneBot V11 连接配置                             ║"
+  echo "╠══════════════════════════════════════════════════════════╣"
+  echo "║                                                          ║"
+  echo "║  请在 NapCat 管理面板中添加「反向 WebSocket」连接:       ║"
+  echo "║                                                          ║"
+  printf '║  地址: ws://127.0.0.1:%s/onebot/v11/ws' "$port"
+  printf '%*s║\n' $((26 - ${#port})) ''
+  printf '║  Token: %s' "$token_preview"
+  printf '%*s║\n' $((50 - ${#token_preview})) ''
+  echo "║                                                          ║"
+  echo "║  ⚠ NapCat 的 access_token 必须与 ONEBOT_ACCESS_TOKEN   ║"
+  echo "║    保持完全一致，否则连接会被拒绝。                      ║"
+  echo "║                                                          ║"
+  echo "║  NapCat 管理面板默认地址: http://127.0.0.1:6099/webui    ║"
+  echo "╚══════════════════════════════════════════════════════════╝"
+  echo ""
+}
+
 detect_napcat_custom_tree() {
   local -a candidate_roots=(
     "/root"
@@ -854,6 +901,9 @@ main() {
   parse_args "$@"
   cd "$ROOT_DIR"
 
+  # 自动检测中国大陆网络并应用镜像加速
+  auto_detect_china_mirror
+
   if [[ ! -f "$ENV_FILE" ]]; then
     if [[ -f "$ENV_EXAMPLE" ]]; then
       cp "$ENV_EXAMPLE" "$ENV_FILE"
@@ -1016,6 +1066,18 @@ main() {
     echo "Restart: sudo systemctl restart $service_name"
   else
     echo "Run manually: bash start.sh"
+  fi
+
+  # NapCat 连接配置指引
+  print_napcat_connection_guide "$port" "$onebot_access_token"
+
+  # 自动注入 NapCat onebot11 配置 (如果找到 NapCat)
+  if [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+    if [[ -f "$ROOT_DIR/scripts/napcat_config_helper.py" ]]; then
+      info "Attempting auto-inject YuKiKo connection into NapCat config..."
+      "$ROOT_DIR/.venv/bin/python" "$ROOT_DIR/scripts/napcat_config_helper.py" \
+        --inject --port "$port" --token "$onebot_access_token" || true
+    fi
   fi
 }
 

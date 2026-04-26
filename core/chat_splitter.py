@@ -29,8 +29,9 @@ def split_semantic_text(
 
     # Extract code blocks as atomic units
     code_blocks: dict[str, str] = {}
+    import uuid
     def _mask_code(match: re.Match[str]) -> str:
-        key = f"__CODEBLOCK{len(code_blocks)}__"
+        key = f"__CODEBLOCK_{uuid.uuid4().hex}__"
         code_blocks[key] = match.group(0)
         return key
 

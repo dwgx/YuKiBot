@@ -100,12 +100,11 @@ def _choice(prompt: str, options: list[str], default: int = 0) -> str:
 
 def _ask_api() -> dict[str, Any]:
     providers = [
-        "skiapi",
+        "newapi",
         "openai",
         "anthropic",
         "gemini",
         "deepseek",
-        "newapi",
         "openrouter",
         "xai",
         "qwen",
@@ -118,12 +117,11 @@ def _ask_api() -> dict[str, Any]:
     api_key = _input(f"输入 {provider} 的 API Key（留空则从环境变量读取）")
 
     models = {
-        "skiapi": "claude-opus-4-6",
+        "newapi": "gpt-5-codex",
         "openai": "gpt-5.2",
         "anthropic": "claude-sonnet-4-5-20250929",
         "gemini": "gemini-2.5-pro",
         "deepseek": "deepseek-chat",
-        "newapi": "gpt-5-codex",
         "openrouter": "openrouter/auto",
         "xai": "grok-3-latest",
         "qwen": "qwen-max-latest",
@@ -155,10 +153,9 @@ def _ask_api() -> dict[str, Any]:
             print("  加密不可用，API Key 以明文存储。")
     else:
         env_map = {
-            "skiapi": "${SKIAPI_KEY}",
+            "newapi": "${NEWAPI_API_KEY}",
             "openai": "${OPENAI_API_KEY}",
             "deepseek": "${DEEPSEEK_API_KEY}",
-            "newapi": "${NEWAPI_API_KEY}",
             "anthropic": "${ANTHROPIC_API_KEY}",
             "gemini": "${GEMINI_API_KEY}",
             "openrouter": "${OPENROUTER_API_KEY}",
@@ -411,7 +408,7 @@ def _write_env(cfg: dict[str, Any]) -> None:
 
     # 从 cfg 中提取 API key
     api_cfg = cfg.get("api", {})
-    provider = str(api_cfg.get("provider", "skiapi")).lower()
+    provider = str(api_cfg.get("provider", "newapi")).lower()
     api_key = str(api_cfg.get("api_key", "")).strip()
 
     # 生成随机 WEBUI_TOKEN
@@ -438,17 +435,16 @@ def _write_env(cfg: dict[str, Any]) -> None:
 
     # 根据 provider 设置对应的 key
     key_map = {
-        "skiapi": "SKIAPI_KEY",
+        "newapi": "NEWAPI_API_KEY",
         "openai": "OPENAI_API_KEY",
         "deepseek": "DEEPSEEK_API_KEY",
         "anthropic": "ANTHROPIC_API_KEY",
         "gemini": "GEMINI_API_KEY",
         "qwen": "QWEN_API_KEY",
         "moonshot": "MOONSHOT_API_KEY",
-        "newapi": "NEWAPI_API_KEY",
         "siliconflow": "SILICONFLOW_API_KEY",
     }
-    env_key = key_map.get(provider, "SKIAPI_KEY")
+    env_key = key_map.get(provider, "NEWAPI_API_KEY")
     if api_key:
         lines.append(f"{env_key}={api_key}")
     else:

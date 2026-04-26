@@ -323,6 +323,7 @@ class Plugin:
 
         # 运行时状态
         self._registry: Any = None
+        self._search_engine: Any = None  # 延迟在 setup 中从 config 初始化
         self._sessions: dict[str, LearningSession] = {}
         self._last_devlog_time: float = 0
         self._api_call: Any = None
@@ -383,6 +384,18 @@ class Plugin:
         )
 
         self._registry = getattr(context, "agent_tool_registry", None)
+
+        # 从全局 config 中初始化 SearchEngine，供 learn_from_web 使用
+        try:
+            from core.search import SearchEngine
+            global_config = getattr(context, "config", None) or {}
+            search_cfg = global_config.get("search", {}) if isinstance(global_config, dict) else {}
+            self._search_engine = SearchEngine(search_cfg)
+            _log.info("self_learning search_engine_bound | enabled=%s", self._search_engine.enabled)
+        except Exception as exc:
+            _log.warning("self_learning search_engine_init_failed | %s", exc)
+            self._search_engine = None
+
         if self._registry is not None:
             self._register_tools()
 
@@ -621,44 +634,67 @@ class Plugin:
             "learning_source": self._learning_source,
         })
 
-        # 这里应该调用搜索工具或其他学习资源
-        # 简化实现：返回学习指导
+        # 真实环境下的知识整合：利用 setup 阶段绑定的 SearchEngine 拉取资料
+        search_markdown = ""
         dangerous_tools_enabled = self._code_execution_enabled()
+
+        if self._search_engine and getattr(self._search_engine, "enabled", False):
+            try:
+                results = await self._search_engine.search(topic)
+                if results:
+                    fragments = []
+                    for idx, res in enumerate(results[:5], start=1):
+                        fragments.append(f"### {idx}. {res.title}\n**摘要**: {res.snippet}\n**来源**: {res.url}")
+                    search_markdown = "\n\n".join(fragments)
+                    session.devlog.append(f"成功收集到关于 '{topic}' 的 {len(results)} 篇前沿知识！")
+                else:
+                    search_markdown = "未能在外网搜到直接关联内容，可能是一个非公开的主题。"
+                    session.devlog.append(f"关键词 '{topic}' 搜索无结果。")
+            except Exception as e:
+                _log.warning("learn_from_web search error | topic=%s | %s", topic, e)
+                search_markdown = f"搜索知识时发生异常: {e}"
+        else:
+            search_markdown = "当前搜索引擎未启用或未配置，无法访问外部网络。请确认 config.yml 中 search 配置。"
+
         plan_steps = [
-            "1. 使用 web_search 搜索相关文档和教程",
-            "2. 阅读官方文档了解 API 和用法",
-            "3. 查看示例代码理解实现方式",
+            "1. 仔细阅读下方由系统整理提炼的『真实检索情报』",
+            "2. 若摘要不够详细导致仍无法写出代码/方案，可以立刻向这几个来源提取的 URL 发送 fetch_webpage 抓取原网页详情！",
         ]
+        
         if dangerous_tools_enabled:
             plan_steps.extend([
-                "4. 使用 create_skill 编写自己的实现",
-                "5. 使用 test_in_sandbox 测试代码",
+                "3. 根据学到的真实方法，使用 create_skill 编写自己的实现",
+                "4. 使用 test_in_sandbox 验证代码逻辑正确性",
             ])
         else:
             plan_steps.extend([
-                "4. 先整理方案、补丁建议或人工操作步骤，不要执行任意 Python",
-                "5. 使用 send_devlog 汇报你学到了什么以及下一步建议",
+                "3. 根据学到的知识给出详细的技术落地方案，不要执行任意 Python",
+                "4. 使用 send_devlog 汇报你的结论",
             ])
+
         learned = f"""
-已开始学习 '{topic}'。
+# 环境注入完成，已为您拉取 '{topic}' 的真实联网情报。
+> 学习目标: {goal}
 
-学习目标: {goal}
-
-建议步骤:
+## 建议下一步行动指令
 {chr(10).join(plan_steps)}
 
+## 📡 核心情报提炼 (Search Results)
+{search_markdown}
+
+---
 学习会话 ID: {session_id}
+通过真网搜注入，你现在已经可以直接看到摘要，请利用以上情报完成任务。
 """
 
         session.learned_content = learned
-        session.devlog.append("学习资料收集完成")
         session.status = "completed"
         session.end_time = datetime.now()
-        session.metrics["result"] = "guidance_generated"
+        session.metrics["result"] = "real_search_aggregated"
 
         return ToolCallResult(
             ok=True,
-            data={"session_id": session_id, "topic": topic},
+            data={"session_id": session_id, "topic": topic, "has_search": bool(search_markdown)},
             display=learned,
         )
 

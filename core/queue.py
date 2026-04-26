@@ -500,7 +500,7 @@ class GroupQueueDispatcher:
         return state
 
     def _cleanup_idle_groups(self) -> None:
-        if len(self._groups) < 50:
+        if len(self._groups) < 1000:
             return
         now = datetime.now(timezone.utc)
         idle_threshold = timedelta(hours=1)

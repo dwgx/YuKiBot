@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import math
 import re
 import sqlite3
+import threading
 
+_db_local = threading.local()
+
+import logging
 _log = logging.getLogger("yukiko.memory")
+
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -314,22 +318,22 @@ class MemoryEngine:
         self._flush_thread_state()
 
     def close(self) -> None:
-        """关闭 memory 引擎（刷盘并释放 SQLite 连接）。"""
+        """关闭 memory 引擎（刷盘并释放当前线程的 SQLite 连接）。"""
         self.flush()
-        conn = getattr(self, "_db_conn", None)
+        conn = getattr(_db_local, "conn", None)
         if conn is None:
             return
         try:
             conn.close()
         except Exception:
             pass
-        self._db_conn = None
+        _db_local.conn = None
 
     def _connect(self) -> sqlite3.Connection:
-        if not hasattr(self, "_db_conn") or self._db_conn is None:
-            self._db_conn = sqlite3.connect(self.db_path, check_same_thread=False)
-            self._db_conn.execute("PRAGMA journal_mode=WAL;")
-        return self._db_conn
+        if not hasattr(_db_local, "conn") or _db_local.conn is None:
+            _db_local.conn = sqlite3.connect(self.db_path, timeout=30.0)
+            _db_local.conn.execute("PRAGMA journal_mode=WAL;")
+        return _db_local.conn
 
     def _init_vector_db(self) -> None:
         with self._connect() as conn:
@@ -1787,6 +1791,10 @@ class MemoryEngine:
             "content": str(row[4] or ""),
             "created_at": str(row[5] or ""),
         }
+
+    def get_memory_record(self, record_id: int) -> dict[str, Any] | None:
+        """Public wrapper used by tool handlers for ownership checks."""
+        return self._fetch_embedding_record(record_id)
 
     def _append_history_entry(self, conversation_id: str, user_id: str, role: str, content: str, timestamp: datetime | None = None) -> None:
         text = normalize_text(content)

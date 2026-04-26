@@ -17,7 +17,7 @@ from typing import Any
 import yaml
 
 from core.config_templates import deep_merge_dict, load_config_template
-from core.crypto import SecretManager
+from core.crypto import DecryptionError, SecretManager
 
 _log = logging.getLogger("yukiko.config")
 _ENV_PATTERN = re.compile(r"^\$\{([A-Z0-9_]+)\}$")
@@ -60,7 +60,10 @@ class ConfigManager:
                 merged = deep_merge_dict(dict(template), raw if isinstance(raw, dict) else {})
                 raw = merged
             resolved = self._resolve_env_vars(raw)
-            self._data = self._secret.decrypt_dict(resolved)  # type: ignore[assignment]
+            try:
+                self._data = self._secret.decrypt_dict(resolved)  # type: ignore[assignment]
+            except DecryptionError as exc:
+                raise RuntimeError(f"配置中的加密字段无法解密: {exc}") from exc
             _log.info("配置已加载: %s", self._config_file)
 
     def reload(self) -> tuple[bool, str]:

@@ -5,7 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from core.webui import _build_repo_artifact_urls, _normalize_repo_http_url, _validate_sqlite_upload
+import core.webui as webui
+from core.webui import (
+    _build_repo_artifact_urls,
+    _is_allowed_webui_db_path,
+    _normalize_repo_http_url,
+    _resolve_webui_db_path,
+    _validate_sqlite_upload,
+)
 
 
 class WebuiManagementRegressionTests(unittest.TestCase):
@@ -50,6 +57,36 @@ class WebuiManagementRegressionTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertEqual(error, "")
         self.assertIn("demo", tables)
+
+    def test_backup_db_is_not_allowed_for_webui_browse(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root_dir = Path(tmp)
+            storage_dir = root_dir / "storage"
+            backup_db = storage_dir / "backups" / "db" / "sample.db"
+            backup_db.parent.mkdir(parents=True, exist_ok=True)
+            sqlite3.connect(str(backup_db)).close()
+
+            self.assertFalse(_is_allowed_webui_db_path(backup_db, storage_dir))
+
+    def test_resolve_webui_db_path_excludes_backups_directory(self) -> None:
+        old_root = webui._ROOT_DIR
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root_dir = Path(tmp)
+                storage_dir = root_dir / "storage"
+                live_dir = storage_dir / "knowledge"
+                backup_dir = storage_dir / "backups" / "db"
+                live_dir.mkdir(parents=True, exist_ok=True)
+                backup_dir.mkdir(parents=True, exist_ok=True)
+
+                sqlite3.connect(str(live_dir / "knowledge.db")).close()
+                sqlite3.connect(str(backup_dir / "knowledge.db")).close()
+
+                webui._ROOT_DIR = root_dir
+                resolved = _resolve_webui_db_path("knowledge")
+                self.assertEqual(resolved, live_dir / "knowledge.db")
+        finally:
+            webui._ROOT_DIR = old_root
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ class AnalyzeVoiceFallbackRegressionTests(unittest.IsolatedAsyncioTestCase):
         with (
             patch("utils.media.download_file", new=AsyncMock(side_effect=fake_download)),
             patch("utils.media.extract_audio", new=AsyncMock(return_value="voice.wav")),
-            patch("utils.media.transcribe_audio", new=AsyncMock(return_value="voice text")),
+            patch("utils.media.transcribe_audio_enhanced", new=AsyncMock(return_value={"text": "voice text", "formatted_text": "voice text", "score": -0.5, "pass": "Pass-1-BeamSearch"})),
         ):
             result = await _handle_analyze_voice(
                 {"url": explicit_url},
@@ -65,12 +65,12 @@ class AnalyzeVoiceFallbackRegressionTests(unittest.IsolatedAsyncioTestCase):
 
         with (
             patch(
-                "core.agent_tools.call_napcat_api",
+                "core.agent_tools_media.call_napcat_api",
                 new=AsyncMock(return_value={"url": recovered_url}),
             ) as mock_call_napcat_api,
             patch("utils.media.download_file", new=AsyncMock(side_effect=fake_download)),
             patch("utils.media.extract_audio", new=AsyncMock(return_value="voice.wav")),
-            patch("utils.media.transcribe_audio", new=AsyncMock(return_value="voice text")),
+            patch("utils.media.transcribe_audio_enhanced", new=AsyncMock(return_value={"text": "voice text", "formatted_text": "voice text", "score": -0.5, "pass": "Pass-1-BeamSearch"})),
         ):
             result = await _handle_analyze_voice(
                 {"url": explicit_url},

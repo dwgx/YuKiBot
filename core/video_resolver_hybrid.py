@@ -177,6 +177,21 @@ class DouyinResolver:
                 aweme_id = self._extract_aweme_id(final_url)
 
             vid = self._find_video_id_in_text(resp.text, final_url)
+            if not vid:
+                # 尝试从 RENDER_DATA 或 __INITIAL_STATE__ 提取
+                m_render = re.search(r'<script id="RENDER_DATA" type="application/json">(.*?)</script>', resp.text, re.DOTALL)
+                if m_render:
+                    try:
+                        import urllib.parse
+                        decoded = urllib.parse.unquote(m_render.group(1))
+                        vid = self._find_video_id_in_text(decoded, final_url)
+                    except Exception:
+                        pass
+                if not vid:
+                    m_state = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.+?});', resp.text, re.DOTALL)
+                    if m_state:
+                        vid = self._find_video_id_in_text(m_state.group(1), final_url)
+
             if vid:
                 return vid, aweme_id
 
