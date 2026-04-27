@@ -44,6 +44,10 @@ class _StubRegistry:
         _ = (section, tool_names)
         return ""
 
+    def list_tools_for_permission(self, permission_level: str = "user") -> list[str]:
+        _ = permission_level
+        return list(self._names)
+
     def get_schemas_for_native_tools(self, tool_names: list[str]) -> list[dict]:
         return [{"type": "function", "function": {"name": n, "description": "", "parameters": {"type": "object", "properties": {}}}} for n in tool_names]
 

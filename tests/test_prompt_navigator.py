@@ -138,9 +138,13 @@ class _Registry:
         _ = name
         return None
 
+    def list_tools_for_permission(self, permission_level: str = "user") -> list[str]:
+        _ = permission_level
+        return list(self.names)
+
     def select_tools_for_intent(self, message_text: str, permission_level: str) -> list[str]:
         _ = (message_text, permission_level)
-        return list(self.names)
+        raise AssertionError("strict navigator should not use legacy intent selector")
 
     def get_schemas_for_prompt_filtered(self, tool_names: list[str]) -> str:
         return "\n".join(f"### {name}" for name in tool_names if name in self.names)

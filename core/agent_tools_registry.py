@@ -251,6 +251,10 @@ class AgentToolRegistry:
                 selected.append(must_keep)
         return selected
 
+    def list_tools_for_permission(self, permission_level: str = "user") -> list[str]:
+        """Return the permission-filtered full tool pool before Navigator scoping."""
+        return self._list_tools_for_permission(permission_level)
+
     def set_intent_keyword_routing_enabled(self, enabled: bool) -> None:
         """兼容旧版 Engine: 仅保留开关 API，不再启用本地关键词路由。"""
         self._intent_keyword_routing_enabled = bool(enabled)

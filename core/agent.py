@@ -2003,6 +2003,19 @@ class AgentLoop:
         navigator = self._load_prompt_navigator()
         return bool(navigator.enabled and navigator.config.strict_tool_routing)
 
+    def _list_permission_visible_tools(self, permission_level: str) -> list[str]:
+        registry = self.tool_registry
+        public_lister = getattr(registry, "list_tools_for_permission", None)
+        if callable(public_lister):
+            return list(public_lister(permission_level))
+        private_lister = getattr(registry, "_list_tools_for_permission", None)
+        if callable(private_lister):
+            return list(private_lister(permission_level))
+        legacy_selector = getattr(registry, "select_tools_for_intent", None)
+        if callable(legacy_selector):
+            return list(legacy_selector("", permission_level))
+        return ["think", "final_answer", NAVIGATE_SECTION_TOOL]
+
     def _requires_tool_review_before_final(self, ctx: AgentContext) -> bool:
         state = ctx.navigator_state
         evidence = set(state.evidence if state is not None else [])
@@ -2151,10 +2164,7 @@ class AgentLoop:
 
         # Prompt Navigator: 本地只用结构信号预选分区，最终由 LLM 复核/跳转。
         perm_level = self._resolve_permission_level(ctx)
-        base_tools = self.tool_registry.select_tools_for_intent(
-            ctx.message_text,
-            perm_level,
-        )
+        base_tools = self._list_permission_visible_tools(perm_level)
         selected_tools, navigator_prompt = self._apply_prompt_navigator_scope(
             ctx,
             base_tools,
