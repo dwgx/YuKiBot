@@ -18,6 +18,52 @@ class _DummyExecutor(ToolExecutor):
 
 
 class LocalIntentHeuristicRegressionTests(unittest.TestCase):
+    def test_passive_group_image_followup_does_not_enter_agent(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine._recent_directed_hints = {}
+        engine._looks_like_bot_call = lambda text: False
+
+        message = EngineMessage(
+            conversation_id="group:1",
+            user_id="2",
+            text="MULTIMODAL_EVENT user sent multimodal message: image:[image]",
+            mentioned=False,
+            is_private=False,
+        )
+        trigger = SimpleNamespace(reason="followup_window")
+
+        self.assertTrue(
+            engine._should_ignore_passive_multimodal_turn(
+                message=message,
+                text=message.text,
+                trigger=trigger,
+                explicit_bot_addressed=False,
+            )
+        )
+
+    def test_directed_image_still_enters_agent(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine._recent_directed_hints = {}
+        engine._looks_like_bot_call = lambda text: False
+
+        message = EngineMessage(
+            conversation_id="group:1",
+            user_id="2",
+            text="MULTIMODAL_EVENT_AT user mentioned bot and sent multimodal message: image:[image]",
+            mentioned=True,
+            is_private=False,
+        )
+        trigger = SimpleNamespace(reason="directed")
+
+        self.assertFalse(
+            engine._should_ignore_passive_multimodal_turn(
+                message=message,
+                text=message.text,
+                trigger=trigger,
+                explicit_bot_addressed=True,
+            )
+        )
+
     def test_engine_followup_keywords_do_not_trigger_local_guesses(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)
         engine._is_passive_multimodal_text = lambda text: False

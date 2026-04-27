@@ -1655,7 +1655,23 @@ class YukikoEngine:
 
         # ── Agent 模式：优先走 Agent 循环 ──
         if self.agent.enable and self.model_client.enabled:
-            if self._should_prefer_router_for_plain_text(
+            if self._should_ignore_passive_multimodal_turn(
+                message=message,
+                text=text,
+                trigger=trigger,
+                explicit_bot_addressed=explicit_bot_addressed,
+            ):
+                self.logger.info(
+                    "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
+                    message.conversation_id,
+                    message.user_id,
+                    "passive_multimodal_not_directed",
+                    clip_text(text, 80),
+                )
+                return EngineResponse(
+                    action="ignore", reason="passive_multimodal_not_directed"
+                )
+            elif self._should_prefer_router_for_plain_text(
                 message=message, text=text, trigger=trigger
             ):
                 self.logger.info(
@@ -2996,6 +3012,37 @@ class YukikoEngine:
             return True
 
         return False
+
+    def _should_ignore_passive_multimodal_turn(
+        self,
+        message: EngineMessage,
+        text: str,
+        trigger: Any,
+        explicit_bot_addressed: bool,
+    ) -> bool:
+        _ = text
+        if explicit_bot_addressed or message.mentioned or message.is_private:
+            return False
+
+        if not self._is_passive_multimodal_text(message.text):
+            return False
+
+        user_text = normalize_text(self._extract_multimodal_user_text(message.text))
+        if user_text and (
+            self._looks_like_explicit_request(user_text)
+            or self._looks_like_media_instruction(user_text)
+            or self._looks_like_bot_call(user_text)
+        ):
+            return False
+
+        if self._has_recent_directed_hint(message):
+            return False
+
+        reason = normalize_text(str(getattr(trigger, "reason", ""))).lower()
+        if reason == "recent_media_followup":
+            return False
+
+        return True
 
     async def _retry_tool_after_failure(
         self,
