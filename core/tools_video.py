@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 
 from html import unescape
 from pathlib import Path
@@ -3427,6 +3428,14 @@ class ToolVideoMixin:
             len(format_candidates),
             source_url[:60],
         )
+        if is_iqiyi:
+            iqiyi_path = self._download_iqiyi_video_subprocess_sync(
+                source_url=source_url,
+                digest=digest,
+                output_template=output_template,
+            )
+            if iqiyi_path is not None:
+                return iqiyi_path
         require_audio = bool(
             "bilibili.com" in host
             or host.endswith("b23.tv")
@@ -3605,6 +3614,79 @@ class ToolVideoMixin:
                     os.unlink(_tmp_cookie_file)
                 except OSError:
                     pass
+
+    def _download_iqiyi_video_subprocess_sync(
+        self,
+        source_url: str,
+        digest: str,
+        output_template: str,
+    ) -> Path | None:
+        """Download iQiyi/iQ.com in a fresh process to isolate PhantomJS crashes."""
+        self._ensure_legacy_phantomjs_path()
+        env = os.environ.copy()
+        timeout = max(45, min(180, int(self._video_download_timeout_seconds) + 45))
+        cmd = [
+            sys.executable,
+            "-m",
+            "yt_dlp",
+            "--no-warnings",
+            "--socket-timeout",
+            str(max(10, int(self._video_download_timeout_seconds))),
+            "--retries",
+            "3",
+            "--extractor-retries",
+            "2",
+            "--fragment-retries",
+            "3",
+            "--skip-unavailable-fragments",
+            "-f",
+            "200/100/300/500/best",
+            "-o",
+            output_template,
+            source_url,
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except Exception as exc:
+            self._last_video_download_error[source_url] = normalize_text(str(exc))
+            return None
+
+        fallback = self._pick_downloaded_video_fallback(digest)
+        if fallback is not None:
+            if not self._video_has_audio_stream(fallback):
+                _ytdlp_log.warning(
+                    "iqiyi_subprocess_no_audio%s | path=%s",
+                    _tool_trace_tag(),
+                    fallback.name,
+                )
+                self._safe_unlink(fallback)
+            else:
+                self._last_video_download_error.pop(source_url, None)
+                _ytdlp_log.info(
+                    "iqiyi_subprocess_download_ok%s | code=%s | path=%s | size=%d",
+                    _tool_trace_tag(),
+                    proc.returncode,
+                    fallback.name,
+                    fallback.stat().st_size,
+                )
+                return fallback
+
+        err = normalize_text((proc.stderr or proc.stdout or "").strip())
+        self._last_video_download_error[source_url] = err or f"yt_dlp_exit_{proc.returncode}"
+        _ytdlp_log.warning(
+            "iqiyi_subprocess_download_failed%s | code=%s | error=%s",
+            _tool_trace_tag(),
+            proc.returncode,
+            clip_text(self._last_video_download_error[source_url], 180),
+        )
+        return None
 
     def _pick_downloaded_video_fallback(self, digest: str) -> Path | None:
         candidates = sorted(
