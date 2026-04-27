@@ -2844,7 +2844,10 @@ class AgentLoop:
                 "keyword", self._infer_lookup_keyword(contextual_query or text)
             )
         elif tool_name == "split_video":
-            _set_if_empty("url", recent_video_url or candidate_url)
+            explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
+                normalize_text(ctx.reply_to_text)
+            )
+            _set_if_empty("url", explicit_video_url or recent_video_url or candidate_url)
             inferred_mode = self._infer_split_video_mode(contextual_query or text)
             if inferred_mode:
                 _set_if_empty("mode", inferred_mode)
@@ -2870,7 +2873,10 @@ class AgentLoop:
             "smart_download",
         }:
             if tool_name in {"parse_video", "analyze_video"}:
-                _set_if_empty("url", recent_video_url or candidate_url)
+                explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
+                    normalize_text(ctx.reply_to_text)
+                )
+                _set_if_empty("url", explicit_video_url or recent_video_url or candidate_url)
             elif tool_name == "fetch_webpage":
                 _set_if_empty(
                     "url",
@@ -2896,7 +2902,10 @@ class AgentLoop:
                 "media_type", self._infer_media_type(contextual_query or text)
             )
         elif tool_name == "analyze_local_video":
-            _set_if_empty("url", recent_video_url or candidate_url)
+            explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
+                normalize_text(ctx.reply_to_text)
+            )
+            _set_if_empty("url", explicit_video_url or recent_video_url or candidate_url)
             _set_if_empty("question", text)
         elif tool_name == "analyze_image":
             _set_if_empty("question", text)
@@ -3048,6 +3057,7 @@ class AgentLoop:
             "介绍",
             "是什么",
             "安全吗",
+            "看",
             "website",
             "webpage",
             "site",
@@ -4107,12 +4117,15 @@ class AgentLoop:
         text = normalize_text(ctx.message_text)
         contextual_text = self._rebuild_query_with_context(text, ctx) or text
         has_video_media = self._has_video_media(ctx)
-        video_url = self._extract_recent_media_url(
-            ctx, "video"
-        ) or self._extract_first_video_url(contextual_text)
+        explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
+            normalize_text(ctx.reply_to_text)
+        )
+        video_url = explicit_video_url or self._extract_recent_media_url(ctx, "video")
         if not has_video_media and not video_url:
             return None
         instruction_text = normalize_text(_RE_URL_STRIP.sub(" ", contextual_text))
+        if video_url and self._looks_like_video_parse_request(contextual_text):
+            return "parse_video", {"url": video_url}
         mode = self._infer_split_video_mode(instruction_text)
         time_hints = self._infer_video_time_hints(instruction_text)
         frame_hint = self._infer_frame_count_hint(instruction_text)

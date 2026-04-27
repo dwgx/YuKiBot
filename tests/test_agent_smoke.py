@@ -343,7 +343,7 @@ class AgentLoopSmokeTests(unittest.TestCase):
         )
 
         result = asyncio.run(loop.run(_make_ctx(
-            message_text="skiapi.dev这个网站帮我看看",
+            message_text="网络是时光机 看skiapi.dev",
             media_summary=[],
             raw_segments=[],
         )))
@@ -385,6 +385,27 @@ class AgentLoopSmokeTests(unittest.TestCase):
             message_text="解析7.64 复制打开抖音，看看【宇鸽的作品】 https://v.douyin.com/hskaBb36Hfg/ a@N.JI",
             media_summary=[],
             raw_segments=[],
+        )))
+
+        self.assertEqual(registry.calls[0][0], "parse_video")
+        self.assertEqual(registry.calls[0][1]["url"], "https://v.douyin.com/hskaBb36Hfg/")
+        self.assertEqual(result.tool_calls_made, 1)
+
+    def test_forced_douyin_parse_uses_current_url_over_recent_video_context(self):
+        """当前消息有视频链接时，不能拿上一轮视频 URL 去执行强制工具。"""
+        registry = _RecordingRegistry({"parse_video", "split_video", "final_answer", "think"})
+        loop = _make_loop(
+            [],
+            registry=registry,
+        )
+
+        result = asyncio.run(loop.run(_make_ctx(
+            message_text="@30秒 解析7.64 复制打开抖音，看看【宇鸽的作品】 https://v.douyin.com/hskaBb36Hfg/ a@N.JI",
+            media_summary=[],
+            raw_segments=[],
+            memory_context=[
+                "[user] https://www.bilibili.com/video/BV16aw4zAEqD/?spm_id_from=333.337.search-card.all.click",
+            ],
         )))
 
         self.assertEqual(registry.calls[0][0], "parse_video")

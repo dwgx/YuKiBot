@@ -34,6 +34,14 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertIn("video_url", state.candidate_sections)
         self.assertIn("video_url", state.evidence)
 
+    def test_bare_domain_preselects_web_research(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "网络是时光机 看skiapi.dev"
+        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "fetch_webpage"])
+        self.assertEqual(state.active_section, "web_research")
+        self.assertIn("url", state.evidence)
+
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         samples = [

@@ -9,6 +9,13 @@ from urllib.parse import urlparse
 from utils.text import clip_text, normalize_text
 
 _URL_RE = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_BARE_WEB_HOST_RE = re.compile(
+    r"(?<![@A-Za-z0-9_.-])"
+    r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"(?:com|net|org|dev|io|ai|app|site|xyz|me|co|cn|jp|tv|gg|cc|info|wiki|top)"
+    r"(?::\d{2,5})?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?)",
+    re.IGNORECASE,
+)
 _DOWNLOAD_EXT_RE = re.compile(r"\.(?:apk|exe|msi|zip|7z|rar|ipa|dmg)(?:[?#]|$)", re.IGNORECASE)
 _VIDEO_EXT_RE = re.compile(r"\.(?:mp4|webm|mov|m4v|mkv)(?:[?#]|$)", re.IGNORECASE)
 _VIDEO_DOMAINS = (
@@ -582,6 +589,10 @@ class PromptNavigator:
         for part in parts:
             for match in _URL_RE.findall(part):
                 url = match.rstrip(").,，。!?！？】》」』")
+                if url not in urls:
+                    urls.append(url)
+            for match in _BARE_WEB_HOST_RE.findall(part):
+                url = "https://" + match.rstrip(").,，。!?！？】》」』")
                 if url not in urls:
                     urls.append(url)
         return urls
