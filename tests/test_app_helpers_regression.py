@@ -125,7 +125,8 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.calls[0][0], "upload_private_file")
         self.assertEqual(bot.calls[0][1]["user_id"], "123456")
         self.assertEqual(bot.calls[0][1]["name"], "demo.mp4")
-        self.assertTrue(str(bot.calls[0][1]["file"]).startswith(str(stage_dir)))
+        sent_path = Path(str(bot.calls[0][1]["file"])).resolve()
+        self.assertTrue(sent_path.is_relative_to(stage_dir.resolve()))
 
 
 if __name__ == "__main__":
