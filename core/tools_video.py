@@ -2975,6 +2975,8 @@ class ToolVideoMixin:
             return "当前环境关闭了视频解析能力，请联系管理员开启。"
         if code == "ytdlp_missing":
             return "当前环境缺少视频解析依赖（yt-dlp），暂时无法解析这条链接。"
+        if "phantomjs not found" in code:
+            return "这条爱奇艺/iQ.com 链接需要 PhantomJS 才能解析，当前运行环境没有这个依赖。请安装 PhantomJS 后再试，或换一个可公开下载的视频链接。"
         if (
             code.startswith("cookie_unavailable:")
             or "cookies database" in code
@@ -3240,6 +3242,7 @@ class ToolVideoMixin:
         is_kuaishou = "kuaishou.com" in host or "chenzhongtech.com" in host
         is_youku = "youku.com" in host
         is_acfun = "acfun.cn" in host or "acfun.com" in host
+        is_youtube = "youtube.com" in host or host.endswith("youtu.be")
         is_tencent = "v.qq.com" in host or (
             "qq.com" in host
             and "/x/" in normalize_text(urlparse(source_url).path).lower()
@@ -3358,6 +3361,14 @@ class ToolVideoMixin:
                 "best[ext=mp4]",
                 "best",
             ]
+        elif is_youtube:
+            # YouTube: 优先有音频的渐进式小 mp4；必要时再让 ffmpeg 合并 720p 内视频+音频。
+            format_candidates = [
+                "best[ext=mp4][acodec!=none][vcodec!=none][height<=480]/best[acodec!=none][vcodec!=none][height<=480]",
+                "best[ext=mp4][acodec!=none][vcodec!=none][height<=720]/best[acodec!=none][vcodec!=none][height<=720]",
+                "bv*[ext=mp4][height<=720]+ba[ext=m4a]/bv*[height<=720]+ba",
+                "best[ext=mp4]/best",
+            ]
         else:
             format_candidates = [
                 f"best[ext=mp4][filesize<{self._video_download_max_mb}M]/best[ext=mp4]",
@@ -3379,6 +3390,7 @@ class ToolVideoMixin:
             or is_youku
             or is_acfun
             or is_tencent
+            or is_youtube
         )
         no_audio_fallback: Path | None = None
         try:
