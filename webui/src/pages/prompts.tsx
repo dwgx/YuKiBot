@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from "react";
-import { Accordion, AccordionItem, Button, Spinner, Textarea } from "@heroui/react";
+import { Accordion, AccordionItem, Button, Input, Spinner, Switch, Textarea } from "@heroui/react";
 import { Save, RefreshCw, Undo2 } from "lucide-react";
 import CodeMirror from "@uiw/react-codemirror";
 import { yaml } from "@codemirror/lang-yaml";
@@ -88,6 +88,25 @@ function setNestedValue(obj: AnyObj, path: string, value: unknown): AnyObj {
   return root;
 }
 
+function asObject(value: unknown): AnyObj {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as AnyObj) : {};
+}
+
+function formatStringList(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item ?? "").trim()).filter(Boolean).join("\n");
+  }
+  if (typeof value === "string") return value;
+  return "";
+}
+
+function parseStringList(text: string): string[] {
+  return text
+    .split(/\r?\n|,/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
 export default function PromptsPage() {
   const { notifications, success, danger } = useNotifications();
   const undoContentRef = useRef<string | null>(null);
@@ -101,6 +120,7 @@ export default function PromptsPage() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savingQuick, setSavingQuick] = useState(false);
+  const [savingNavigator, setSavingNavigator] = useState(false);
   const [msg, setMsg] = useState("");
 
   const load = useCallback(async () => {
@@ -176,6 +196,37 @@ export default function PromptsPage() {
     }
   };
 
+  const setNavigatorValue = (path: string, value: unknown) => {
+    setQuick((prev) => setNestedValue(prev, `prompt_navigator.${path}`, value));
+  };
+
+  const setNavigatorSectionValue = (sectionId: string, field: string, value: unknown) => {
+    setQuick((prev) => setNestedValue(prev, `prompt_navigator.sections.${sectionId}.${field}`, value));
+  };
+
+  const handleSaveNavigator = async () => {
+    setSavingNavigator(true);
+    setMsg("");
+    try {
+      undoQuickRef.current = JSON.parse(JSON.stringify(quick));
+      undoContentRef.current = content;
+      const payload = asObject(getNestedRawValue(quick, "prompt_navigator"));
+      const res = await api.patchPrompts({ prompt_navigator: payload });
+      setQuick(res.parsed || {});
+      const full = await api.getPrompts();
+      setContent(String(full.content ?? full.yaml_text ?? ""));
+      if (res.ok) {
+        success("保存成功", res.message || "Prompt Navigator 已保存并重载", 5000);
+      } else {
+        danger("保存失败", res.message || "未知错误", 5000);
+      }
+    } catch (e: unknown) {
+      danger("保存失败", e instanceof Error ? e.message : "未知错误", 5000);
+    } finally {
+      setSavingNavigator(false);
+    }
+  };
+
   const handleUndo = async () => {
     if (!undoContentRef.current) return;
     setSaving(true);
@@ -216,6 +267,9 @@ export default function PromptsPage() {
     );
   }
 
+  const navigatorConfig = asObject(getNestedRawValue(quick, "prompt_navigator"));
+  const navigatorSections = asObject(navigatorConfig.sections);
+
   return (
     <>
       <NotificationContainer notifications={notifications} />
@@ -250,7 +304,141 @@ export default function PromptsPage() {
       <p className="text-xs text-default-400">
         说明：本地 cue/关键词路由已硬删除，提示词仅用于 AI 行为约束，不再作为本地分支匹配词表。
       </p>
-      <Accordion selectionMode="multiple" defaultExpandedKeys={["quick_prompts"]}>
+      <Accordion selectionMode="multiple" defaultExpandedKeys={["prompt_navigator", "quick_prompts"]}>
+        <AccordionItem key="prompt_navigator" title="Prompt Navigator">
+          <div className="space-y-4 rounded-xl border border-default-300/30 bg-content2/30 p-3">
+            <div className="grid gap-3 md:grid-cols-4">
+              <Switch
+                isSelected={navigatorConfig.enable !== false}
+                onValueChange={(v) => setNavigatorValue("enable", v)}
+                classNames={{ base: "self-end" }}
+              >
+                启用
+              </Switch>
+              <Input
+                label="模式"
+                labelPlacement="outside"
+                value={String(navigatorConfig.mode ?? "local_prefilter_llm_review")}
+                onValueChange={(v) => setNavigatorValue("mode", v)}
+                classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+              />
+              <Input
+                label="默认分区"
+                labelPlacement="outside"
+                value={String(navigatorConfig.default_section ?? "general_chat")}
+                onValueChange={(v) => setNavigatorValue("default_section", v)}
+                classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+              />
+              <Input
+                type="number"
+                label="最大跳转次数"
+                labelPlacement="outside"
+                min={0}
+                max={12}
+                value={String(navigatorConfig.max_switches ?? 3)}
+                onValueChange={(v) => setNavigatorValue("max_switches", Number(v || 0))}
+                classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+              />
+            </div>
+            <Textarea
+              label="总目录提示词"
+              labelPlacement="outside"
+              minRows={3}
+              maxRows={8}
+              value={String(navigatorConfig.root_prompt ?? "")}
+              onValueChange={(v) => setNavigatorValue("root_prompt", v)}
+              classNames={{
+                label: "text-sm font-semibold mb-1.5",
+                input: "text-sm",
+                inputWrapper: "bg-content1/70 border border-default-300/35 data-[focus=true]:border-primary/60",
+              }}
+            />
+            <div className="space-y-3">
+              {Object.entries(navigatorSections).map(([sectionId, rawSection]) => {
+                const section = asObject(rawSection);
+                return (
+                  <div key={sectionId} className="space-y-3 rounded-lg border border-default-300/30 bg-content1/45 p-3">
+                    <div className="grid gap-3 md:grid-cols-[minmax(140px,0.8fr)_minmax(180px,1fr)_minmax(180px,1fr)]">
+                      <Input
+                        label="分区 ID"
+                        labelPlacement="outside"
+                        value={sectionId}
+                        isReadOnly
+                        classNames={{ inputWrapper: "bg-content2/60 border border-default-300/30" }}
+                      />
+                      <Input
+                        label="分区名"
+                        labelPlacement="outside"
+                        value={String(section.name ?? "")}
+                        onValueChange={(v) => setNavigatorSectionValue(sectionId, "name", v)}
+                        classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+                      />
+                      <Textarea
+                        label="Fallback 分区"
+                        labelPlacement="outside"
+                        minRows={1}
+                        maxRows={4}
+                        placeholder="每行一个"
+                        value={formatStringList(section.fallback_sections)}
+                        onValueChange={(v) => setNavigatorSectionValue(sectionId, "fallback_sections", parseStringList(v))}
+                        classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+                      />
+                    </div>
+                    <Textarea
+                      label="使用条件"
+                      labelPlacement="outside"
+                      minRows={2}
+                      maxRows={6}
+                      value={String(section.when_to_use ?? "")}
+                      onValueChange={(v) => setNavigatorSectionValue(sectionId, "when_to_use", v)}
+                      classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+                    />
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <Textarea
+                        label="工具列表"
+                        labelPlacement="outside"
+                        minRows={4}
+                        maxRows={10}
+                        placeholder="每行一个"
+                        value={formatStringList(section.tools)}
+                        onValueChange={(v) => setNavigatorSectionValue(sectionId, "tools", parseStringList(v))}
+                        classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+                      />
+                      <Textarea
+                        label="失败策略"
+                        labelPlacement="outside"
+                        minRows={4}
+                        maxRows={10}
+                        value={String(section.failure_policy ?? "")}
+                        onValueChange={(v) => setNavigatorSectionValue(sectionId, "failure_policy", v)}
+                        classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+                      />
+                    </div>
+                    <Textarea
+                      label="分区提示词"
+                      labelPlacement="outside"
+                      minRows={4}
+                      maxRows={12}
+                      value={String(section.instructions ?? "")}
+                      onValueChange={(v) => setNavigatorSectionValue(sectionId, "instructions", v)}
+                      classNames={{ inputWrapper: "bg-content1/70 border border-default-300/35" }}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+            <div className="flex justify-end pt-2">
+              <Button
+                color="primary"
+                startContent={<Save size={18} />}
+                isLoading={savingNavigator}
+                onPress={handleSaveNavigator}
+              >
+                保存 Navigator
+              </Button>
+            </div>
+          </div>
+        </AccordionItem>
         <AccordionItem key="quick_prompts" title="常用提示词可视化编辑">
           <div className="space-y-3 rounded-xl border border-default-300/30 bg-content2/30 p-3">
             {QUICK_FIELDS.map((item) => (

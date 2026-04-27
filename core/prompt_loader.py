@@ -132,6 +132,15 @@ def get_dict(section: str) -> dict[str, str]:
     return {}
 
 
+def get_section(section: str) -> dict[str, Any]:
+    """获取整个 section 的原始结构副本，供嵌套配置使用。"""
+    _ensure_loaded()
+    sec = _cache.get(section)
+    if isinstance(sec, dict):
+        return copy.deepcopy(sec)
+    return {}
+
+
 def get_list(key: str) -> list[str]:
     """获取列表类型的值。"""
     _ensure_loaded()

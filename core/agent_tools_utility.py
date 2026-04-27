@@ -66,6 +66,23 @@ def _register_utility_tools(registry: AgentToolRegistry) -> None:
         _handle_think,
     )
 
+    registry.register(
+        ToolSchema(
+            name="navigate_section",
+            description="内部 Prompt Navigator 分区跳转工具。当当前分区缺少工具或任务应由其他提示词分区处理时调用",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "section_id": {"type": "string", "description": "目标分区 ID"},
+                    "reason": {"type": "string", "description": "切换原因，简短说明当前分区为什么不够用"},
+                },
+                "required": ["section_id"],
+            },
+            category="general",
+        ),
+        _handle_navigate_section,
+    )
+
 
 async def _handle_final_answer(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     text = str(args.get("text", "")).strip()
@@ -98,6 +115,15 @@ async def _handle_final_answer(args: dict[str, Any], context: dict[str, Any]) ->
 async def _handle_think(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
     thought = str(args.get("thought", "")).strip()
     return ToolCallResult(ok=True, data={"thought": thought}, display=f"[思考] {clip_text(thought, 200)}")
+
+
+async def _handle_navigate_section(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    _ = (args, context)
+    return ToolCallResult(
+        ok=False,
+        error="navigate_section_internal_only",
+        display="navigate_section 只能由 AgentLoop 内部处理。",
+    )
 
 
 # ── Sticker / Face tools ──
@@ -899,4 +925,3 @@ def register_sticker_tools(registry: "AgentToolRegistry", model_client: Any = No
 
 
 # ── Memory tools ──
-

@@ -7,6 +7,8 @@ from typing import Any
 
 import yaml
 
+from core.prompt_navigator import default_prompt_navigator_payload
+
 _log = logging.getLogger("yukiko.templates")
 
 _ROOT = Path(__file__).resolve().parents[1]
@@ -453,6 +455,7 @@ def _built_in_prompts_defaults() -> dict[str, Any]:
             "brief": "回复简短精炼，抓重点，不展开细节。",
             "minimal": "极简回复，一两句话概括。",
         },
+        "prompt_navigator": default_prompt_navigator_payload(),
     }
     return _strip_heuristic_prompt_lists(payload)
 

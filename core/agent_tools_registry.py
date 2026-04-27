@@ -226,7 +226,7 @@ class AgentToolRegistry:
         return "\n".join(parts)
 
     # 每个分组始终包含的工具名
-    _ALWAYS_INCLUDE = {"final_answer", "think"}
+    _ALWAYS_INCLUDE = {"final_answer", "think", "navigate_section"}
 
     def _tool_visible_for_permission(self, name: str, permission_level: str) -> bool:
         level = normalize_text(permission_level or "user").lower() or "user"
@@ -334,6 +334,9 @@ class AgentToolRegistry:
 
     def get_schema(self, name: str) -> ToolSchema | None:
         return self._schemas.get(name)
+
+    def list_tool_names(self) -> list[str]:
+        return list(self._schemas.keys())
 
     @classmethod
     def _coerce_basic_type(cls, value: Any, expected_type: str) -> tuple[Any, bool]:

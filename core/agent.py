@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from core.agent_tools import AgentToolRegistry, ToolCallResult
 from core import prompt_loader as _pl
+from core.prompt_navigator import NAVIGATE_SECTION_TOOL, NavigatorState, PromptNavigator
 from core.prompt_policy import PromptPolicy
 from services.model_client import ModelClient
 from utils.intent import (
@@ -124,6 +125,7 @@ class AgentContext:
     memory_context: list[str] = field(default_factory=list)
     related_memories: list[str] = field(default_factory=list)
     native_tools: list[str] = field(default_factory=list)
+    navigator_state: NavigatorState | None = None
     user_profile_summary: str = ""
     preferred_name: str = ""
     recent_speakers: list[tuple[str, str, str]] = field(default_factory=list)
@@ -1080,6 +1082,25 @@ class AgentLoop:
                 tool_name, tool_args, ctx
             )
             tool_args = self._normalize_tool_args(tool_name, tool_args, ctx)
+            if tool_name == NAVIGATE_SECTION_TOOL:
+                ok, nav_result = self._handle_navigate_section_tool(ctx, tool_args)
+                steps.append(
+                    {
+                        "step": step_idx,
+                        "tool": NAVIGATE_SECTION_TOOL,
+                        "ok": ok,
+                        "display": clip_text(str(nav_result.get("display", "")), 300),
+                        "error": str(nav_result.get("error", "")),
+                    }
+                )
+                self._append_tool_result(
+                    messages,
+                    parsed,
+                    assistant_msg,
+                    response_text,
+                    nav_result,
+                )
+                continue
             if (
                 forced_media_tool
                 and tool_calls_made == 0
@@ -1898,6 +1919,103 @@ class AgentLoop:
             )
         return "".join(hint_parts) if hint_parts else ""
 
+    def _load_prompt_navigator(self) -> PromptNavigator:
+        return PromptNavigator.from_payload(_pl.get_section("prompt_navigator"))
+
+    def _apply_prompt_navigator_scope(
+        self,
+        ctx: AgentContext,
+        base_tools: list[str],
+    ) -> tuple[list[str], str]:
+        navigator = self._load_prompt_navigator()
+        if not navigator.enabled:
+            ctx.navigator_state = None
+            return base_tools, ""
+
+        state = navigator.initial_state(ctx, base_tools)
+        ctx.navigator_state = state
+        selected_tools = navigator.scoped_tools(state) or list(base_tools)
+        _log.info(
+            "navigator_preselect | trace=%s | active=%s | candidates=%s | evidence=%s",
+            ctx.trace_id,
+            state.active_section,
+            ",".join(state.candidate_sections),
+            ",".join(state.evidence),
+        )
+        _log.info(
+            "navigator_tool_scope | trace=%s | section=%s | tools=%s",
+            ctx.trace_id,
+            state.active_section,
+            ",".join(selected_tools),
+        )
+        _log.info(
+            "navigator_section_selected | trace=%s | section=%s",
+            ctx.trace_id,
+            state.active_section,
+        )
+        return selected_tools, navigator.render_system_block(state, selected_tools)
+
+    def _handle_navigate_section_tool(
+        self,
+        ctx: AgentContext,
+        tool_args: dict[str, Any],
+    ) -> tuple[bool, dict[str, Any]]:
+        state = ctx.navigator_state
+        navigator = self._load_prompt_navigator()
+        if state is None or not navigator.enabled:
+            _log.info("navigator_fallback | trace=%s | reason=disabled", ctx.trace_id)
+            return False, {
+                "tool": NAVIGATE_SECTION_TOOL,
+                "ok": False,
+                "error": "prompt_navigator_disabled",
+                "display": "Prompt Navigator 未启用，请直接使用当前工具或 final_answer。",
+            }
+
+        section_id = normalize_text(str(tool_args.get("section_id", "")))
+        reason = normalize_text(str(tool_args.get("reason", "")))
+        previous = state.active_section
+        ok, status = navigator.switch_section(state, section_id)
+        selected_tools = navigator.scoped_tools(state) or list(state.visible_tools)
+        ctx.native_tools = selected_tools
+        if ok:
+            _log.info(
+                "navigator_switch | trace=%s | from=%s | to=%s | count=%d | reason=%s",
+                ctx.trace_id,
+                previous,
+                state.active_section,
+                state.switch_count,
+                clip_text(reason, 160),
+            )
+            _log.info(
+                "navigator_tool_scope | trace=%s | section=%s | tools=%s",
+                ctx.trace_id,
+                state.active_section,
+                ",".join(selected_tools),
+            )
+        else:
+            _log.info(
+                "navigator_fallback | trace=%s | from=%s | target=%s | status=%s",
+                ctx.trace_id,
+                previous,
+                section_id,
+                status,
+            )
+        tool_docs = self.tool_registry.get_schemas_for_prompt_filtered(selected_tools)
+        display = navigator.render_switch_result(state, selected_tools, tool_docs)
+        payload: dict[str, Any] = {
+            "tool": NAVIGATE_SECTION_TOOL,
+            "ok": ok,
+            "display": display if ok else f"{status}\n{display}",
+            "data": {
+                "active_section": state.active_section,
+                "tools": selected_tools,
+                "switch_count": state.switch_count,
+            },
+        }
+        if not ok:
+            payload["error"] = status
+        return ok, payload
+
     def _build_system_prompt(self, ctx: AgentContext) -> str:
         """构建 Agent 系统提示词。"""
         template = _pl.get_dict("agent")
@@ -1925,11 +2043,15 @@ class AgentLoop:
         context_rules_text = template.get("context_rules", "")
         network_flow_text = template.get("network_flow", "")
 
-        # 智能工具过滤: 根据用户意图选择相关工具子集
+        # Prompt Navigator: 本地只用结构信号预选分区，最终由 LLM 复核/跳转。
         perm_level = self._resolve_permission_level(ctx)
-        selected_tools = self.tool_registry.select_tools_for_intent(
+        base_tools = self.tool_registry.select_tools_for_intent(
             ctx.message_text,
             perm_level,
+        )
+        selected_tools, navigator_prompt = self._apply_prompt_navigator_scope(
+            ctx,
+            base_tools,
         )
         ctx.native_tools = selected_tools
         tool_docs = (
@@ -2035,6 +2157,8 @@ class AgentLoop:
         prompt += f"## 工具使用\n{tools_text}{sticker_hint}\n\n"
         if normalize_text(tool_priority_text):
             prompt += f"## 工具优先级\n{tool_priority_text}\n\n"
+        if navigator_prompt:
+            prompt += f"{navigator_prompt}\n\n"
         if selected_tool_hints:
             prompt += (
                 "## 工具细粒度提示（按本轮可用工具）\n"

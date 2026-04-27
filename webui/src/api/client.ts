@@ -192,14 +192,14 @@ class ApiClient {
   }
 
   updatePrompts(content: string) {
-    return this.request<{ ok: boolean; message: string }>("/prompts", {
+    return this.request<{ ok: boolean; message: string; warnings?: string[] }>("/prompts", {
       method: "PUT",
       body: JSON.stringify({ yaml_text: content, content }),
     });
   }
 
   patchPrompts(patch: Record<string, unknown>) {
-    return this.request<{ ok: boolean; message: string; parsed: Record<string, unknown> }>("/prompts", {
+    return this.request<{ ok: boolean; message: string; parsed: Record<string, unknown>; warnings?: string[] }>("/prompts", {
       method: "PATCH",
       body: JSON.stringify({ patch }),
     });

@@ -199,6 +199,213 @@ verbosity:
   medium: 中等长度，先结论后说明
   brief: 简短精炼，抓重点
   minimal: 极简，一两句话
+prompt_navigator:
+  enable: true
+  mode: local_prefilter_llm_review
+  default_section: general_chat
+  max_switches: 3
+  root_prompt: 当前使用 Prompt Navigator。先看分区目录和当前分区提示；如果当前分区缺少工具或任务更适合其他分区，先调用 navigate_section(section_id, reason) 切换，再继续执行。不要伪造工具结果。
+  sections:
+    general_chat:
+      name: 普通对话与澄清
+      when_to_use: 没有明确结构化媒体、链接、下载、管理或记忆任务时，从这里开始。
+      tools:
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 先判断是否能直接自然回复。若用户实际在要联网、看图、解析链接、下载、点歌、记忆或管理，不要硬答，调用 navigate_section 切到对应分区。
+      fallback_sections:
+      - web_research
+      - multimodal_media
+      - memory_knowledge
+      - fallback_debug
+      failure_policy: 不确定任务类型时，用一句话澄清；发现缺工具时切分区。
+    multimodal_media:
+      name: 图片语音本地视频
+      when_to_use: 当前消息或引用消息携带图片、语音、视频文件等媒体结构。
+      tools:
+      - analyze_image
+      - ocr_image
+      - analyze_voice
+      - analyze_local_video
+      - split_video
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 图片理解用 analyze_image，提取文字用 ocr_image，语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。
+      fallback_sections:
+      - video_url
+      - creative_generation
+      - fallback_debug
+      failure_policy: 媒体缺失或无法读取时，说明缺少哪类媒体并请求用户重发或改发直链。
+    video_url:
+      name: 视频链接解析与分析
+      when_to_use: 消息中有视频平台链接或视频文件 URL，需要解析、提取音频/封面/直链或总结内容。
+      tools:
+      - parse_video
+      - analyze_video
+      - split_video
+      - fetch_webpage
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 拿可发送视频直链优先 parse_video；理解/总结视频内容优先 analyze_video；抽音频、切片、封面、关键帧用 split_video。链接后带说明文字时，仍以提取出的 URL 为目标。
+      fallback_sections:
+      - web_research
+      - download_resources
+      - fallback_debug
+      failure_policy: 解析失败时换 analyze_video 或 fetch_webpage 验证页面；仍失败则回报平台限制和下一步。
+    web_research:
+      name: 网页检索与阅读
+      when_to_use: 用户要查外部事实、打开网页、读链接、搜资料、查 GitHub 或需要最新信息。
+      tools:
+      - web_search
+      - fetch_webpage
+      - scrape_extract
+      - scrape_summarize
+      - scrape_structured
+      - scrape_follow_links
+      - github_search
+      - github_readme
+      - douyin_search
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 外部事实先工具验证。搜索 query 要具体；打开已有 URL 用 fetch_webpage；网页内容复杂时再用 scrape_extract/summarize/structured/follow_links。
+      fallback_sections:
+      - video_url
+      - download_resources
+      - memory_knowledge
+      - fallback_debug
+      failure_policy: 搜索无结果时换一个更具体查询；仍失败就说明查不到的范围和原因。
+    download_resources:
+      name: 资源下载与文件候选
+      when_to_use: 用户要安装包、文件直链、下载候选，或 URL/文件名带下载型扩展名。
+      tools:
+      - search_download_resources
+      - smart_download
+      - web_search
+      - fetch_webpage
+      - scrape_extract
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 先识别平台和扩展名，再找真实候选链接。smart_download 只能传真实直链或高可信候选，遇到 HTML 壳/签名不匹配要换源或回到资源检索。
+      fallback_sections:
+      - web_research
+      - video_url
+      - fallback_debug
+      failure_policy: 下载失败要给出已尝试路径、失败原因和可执行替代候选。
+    music_audio:
+      name: 音乐点歌与音频
+      when_to_use: 用户要点歌、找歌、播放音乐、提取音频或发送音乐卡片。
+      tools:
+      - music_search
+      - music_play_by_id
+      - music_play
+      - bilibili_audio_extract
+      - send_music_card
+      - parse_video
+      - split_video
+      - web_search
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 点歌先 music_search，再基于返回结果选择 music_play_by_id。能识别时拆出歌名/歌手；第三方视频回退链只在用户允许时使用。
+      fallback_sections:
+      - video_url
+      - web_research
+      - fallback_debug
+      failure_policy: 版本不明确或只有试听时，先澄清歌手/版本，不要乱播。
+    creative_generation:
+      name: 创作生成与富消息
+      when_to_use: 用户要画图、生图、语音合成、JSON 卡片、合并转发或创作型输出。
+      tools:
+      - generate_image_enhanced
+      - generate_image
+      - list_image_models
+      - send_json_card
+      - send_forward_message
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 生成图片优先 generate_image_enhanced；需要模型列表用 list_image_models；长内容展示可用 send_forward_message。
+      fallback_sections:
+      - multimodal_media
+      - web_research
+      - fallback_debug
+      failure_policy: 生成失败时保留用户目标，说明失败原因并给一个可重试的简化方案。
+    qq_admin_social:
+      name: QQ 群管理与社交资料
+      when_to_use: 用户要操作群、成员、消息、公告、名片、资料、Qzone、头像或社交关系。
+      tools:
+      - get_group_member_list
+      - get_group_info
+      - get_user_info
+      - get_message
+      - delete_message
+      - recall_recent_messages
+      - set_group_ban
+      - set_group_card
+      - set_group_kick
+      - set_group_special_title
+      - send_group_notice
+      - set_group_whole_ban
+      - set_group_admin
+      - set_group_name
+      - get_qzone_profile
+      - get_qzone_moods
+      - get_qzone_albums
+      - get_qzone_photos
+      - analyze_qzone
+      - send_poke
+      - send_like
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 严格使用当前用户权限和本轮对象解析。@对象通常是操作对象；回复消息通常是引用对象。群管理操作需要明确点名机器人，并遵守高风险确认。
+      fallback_sections:
+      - memory_knowledge
+      - web_research
+      - fallback_debug
+      failure_policy: 权限不足或对象不明确时，不执行，先说明需要的权限或目标。
+    memory_knowledge:
+      name: 记忆知识与长期上下文
+      when_to_use: 用户要记住、回忆、修正记忆、查询知识库或总结对话。
+      tools:
+      - memory_list
+      - memory_add
+      - memory_update
+      - memory_delete
+      - memory_audit
+      - memory_compact
+      - remember_user_fact
+      - recall_about_user
+      - search_knowledge
+      - learn_knowledge
+      - summarize_conversation
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 只把明确、可归属、用户授权的事实写入记忆；偏好和身份不要套给其他人。回忆时优先引用当前用户相关记录。
+      fallback_sections:
+      - web_research
+      - general_chat
+      - fallback_debug
+      failure_policy: 无法确认事实归属时先澄清，不要写入模糊记忆。
+    fallback_debug:
+      name: 兜底排错与安全收敛
+      when_to_use: 当前分区无法处理、工具连续失败、参数缺失、任务跨域或需要安全收敛。
+      tools:
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 整理已知信息、缺失条件、已失败工具和下一步。能切到明确分区就切；不能切时用 final_answer 给用户一个清楚的状态和补充请求。
+      fallback_sections:
+      - general_chat
+      - web_research
+      - multimodal_media
+      failure_policy: 停止循环，输出最小可用结论或向用户要一个关键补充。
 tool_hints:
   web_search: '搜索时 query 要具体，可加 site: 限定'
   parse_video: 支持 B站/抖音/快手/AcFun，自动提取元数据

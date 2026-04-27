@@ -46,6 +46,7 @@ from core.config_templates import (
     load_prompts_template,
 )
 from core.image_gen import ImageGenEngine
+from core.prompt_navigator import validate_prompt_navigator_payload
 from core.webui_auth_routes import build_auth_status_router
 from core.webui_cookie_routes import build_cookie_router
 from core.webui_log_routes import build_log_router
@@ -296,6 +297,31 @@ def _read_prompts_payload() -> tuple[str, dict, bool]:
     default_dict = _default_prompts()
     default_text = yaml.safe_dump(default_dict, allow_unicode=True, default_flow_style=False)
     return default_text, default_dict, True
+
+
+def _prompt_validation_tool_names() -> set[str]:
+    registry = getattr(_engine, "agent_tool_registry", None)
+    if registry is None:
+        return set()
+    if hasattr(registry, "list_tool_names"):
+        try:
+            return {normalize_text(str(name)) for name in registry.list_tool_names()}
+        except Exception:
+            return set()
+    schemas = getattr(registry, "_schemas", {})
+    if isinstance(schemas, dict):
+        return {normalize_text(str(name)) for name in schemas.keys()}
+    return set()
+
+
+def _validate_prompts_payload(parsed: dict[str, Any]) -> list[str]:
+    errors, warnings = validate_prompt_navigator_payload(
+        parsed.get("prompt_navigator"),
+        known_tools=_prompt_validation_tool_names(),
+    )
+    if errors:
+        raise HTTPException(400, "；".join(errors))
+    return warnings
 
 
 def init_webui(engine: Any) -> APIRouter:
@@ -2321,6 +2347,7 @@ async def put_prompts(request: Request):
             raise HTTPException(400, "YAML 必须是对象")
     except Exception as e:
         raise HTTPException(400, f"YAML 格式错误: {e}")
+    warnings = _validate_prompts_payload(parsed)
 
     # 写入文件
     _PROMPTS_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -2330,7 +2357,10 @@ async def put_prompts(request: Request):
     _pl.reload()
     _log.info("提示词已更新并重载")
 
-    return {"ok": True, "message": "提示词已保存并重载", "parsed": parsed}
+    message = "提示词已保存并重载"
+    if warnings:
+        message += "；警告: " + "；".join(warnings[:6])
+    return {"ok": True, "message": message, "parsed": parsed, "warnings": warnings}
 
 
 @router.patch("/prompts", dependencies=[Depends(_check_auth)])
@@ -2347,6 +2377,7 @@ async def patch_prompts(request: Request):
 
     # 合并
     merged = _deep_merge_plain(current, patch)
+    warnings = _validate_prompts_payload(merged)
 
     # 写入
     yaml_text = yaml.safe_dump(merged, allow_unicode=True, default_flow_style=False, sort_keys=False)
@@ -2357,7 +2388,10 @@ async def patch_prompts(request: Request):
     _pl.reload()
     _log.info("提示词已部分更新并重载")
 
-    return {"ok": True, "message": "提示词已更新并重载", "parsed": merged}
+    message = "提示词已更新并重载"
+    if warnings:
+        message += "；警告: " + "；".join(warnings[:6])
+    return {"ok": True, "message": message, "parsed": merged, "warnings": warnings}
 
 
 @router.post("/reload", dependencies=[Depends(_check_auth)])
