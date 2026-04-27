@@ -3398,6 +3398,8 @@ class ToolVideoMixin:
         elif is_iqiyi:
             # 爱奇艺/iQ.com: 旧 extractor 常返回 HLS，优先低清晰度，避免长视频直接超体积。
             format_candidates = [
+                "200/100/300/500",
+                "300/200/100/500",
                 f"best[ext=mp4][height<=360][filesize<{self._video_download_max_mb}M]/best[height<=360]",
                 f"best[ext=mp4][height<=480][filesize<{self._video_download_max_mb}M]/best[height<=480]",
                 "best[ext=mp4][height<=720]/best[height<=720]",
@@ -3530,6 +3532,28 @@ class ToolVideoMixin:
                             source_url[:80],
                         )
                         break
+                    fallback_after_error = self._pick_downloaded_video_fallback(digest)
+                    if fallback_after_error is not None:
+                        if require_audio and not self._video_has_audio_stream(
+                            fallback_after_error
+                        ):
+                            _ytdlp_log.warning(
+                                "video_download_error_fallback_no_audio%s | fmt=%s | path=%s",
+                                _tool_trace_tag(),
+                                fmt[:40],
+                                fallback_after_error.name,
+                            )
+                            self._safe_unlink(fallback_after_error)
+                        else:
+                            self._last_video_download_error.pop(source_url, None)
+                            _ytdlp_log.info(
+                                "video_download_recovered_after_error%s | fmt=%s | path=%s | error=%s",
+                                _tool_trace_tag(),
+                                fmt[:40],
+                                fallback_after_error.name,
+                                clip_text(last_error, 120),
+                            )
+                            return fallback_after_error
                     # 412 Precondition Failed: B站限流，等待后重试下一个格式
                     if "412" in last_error:
                         _ytdlp_log.warning(
