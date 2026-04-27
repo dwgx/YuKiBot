@@ -8,6 +8,11 @@ from core.queue import GroupQueueDispatcher
 
 
 class QueueParallelismRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_process_timeout_accepts_legacy_timeout_alias(self) -> None:
+        dispatcher = GroupQueueDispatcher({"timeout_seconds": 180})
+
+        self.assertEqual(dispatcher.process_timeout_seconds, 180)
+
     async def test_different_conversations_can_run_in_parallel(self) -> None:
         dispatcher = GroupQueueDispatcher(
             {

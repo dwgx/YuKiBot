@@ -1604,19 +1604,27 @@ def register_handlers(engine: YukikoEngine) -> None:
         queue_cfg = queue_cfg_rt
         video_heavy_request = _looks_like_video_heavy_request(text=text, raw_segments=raw_segments)
         download_heavy_request = _looks_like_download_heavy_request(text=text, raw_segments=raw_segments)
-        default_video_timeout = max(dispatcher.process_timeout_seconds + 45, 190)
+        web_heavy_request = _looks_like_web_heavy_request(text=text, raw_segments=raw_segments)
+        default_web_timeout = max(dispatcher.process_timeout_seconds + 90, 270)
+        web_process_timeout = max(
+            dispatcher.process_timeout_seconds,
+            int(queue_cfg.get("web_process_timeout_seconds", default_web_timeout)),
+        )
+        default_video_timeout = max(dispatcher.process_timeout_seconds + 180, 300)
         video_process_timeout = max(
             dispatcher.process_timeout_seconds,
             int(queue_cfg.get("video_process_timeout_seconds", default_video_timeout)),
         )
-        default_download_timeout = max(dispatcher.process_timeout_seconds + 90, 240)
+        default_download_timeout = max(dispatcher.process_timeout_seconds + 180, 300)
         download_process_timeout = max(
             dispatcher.process_timeout_seconds,
             int(queue_cfg.get("download_process_timeout_seconds", default_download_timeout)),
         )
         process_timeout_override = None
+        if web_heavy_request:
+            process_timeout_override = web_process_timeout
         if video_heavy_request:
-            process_timeout_override = video_process_timeout
+            process_timeout_override = max(process_timeout_override or 0, video_process_timeout)
         if download_heavy_request:
             process_timeout_override = max(process_timeout_override or 0, download_process_timeout)
 

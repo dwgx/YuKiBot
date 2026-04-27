@@ -58,7 +58,10 @@ class GroupQueueDispatcher:
 
         self.max_pending_per_group = max(1, int(config.get("max_pending_per_group", 80)))
         ttl_s = max(1, int(config.get("message_ttl_seconds", 90)))
-        timeout_s = max(1, int(config.get("process_timeout_seconds", 120)))
+        timeout_s = max(
+            1,
+            int(config.get("process_timeout_seconds", config.get("timeout_seconds", 120))),
+        )
         # TTL 必须 >= timeout + 裕度，否则消息在处理中过期被丢弃
         min_ttl = timeout_s + 15
         if ttl_s < min_ttl:

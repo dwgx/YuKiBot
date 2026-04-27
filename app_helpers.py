@@ -222,14 +222,123 @@ def _build_trace_id(conversation_id: str, seq: int) -> str:
     return f"{conversation_token}-{int(seq):x}-{uuid4().hex[:8]}"
 
 
-def _looks_like_video_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
-    _ = (text, raw_segments)
+_RE_WEB_URL = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
+_RE_BARE_WEB_HOST = re.compile(
+    r"(?<![@A-Za-z0-9_.-])"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"(?:com|net|org|dev|io|ai|app|site|xyz|me|co|cn|jp|tv|gg|cc|info|wiki|top)"
+    r"(?::\d{2,5})?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?",
+    re.IGNORECASE,
+)
+
+
+def _has_segment_type(raw_segments: list[dict[str, Any]], segment_types: set[str]) -> bool:
+    expected = {normalize_text(item).lower() for item in segment_types if normalize_text(item)}
+    for seg in raw_segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", ""))).lower()
+        if seg_type in expected:
+            return True
     return False
+
+
+def _message_and_segment_blob(text: str, raw_segments: list[dict[str, Any]]) -> str:
+    parts = [normalize_text(text)]
+    for seg in raw_segments or []:
+        if not isinstance(seg, dict):
+            continue
+        seg_type = normalize_text(str(seg.get("type", "")))
+        if seg_type:
+            parts.append(seg_type)
+        data = seg.get("data", {}) or {}
+        if not isinstance(data, dict):
+            continue
+        for key in ("text", "url", "file", "file_id", "summary", "title", "content"):
+            value = normalize_text(str(data.get(key, "")))
+            if value:
+                parts.append(value)
+    return normalize_text(" ".join(part for part in parts if part))
+
+
+def _looks_like_video_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
+    content = _message_and_segment_blob(text, raw_segments).lower()
+    if _has_segment_type(raw_segments, {"video"}):
+        return True
+    if re.search(r"\bbv[0-9a-z]{6,}\b", content, flags=re.IGNORECASE):
+        return True
+    cues = (
+        "视频",
+        "解析",
+        "bilibili",
+        "b23.tv",
+        "抖音",
+        "douyin",
+        "快手",
+        "kuaishou",
+        "acfun",
+        "v.qq.com",
+        "m.v.qq.com",
+        "腾讯视频",
+        "騰訊視頻",
+        "youku",
+        "iqiyi",
+        "mgtv",
+        "youtube",
+        "youtu.be",
+        "小红书",
+        "xiaohongshu",
+        "xhslink",
+    )
+    return any(cue in content for cue in cues)
 
 
 def _looks_like_download_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
-    _ = (text, raw_segments)
-    return False
+    content = _message_and_segment_blob(text, raw_segments).lower()
+    cues = (
+        "下载",
+        "安装包",
+        "网盘",
+        "download",
+        "pan.baidu",
+        "lanzou",
+        "123pan",
+        "quark.cn",
+        "aliyundrive",
+        "alipan",
+    )
+    if any(cue in content for cue in cues):
+        return True
+    return bool(re.search(r"\.(?:exe|apk|zip|rar|7z|dmg|pkg|msi)(?:\b|[?#/])", content))
+
+
+def _looks_like_web_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
+    content = _message_and_segment_blob(text, raw_segments).lower()
+    if not content:
+        return False
+    if not (_RE_WEB_URL.search(content) or _RE_BARE_WEB_HOST.search(content)):
+        return False
+    if _looks_like_video_heavy_request(text, raw_segments) or _looks_like_download_heavy_request(text, raw_segments):
+        return False
+    cues = (
+        "网站",
+        "网页",
+        "页面",
+        "官网",
+        "打开",
+        "看看",
+        "看下",
+        "帮我看",
+        "分析",
+        "介绍",
+        "是什么",
+        "安全吗",
+        "website",
+        "webpage",
+        "site",
+        "page",
+    )
+    return any(cue in content for cue in cues)
 
 
 def _looks_like_sticker_learning_request(
@@ -237,8 +346,30 @@ def _looks_like_sticker_learning_request(
     raw_segments: list[dict[str, Any]],
     reply_media_segments: list[dict[str, Any]] | None = None,
 ) -> bool:
-    _ = (text, raw_segments, reply_media_segments)
-    return False
+    media_segments = list(raw_segments or []) + list(reply_media_segments or [])
+    content = _message_and_segment_blob(text, media_segments).lower()
+    if not content:
+        return False
+    sticker_cues = ("表情包", "表情", "贴纸", "貼紙", "emoji", "emote", "sticker")
+    learn_cues = (
+        "学习",
+        "学一下",
+        "学下",
+        "添加",
+        "收录",
+        "记住",
+        "纠正",
+        "改一下",
+        "改下",
+        "描述",
+        "标签",
+        "分类",
+    )
+    if not any(cue in content for cue in sticker_cues):
+        return False
+    if not any(cue in content for cue in learn_cues):
+        return False
+    return _has_segment_type(media_segments, {"image", "mface", "face", "reply"})
 
 
 def _looks_like_cancel_previous_request(text: str) -> bool:

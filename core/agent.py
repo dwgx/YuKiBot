@@ -71,6 +71,23 @@ _RE_PUNCTUATION_CJK = re.compile(
 )
 
 
+def _strip_trailing_url_noise(url: str) -> str:
+    target = normalize_text(url).strip().rstrip(").,，。!?！？】》」』")
+    if not target:
+        return ""
+    suffix_re = re.compile(
+        r"(?:解析|分析|看看|看下|看一下|下载|下載|发我|發我|发出来|發出來|"
+        r"转发|轉發|总结|總結|解说|解說|parse|analyze|download)+$",
+        re.IGNORECASE,
+    )
+    for _ in range(4):
+        cleaned = suffix_re.sub("", target).rstrip(").,，。!?！？】》」』")
+        if cleaned == target:
+            break
+        target = cleaned
+    return target
+
+
 @dataclass(slots=True)
 class AgentContext:
     """Agent 单次运行的上下文。"""
@@ -2511,14 +2528,7 @@ class AgentLoop:
         # 检测用户消息中的链接
         first_url = self._extract_first_url(ctx.message_text)
         if first_url:
-            if (
-                "b23.tv" in first_url
-                or "bilibili.com" in first_url
-                or "douyin.com" in first_url
-                or "kuaishou.com" in first_url
-                or "acfun.cn" in first_url
-                or "acfun.com" in first_url
-            ):
+            if self._looks_like_video_url(first_url):
                 line = self._render_runtime_tpl(
                     self._runtime_tpl(
                         runtime_templates,
@@ -2866,7 +2876,14 @@ class AgentLoop:
         m = _RE_URL_EXTRACT.search(text or "")
         if not m:
             return ""
-        return m.group(0).strip().rstrip(").,，。!?！？")
+        return _strip_trailing_url_noise(m.group(0))
+
+    @classmethod
+    def _extract_first_video_url(cls, text: str) -> str:
+        url = cls._extract_first_url(text)
+        if url and cls._looks_like_video_url(url):
+            return url
+        return ""
 
     @classmethod
     def _extract_first_web_url(cls, text: str) -> str:
@@ -2951,10 +2968,17 @@ class AgentLoop:
                 "bilibili.com/video/",
                 "b23.tv/",
                 "douyin.com/",
+                "iesdouyin.com/",
                 "kuaishou.com/",
                 "acfun.cn/v/ac",
                 "acfun.com/v/ac",
                 "m.acfun.cn/v/",
+                "v.qq.com/",
+                "m.v.qq.com/",
+                "qq.com/x/",
+                "youku.com/v_show/",
+                "iqiyi.com/",
+                "mgtv.com/",
             )
         )
 
@@ -3209,6 +3233,8 @@ class AgentLoop:
             if start is not None and end is not None and end > start:
                 return {"start": start, "end": end}
 
+        if not re.search(r"(?:秒|\bs\b|\d{1,2}:\d{1,2})", t):
+            return {}
         first_token = re.search(r"\d{1,2}:\d{1,2}(?::\d{1,2})?|\d+(?:\.\d+)?", t)
         if first_token:
             sec = cls._parse_time_token_to_seconds(first_token.group(0))
@@ -3418,8 +3444,13 @@ class AgentLoop:
             self.config.get("queue", {}) if isinstance(self.config, dict) else {}
         )
         if isinstance(queue_cfg, dict):
-            queue_timeout = self._to_safe_int(queue_cfg.get("process_timeout_seconds"))
+            queue_timeout = self._to_safe_int(
+                queue_cfg.get("process_timeout_seconds", queue_cfg.get("timeout_seconds"))
+            )
             text = normalize_text(ctx.message_text).lower()
+            web_override = self._to_safe_int(
+                queue_cfg.get("web_process_timeout_seconds")
+            )
             video_override = self._to_safe_int(
                 queue_cfg.get("video_process_timeout_seconds")
             )
@@ -3433,9 +3464,11 @@ class AgentLoop:
                 queue_timeout = max(queue_timeout, download_override)
             elif has_media or any(
                 token in text
-                for token in ("视频", "解析", "bilibili", "抖音", "快手", "acfun", "bv")
+                for token in ("视频", "解析", "bilibili", "抖音", "快手", "acfun", "腾讯视频", "v.qq.com", "bv")
             ):
                 queue_timeout = max(queue_timeout, video_override)
+            elif self._looks_like_webpage_fetch_request(text):
+                queue_timeout = max(queue_timeout, web_override)
 
             if queue_timeout > 0:
                 queue_budget = max(
@@ -3947,15 +3980,18 @@ class AgentLoop:
     def _select_forced_video_tool(
         self, ctx: AgentContext
     ) -> tuple[str, dict[str, Any]] | None:
-        if not self._has_video_media(ctx):
-            return None
-
         text = normalize_text(ctx.message_text)
         contextual_text = self._rebuild_query_with_context(text, ctx) or text
-        video_url = self._extract_recent_media_url(ctx, "video")
-        mode = self._infer_split_video_mode(contextual_text)
-        time_hints = self._infer_video_time_hints(contextual_text)
-        frame_hint = self._infer_frame_count_hint(contextual_text)
+        has_video_media = self._has_video_media(ctx)
+        video_url = self._extract_recent_media_url(
+            ctx, "video"
+        ) or self._extract_first_video_url(contextual_text)
+        if not has_video_media and not video_url:
+            return None
+        instruction_text = normalize_text(_RE_URL_STRIP.sub(" ", contextual_text))
+        mode = self._infer_split_video_mode(instruction_text)
+        time_hints = self._infer_video_time_hints(instruction_text)
+        frame_hint = self._infer_frame_count_hint(instruction_text)
 
         if not mode:
             if frame_hint > 0:
@@ -3981,6 +4017,15 @@ class AgentLoop:
                 forced_args["max_frames"] = frame_hint
             return "split_video", forced_args
 
+        if video_url:
+            forced_args = {"url": video_url}
+            if self._looks_like_video_parse_request(contextual_text):
+                return "parse_video", forced_args
+            if self._looks_like_video_analysis_request(contextual_text):
+                return "analyze_video", forced_args
+            if not has_video_media:
+                return "parse_video", forced_args
+
         if self._should_force_local_video_tool_first(ctx):
             forced_args = {}
             if video_url:
@@ -3990,6 +4035,58 @@ class AgentLoop:
             return "analyze_local_video", forced_args
 
         return None
+
+    @staticmethod
+    def _looks_like_video_parse_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        cues = (
+            "解析",
+            "直链",
+            "下载",
+            "下載",
+            "发我",
+            "發我",
+            "发出来",
+            "發出來",
+            "转发",
+            "轉發",
+            "搬运",
+            "保存",
+            "parse",
+            "download",
+        )
+        return any(cue in content for cue in cues)
+
+    @staticmethod
+    def _looks_like_video_analysis_request(text: str) -> bool:
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        cues = (
+            "分析",
+            "总结",
+            "總結",
+            "评价",
+            "評價",
+            "看看",
+            "看下",
+            "看一下",
+            "讲了什么",
+            "講了什麼",
+            "内容",
+            "內容",
+            "解说",
+            "解說",
+            "字幕",
+            "弹幕",
+            "熱評",
+            "热评",
+            "analyze",
+            "summary",
+        )
+        return any(cue in content for cue in cues)
 
     def _should_force_voice_tool_first(self, ctx: AgentContext) -> bool:
         text = normalize_text(ctx.message_text).lower()

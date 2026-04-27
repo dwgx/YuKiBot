@@ -305,6 +305,11 @@ def _built_in_config_defaults() -> dict[str, Any]:
         "queue": {
             "group_concurrency": 3,
             "single_inflight_per_conversation": False,
+            "message_ttl_seconds": 315,
+            "process_timeout_seconds": 120,
+            "web_process_timeout_seconds": 270,
+            "video_process_timeout_seconds": 300,
+            "download_process_timeout_seconds": 300,
             "cancel_previous_on_new": False,
             "cancel_previous_mode": "high_priority",
             "cancel_previous_on_interrupt_request": True,

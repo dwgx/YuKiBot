@@ -352,6 +352,45 @@ class AgentLoopSmokeTests(unittest.TestCase):
         self.assertEqual(registry.calls[0][1]["url"], "https://skiapi.dev")
         self.assertEqual(result.tool_calls_made, 1)
 
+    def test_forced_video_parse_runs_before_first_model_response(self):
+        """视频链接解析请求应先走 parse_video，避免首轮模型超时导致不解析。"""
+        registry = _RecordingRegistry({"parse_video", "final_answer", "think"})
+        loop = _make_loop(
+            [],
+            registry=registry,
+        )
+
+        result = asyncio.run(loop.run(_make_ctx(
+            message_text="https://www.bilibili.com/video/BV16aw4zAEqD/?spm_id_from=333.337.search-card.all.click解析",
+            media_summary=[],
+            raw_segments=[],
+        )))
+
+        self.assertEqual(registry.calls[0][0], "parse_video")
+        self.assertEqual(
+            registry.calls[0][1]["url"],
+            "https://www.bilibili.com/video/BV16aw4zAEqD/?spm_id_from=333.337.search-card.all.click",
+        )
+        self.assertEqual(result.tool_calls_made, 1)
+
+    def test_forced_douyin_parse_prefers_parse_over_analysis_cue(self):
+        """“解析...看看”这类分享文案仍应先解析直链。"""
+        registry = _RecordingRegistry({"parse_video", "analyze_video", "final_answer", "think"})
+        loop = _make_loop(
+            [],
+            registry=registry,
+        )
+
+        result = asyncio.run(loop.run(_make_ctx(
+            message_text="解析7.64 复制打开抖音，看看【宇鸽的作品】 https://v.douyin.com/hskaBb36Hfg/ a@N.JI",
+            media_summary=[],
+            raw_segments=[],
+        )))
+
+        self.assertEqual(registry.calls[0][0], "parse_video")
+        self.assertEqual(registry.calls[0][1]["url"], "https://v.douyin.com/hskaBb36Hfg/")
+        self.assertEqual(result.tool_calls_made, 1)
+
     def test_unknown_tool_notifies_model(self):
         """未知工具名 → 通知模型后继续。"""
         loop = _make_loop([
