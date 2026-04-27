@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import {
   Card, CardBody, Input, Button, Select, SelectItem,
   Switch, Progress, Textarea, Divider, Tooltip, Chip,
@@ -7,12 +7,14 @@ import {
   Rocket, ChevronRight, ChevronLeft, Cpu, Zap,
   Shield, Volume2, Cookie, Check, Download, RefreshCw, Sparkles, QrCode,
 } from "lucide-react";
+import { ModelCombobox } from "../../components/model-combobox";
 import {
   BASE, SETUP_DRAFT_KEY,
   PROVIDERS, ENDPOINT_TYPE_OPTIONS,
   DEFAULT_IMAGE_GEN_PROVIDER, DEFAULT_SETUP_PROVIDER,
   IMAGE_GEN_DEFAULTS, IMAGE_GEN_MODEL_HINTS,
-  MODEL_OPTIONS, STEPS,
+  IMAGE_MODEL_OPTIONS, MODEL_OPTIONS, STEPS,
+  allModelOptions, uniqueModelOptions,
   normalizeImageGenBaseRoot, shouldResetImageGenBaseUrl, getImageGenApiKeyDescription,
   type SetupDraft, type CookieCapabilities, type CookieLoginGuide,
 } from "./setup-constants";
@@ -83,6 +85,14 @@ export default function SetupPage() {
   const [biliQrLoading, setBiliQrLoading] = useState(false);
   const [showCookieManualEditors, setShowCookieManualEditors] = useState(false);
   const [showCookieAdvanced, setShowCookieAdvanced] = useState(false);
+  const mainModelOptions = useMemo(
+    () => uniqueModelOptions(MODEL_OPTIONS[provider], allModelOptions(MODEL_OPTIONS)),
+    [provider],
+  );
+  const imageModelOptions = useMemo(
+    () => uniqueModelOptions(IMAGE_MODEL_OPTIONS[imageGenProvider], allModelOptions(IMAGE_MODEL_OPTIONS)),
+    [imageGenProvider],
+  );
 
   // Auto-poll smart extraction results
   const pollSmartResult = useCallback(async () => {
@@ -685,24 +695,13 @@ export default function SetupPage() {
                   <SelectItem key={p.value}>{p.label}</SelectItem>
                 ))}
               </Select>
-              <Select
-                label="推荐模型（可选）"
-                selectedKeys={model && (MODEL_OPTIONS[provider] || []).some((m) => m.value === model) ? [model] : []}
-                onSelectionChange={(keys) => {
-                  const v = Array.from(keys)[0];
-                  if (v) setModel(String(v));
-                }}
-                classNames={{ trigger: "bg-content2" }}
-              >
-                {(MODEL_OPTIONS[provider] || []).map((m) => (
-                  <SelectItem key={m.value}>{m.label}</SelectItem>
-                ))}
-              </Select>
-              <Input
-                label="模型名称（可自定义输入）"
+              <ModelCombobox
+                label="模型名称（可搜索 / 可自定义）"
                 value={model}
                 onValueChange={setModel}
-                classNames={{ inputWrapper: "bg-content2" }}
+                options={mainModelOptions}
+                placeholder="gpt-5.5"
+                inputClassNames={{ inputWrapper: "bg-content2" }}
               />
               <Input
                 label="API Key"
@@ -889,13 +888,14 @@ export default function SetupPage() {
                     <SelectItem key="sd">Stable Diffusion</SelectItem>
                     <SelectItem key="custom">自定义</SelectItem>
                   </Select>
-                  <Input
+                  <ModelCombobox
                     label="模型名称"
                     description={IMAGE_GEN_MODEL_HINTS[imageGenProvider] || "填写当前提供商实际支持的图片模型名称"}
                     value={imageGenModel}
                     onValueChange={setImageGenModel}
                     placeholder="gpt-image-1"
-                    classNames={{ inputWrapper: "bg-content2" }}
+                    options={imageModelOptions}
+                    inputClassNames={{ inputWrapper: "bg-content2" }}
                   />
                   <div className="flex items-center justify-between gap-3 rounded-lg border border-default-200/50 bg-content2/40 px-3 py-2">
                     <div className="min-w-0">

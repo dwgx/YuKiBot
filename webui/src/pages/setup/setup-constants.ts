@@ -81,7 +81,7 @@ export const getImageGenApiKeyDescription = (provider: string) => {
   return `留空则从环境变量 ${envName} 读取`;
 };
 
-export { MODEL_OPTIONS } from "../../shared/model-options";
+export { allModelOptions, IMAGE_MODEL_OPTIONS, MODEL_OPTIONS, uniqueModelOptions } from "../../shared/model-options";
 
 export const STEPS = [
   { icon: Cpu, title: "API 配置" },
@@ -145,4 +145,3 @@ export type CookieLoginGuide = {
   instructions?: string[];
   notes?: string[];
 };
-

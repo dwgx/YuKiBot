@@ -1,9 +1,36 @@
 /**
- * Shared model options used by both Config and Setup pages.
- * Single source of truth — do NOT duplicate in page-specific modules.
+ * Shared model options used by Config and Setup pages.
+ * These are suggestions only: the UI must still allow custom model names.
  */
-export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> = {
+export type ModelOption = { value: string; label: string; description?: string };
+
+const opt = (value: string, description = ""): ModelOption => ({
+  value,
+  label: value,
+  ...(description ? { description } : {}),
+});
+
+export const uniqueModelOptions = (...groups: Array<ModelOption[] | undefined>): ModelOption[] => {
+  const seen = new Set<string>();
+  const out: ModelOption[] = [];
+  for (const group of groups) {
+    for (const item of group || []) {
+      const value = String(item.value || "").trim();
+      if (!value) continue;
+      const key = value.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ ...item, value, label: item.label || value });
+    }
+  }
+  return out;
+};
+
+export const MODEL_OPTIONS: Record<string, ModelOption[]> = {
   skiapi: [
+    opt("gpt-5.5", "Codex / frontier"),
+    opt("gpt-5.4"),
+    opt("gpt-5.4-mini"),
     { value: "claude-opus-4-6", label: "claude-opus-4-6" },
     { value: "claude-sonnet-4-5-20250929", label: "claude-sonnet-4-5-20250929" },
     { value: "claude-haiku-4-5-20251001", label: "claude-haiku-4-5-20251001" },
@@ -19,6 +46,7 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "grok-imagine-1.0-video", label: "grok-imagine-1.0-video" },
     { value: "gpt-5.3", label: "gpt-5.3" },
     { value: "gpt-5.3-codex", label: "gpt-5.3-codex" },
+    { value: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
     { value: "gpt-5.2-codex", label: "gpt-5.2-codex" },
     { value: "gpt-5.1-codex-mini", label: "gpt-5.1-codex-mini" },
     { value: "gpt-5.1-codex-max", label: "gpt-5.1-codex-max" },
@@ -30,8 +58,12 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "gpt-5", label: "gpt-5" },
   ],
   openai: [
+    opt("gpt-5.5", "Codex / frontier"),
+    opt("gpt-5.4"),
+    opt("gpt-5.4-mini"),
     { value: "gpt-5.3", label: "gpt-5.3" },
     { value: "gpt-5.3-codex", label: "gpt-5.3-codex" },
+    { value: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
     { value: "gpt-5.2-codex", label: "gpt-5.2-codex" },
     { value: "gpt-5.1-codex-mini", label: "gpt-5.1-codex-mini" },
     { value: "gpt-5.1-codex-max", label: "gpt-5.1-codex-max" },
@@ -55,8 +87,12 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "gemini-2.5-flash", label: "gemini-2.5-flash" },
   ],
   newapi: [
+    opt("gpt-5.5", "Codex / frontier"),
+    opt("gpt-5.4"),
+    opt("gpt-5.4-mini"),
     { value: "gpt-5.3", label: "gpt-5.3" },
     { value: "gpt-5.3-codex", label: "gpt-5.3-codex" },
+    { value: "gpt-5.3-codex-spark", label: "gpt-5.3-codex-spark" },
     { value: "gpt-5.2-codex", label: "gpt-5.2-codex" },
     { value: "gpt-5.1-codex-mini", label: "gpt-5.1-codex-mini" },
     { value: "gpt-5.1-codex-max", label: "gpt-5.1-codex-max" },
@@ -105,3 +141,64 @@ export const MODEL_OPTIONS: Record<string, { value: string; label: string }[]> =
     { value: "deepseek-ai/DeepSeek-V3", label: "deepseek-ai/DeepSeek-V3" },
   ],
 };
+
+export const IMAGE_MODEL_OPTIONS: Record<string, ModelOption[]> = {
+  skiapi: [
+    opt("gpt-image-1"),
+    opt("gemini-2.5-flash-image"),
+    opt("gemini-3.1-flash-image"),
+    opt("grok-imagine-1.0"),
+    opt("grok-imagine-1.0-fast"),
+    opt("grok-imagine-1.0-edit"),
+  ],
+  openai: [
+    opt("gpt-image-1"),
+    opt("dall-e-3"),
+    opt("dall-e-2"),
+  ],
+  gemini: [
+    opt("gemini-2.5-flash-image"),
+    opt("gemini-3.1-flash-image"),
+  ],
+  xai: [
+    opt("grok-imagine-image"),
+    opt("grok-imagine-1.0"),
+    opt("grok-imagine-1.0-fast"),
+    opt("grok-imagine-1.0-edit"),
+    opt("grok-imagine-1.0-video"),
+  ],
+  newapi: [
+    opt("gpt-image-1"),
+    opt("dall-e-3"),
+    opt("gemini-2.5-flash-image"),
+    opt("gemini-3.1-flash-image"),
+    opt("grok-imagine-1.0"),
+    opt("black-forest-labs/FLUX.1-schnell"),
+  ],
+  openrouter: [
+    opt("google/gemini-2.5-flash-image"),
+    opt("openai/gpt-image-1"),
+  ],
+  siliconflow: [
+    opt("black-forest-labs/FLUX.1-schnell"),
+    opt("black-forest-labs/FLUX.1-dev"),
+    opt("stabilityai/stable-diffusion-xl-base-1.0"),
+  ],
+  flux: [
+    opt("black-forest-labs/FLUX.1-schnell"),
+    opt("black-forest-labs/FLUX.1-dev"),
+  ],
+  sd: [
+    opt("stable-diffusion-xl"),
+    opt("sdxl"),
+  ],
+  custom: [
+    opt("gpt-image-1"),
+    opt("gemini-2.5-flash-image"),
+    opt("black-forest-labs/FLUX.1-schnell"),
+    opt("stable-diffusion-xl"),
+  ],
+};
+
+export const allModelOptions = (optionsByProvider: Record<string, ModelOption[]>): ModelOption[] =>
+  uniqueModelOptions(...Object.values(optionsByProvider));

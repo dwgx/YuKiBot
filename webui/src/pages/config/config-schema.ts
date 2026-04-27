@@ -503,4 +503,4 @@ export const IMAGE_GEN_PROMPT_PRESETS: Array<{ label: string; prompt: string }> 
   { label: "写实摄影", prompt: "写实摄影风人像，柔光，浅景深，肤质自然，构图干净，高清细节" },
 ];
 
-export { MODEL_OPTIONS } from "../../shared/model-options";
+export { allModelOptions, IMAGE_MODEL_OPTIONS, MODEL_OPTIONS, uniqueModelOptions } from "../../shared/model-options";

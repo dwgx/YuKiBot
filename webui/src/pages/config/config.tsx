@@ -6,11 +6,13 @@ import {
 import { Save, Undo2 } from "lucide-react";
 import { motion } from "framer-motion";
 import { api, type EnvSettingEntry, type EnvUpdateResponse, type ImageGenTestResponse } from "../../api/client";
+import { ModelCombobox } from "../../components/model-combobox";
 import { NotificationContainer } from "../../components/notification";
 import { useNotifications } from "../../hooks/useNotifications";
 import type { Cfg, FieldDef, EnvDraftMap } from "./config-schema";
 import {
-  SECTIONS, SECTION_META, MODEL_OPTIONS, IMAGE_GEN_PROMPT_PRESETS,
+  SECTIONS, SECTION_META, MODEL_OPTIONS, IMAGE_MODEL_OPTIONS, IMAGE_GEN_PROMPT_PRESETS,
+  allModelOptions, uniqueModelOptions,
   INPUT_CLASSES, SELECT_CLASSES, SHELL,
 } from "./config-schema";
 import {
@@ -75,6 +77,31 @@ export default function ConfigPage() {
     [active, compactMode, activeEssentialPaths],
   );
   const activeAdvancedOpen = !!advancedOpenSections[active.key];
+  const mainModelOptions = useMemo(() => {
+    const providerValue = String(getPath(config, "api.provider") ?? "");
+    return uniqueModelOptions(MODEL_OPTIONS[providerValue], allModelOptions(MODEL_OPTIONS));
+  }, [config]);
+  const imageModelOptions = useMemo(() => {
+    const configured = getPath(config, "image_gen.models");
+    const configuredOptions = Array.isArray(configured)
+      ? configured.flatMap((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const data = item as Record<string, unknown>;
+        const model = String(data.model ?? "").trim();
+        const name = String(data.name ?? "").trim();
+        const provider = String(data.provider ?? "").trim();
+        const value = model || name;
+        if (!value) return [];
+        return [{ value, label: name || value, description: provider ? `${provider} 已配置` : "已配置" }];
+      })
+      : [];
+    const provider = String(
+      Array.isArray(configured)
+        ? ((configured.find((item) => item && typeof item === "object" && !Array.isArray(item)) as Record<string, unknown> | undefined)?.provider ?? "")
+        : "",
+    ).trim().toLowerCase();
+    return uniqueModelOptions(configuredOptions, IMAGE_MODEL_OPTIONS[provider], allModelOptions(IMAGE_MODEL_OPTIONS));
+  }, [config]);
   const topLevelJsonKeys = useMemo(() => {
     return Object.keys(config).filter((k) => typeof k === "string" && k.trim()).sort();
   }, [config]);
@@ -327,6 +354,17 @@ export default function ConfigPage() {
       if (field.type === "select") {
         const providerValue = String(getPath(config, "api.provider") ?? "");
         const options = field.path === "api.model" ? (MODEL_OPTIONS[providerValue] || []) : (field.options || []);
+        if (field.path === "api.model") {
+          return (
+            <ModelCombobox
+              label={field.label}
+              value={String(val ?? "")}
+              onValueChange={(v) => updateField(field.path, v)}
+              options={mainModelOptions}
+              inputClassNames={INPUT_CLASSES}
+            />
+          );
+        }
         return (
           <Select
             label={field.label}
@@ -357,6 +395,31 @@ export default function ConfigPage() {
       }
       if (field.type === "password") {
         return <Input label={field.label} labelPlacement="outside" type="password" value={String(val ?? "")} onValueChange={(v) => updateField(field.path, v)} description={val === "***" ? "已加密，留空不修改" : undefined} classNames={INPUT_CLASSES} />;
+      }
+      if (field.path === "image_gen.default_model") {
+        return (
+          <ModelCombobox
+            label={field.label}
+            value={String(val ?? "")}
+            onValueChange={(v) => updateField(field.path, v)}
+            options={imageModelOptions}
+            placeholder="gpt-image-1"
+            inputClassNames={INPUT_CLASSES}
+          />
+        );
+      }
+      if (field.path === "image_gen.prompt_review_model" || field.path === "image_gen.post_review_model") {
+        return (
+          <ModelCombobox
+            label={field.label}
+            value={String(val ?? "")}
+            onValueChange={(v) => updateField(field.path, v)}
+            options={mainModelOptions}
+            placeholder="留空则使用主模型"
+            description="支持搜索主模型候选项；留空则走主模型"
+            inputClassNames={INPUT_CLASSES}
+          />
+        );
       }
       if (field.type === "number") {
         const rawValue = numberDrafts[field.path];
@@ -618,12 +681,14 @@ export default function ConfigPage() {
                 classNames={INPUT_CLASSES}
               />
               <div className="space-y-3">
-                <Input
+                <ModelCombobox
                   label="测试模型（可留空=走默认模型）"
-                  labelPlacement="outside"
                   value={imageGenTestModel}
                   onValueChange={setImageGenTestModel}
-                  classNames={INPUT_CLASSES}
+                  options={imageModelOptions}
+                  placeholder="留空则走默认模型"
+                  description="支持搜索图片模型候选项，也可以直接输入网关模型名"
+                  inputClassNames={INPUT_CLASSES}
                 />
                 <Select
                   label="测试尺寸"
