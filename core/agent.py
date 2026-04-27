@@ -804,6 +804,7 @@ class AgentLoop:
         has_media = bool(ctx.media_summary) or bool(ctx.reply_media_summary)
         total_timeout = self._resolve_total_timeout_seconds(ctx, has_media)
         deadline_ts = t0 + total_timeout
+        forced_media_tool_consumed = False
 
         # 工具超时不计入步骤预算（最多 3 次免费），避免慢工具浪费推理机会
         _tool_timeout_free_budget = 3
@@ -823,116 +824,137 @@ class AgentLoop:
                 return await self._build_fallback_result(
                     ctx, steps, tool_calls_made, t0, "total_timeout"
                 )
-            # 调用 LLM（带重试，agent loop 是关键路径）
-            llm_budget = float(self.llm_step_timeout_seconds)
-            if tool_calls_made > 0:
-                llm_budget = max(
-                llm_budget, float(self.llm_step_timeout_seconds_after_tool)
-            )
-            llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
-            schemas: list[dict[str, Any]] = []
-            if native_tool_calling and ctx.native_tools:
-                schemas = self.tool_registry.get_schemas_for_native_tools(
-                    ctx.native_tools
-                )
-
-            try:
-                if native_tool_calling:
-                    raw_response = await asyncio.wait_for(
-                        self.model_client.chat_completion_with_retry(
-                            messages,
-                            max_tokens=self.max_tokens,
-                            tools=schemas if schemas else None,
-                            retries=1,
-                            backoff=1.0,
-                        ),
-                        timeout=llm_timeout,
-                    )
-                else:
-                    raw_response = await asyncio.wait_for(
-                        self.model_client.chat_text_with_retry(
-                            messages,
-                            max_tokens=self.max_tokens,
-                            retries=1,
-                            backoff=1.0,
-                        ),
-                        timeout=llm_timeout,
-                    )
-            except asyncio.TimeoutError:
-                _log.warning(
-                    "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs",
-                    ctx.trace_id,
-                    step_idx,
-                    llm_timeout,
-                )
-                if steps:
-                    return await self._build_fallback_result(
-                        ctx, steps, tool_calls_made, t0, "llm_timeout"
-                    )
-                fallback = _pl.get_message(
-                    "llm_timeout_fallback",
-                    "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
-                )
-                return AgentResult(
-                    reply_text=fallback,
-                    action="reply",
-                    reason="agent_llm_timeout",
-                    total_time_ms=self._elapsed(t0),
-                )
-            except Exception as exc:
-                _log.warning(
-                    "agent_llm_error | trace=%s | step=%d | %s",
-                    ctx.trace_id,
-                    step_idx,
-                    exc,
-                )
-                if steps:
-                    # 有之前的步骤结果，用最后一步的信息兜底
-                    return await self._build_fallback_result(
-                        ctx, steps, tool_calls_made, t0, "llm_error"
-                    )
-                # undirected 场景可按配置静默，默认不静默，避免用户感知“装死”。
-                if (
-                    self.allow_silent_on_llm_error
-                    and not ctx.mentioned
-                    and not ctx.is_private
-                ):
-                    return AgentResult(
-                        reply_text="",
-                        action="reply",
-                        reason="agent_llm_error_silent",
-                        total_time_ms=self._elapsed(t0),
-                    )
-                err_text = normalize_text(str(exc)).lower()
-                if (
-                    "http 401" in err_text
-                    or "invalid token" in err_text
-                    or "unauthorized" in err_text
-                    or "无效的令牌" in err_text
-                    or "认证失败" in err_text
-                ):
-                    fallback = _pl.get_message(
-                        "llm_auth_error_fallback",
-                        "AI 服务鉴权失败（令牌无效/过期），请管理员检查 API Key 后重试。",
-                    )
-                else:
-                    fallback = _pl.get_message(
-                        "llm_error_fallback",
-                        _pl.get_message(
-                            "generic_error", "我这边接口抖了，稍等我再试一次。"
-                        ),
-                    )
-                return AgentResult(
-                    reply_text=fallback,
-                    action="reply",
-                    reason="agent_llm_error",
-                    total_time_ms=self._elapsed(t0),
-                )
-
+            raw_response: Any = None
             assistant_msg: dict[str, Any] = {}
             response_text = ""
             parsed = None
-            if native_tool_calling:
+            synthetic_tool_call = False
+            if (
+                forced_media_tool
+                and not forced_media_tool_consumed
+                and tool_calls_made == 0
+                and self.tool_registry.has_tool(forced_media_tool[0])
+            ):
+                forced_media_tool_consumed = True
+                forced_name, forced_args = forced_media_tool
+                parsed = {"tool": forced_name, "args": dict(forced_args)}
+                response_text = json.dumps(parsed, ensure_ascii=False)
+                assistant_msg = {"role": "assistant", "content": response_text}
+                synthetic_tool_call = True
+                _log.info(
+                    "agent_force_media_tool_pre_llm | trace=%s | step=%d | tool=%s",
+                    ctx.trace_id,
+                    step_idx,
+                    forced_name,
+                )
+            else:
+                # 调用 LLM（带重试，agent loop 是关键路径）
+                llm_budget = float(self.llm_step_timeout_seconds)
+                if tool_calls_made > 0:
+                    llm_budget = max(
+                        llm_budget, float(self.llm_step_timeout_seconds_after_tool)
+                    )
+                llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
+                schemas: list[dict[str, Any]] = []
+                if native_tool_calling and ctx.native_tools:
+                    schemas = self.tool_registry.get_schemas_for_native_tools(
+                        ctx.native_tools
+                    )
+
+                try:
+                    if native_tool_calling:
+                        raw_response = await asyncio.wait_for(
+                            self.model_client.chat_completion_with_retry(
+                                messages,
+                                max_tokens=self.max_tokens,
+                                tools=schemas if schemas else None,
+                                retries=1,
+                                backoff=1.0,
+                            ),
+                            timeout=llm_timeout,
+                        )
+                    else:
+                        raw_response = await asyncio.wait_for(
+                            self.model_client.chat_text_with_retry(
+                                messages,
+                                max_tokens=self.max_tokens,
+                                retries=1,
+                                backoff=1.0,
+                            ),
+                            timeout=llm_timeout,
+                        )
+                except asyncio.TimeoutError:
+                    _log.warning(
+                        "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs",
+                        ctx.trace_id,
+                        step_idx,
+                        llm_timeout,
+                    )
+                    if steps:
+                        return await self._build_fallback_result(
+                            ctx, steps, tool_calls_made, t0, "llm_timeout"
+                        )
+                    fallback = _pl.get_message(
+                        "llm_timeout_fallback",
+                        "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
+                    )
+                    return AgentResult(
+                        reply_text=fallback,
+                        action="reply",
+                        reason="agent_llm_timeout",
+                        total_time_ms=self._elapsed(t0),
+                    )
+                except Exception as exc:
+                    _log.warning(
+                        "agent_llm_error | trace=%s | step=%d | %s",
+                        ctx.trace_id,
+                        step_idx,
+                        exc,
+                    )
+                    if steps:
+                        # 有之前的步骤结果，用最后一步的信息兜底
+                        return await self._build_fallback_result(
+                            ctx, steps, tool_calls_made, t0, "llm_error"
+                        )
+                    # undirected 场景可按配置静默，默认不静默，避免用户感知“装死”。
+                    if (
+                        self.allow_silent_on_llm_error
+                        and not ctx.mentioned
+                        and not ctx.is_private
+                    ):
+                        return AgentResult(
+                            reply_text="",
+                            action="reply",
+                            reason="agent_llm_error_silent",
+                            total_time_ms=self._elapsed(t0),
+                        )
+                    err_text = normalize_text(str(exc)).lower()
+                    if (
+                        "http 401" in err_text
+                        or "invalid token" in err_text
+                        or "unauthorized" in err_text
+                        or "无效的令牌" in err_text
+                        or "认证失败" in err_text
+                    ):
+                        fallback = _pl.get_message(
+                            "llm_auth_error_fallback",
+                            "AI 服务鉴权失败（令牌无效/过期），请管理员检查 API Key 后重试。",
+                        )
+                    else:
+                        fallback = _pl.get_message(
+                            "llm_error_fallback",
+                            _pl.get_message(
+                                "generic_error", "我这边接口抖了，稍等我再试一次。"
+                            ),
+                        )
+                    return AgentResult(
+                        reply_text=fallback,
+                        action="reply",
+                        reason="agent_llm_error",
+                        total_time_ms=self._elapsed(t0),
+                    )
+
+            if not synthetic_tool_call and native_tool_calling:
                 assistant_msg = (
                     raw_response.get("choices", [{}])[0].get("message", {})
                     if isinstance(raw_response, dict)
@@ -974,7 +996,7 @@ class AgentLoop:
                 if parsed is None:
                     # Fallback to parse text just in case model ignores native tools
                     parsed = self._parse_llm_output(response_text)
-            else:
+            elif not synthetic_tool_call:
                 response_text = normalize_text(raw_response)
                 if not response_text:
                     break

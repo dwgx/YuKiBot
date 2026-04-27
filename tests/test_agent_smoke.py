@@ -297,13 +297,11 @@ class AgentLoopSmokeTests(unittest.TestCase):
         self.assertIn("搜索完成", result.reply_text)
         self.assertEqual(result.tool_calls_made, 1)
 
-    def test_forced_image_tool_replaces_wrong_final_answer(self):
-        """图片消息下模型若先 final_answer，应被改写为图片工具调用。"""
+    def test_forced_image_tool_runs_before_first_model_response(self):
+        """图片消息应先走本地识图工具，模型首轮异常时仍能用工具结果兜底。"""
         registry = _RecordingRegistry()
         loop = _make_loop(
-            [
-                '{"tool":"final_answer","args":{"text":"我看看这张。"}}',
-            ],
+            [],
             registry=registry,
         )
 
