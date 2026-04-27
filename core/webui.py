@@ -3420,6 +3420,17 @@ async def chat_agent_text(request: Request):
         image_urls.insert(0, image_url)
     video_url = normalize_text(str(getattr(result, "video_url", "")))
     audio_file = normalize_text(str(getattr(result, "audio_file", "")))
+    if video_url and reply_text:
+        local_video_ref = (
+            video_url.lower().startswith("file://")
+            or bool(re.match(r"^(?:/|[A-Za-z]:[\\/])", video_url))
+        )
+        local_video_pattern = re.compile(
+            r"(?:file://)?(?:/[^\s`，。；、]+|[A-Za-z]:[\\/][^\s`，。；、]+?)\.(?:mp4|webm|mov|m4v)",
+            flags=re.IGNORECASE,
+        )
+        if local_video_ref or local_video_pattern.search(reply_text):
+            reply_text = "解析好了，我直接把视频发出来。"
 
     sent_message_id = ""
     if reply_text:
