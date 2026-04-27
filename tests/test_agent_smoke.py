@@ -126,6 +126,22 @@ class _RecordingRegistry(_StubRegistry):
         )
 
 
+class _VideoRegistry(_StubRegistry):
+    def __init__(self, video_url: str):
+        super().__init__({"parse_video", "final_answer", "think"})
+        self.video_url = video_url
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call(self, name: str, args: dict, context: dict) -> ToolCallResult:
+        _ = context
+        self.calls.append((name, dict(args)))
+        return ToolCallResult(
+            ok=True,
+            data={"video_url": self.video_url, "text": "解析成功"},
+            display=f"解析成功: {self.video_url}",
+        )
+
+
 def _make_ctx(**overrides) -> AgentContext:
     base = AgentContext(
         conversation_id="group:1:user:2",
@@ -282,6 +298,39 @@ class AgentLoopSmokeTests(unittest.TestCase):
         self.assertEqual(result.reason, "agent_final_answer")
         self.assertIn("搜索完成", result.reply_text)
         self.assertEqual(result.tool_calls_made, 1)
+
+    def test_video_tool_result_is_sent_even_when_final_answer_omits_video_url(self):
+        """视频工具拿到本地文件后，模型只写文字也要保留结构化 video_url 供发送层直发。"""
+        video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/demo.mp4"
+        loop = _make_loop(
+            [
+                '{"tool":"parse_video","args":{"url":"https://v.douyin.com/demo/"}}',
+                (
+                    '{"tool":"final_answer","args":{"text":"解析好了。直链在这： `'
+                    + video_path
+                    + '`"}}'
+                ),
+            ],
+            registry=_VideoRegistry(video_path),
+            native_tools=False,
+        )
+        result = asyncio.run(loop.run(_make_ctx(message_text="解析 https://v.douyin.com/demo/")))
+        self.assertEqual(result.reason, "agent_final_answer")
+        self.assertEqual(result.video_url, video_path)
+        self.assertNotIn(video_path, result.reply_text)
+
+    def test_video_tool_result_survives_llm_timeout_fallback(self):
+        """视频工具成功后第二轮 LLM 超时，也不能丢掉 video_url。"""
+        video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/demo.mp4"
+        loop = _make_loop(
+            ['{"tool":"parse_video","args":{"url":"https://v.douyin.com/demo/"}}'],
+            registry=_VideoRegistry(video_path),
+            native_tools=False,
+        )
+        result = asyncio.run(loop.run(_make_ctx(message_text="解析 https://v.douyin.com/demo/")))
+        self.assertEqual(result.reason, "agent_fallback_llm_error")
+        self.assertEqual(result.video_url, video_path)
+        self.assertNotIn(video_path, result.reply_text)
 
     def test_non_native_tool_provider_uses_text_protocol(self):
         """不支持原生 tools 的 provider 应回退到 JSON/text 协议。"""

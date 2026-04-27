@@ -1166,6 +1166,7 @@ class AgentLoop:
                 image_url = str(tool_args.get("image_url", "")).strip()
                 video_url = str(tool_args.get("video_url", "")).strip()
                 audio_file = str(tool_args.get("audio_file", "")).strip()
+                cover_url = str(tool_args.get("cover_url", "")).strip()
                 if audio_file.lower().endswith(".silk"):
                     preferred_audio = self._last_success_audio_file(
                         steps, prefer_non_silk=True
@@ -1181,6 +1182,10 @@ class AgentLoop:
                         audio_file = preferred_audio
                 if not audio_file:
                     audio_file = self._last_success_audio_file(steps)
+                if not video_url:
+                    video_url = self._last_success_video_url(steps)
+                if video_url:
+                    text = self._sanitize_final_text_for_local_media(text, video_url)
                 # 防止工具 JSON 泄漏给用户
                 if text.startswith("{") and text.endswith("}"):
                     try:
@@ -1484,6 +1489,7 @@ class AgentLoop:
                         ),
                         video_url=video_url,
                         audio_file=audio_file,
+                        cover_url=cover_url,
                         action="reply",
                         reason="agent_final_answer",
                         tool_calls_made=tool_calls_made,
@@ -4719,6 +4725,47 @@ class AgentLoop:
                     return path
         return ""
 
+    @staticmethod
+    def _last_success_video_url(steps: list[dict[str, Any]]) -> str:
+        for step in reversed(steps):
+            if not bool(step.get("ok")):
+                continue
+            data = step.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            for key in ("video_url", "video_file", "video_path", "file_path", "path"):
+                path = normalize_text(str(data.get(key, "")))
+                if path:
+                    return path
+        return ""
+
+    @classmethod
+    def _sanitize_final_text_for_local_media(cls, text: str, media_path: str) -> str:
+        content = str(text or "").strip()
+        path = normalize_text(media_path)
+        if not content or not path or not cls._is_local_media_path(path):
+            return content
+        slash_path = path.replace("\\", "/")
+        variants = {
+            path,
+            slash_path,
+            path.replace("/", "\\"),
+            f"`{path}`",
+            f"`{slash_path}`",
+        }
+        cleaned = content
+        for variant in sorted(variants, key=len, reverse=True):
+            if variant:
+                cleaned = cleaned.replace(variant, "视频文件")
+        cleaned = re.sub(
+            r"(?:直链|路径|本地缓存文件路径)\s*(?:在这|是)?\s*[:：]?\s*`?视频文件`?",
+            "视频我直接发出来了",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"`?视频文件`?\s*`?视频文件`?", "视频文件", cleaned)
+        return normalize_text(cleaned) or content
+
     def _extract_embedded_tool_call_from_text(self, text: str) -> dict[str, Any] | None:
         """从 final_answer 文本中恢复误包裹的工具调用 JSON。"""
         clean = normalize_text(text)
@@ -4879,8 +4926,16 @@ class AgentLoop:
             if len(display) > 280:
                 display = clip_text(display, 280)
             if display:
+                video_url = self._last_success_video_url(steps)
+                audio_file = self._last_success_audio_file(steps)
+                if video_url:
+                    display = self._sanitize_final_text_for_local_media(
+                        display, video_url
+                    )
                 return AgentResult(
                     reply_text=display,
+                    video_url=video_url,
+                    audio_file=audio_file,
                     action="reply",
                     reason=f"agent_fallback_{reason}",
                     tool_calls_made=tool_calls_made,
@@ -4901,8 +4956,16 @@ class AgentLoop:
             "no_result",
             "我这边工具刚刚没跑通，你换个说法或稍后再试，我继续处理。",
         )
+        video_url = self._last_success_video_url(steps)
+        audio_file = self._last_success_audio_file(steps)
+        if video_url:
+            fallback_text = self._sanitize_final_text_for_local_media(
+                fallback_text, video_url
+            )
         return AgentResult(
             reply_text=fallback_text,
+            video_url=video_url,
+            audio_file=audio_file,
             action="reply",
             reason=f"agent_fallback_{reason}",
             tool_calls_made=tool_calls_made,
