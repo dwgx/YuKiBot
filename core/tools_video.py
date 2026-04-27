@@ -2164,7 +2164,8 @@ class ToolVideoMixin:
         # 只在显式参数中收窄平台，避免把普通描述词当成强约束。
         explicit_platform = ""
         m = re.search(
-            r"(?:^|\s)platform\s*=\s*(bilibili|douyin|kuaishou|acfun)(?:\s|$)", lower
+            r"(?:^|\s)platform\s*=\s*(bilibili|douyin|kuaishou|acfun|youtube|tencent|qq|iqiyi|youku)(?:\s|$)",
+            lower,
         )
         if m:
             explicit_platform = normalize_text(m.group(1)).lower()
@@ -2176,6 +2177,14 @@ class ToolVideoMixin:
             explicit_platform = "kuaishou"
         elif "site:acfun.cn" in plain:
             explicit_platform = "acfun"
+        elif "site:youtube.com" in plain or "site:youtu.be" in plain:
+            explicit_platform = "youtube"
+        elif "site:v.qq.com" in plain or "site:m.v.qq.com" in plain:
+            explicit_platform = "tencent"
+        elif "site:iqiyi.com" in plain or "site:qiyi.com" in plain or "site:iq.com" in plain:
+            explicit_platform = "iqiyi"
+        elif "site:youku.com" in plain:
+            explicit_platform = "youku"
 
         if explicit_platform == "bilibili":
             out.append(f"{content} site:bilibili.com/video")
@@ -2185,6 +2194,14 @@ class ToolVideoMixin:
             out.append(f"{content} site:kuaishou.com/short-video")
         elif explicit_platform == "acfun":
             out.append(f"{content} site:acfun.cn/v/ac")
+        elif explicit_platform == "youtube":
+            out.extend([f"{content} site:youtube.com/watch", f"{content} site:youtu.be"])
+        elif explicit_platform in {"tencent", "qq"}:
+            out.append(f"{content} site:v.qq.com/x")
+        elif explicit_platform == "iqiyi":
+            out.extend([f"{content} site:iqiyi.com/v_", f"{content} site:iq.com/play"])
+        elif explicit_platform == "youku":
+            out.append(f"{content} site:youku.com/v_show")
 
         # 未显式指定平台时给一组通用详情页搜索
         if not out:
@@ -2194,6 +2211,10 @@ class ToolVideoMixin:
                     f"{content} site:douyin.com/video",
                     f"{content} site:kuaishou.com/short-video",
                     f"{content} site:acfun.cn/v/ac",
+                    f"{content} site:youtube.com/watch",
+                    f"{content} site:v.qq.com/x",
+                    f"{content} site:iqiyi.com/v_",
+                    f"{content} site:iq.com/play",
                 ]
             )
 
@@ -2847,6 +2868,30 @@ class ToolVideoMixin:
             if "/v_show/" in path:
                 return True
             if re.search(r"/id_[a-zA-Z0-9]+", path):
+                return True
+            return False
+
+        if "youtube.com" in host:
+            if path.startswith("/watch") and re.search(r"(?:^|&)v=[a-z0-9_-]{6,}", query, flags=re.IGNORECASE):
+                return True
+            if path.startswith("/shorts/") or path.startswith("/embed/"):
+                return bool(path.strip("/").split("/")[-1])
+            return False
+
+        if "youtu.be" in host:
+            return bool(path.strip("/"))
+
+        if "iqiyi.com" in host or "qiyi.com" in host or "iq.com" in host:
+            blocked_cues = ("/search", "/so/", "/playlist", "/album")
+            if any(cue in path for cue in blocked_cues):
+                return False
+            if "iq.com" in host and path.startswith("/play/"):
+                return True
+            if re.search(r"/(?:v|w)_[a-z0-9]+", path, flags=re.IGNORECASE):
+                return True
+            if path.endswith(".html") and re.search(r"/(?:v|w|a)_", path, flags=re.IGNORECASE):
+                return True
+            if re.search(r"(?:^|&)(?:tvid|vid)=[a-z0-9_-]+", query, flags=re.IGNORECASE):
                 return True
             return False
 
@@ -3946,4 +3991,3 @@ class ToolVideoMixin:
             ),
         )
         return any(cue in content for cue in cues)
-

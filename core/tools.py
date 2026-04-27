@@ -395,7 +395,13 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             "acfun.cn",
             "acfun.com",
             "youku.com",
+            "youtube.com",
+            "youtu.be",
+            "iqiyi.com",
+            "qiyi.com",
+            "iq.com",
             "v.qq.com",
+            "m.v.qq.com",
             "qq.com",
         }
 

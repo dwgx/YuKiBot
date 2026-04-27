@@ -51,6 +51,14 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertEqual(state.active_section, "web_research")
         self.assertIn("external_research_request", state.evidence)
 
+    def test_media_search_request_preselects_media_search_without_url(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "给我找一个异环新手教程视频，直接发最合适的"
+        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "search_media"])
+        self.assertEqual(state.active_section, "media_search")
+        self.assertIn("media_search_request", state.evidence)
+
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         samples = [
@@ -150,7 +158,15 @@ class _Registry:
     tool_count = 4
 
     def __init__(self):
-        self.names = ["web_search", "fetch_webpage", "parse_video", "think", "final_answer", "navigate_section"]
+        self.names = [
+            "web_search",
+            "fetch_webpage",
+            "parse_video",
+            "search_media",
+            "think",
+            "final_answer",
+            "navigate_section",
+        ]
         self.calls: list[tuple[str, dict]] = []
 
     def has_tool(self, name: str) -> bool:
@@ -200,6 +216,14 @@ class _Registry:
             return ToolCallResult(ok=True, display="fetch ok", data={"url": args.get("url", "")})
         if name == "web_search":
             return ToolCallResult(ok=True, display="search ok", data={"query": args.get("query", "")})
+        if name == "search_media":
+            media_type = args.get("media_type", "")
+            data = {"query": args.get("query", ""), "media_type": media_type, "text": "media ok"}
+            if media_type == "video":
+                data["video_url"] = "/tmp/yukiko/search.mp4"
+            else:
+                data["image_url"] = "https://example.test/image.jpg"
+            return ToolCallResult(ok=True, display="media ok", data=data)
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
 
 
@@ -403,6 +427,38 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         self.assertEqual([name for name, _ in registry.calls], ["web_search"])
         self.assertEqual(registry.calls[0][1]["query"], "异环的新手教程")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_media_search_llm_timeout_falls_back_to_search_media_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="给我找一个异环新手教程视频，直接发最合适的",
+            trace_id="navigator-media-search-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
+        self.assertEqual(registry.calls[0][1]["media_type"], "video")
+        self.assertIn("异环新手教程视频", registry.calls[0][1]["query"])
+        self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_web_url_llm_timeout_falls_back_to_fetch_tool(self):

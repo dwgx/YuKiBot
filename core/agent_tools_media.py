@@ -60,7 +60,7 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
             name="parse_video",
             description=(
                 "解析短视频链接，返回可发送的视频URL。\n"
-                "支持平台: 抖音(douyin/v.douyin.com)、快手(kuaishou)、B站(bilibili/b23.tv)、AcFun、直链视频(.mp4等)。\n"
+                "支持平台: 抖音(douyin/v.douyin.com)、快手(kuaishou)、B站(bilibili/b23.tv)、AcFun、腾讯视频、爱奇艺、YouTube、优酷、直链视频(.mp4等)。\n"
                 "使用场景: 用户发了视频链接让你解析/下载/发送时使用。\n"
                 "返回 video_url 可直接通过 final_answer 的 video_url 参数发送。\n"
                 "同时返回 qq_safety 安全度评估(safe/risky/blocked)。"
@@ -386,7 +386,7 @@ async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> 
         return ToolCallResult(
             ok=False,
             error="invalid_args:not_supported_video_url",
-            display="parse_video 只支持抖音/快手/B站/AcFun/直链视频，不支持该链接类型。",
+            display="parse_video 只支持抖音/快手/B站/AcFun/腾讯视频/爱奇艺/YouTube/优酷/直链视频，不支持该链接类型。",
         )
 
     query = url  # 用 URL 作为 query

@@ -222,6 +222,8 @@ class VideoAnalyzer:
             return "tencent"
         if "iqiyi.com" in host or "iq.com" in host:
             return "iqiyi"
+        if "youtube.com" in host or host.endswith("youtu.be"):
+            return "youtube"
         if "mgtv.com" in host:
             return "mgtv"
         return "unknown"

@@ -1041,12 +1041,54 @@ class SearchEngine:
 
         results: list[SearchResult] = []
         seen: set[str] = set()
+        platform_href_re = (
+            r"https?://(?:"
+            r"(?:www\.)?bilibili\.com/video/[^\"&<>\s]+|"
+            r"b23\.tv/[^\"&<>\s]+|"
+            r"(?:www\.)?acfun\.cn/v/ac\d+[^\"&<>\s]*|"
+            r"m\.acfun\.cn/v/\?ac=\d+[^\"&<>\s]*|"
+            r"(?:www\.)?youtube\.com/watch\?v=[^\"&<>\s]+|"
+            r"youtu\.be/[^\"&<>\s]+|"
+            r"v\.qq\.com/x/(?:cover|page)/[^\"&<>\s]+|"
+            r"m\.v\.qq\.com/x/(?:cover|page)/[^\"&<>\s]+|"
+            r"(?:www\.|m\.)?iqiyi\.com/(?:v|w)_[^\"&<>\s]+\.html[^\"&<>\s]*|"
+            r"(?:www\.)?iq\.com/play/[^\"&<>\s]+|"
+            r"(?:www\.)?douyin\.com/video/\d+|"
+            r"(?:www\.)?kuaishou\.com/short-video/[^\"&<>\s]+"
+            r")"
+        )
+
+        def _normalize_video_url(raw: str) -> str:
+            raw_url = unescape(raw)
+            lower_url = raw_url.lower()
+            if "youtube.com/watch" in lower_url:
+                parsed = urlparse(raw_url)
+                v_param = ""
+                for part in parsed.query.split("&"):
+                    if part.lower().startswith("v="):
+                        v_param = part
+                        break
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" + (
+                    f"?{v_param}" if v_param else ""
+                )
+            if "m.acfun.cn/v/" in lower_url and "ac=" in lower_url:
+                parsed = urlparse(raw_url)
+                ac_param = ""
+                for part in parsed.query.split("&"):
+                    if part.lower().startswith("ac="):
+                        ac_param = part
+                        break
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}" + (
+                    f"?{ac_param}" if ac_param else ""
+                )
+            return raw_url.split("?")[0]
+
         # Bing 视频搜索结果中的链接
         for match in re.finditer(
-            r'<a[^>]+href="(https?://(?:www\.)?bilibili\.com/video/[^"]+)"[^>]*>(.*?)</a>',
+            rf'<a[^>]+href="({platform_href_re})"[^>]*>(.*?)</a>',
             html, flags=re.IGNORECASE | re.DOTALL,
         ):
-            url = unescape(match.group(1)).split("?")[0]
+            url = _normalize_video_url(match.group(1))
             if url in seen:
                 continue
             seen.add(url)
@@ -1057,10 +1099,11 @@ class SearchEngine:
 
         # 也尝试从 JSON-LD 或 data 属性中提取视频链接
         for match in re.finditer(
-            r'"(https?://(?:www\.)?(?:bilibili\.com/video/BV\w+|douyin\.com/video/\d+|kuaishou\.com/short-video/\w+))[^"]*"',
+            rf'"({platform_href_re})[^"]*"',
             html,
+            flags=re.IGNORECASE,
         ):
-            url = match.group(1).split("?")[0]
+            url = _normalize_video_url(match.group(1))
             if url in seen:
                 continue
             seen.add(url)

@@ -7700,6 +7700,7 @@ class YukikoEngine:
 
             tool_name = normalize_text(str(step.get("tool", ""))).lower()
             if tool_name not in {
+                "search_media",
                 "search_web_media",
                 "web_search",
                 "search_zhihu",

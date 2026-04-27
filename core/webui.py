@@ -3460,7 +3460,11 @@ async def chat_agent_text(request: Request):
 
         async def _send_video_segment(*, prefer_plain_path: bool) -> bool:
             nonlocal staged_video_ref, sent_message_id
-            segment = await _build_video_segment(video_url, prefer_plain_path=prefer_plain_path)
+            segment = await _build_video_segment(
+                video_url,
+                prefer_plain_path=prefer_plain_path,
+                trace_id=trace_id,
+            )
             if segment is None:
                 delivery_errors.append("build_video_segment_returned_none")
                 return False
@@ -3469,7 +3473,8 @@ async def chat_agent_text(request: Request):
             staged_video_ref = normalize_text(str(seg_data.get("file", "") or staged_video_ref))
             payload = [{"type": seg_type, "data": seg_data}]
             _log.info(
-                "media_delivery_inline_attempt | source=webui_agent_text | chat=%s | peer=%s | file=%s",
+                "media_delivery_inline_attempt | source=webui_agent_text | trace=%s | chat=%s | peer=%s | file=%s",
+                trace_id,
                 resolved_type,
                 peer_id,
                 clip_text(staged_video_ref, 180),
@@ -3482,6 +3487,14 @@ async def chat_agent_text(request: Request):
                 sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "") or sent_message_id))
             elif isinstance(sent, int):
                 sent_message_id = str(sent)
+            _log.info(
+                "media_delivery_inline_ok | source=webui_agent_text | trace=%s | chat=%s | peer=%s | message_id=%s | file=%s",
+                trace_id,
+                resolved_type,
+                peer_id,
+                sent_message_id,
+                clip_text(staged_video_ref, 180),
+            )
             return True
 
         video_delivered = False
@@ -3493,7 +3506,8 @@ async def chat_agent_text(request: Request):
             except Exception as exc:
                 delivery_errors.append(str(exc))
                 _log.warning(
-                    "media_delivery_failed_exact | source=webui_agent_text | channel=inline_video | plain=%s | peer=%s | error=%s",
+                    "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=inline_video | plain=%s | peer=%s | error=%s",
+                    trace_id,
                     prefer_plain,
                     peer_id,
                     exc,
@@ -3508,11 +3522,12 @@ async def chat_agent_text(request: Request):
                 try:
                     if resolved_type == "group":
                         _log.info(
-                            "media_delivery_upload_attempt | source=webui_agent_text | channel=upload_group_file | group=%s | file=%s",
+                            "media_delivery_upload_attempt | source=webui_agent_text | trace=%s | channel=upload_group_file | group=%s | file=%s",
+                            trace_id,
                             peer_num,
                             clip_text(abs_path, 180),
                         )
-                        await _onebot_call(
+                        sent = await _onebot_call(
                             "upload_group_file",
                             bot_id=bot_id,
                             group_id=peer_num,
@@ -3521,22 +3536,35 @@ async def chat_agent_text(request: Request):
                         )
                     else:
                         _log.info(
-                            "media_delivery_upload_attempt | source=webui_agent_text | channel=upload_private_file | user=%s | file=%s",
+                            "media_delivery_upload_attempt | source=webui_agent_text | trace=%s | channel=upload_private_file | user=%s | file=%s",
+                            trace_id,
                             peer_num,
                             clip_text(abs_path, 180),
                         )
-                        await _onebot_call(
+                        sent = await _onebot_call(
                             "upload_private_file",
                             bot_id=bot_id,
                             user_id=peer_num,
                             file=abs_path,
                             name=filename,
                         )
+                    if isinstance(sent, dict):
+                        sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "") or sent_message_id))
+                    elif isinstance(sent, int):
+                        sent_message_id = str(sent)
+                    _log.info(
+                        "media_delivery_upload_ok | source=webui_agent_text | trace=%s | peer=%s | message_id=%s | file=%s",
+                        trace_id,
+                        peer_id,
+                        sent_message_id,
+                        clip_text(abs_path, 180),
+                    )
                     video_delivered = True
                 except Exception as exc:
                     delivery_errors.append(str(exc))
                     _log.warning(
-                        "media_delivery_failed_exact | source=webui_agent_text | channel=upload_file | peer=%s | file=%s | error=%s",
+                        "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=upload_file | peer=%s | file=%s | error=%s",
+                        trace_id,
                         peer_id,
                         clip_text(abs_path, 180),
                         exc,
@@ -3544,7 +3572,8 @@ async def chat_agent_text(request: Request):
 
         if not video_delivered:
             _log.warning(
-                "media_delivery_failed_exact | source=webui_agent_text | channel=all | peer=%s | errors=%s",
+                "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=all | peer=%s | errors=%s",
+                trace_id,
                 peer_id,
                 clip_text(" | ".join(delivery_errors), 500),
             )

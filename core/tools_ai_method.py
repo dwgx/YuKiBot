@@ -30,7 +30,7 @@ class ToolAiMethodMixin:
             {
                 "name": "browser.resolve_video",
                 "scope": "browser",
-                "description": "解析抖音/快手/B站/AcFun 或直链视频，返回可发送 video_url",
+                "description": "解析抖音/快手/B站/AcFun/腾讯视频/爱奇艺/YouTube/优酷或直链视频，返回可发送 video_url",
                 "args_schema": {"url": "string"},
             },
             {

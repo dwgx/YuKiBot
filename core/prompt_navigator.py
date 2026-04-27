@@ -26,6 +26,9 @@ _VIDEO_DOMAINS = (
     "kuaishou.com",
     "acfun.cn",
     "ixigua.com",
+    "iqiyi.com",
+    "qiyi.com",
+    "iq.com",
     "youtube.com",
     "youtu.be",
     "tiktok.com",
@@ -188,6 +191,27 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 ),
                 "fallback_sections": ["video_url", "download_resources", "memory_knowledge", "fallback_debug"],
                 "failure_policy": "搜索无结果时换一个更具体查询；仍失败就说明查不到的范围和原因。",
+            },
+            "media_search": {
+                "name": "图片视频检索与推送",
+                "when_to_use": "用户想看、找、发某个主题的视频、图片、壁纸、头像、GIF，但没有给出具体可解析链接。",
+                "tools": [
+                    "search_media",
+                    "search_web_media",
+                    "web_search",
+                    "parse_video",
+                    "think",
+                    "final_answer",
+                    "navigate_section",
+                ],
+                "instructions": (
+                    "用户要看某主题视频/图片时，先 search_media；media_type 按需求填 video/image/gif。"
+                    "search_media 若返回 video_url/image_url，final_answer 必须携带该媒体，不要只给文字。"
+                    "如果结果明显不唯一或主题含糊，先用一句话向用户确认候选；确认后再解析/发送。"
+                    "用户指定平台时在 query 中保留平台词或 site: 限定。"
+                ),
+                "fallback_sections": ["video_url", "web_research", "creative_generation", "fallback_debug"],
+                "failure_policy": "找不到可发送媒体时给出候选来源或询问更具体的关键词，不要假装已经发送。",
             },
             "download_resources": {
                 "name": "资源下载与文件候选",
@@ -551,6 +575,8 @@ class PromptNavigator:
             add("download_resources", "download_file_extension")
         if urls:
             add("web_research", "url")
+        if self._looks_like_media_search_request(ctx):
+            add("media_search", "media_search_request")
         if self._looks_like_web_research_request(ctx):
             add("web_research", "external_research_request")
         if getattr(ctx, "at_other_user_ids", None):
@@ -682,6 +708,63 @@ class PromptNavigator:
             "下载地址",
         )
         return any(cue in text for cue in cues)
+
+    @staticmethod
+    def _looks_like_media_search_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        if _URL_RE.search(text):
+            return False
+        media_cues = (
+            "视频",
+            "影片",
+            "片段",
+            "图片",
+            "壁纸",
+            "头像",
+            "gif",
+            "动图",
+            "image",
+            "photo",
+            "video",
+            "clip",
+            "youtube",
+            "b站",
+            "bilibili",
+            "抖音",
+            "douyin",
+            "快手",
+            "kuaishou",
+            "acfun",
+            "爱奇艺",
+            "iqiyi",
+            "腾讯视频",
+            "v.qq.com",
+        )
+        action_cues = (
+            "找",
+            "搜",
+            "看",
+            "发",
+            "给我",
+            "来个",
+            "来张",
+            "整",
+            "推",
+            "推荐",
+            "want",
+            "show",
+            "send",
+            "find",
+            "search",
+        )
+        return any(cue in text for cue in media_cues) and any(cue in text for cue in action_cues)
 
 
 def _dedupe(items: list[str]) -> list[str]:

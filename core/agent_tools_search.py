@@ -69,6 +69,28 @@ def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> N
 
     registry.register(
         ToolSchema(
+            name="search_media",
+            description=(
+                "搜索并推送最合适的图片/视频/GIF。\n"
+                "适用于用户说想看某主题视频、图片、壁纸、头像或 GIF，但没有给具体链接的场景。\n"
+                "视频会尽量解析成可发送 video_url；图片/GIF 会返回可发送 image_url。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "媒体主题或关键词"},
+                    "media_type": {"type": "string", "description": "类型: image/video/gif"},
+                    "limit": {"type": "integer", "description": "候选数量提示，默认5，最大8"},
+                },
+                "required": ["query"],
+            },
+            category="search",
+        ),
+        _make_search_media_handler(search_engine),
+    )
+
+    registry.register(
+        ToolSchema(
             name="search_download_resources",
             description=(
                 "检索可下载资源候选（压缩包/安装包/数据集/模组等），返回编号列表供用户选择。"
@@ -186,6 +208,126 @@ def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
             return ToolCallResult(ok=False, error=f"search_web_media_error:{exc}", display=f"媒体检索失败: {exc}")
 
     return handler
+
+
+def _infer_media_search_type(query: str, explicit: str = "") -> str:
+    explicit_type = normalize_text(explicit).lower()
+    if explicit_type in {"image", "img", "picture", "photo", "pic"}:
+        return "image"
+    if explicit_type in {"video", "movie", "clip", "vid"}:
+        return "video"
+    if explicit_type in {"gif", "动图"}:
+        return "gif"
+
+    text = normalize_text(query).lower()
+    compact = re.sub(r"\s+", "", text)
+    if any(cue in compact for cue in ("gif", "动图", "表情动图")):
+        return "gif"
+    if any(
+        cue in compact
+        for cue in (
+            "视频",
+            "影片",
+            "短片",
+            "片段",
+            "教程视频",
+            "youtube",
+            "b站",
+            "bilibili",
+            "抖音",
+            "douyin",
+            "快手",
+            "kuaishou",
+            "acfun",
+            "爱奇艺",
+            "iqiyi",
+            "腾讯视频",
+        )
+    ):
+        return "video"
+    if any(cue in compact for cue in ("图片", "搜图", "找图", "壁纸", "头像", "配图", "照片")):
+        return "image"
+    if re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", text):
+        return "image"
+    if re.search(r"\b(?:video|movie|clip)\b", text):
+        return "video"
+    return "image"
+
+
+def _coerce_group_id(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _make_search_media_handler(search_engine: Any) -> ToolHandler:
+    async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+        _ = search_engine
+        query = normalize_text(str(args.get("query", "")))
+        if not query:
+            return ToolCallResult(ok=False, error="missing query", display="缺少 query")
+
+        media_type = _infer_media_search_type(query, str(args.get("media_type", "")))
+        tool_executor = context.get("tool_executor")
+        if tool_executor is None:
+            return ToolCallResult(
+                ok=False,
+                error="tool_executor unavailable",
+                display="媒体搜索模块未初始化",
+            )
+
+        search_query = query
+        if media_type == "gif" and "gif" not in search_query.lower():
+            search_query = f"{search_query} gif"
+        mode = "video" if media_type == "video" else "image"
+
+        try:
+            result = await tool_executor.execute(
+                action="search",
+                tool_name="search_media",
+                tool_args={"query": search_query, "mode": mode},
+                message_text=str(context.get("message_text", "")) or search_query,
+                conversation_id=str(context.get("conversation_id", "")),
+                user_id=str(context.get("user_id", "")),
+                user_name=str(context.get("user_name", "")),
+                group_id=_coerce_group_id(context.get("group_id", 0)),
+                api_call=context.get("api_call"),
+                raw_segments=context.get("raw_segments", []) or [],
+                bot_id=str(context.get("bot_id", "")),
+                trace_id=str(context.get("trace_id", "")),
+            )
+        except Exception as exc:
+            _log.warning("search_media_error | query=%s | type=%s | err=%s", query, media_type, exc)
+            return ToolCallResult(
+                ok=False,
+                error=f"search_media_error:{exc}",
+                display=f"媒体搜索失败: {exc}",
+            )
+
+        payload = result.payload if isinstance(getattr(result, "payload", None), dict) else {}
+        payload = dict(payload)
+        payload.setdefault("query", query)
+        payload.setdefault("media_type", media_type)
+        payload.setdefault("mode", mode)
+        display = normalize_text(str(payload.get("text", "")))
+        if not display:
+            if payload.get("video_url"):
+                display = "找到可发送视频。"
+            elif payload.get("image_url") or payload.get("image_urls"):
+                display = "找到可发送图片。"
+            else:
+                display = f"媒体搜索完成: {query}"
+        return ToolCallResult(
+            ok=bool(result.ok),
+            data=payload,
+            error=result.error,
+            display=display,
+        )
+
+    return handler
+
+
 def _make_search_download_resources_handler(search_engine: Any) -> ToolHandler:
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         query = normalize_text(str(args.get("query", "")))
@@ -235,4 +377,3 @@ def _make_search_download_resources_handler(search_engine: Any) -> ToolHandler:
 
 
 # ── 媒体工具 ──
-

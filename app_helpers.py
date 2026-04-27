@@ -1271,6 +1271,7 @@ async def _build_video_segment(
     *,
     stage_dir: str = "",
     prefer_plain_path: bool = False,
+    trace_id: str = "",
 ) -> MessageSegment | None:
     target = str(url or "").strip()
     if not target:
@@ -1284,7 +1285,7 @@ async def _build_video_segment(
             ok, _ = await _probe_local_video_health(local_path)
             if not ok:
                 return None
-            staged = _stage_media_for_napcat(local_path, stage_dir) or local_path
+            staged = _stage_media_for_napcat(local_path, stage_dir, trace_id=trace_id) or local_path
             return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
         return None
 
@@ -1293,7 +1294,7 @@ async def _build_video_segment(
         ok, _ = await _probe_local_video_health(local_path)
         if not ok:
             return None
-        staged = _stage_media_for_napcat(local_path, stage_dir) or local_path
+        staged = _stage_media_for_napcat(local_path, stage_dir, trace_id=trace_id) or local_path
         return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
 
     if not re.match(r"^https?://", target, flags=re.IGNORECASE):
@@ -1309,7 +1310,7 @@ async def _build_video_segment(
         ok, _ = await _probe_local_video_health(local_tmp)
         if not ok:
             return None
-        staged = _stage_media_for_napcat(local_tmp, stage_dir) or local_tmp
+        staged = _stage_media_for_napcat(local_tmp, stage_dir, trace_id=trace_id) or local_tmp
         return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
     # 下载失败则回退，让调用方走文本链接兜底
     return None
@@ -1391,7 +1392,7 @@ def _resolve_napcat_media_stage_dir(stage_dir: str = "") -> Path:
     return _default_napcat_media_stage_dir()
 
 
-def _stage_media_for_napcat(local_path: Path, stage_dir: str = "") -> Path | None:
+def _stage_media_for_napcat(local_path: Path, stage_dir: str = "", *, trace_id: str = "") -> Path | None:
     """Copy media into a NapCat/QQ-readable staging directory before sending."""
     try:
         src = local_path.expanduser().resolve()
@@ -1414,7 +1415,8 @@ def _stage_media_for_napcat(local_path: Path, stage_dir: str = "") -> Path | Non
         except Exception:
             pass
         _log.info(
-            "media_stage_for_napcat | src=%s | staged=%s | size=%d",
+            "media_stage_for_napcat | trace=%s | src=%s | staged=%s | size=%d",
+            normalize_text(trace_id),
             clip_text(str(src), 180),
             clip_text(str(staged), 180),
             staged.stat().st_size,
@@ -1422,7 +1424,8 @@ def _stage_media_for_napcat(local_path: Path, stage_dir: str = "") -> Path | Non
         return staged
     except Exception as exc:
         _log.warning(
-            "media_stage_for_napcat_fail | src=%s | stage_dir=%s | err=%s",
+            "media_stage_for_napcat_fail | trace=%s | src=%s | stage_dir=%s | err=%s",
+            normalize_text(trace_id),
             clip_text(str(local_path), 180),
             clip_text(stage_dir, 120),
             exc,

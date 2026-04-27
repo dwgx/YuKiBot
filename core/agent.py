@@ -202,6 +202,7 @@ class AgentLoop:
             "fetch_webpage",
             "github_search",
             "github_readme",
+            "search_media",
             "search_web_media",
             "search_download_resources",
             "douyin_search",
@@ -2050,6 +2051,7 @@ class AgentLoop:
             "message_or_reply_media",
             "download_file_extension",
             "recent_media_artifact",
+            "media_search_request",
         }:
             return True
         if ctx.media_summary or ctx.reply_media_summary:
@@ -2096,9 +2098,36 @@ class AgentLoop:
             if not url and artifact:
                 url = normalize_text(str(artifact.get("source_url", ""))) or normalize_text(
                     str(artifact.get("url", ""))
-                )
+            )
             if url:
                 return "parse_video", {"url": url}
+        if (
+            active == "media_search"
+            and "search_media" in visible_tools
+            and self.tool_registry.has_tool("search_media")
+            and evidence & {"media_search_request"}
+        ):
+            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+                " ".join(
+                    str(item or "")
+                    for item in (
+                        ctx.message_text,
+                        ctx.original_message_text,
+                        ctx.reply_to_text,
+                    )
+                )
+            )
+            query = normalize_text(_RE_URL_STRIP.sub(" ", merged))
+            query = re.sub(
+                r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我|我想看|我要看|想看|我要|我想|"
+                r"搜索|搜一下|搜下|搜|查一下|查下|找一下|找下|找|来个|来张|整一个|发一个|发个|推一个|推荐一个)\s*",
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+            media_type = self._infer_media_type(merged) or "image"
+            if query:
+                return "search_media", {"query": query, "media_type": media_type}
         if active == "web_research" and evidence & {"url", "external_research_request"}:
             merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
                 " ".join(
@@ -2141,7 +2170,10 @@ class AgentLoop:
                 return False
             if step.get("tool") != "policy_guard":
                 return False
-            if step.get("error") != "navigator_tool_required_before_final_answer":
+            if step.get("error") not in {
+                "navigator_tool_required_before_final_answer",
+                "navigator_tool_required_before_direct_reply",
+            }:
                 return False
         return True
 
@@ -3124,7 +3156,7 @@ class AgentLoop:
                     _set_if_empty("prefer_ext", inferred_ext)
         elif tool_name in {"github_search", "douyin_search", "search_knowledge"}:
             _set_if_empty("query", contextual_query or text)
-        elif tool_name == "search_web_media":
+        elif tool_name in {"search_web_media", "search_media"}:
             _set_if_empty("query", contextual_query or text)
             _set_if_empty(
                 "media_type", self._infer_media_type(contextual_query or text)
@@ -3202,6 +3234,7 @@ class AgentLoop:
             "github_search": ["query"],
             "douyin_search": ["query"],
             "search_knowledge": ["query"],
+            "search_media": ["query"],
             "search_web_media": ["query"],
             "search_download_resources": ["query"],
             "cli_invoke": ["prompt"],
@@ -3519,6 +3552,31 @@ class AgentLoop:
             t,
         ):
             return "video"
+        if any(cue in plain for cue in ("搜图", "找图", "图片", "壁纸", "头像", "照片")):
+            return "image"
+        if any(
+            cue in plain
+            for cue in (
+                "搜视频",
+                "找视频",
+                "视频",
+                "影片",
+                "短片",
+                "片段",
+                "youtube",
+                "b站",
+                "bilibili",
+                "抖音",
+                "douyin",
+                "快手",
+                "kuaishou",
+                "acfun",
+                "爱奇艺",
+                "iqiyi",
+                "腾讯视频",
+            )
+        ):
+            return "video"
         return "text"
 
     @staticmethod
@@ -3529,6 +3587,37 @@ class AgentLoop:
         if "type=video" in _RE_WHITESPACE.sub("", t):
             return "video"
         if "type=image" in _RE_WHITESPACE.sub("", t):
+            return "image"
+        plain = _RE_WHITESPACE.sub("", t)
+        if any(cue in plain for cue in ("gif", "动图")):
+            return "gif"
+        if any(
+            cue in plain
+            for cue in (
+                "视频",
+                "影片",
+                "短片",
+                "片段",
+                "教程视频",
+                "youtube",
+                "b站",
+                "bilibili",
+                "抖音",
+                "douyin",
+                "快手",
+                "kuaishou",
+                "acfun",
+                "爱奇艺",
+                "iqiyi",
+                "腾讯视频",
+            )
+        ):
+            return "video"
+        if any(cue in plain for cue in ("图片", "壁纸", "头像", "配图", "照片", "搜图", "找图")):
+            return "image"
+        if re.search(r"\b(?:video|movie|clip)\b", t):
+            return "video"
+        if re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", t):
             return "image"
         return ""
 
@@ -3781,7 +3870,7 @@ class AgentLoop:
             return None
         if tool_name == "search_download_resources":
             return "web_search", {"query": f"{query} 官网 下载", "mode": "text"}
-        if tool_name == "search_web_media":
+        if tool_name in {"search_web_media", "search_media"}:
             media_type = (
                 normalize_text(str(args.get("media_type", "image"))).lower() or "image"
             )
@@ -4991,6 +5080,28 @@ class AgentLoop:
                     return path
         return ""
 
+    @staticmethod
+    def _last_success_image_urls(steps: list[dict[str, Any]]) -> list[str]:
+        for step in reversed(steps):
+            if not bool(step.get("ok")):
+                continue
+            data = step.get("data", {})
+            if not isinstance(data, dict):
+                continue
+            urls: list[str] = []
+            image_urls = data.get("image_urls", [])
+            if isinstance(image_urls, list):
+                for item in image_urls:
+                    url = normalize_text(str(item))
+                    if url and url not in urls:
+                        urls.append(url)
+            image_url = normalize_text(str(data.get("image_url", "")))
+            if image_url and image_url not in urls:
+                urls.insert(0, image_url)
+            if urls:
+                return urls
+        return []
+
     @classmethod
     def _sanitize_final_text_for_local_media(cls, text: str, media_path: str) -> str:
         content = str(text or "").strip()
@@ -5179,6 +5290,8 @@ class AgentLoop:
                 display = clip_text(display, 280)
             if display:
                 video_url = self._last_success_video_url(steps)
+                image_urls = self._last_success_image_urls(steps)
+                image_url = image_urls[0] if image_urls else ""
                 audio_file = self._last_success_audio_file(steps)
                 if video_url:
                     display = self._sanitize_final_text_for_local_media(
@@ -5186,6 +5299,8 @@ class AgentLoop:
                     )
                 return AgentResult(
                     reply_text=display,
+                    image_url=image_url,
+                    image_urls=image_urls,
                     video_url=video_url,
                     audio_file=audio_file,
                     action="reply",
@@ -5209,6 +5324,8 @@ class AgentLoop:
             "我这边工具刚刚没跑通，你换个说法或稍后再试，我继续处理。",
         )
         video_url = self._last_success_video_url(steps)
+        image_urls = self._last_success_image_urls(steps)
+        image_url = image_urls[0] if image_urls else ""
         audio_file = self._last_success_audio_file(steps)
         if video_url:
             fallback_text = self._sanitize_final_text_for_local_media(
@@ -5216,6 +5333,8 @@ class AgentLoop:
             )
         return AgentResult(
             reply_text=fallback_text,
+            image_url=image_url,
+            image_urls=image_urls,
             video_url=video_url,
             audio_file=audio_file,
             action="reply",

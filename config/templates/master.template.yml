@@ -645,6 +645,24 @@ prompts:
         - memory_knowledge
         - fallback_debug
         failure_policy: 搜索无结果时换一个更具体查询；仍失败就说明查不到的范围和原因。
+      media_search:
+        name: 图片视频检索与推送
+        when_to_use: 用户想看、找、发某个主题的视频、图片、壁纸、头像、GIF，但没有给出具体可解析链接。
+        tools:
+        - search_media
+        - search_web_media
+        - web_search
+        - parse_video
+        - think
+        - final_answer
+        - navigate_section
+        instructions: 用户要看某主题视频/图片时，先 search_media；media_type 按需求填 video/image/gif。search_media 若返回 video_url/image_url，final_answer 必须携带该媒体，不要只给文字。如果结果明显不唯一或主题含糊，先用一句话向用户确认候选；确认后再解析/发送。用户指定平台时在 query 中保留平台词或 site: 限定。
+        fallback_sections:
+        - video_url
+        - web_research
+        - creative_generation
+        - fallback_debug
+        failure_policy: 找不到可发送媒体时给出候选来源或询问更具体的关键词，不要假装已经发送。
       download_resources:
         name: 资源下载与文件候选
         when_to_use: 用户要安装包、文件直链、下载候选，或 URL/文件名带下载型扩展名。

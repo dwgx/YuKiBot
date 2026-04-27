@@ -196,14 +196,14 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             "\u6240\u4ee5\u5462 \u5e2e\u6211\u770b",
         )
 
-        self.assertEqual(AgentLoop._infer_search_mode("\u641c\u56fe \u732b"), "text")
+        self.assertEqual(AgentLoop._infer_search_mode("\u641c\u56fe \u732b"), "image")
         self.assertEqual(AgentLoop._infer_search_mode("/image cat"), "image")
         self.assertEqual(AgentLoop._infer_search_mode("mode=image cat"), "image")
         self.assertEqual(
             AgentLoop._infer_search_mode("https://example.com/demo.mp4"), "video"
         )
 
-        self.assertEqual(AgentLoop._infer_media_type("\u52a8\u56fe\u8868\u60c5"), "")
+        self.assertEqual(AgentLoop._infer_media_type("\u52a8\u56fe\u8868\u60c5"), "gif")
         self.assertEqual(AgentLoop._infer_media_type("type=gif"), "gif")
 
         self.assertEqual(
@@ -335,12 +335,25 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
                 "\u6296\u97f3 \u732b\u732b site:douyin.com/video",
                 "\u6296\u97f3 \u732b\u732b site:kuaishou.com/short-video",
                 "\u6296\u97f3 \u732b\u732b site:acfun.cn/v/ac",
+                "\u6296\u97f3 \u732b\u732b site:youtube.com/watch",
+                "\u6296\u97f3 \u732b\u732b site:v.qq.com/x",
+                "\u6296\u97f3 \u732b\u732b site:iqiyi.com/v_",
+                "\u6296\u97f3 \u732b\u732b site:iq.com/play",
             ],
         )
         self.assertEqual(
             executor._build_targeted_video_queries("platform=douyin cat"),
             ["platform=douyin cat site:douyin.com/video"],
         )
+        for url in (
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://v.qq.com/x/page/m3534f3t3hb.html",
+            "https://www.iqiyi.com/v_19rr7p0r18.html",
+            "https://www.iq.com/play/demo-12345",
+        ):
+            self.assertTrue(executor._is_supported_platform_video_url(url), url)
+            self.assertTrue(executor._is_platform_video_detail_url(url), url)
         self.assertEqual(executor._pick_gif_keyframe_indexes(1), [0])
         self.assertEqual(executor._pick_gif_keyframe_indexes(3), [0, 1, 2])
         self.assertEqual(executor._pick_gif_keyframe_indexes(8), [0, 1, 3, 4, 6, 7])
