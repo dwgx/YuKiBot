@@ -124,6 +124,17 @@ class _SequencedModelClient:
         return self.responses.pop(0)
 
 
+class _TimeoutModelClient:
+    enabled = True
+
+    def supports_native_tool_calling(self) -> bool:
+        return False
+
+    async def chat_text_with_retry(self, messages, max_tokens=0, retries=0, backoff=0.0):
+        _ = (messages, max_tokens, retries, backoff)
+        raise asyncio.TimeoutError()
+
+
 class _Registry:
     tool_count = 4
 
@@ -268,6 +279,37 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(result.video_url, "/tmp/yukiko/demo.mp4")
         self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
         self.assertTrue(any(step.get("tool") == "policy_guard" for step in result.steps))
+
+    def test_video_url_llm_timeout_falls_back_to_parse_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="解析 https://v.douyin.com/demo/",
+            trace_id="navigator-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual(result.video_url, "/tmp/yukiko/demo.mp4")
+        self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(result.tool_calls_made, 1)
 
 
 if __name__ == "__main__":

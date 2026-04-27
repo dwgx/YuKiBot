@@ -924,20 +924,42 @@ class AgentLoop:
                         step_idx,
                         llm_timeout,
                     )
-                    if steps:
-                        return await self._build_fallback_result(
-                            ctx, steps, tool_calls_made, t0, "llm_timeout"
+                    fallback_tool = None
+                    if (
+                        strict_tool_routing
+                        and tool_calls_made == 0
+                        and not steps
+                    ):
+                        fallback_tool = self._navigator_timeout_fallback_tool(ctx)
+                    if fallback_tool:
+                        tool_name_fb, tool_args_fb = fallback_tool
+                        parsed = {"tool": tool_name_fb, "args": dict(tool_args_fb)}
+                        response_text = json.dumps(parsed, ensure_ascii=False)
+                        assistant_msg = {"role": "assistant", "content": response_text}
+                        synthetic_tool_call = True
+                        _log.info(
+                            "navigator_timeout_tool_fallback | trace=%s | step=%d | section=%s | tool=%s | evidence=%s",
+                            ctx.trace_id,
+                            step_idx,
+                            ctx.navigator_state.active_section if ctx.navigator_state else "",
+                            tool_name_fb,
+                            ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
                         )
-                    fallback = _pl.get_message(
-                        "llm_timeout_fallback",
-                        "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
-                    )
-                    return AgentResult(
-                        reply_text=fallback,
-                        action="reply",
-                        reason="agent_llm_timeout",
-                        total_time_ms=self._elapsed(t0),
-                    )
+                    else:
+                        if steps:
+                            return await self._build_fallback_result(
+                                ctx, steps, tool_calls_made, t0, "llm_timeout"
+                            )
+                        fallback = _pl.get_message(
+                            "llm_timeout_fallback",
+                            "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
+                        )
+                        return AgentResult(
+                            reply_text=fallback,
+                            action="reply",
+                            reason="agent_llm_timeout",
+                            total_time_ms=self._elapsed(t0),
+                        )
                 except Exception as exc:
                     _log.warning(
                         "agent_llm_error | trace=%s | step=%d | %s",
@@ -2040,6 +2062,41 @@ class AgentLoop:
             )
         )
         return bool(self._extract_first_url(merged))
+
+    def _navigator_timeout_fallback_tool(
+        self,
+        ctx: AgentContext,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Execute the active Navigator section's obvious first tool when the LLM stalls."""
+        state = ctx.navigator_state
+        if state is None:
+            return None
+        active = normalize_text(state.active_section)
+        visible_tools = set(ctx.native_tools or [])
+        evidence = set(state.evidence or [])
+        if (
+            active == "video_url"
+            and "parse_video" in visible_tools
+            and self.tool_registry.has_tool("parse_video")
+            and evidence & {"video_url", "url", "recent_media_artifact"}
+        ):
+            merged = "\n".join(
+                normalize_text(str(item or ""))
+                for item in (
+                    ctx.message_text,
+                    ctx.original_message_text,
+                    ctx.reply_to_text,
+                )
+            )
+            url = self._extract_first_video_url(merged) or self._extract_first_url(merged)
+            artifact = ctx.recent_media_artifact if isinstance(ctx.recent_media_artifact, dict) else {}
+            if not url and artifact:
+                url = normalize_text(str(artifact.get("source_url", ""))) or normalize_text(
+                    str(artifact.get("url", ""))
+                )
+            if url:
+                return "parse_video", {"url": url}
+        return None
 
     def _apply_prompt_navigator_scope(
         self,
