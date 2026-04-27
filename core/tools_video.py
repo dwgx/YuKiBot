@@ -3341,9 +3341,12 @@ class ToolVideoMixin:
                 "best",
             ]
         elif is_acfun:
-            # ACFUN：优先 mp4 格式
+            # AcFun HLS 的 best 往往会选 720p60/1080p，群聊投递容易超时。
+            # 先取小清晰度，必要时再回退到高码率。
             format_candidates = [
-                f"best[ext=mp4][height<=720]/best[ext=mp4]",
+                "best[ext=mp4][height<=480]/best[height<=480]",
+                "best[ext=mp4][height<=540]/best[height<=540]",
+                "best[ext=mp4][height<=720]/best[height<=720]",
                 "best[ext=mp4]",
                 "best",
             ]
