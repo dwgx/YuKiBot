@@ -1051,7 +1051,7 @@ class SearchEngine:
             r"youtu\.be/[^\"&<>\s]+|"
             r"v\.qq\.com/x/(?:cover|page)/[^\"&<>\s]+|"
             r"m\.v\.qq\.com/x/(?:cover|page)/[^\"&<>\s]+|"
-            r"(?:www\.|m\.)?iqiyi\.com/(?:v|w)_[^\"&<>\s]+\.html[^\"&<>\s]*|"
+            r"(?:www\.|m\.)?iqiyi\.com/(?:v|w|a)_[^\"&<>\s]+\.html[^\"&<>\s]*|"
             r"(?:www\.)?iq\.com/play/[^\"&<>\s]+|"
             r"(?:www\.)?douyin\.com/video/\d+|"
             r"(?:www\.)?kuaishou\.com/short-video/[^\"&<>\s]+"

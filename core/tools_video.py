@@ -2199,7 +2199,7 @@ class ToolVideoMixin:
         elif explicit_platform in {"tencent", "qq"}:
             out.append(f"{content} site:v.qq.com/x")
         elif explicit_platform == "iqiyi":
-            out.extend([f"{content} site:iqiyi.com/v_", f"{content} site:iq.com/play"])
+            out.extend([f"{content} site:iqiyi.com/v_", f"{content} site:iqiyi.com/a_", f"{content} site:iq.com/play"])
         elif explicit_platform == "youku":
             out.append(f"{content} site:youku.com/v_show")
 
@@ -2214,6 +2214,7 @@ class ToolVideoMixin:
                     f"{content} site:youtube.com/watch",
                     f"{content} site:v.qq.com/x",
                     f"{content} site:iqiyi.com/v_",
+                    f"{content} site:iqiyi.com/a_",
                     f"{content} site:iq.com/play",
                 ]
             )

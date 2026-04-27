@@ -338,6 +338,7 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
                 "\u6296\u97f3 \u732b\u732b site:youtube.com/watch",
                 "\u6296\u97f3 \u732b\u732b site:v.qq.com/x",
                 "\u6296\u97f3 \u732b\u732b site:iqiyi.com/v_",
+                "\u6296\u97f3 \u732b\u732b site:iqiyi.com/a_",
                 "\u6296\u97f3 \u732b\u732b site:iq.com/play",
             ],
         )
