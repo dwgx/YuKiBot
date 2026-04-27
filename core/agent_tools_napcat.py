@@ -327,6 +327,7 @@ def _register_napcat_tools(registry: AgentToolRegistry) -> None:
                     "group_id": {"type": "integer", "description": "群号"},
                     "file": {"type": "string", "description": "本地文件路径"},
                     "name": {"type": "string", "description": "文件名"},
+                    "folder": {"type": "string", "description": "可选群文件夹 ID"},
                 },
                 "required": ["group_id", "file", "name"],
             },
@@ -1581,6 +1582,7 @@ async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any
     group_id = int(args.get("group_id", 0))
     file_path = str(args.get("file", ""))
     name = str(args.get("name", ""))
+    folder = str(args.get("folder", "") or "").strip()
     if not group_id or not file_path or not name:
         return ToolCallResult(ok=False, error="missing group_id, file or name")
     # 安全: 限制文件路径，防止 LLM 上传任意系统文件
@@ -1606,9 +1608,11 @@ async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any
         return ToolCallResult(ok=False, error="安全限制: 只能上传 storage/tmp 或 NapCat temp 目录下的文件")
     if not resolved.is_file():
         return ToolCallResult(ok=False, error=f"文件不存在: {file_path}")
+    kwargs: dict[str, Any] = {"group_id": group_id, "file": str(resolved), "name": name}
+    if folder:
+        kwargs["folder"] = folder
     return await _napcat_api_call(
-        context, "upload_group_file", f"已上传文件 {name} 到群 {group_id}",
-        group_id=group_id, file=str(resolved), name=name,
+        context, "upload_group_file", f"已上传文件 {name} 到群 {group_id}", **kwargs,
     )
 
 
@@ -4365,4 +4369,3 @@ async def _handle_clean_cache(args: dict[str, Any], context: dict[str, Any]) -> 
 
 
 # ── 搜索工具 ──
-

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import core.webui as webui
 from core.agent_tools import _napcat_api_call
-from core.napcat_compat import normalize_napcat_api_kwargs, resolve_napcat_api_name
+from core.napcat_compat import (
+    build_napcat_file_reference,
+    napcat_file_uri_to_path,
+    normalize_napcat_api_kwargs,
+    resolve_napcat_api_name,
+)
 
 
 class _StubBot:
@@ -33,6 +39,21 @@ class _StubBot:
 
 
 class NapCatCompatRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_build_file_reference_uses_file_uri_for_local_paths(self) -> None:
+        local_file = Path(__file__).resolve()
+
+        reference = build_napcat_file_reference(local_file, require_exists=True)
+
+        self.assertTrue(reference.startswith("file://"))
+        self.assertEqual(napcat_file_uri_to_path(reference).resolve(), local_file)
+
+    def test_file_uri_parser_ignores_napcat_resource_ids(self) -> None:
+        self.assertIsNone(napcat_file_uri_to_path("file://1234567890"))
+        self.assertEqual(
+            build_napcat_file_reference("https://example.com/a.mp4"),
+            "https://example.com/a.mp4",
+        )
+
     def test_resolve_napcat_api_name_maps_legacy_aliases(self) -> None:
         self.assertEqual(resolve_napcat_api_name("set_group_sign"), "send_group_sign")
         self.assertEqual(resolve_napcat_api_name("get_group_notice"), "_get_group_notice")

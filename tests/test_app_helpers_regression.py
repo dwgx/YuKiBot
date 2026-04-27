@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
+import app_helpers
 from app_helpers import (
     _looks_like_download_heavy_request,
     _looks_like_sticker_learning_request,
@@ -42,6 +46,67 @@ class AppHelpersRegressionTests(unittest.TestCase):
                 [{"type": "image", "data": {"url": "https://example.com/a.png"}}],
             )
         )
+
+
+class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_video_segment_uses_napcat_file_uris_for_local_media(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video = Path(tmpdir) / "demo.mp4"
+            thumb = Path(tmpdir) / "demo.jpg"
+            video.write_bytes(b"video")
+            thumb.write_bytes(b"thumb")
+
+            async def passthrough(path: Path) -> Path:
+                return path
+
+            async def healthy(path: Path) -> tuple[bool, str]:
+                return True, ""
+
+            async def thumbnail(path: Path) -> Path:
+                return thumb
+
+            with (
+                patch.object(app_helpers, "_compress_video_if_needed", passthrough),
+                patch.object(app_helpers, "_ensure_qq_preview_video", passthrough),
+                patch.object(app_helpers, "_probe_local_video_health", healthy),
+                patch.object(app_helpers, "_generate_video_thumbnail", thumbnail, create=True),
+            ):
+                segment = await app_helpers._video_seg_with_thumb(video)
+
+            self.assertIsNotNone(segment)
+            self.assertEqual(segment.type, "video")
+            self.assertTrue(segment.data["file"].startswith("file://"))
+            self.assertTrue(segment.data["thumb"].startswith("file://"))
+
+    async def test_private_video_upload_fallback_uses_private_file_api(self) -> None:
+        class FakeBot:
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object]]] = []
+
+            async def call_api(self, api: str, **kwargs):
+                self.calls.append((api, dict(kwargs)))
+                return {"status": "ok", "retcode": 0, "data": {}}
+
+        class FakePrivateEvent:
+            user_id = 123456
+
+            def get_user_id(self) -> str:
+                return "123456"
+
+        async def healthy(path: Path) -> tuple[bool, str]:
+            return True, ""
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video = Path(tmpdir) / "demo.mp4"
+            video.write_bytes(b"video")
+            bot = FakeBot()
+            with patch.object(app_helpers, "_probe_local_video_health", healthy):
+                uploaded = await app_helpers._try_upload_video_file(bot, FakePrivateEvent(), str(video))
+
+        self.assertTrue(uploaded)
+        self.assertEqual(bot.calls[0][0], "upload_private_file")
+        self.assertEqual(bot.calls[0][1]["user_id"], "123456")
+        self.assertEqual(bot.calls[0][1]["name"], "demo.mp4")
 
 
 if __name__ == "__main__":

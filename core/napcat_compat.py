@@ -6,6 +6,7 @@ import re
 import shutil
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
+from urllib.parse import unquote, urlparse
 
 NAPCAT_ID_KEYS = frozenset({
     "bot_id",
@@ -35,11 +36,69 @@ NAPCAT_API_ALIASES: dict[str, str] = {
     # 注意: 旧版 group_poke / friend_poke 仍然可用，但推荐用 send_poke
 }
 _VERSION_PART_RE = re.compile(r"\d+")
+_URI_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 _STRING_ID_VERSION_FLOOR = (4, 8, 115)
 
 
 def _clean_text(value: Any) -> str:
     return str(value or "").strip()
+
+
+def napcat_file_uri_to_path(value: Any) -> Path | None:
+    """Parse a local file:// URI into a Path.
+
+    NapCat also uses file://<id> as an internal resource identifier; that form
+    is not a local filesystem path and intentionally returns None.
+    """
+    raw = _clean_text(value)
+    if not raw.lower().startswith("file://"):
+        return None
+    parsed = urlparse(raw)
+    if parsed.netloc and parsed.netloc.lower() not in {"", "localhost"}:
+        if not parsed.path or parsed.path == "/":
+            return None
+        local_raw = f"//{parsed.netloc}{unquote(parsed.path)}"
+    else:
+        local_raw = unquote(parsed.path or "")
+    if re.match(r"^/[A-Za-z]:/", local_raw):
+        local_raw = local_raw[1:]
+    if not local_raw:
+        return None
+    return Path(local_raw)
+
+
+def build_napcat_file_reference(path_like: Any, *, require_exists: bool = False) -> str:
+    """Return the file reference format YuKiKo sends to NapCat message segments.
+
+    HTTP(S), base64, data URL, and existing file:// references pass through.
+    Local files become absolute file:// URIs, which is the most stable form for
+    OneBot/NapCat media segments.
+    """
+    source = _clean_text(path_like)
+    if not source:
+        return ""
+    lower_source = source.lower()
+    if lower_source.startswith(("file://", "http://", "https://", "base64://", "data:")):
+        return source
+    if _URI_SCHEME_RE.match(source) and not re.match(r"^[A-Za-z]:[\\/]", source):
+        return source
+    try:
+        path = Path(source).expanduser().resolve()
+        if path.exists():
+            if require_exists and not path.is_file():
+                return ""
+            return path.as_uri()
+        if require_exists:
+            return ""
+    except Exception:
+        if require_exists:
+            return ""
+    normalized = source.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/", normalized):
+        normalized = f"/{normalized}"
+    elif not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    return f"file://{normalized}"
 
 
 def normalize_napcat_id(value: Any) -> str | None:

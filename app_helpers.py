@@ -17,11 +17,14 @@ import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import httpx
-from core.napcat_compat import call_napcat_bot_api
+from core.napcat_compat import (
+    build_napcat_file_reference,
+    call_napcat_bot_api,
+    napcat_file_uri_to_path,
+)
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageEvent, MessageSegment
 from utils.text import clip_text, normalize_text
 
@@ -1156,11 +1159,8 @@ async def _build_image_segment(url: str) -> MessageSegment | None:
             return MessageSegment.image(f"base64://{b64}")
 
     if target.startswith("file://"):
-        parsed = urlparse(target)
-        local_raw = unquote(parsed.path or "")
-        if re.match(r"^/[A-Za-z]:/", local_raw):
-            local_raw = local_raw[1:]
-        return _build_image_segment_from_local_path(Path(local_raw))
+        local_path = napcat_file_uri_to_path(target)
+        return _build_image_segment_from_local_path(local_path) if local_path is not None else None
 
     local_path = Path(target)
     if local_path.exists() and local_path.is_file():
@@ -1181,7 +1181,9 @@ def _build_image_segment_from_local_path(path: Path) -> MessageSegment | None:
     except Exception:
         return None
     # NapCat 原生支持 file:// URI，直接读取本地文件，零内存开销。
-    file_uri = resolved.as_uri()  # file:///C:/xxx/pic.jpg
+    file_uri = build_napcat_file_reference(resolved, require_exists=True)
+    if not file_uri:
+        return None
     return MessageSegment.image(file=file_uri)
 
 
@@ -1244,9 +1246,14 @@ async def _video_seg_with_thumb(local_path: Path) -> MessageSegment | None:
         return None
     thumb_path = await _generate_video_thumbnail(actual_path)
 
-    data: dict[str, Any] = {"file": str(actual_path)}
+    video_ref = build_napcat_file_reference(actual_path, require_exists=True)
+    if not video_ref:
+        return None
+    data: dict[str, Any] = {"file": video_ref}
     if thumb_path is not None and thumb_path.exists():
-        data["thumb"] = str(thumb_path.expanduser().resolve())
+        thumb_ref = build_napcat_file_reference(thumb_path.expanduser().resolve(), require_exists=True)
+        if thumb_ref:
+            data["thumb"] = thumb_ref
         _log.info("video_seg_with_thumb | video=%s | thumb=%s", actual_path.name, thumb_path.name)
     else:
         _log.info("video_seg_no_thumb | video=%s", actual_path.name)
@@ -1259,11 +1266,9 @@ async def _build_video_segment(url: str) -> MessageSegment | None:
         return None
 
     if target.startswith("file://"):
-        parsed = urlparse(target)
-        local_raw = unquote(parsed.path or "")
-        if re.match(r"^/[A-Za-z]:/", local_raw):
-            local_raw = local_raw[1:]
-        local_path = Path(local_raw)
+        local_path = napcat_file_uri_to_path(target)
+        if local_path is None:
+            return None
         if local_path.exists() and local_path.is_file():
             ok, _ = await _probe_local_video_health(local_path)
             if not ok:
@@ -1691,12 +1696,8 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
     return src
 
 
-async def _try_upload_group_file(bot: Bot, event: MessageEvent, video_url: str) -> bool:
-    """尝试用 upload_group_file API 上传视频文件（大文件兜底）。"""
-    group_id = getattr(event, "group_id", 0)
-    if not group_id:
-        return False
-
+async def _try_upload_video_file(bot: Bot, event: MessageEvent, video_url: str) -> bool:
+    """用 NapCat 文件 API 发送本地视频：群聊走群文件，私聊走私聊文件。"""
     local_path = _as_local_video_path(video_url)
     if local_path is None:
         return False
@@ -1707,19 +1708,47 @@ async def _try_upload_group_file(bot: Bot, event: MessageEvent, video_url: str) 
 
     abs_path = str(local_path.resolve())
     file_name = local_path.name
+    group_id = getattr(event, "group_id", 0)
+    if group_id:
+        try:
+            await call_napcat_bot_api(
+                bot,
+                "upload_group_file",
+                group_id=int(group_id),
+                file=abs_path,
+                name=file_name,
+            )
+            _log.info("upload_group_file_ok | group=%s | file=%s", group_id, file_name)
+            return True
+        except Exception as exc:
+            _log.warning("upload_group_file_fail | %s", exc)
+            return False
+
+    user_id = getattr(event, "user_id", 0)
+    try:
+        user_id = int(user_id or event.get_user_id())
+    except Exception:
+        user_id = 0
+    if not user_id:
+        return False
     try:
         await call_napcat_bot_api(
             bot,
-            "upload_group_file",
-            group_id=int(group_id),
+            "upload_private_file",
+            user_id=user_id,
             file=abs_path,
             name=file_name,
         )
-        _log.info("upload_group_file_ok | group=%s | file=%s", group_id, file_name)
+        _log.info("upload_private_file_ok | user=%s | file=%s", user_id, file_name)
         return True
     except Exception as exc:
-        _log.warning("upload_group_file_fail | %s", exc)
+        _log.warning("upload_private_file_fail | %s", exc)
         return False
+
+
+async def _try_upload_group_file(bot: Bot, event: MessageEvent, video_url: str) -> bool:
+    """兼容旧调用名：群聊时上传群文件，私聊时上传私聊文件。"""
+    return await _try_upload_video_file(bot, event, video_url)
 
 
 async def _compress_video_if_needed(src: Path) -> Path:
@@ -1743,11 +1772,9 @@ def _as_local_video_path(value: str) -> Path | None:
     if not raw:
         return None
     if raw.startswith("file://"):
-        parsed = urlparse(raw)
-        local_raw = unquote(parsed.path or "")
-        if re.match(r"^/[A-Za-z]:/", local_raw):
-            local_raw = local_raw[1:]
-        path = Path(local_raw)
+        path = napcat_file_uri_to_path(raw)
+        if path is None:
+            return None
     else:
         path = Path(raw)
     if path.exists() and path.is_file():

@@ -22,7 +22,7 @@ from nonebot import on_message, on_metaevent, on_notice, on_request
 from nonebot.adapters.onebot.v11 import Bot, Event, Message, MessageEvent, MessageSegment
 
 from core.chat_splitter import coalesce_for_rate_limit, split_semantic_text
-from core.napcat_compat import call_napcat_bot_api
+from core.napcat_compat import build_napcat_file_reference, call_napcat_bot_api
 from core import prompt_loader as _pl
 from core.engine import EngineMessage, YukikoEngine
 from core.queue import GroupQueueDispatcher
@@ -625,22 +625,7 @@ async def _prepare_voice_audio_file(audio_path: Path, max_seconds: int) -> tuple
 
 
 def _build_file_uri(path_like: Path | str) -> str:
-    source = str(path_like).strip()
-    if not source:
-        return ""
-    lower_source = source.lower()
-    if lower_source.startswith(("file://", "http://", "https://", "base64://")):
-        return source
-    try:
-        p = Path(source).expanduser().resolve()
-        if p.exists():
-            return p.as_uri()
-    except Exception:
-        pass
-    normalized = source.replace("\\", "/")
-    if not normalized.startswith("/"):
-        normalized = f"/{normalized}"
-    return f"file://{normalized}"
+    return build_napcat_file_reference(path_like)
 
 
 def _split_voice_audio_file_sync(audio_path: Path, segment_seconds: int, max_segments: int) -> list[Path]:
@@ -2120,13 +2105,13 @@ def register_handlers(engine: YukikoEngine) -> None:
                 video_delivered = False
                 fallback_sent = False
                 if prefer_upload_first:
-                    uploaded = await _try_upload_group_file(
+                    uploaded = await _try_upload_video_file(
                         bot=bot,
                         event=event,
                         video_url=video_url,
                     )
                     if uploaded:
-                        _log.info("video_send_via_upload_group_file | strategy=%s", video_send_strategy)
+                        _log.info("video_send_via_upload_file | strategy=%s", video_send_strategy)
                         delivered = True
                         video_delivered = True
                     if video_send_strategy == "upload_only":
@@ -2155,15 +2140,15 @@ def register_handlers(engine: YukikoEngine) -> None:
                         send_exc = exc
                     if not sent_video:
                         if send_exc is not None:
-                            _log.warning("video_send_fail | %s | trying upload_group_file fallback", send_exc)
+                            _log.warning("video_send_fail | %s | trying upload_file fallback", send_exc)
                         else:
-                            _log.warning("video_send_fail | safe_send_failed | trying upload_group_file fallback")
-                        # 尝试用 upload_group_file 上传（适合大文件）
-                        uploaded = await _try_upload_group_file(
+                            _log.warning("video_send_fail | safe_send_failed | trying upload_file fallback")
+                        # 尝试用 NapCat 文件 API 上传（适合大文件）
+                        uploaded = await _try_upload_video_file(
                             bot=bot, event=event, video_url=video_url,
                         )
                         if uploaded:
-                            _log.info("video_send_via_upload_group_file | strategy=fallback")
+                            _log.info("video_send_via_upload_file | strategy=fallback")
                             video_delivered = True
                             delivered = True
                     else:
