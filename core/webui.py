@@ -3453,7 +3453,7 @@ async def chat_agent_text(request: Request):
             await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
 
     if video_url:
-        from app_helpers import _build_video_segment
+        from app_helpers import _build_video_segment, _stage_media_for_napcat
 
         staged_video_ref = ""
         delivery_errors: list[str] = []
@@ -3517,7 +3517,11 @@ async def chat_agent_text(request: Request):
             upload_ref = staged_video_ref or video_url
             upload_path = napcat_file_uri_to_path(upload_ref) if upload_ref.lower().startswith("file://") else Path(upload_ref)
             if upload_path is not None and upload_path.exists() and upload_path.is_file():
-                abs_path = str(upload_path.expanduser().resolve())
+                staged_upload_path = (
+                    _stage_media_for_napcat(upload_path, trace_id=trace_id)
+                    or upload_path
+                )
+                abs_path = str(staged_upload_path.expanduser().resolve())
                 filename = Path(video_url).name or upload_path.name
                 try:
                     if resolved_type == "group":
