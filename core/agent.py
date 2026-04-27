@@ -40,6 +40,13 @@ _RE_WHITESPACE_2PLUS = re.compile(r"\s{2,}")
 _RE_URL_EXTRACT = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _RE_URL_STRIP = re.compile(r"https?://\S+", re.IGNORECASE)
 _RE_URL_SCHEME = re.compile(r"https?://")
+_RE_BARE_WEB_HOST = re.compile(
+    r"(?<![@A-Za-z0-9_.-])"
+    r"((?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"(?:com|net|org|dev|io|ai|app|site|xyz|me|co|cn|jp|tv|gg|cc|info|wiki|top)"
+    r"(?::\d{2,5})?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?)",
+    re.IGNORECASE,
+)
 _RE_IMAGE_EXT = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?:\?|$)")
 _RE_VIDEO_EXT = re.compile(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)")
 _RE_QQ_NUMBER = re.compile(r"(?<!\d)([1-9]\d{5,11})(?!\d)")
@@ -778,7 +785,9 @@ class AgentLoop:
         """执行 Agent 循环，返回最终结果。"""
         t0 = time.monotonic()
         steps: list[dict[str, Any]] = []
-        forced_media_tool = self._select_forced_media_tool(ctx)
+        forced_media_tool = self._select_forced_media_tool(
+            ctx
+        ) or self._select_forced_web_tool(ctx)
         force_tool_first = self._should_force_tool_first(ctx)
         model_client = getattr(self, "model_client", None)
         native_tool_calling = bool(
@@ -2728,6 +2737,12 @@ class AgentLoop:
         }:
             if tool_name in {"parse_video", "analyze_video"}:
                 _set_if_empty("url", recent_video_url or candidate_url)
+            elif tool_name == "fetch_webpage":
+                _set_if_empty(
+                    "url",
+                    candidate_url
+                    or self._extract_first_web_url(contextual_query or text),
+                )
             else:
                 _set_if_empty("url", candidate_url)
             if tool_name in {"download_file", "smart_download"}:
@@ -2852,6 +2867,52 @@ class AgentLoop:
         if not m:
             return ""
         return m.group(0).strip().rstrip(").,，。!?！？")
+
+    @classmethod
+    def _extract_first_web_url(cls, text: str) -> str:
+        explicit = cls._extract_first_url(text)
+        if explicit:
+            return explicit
+        content = normalize_text(text)
+        if not content:
+            return ""
+        match = _RE_BARE_WEB_HOST.search(content)
+        if not match:
+            return ""
+        url = normalize_text(match.group(1)).rstrip(").,，。!?！？")
+        if not url:
+            return ""
+        return f"https://{url}"
+
+    @classmethod
+    def _looks_like_webpage_fetch_request(cls, text: str) -> bool:
+        url = cls._extract_first_web_url(text)
+        if not url:
+            return False
+        if cls._looks_like_image_url(url) or cls._looks_like_video_url(url):
+            return False
+        content = normalize_text(text).lower()
+        if not content:
+            return False
+        cues = (
+            "网站",
+            "网页",
+            "页面",
+            "官网",
+            "打开",
+            "看看",
+            "看下",
+            "帮我看",
+            "分析",
+            "介绍",
+            "是什么",
+            "安全吗",
+            "website",
+            "webpage",
+            "site",
+            "page",
+        )
+        return any(cue in content for cue in cues)
 
     @staticmethod
     def _looks_like_image_url(url: str) -> bool:
@@ -3951,6 +4012,17 @@ class AgentLoop:
             "內容",
         )
         return any(cue in text for cue in voice_cues)
+
+    def _select_forced_web_tool(
+        self, ctx: AgentContext
+    ) -> tuple[str, dict[str, Any]] | None:
+        text = normalize_text(ctx.message_text)
+        if not self._looks_like_webpage_fetch_request(text):
+            return None
+        url = self._extract_first_web_url(text)
+        if not url:
+            return None
+        return "fetch_webpage", {"url": url}
 
     def _select_forced_media_tool(
         self, ctx: AgentContext

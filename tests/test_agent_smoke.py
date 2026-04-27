@@ -334,6 +334,24 @@ class AgentLoopSmokeTests(unittest.TestCase):
         self.assertEqual(registry.calls[0][1]["url"], "https://example.com/recent.png")
         self.assertEqual(result.tool_calls_made, 1)
 
+    def test_forced_bare_domain_webpage_fetch_runs_before_model_response(self):
+        """裸域名网页请求应先抓网页，避免首轮模型超时导致不执行工具。"""
+        registry = _RecordingRegistry({"fetch_webpage", "final_answer", "think"})
+        loop = _make_loop(
+            [],
+            registry=registry,
+        )
+
+        result = asyncio.run(loop.run(_make_ctx(
+            message_text="skiapi.dev这个网站帮我看看",
+            media_summary=[],
+            raw_segments=[],
+        )))
+
+        self.assertEqual(registry.calls[0][0], "fetch_webpage")
+        self.assertEqual(registry.calls[0][1]["url"], "https://skiapi.dev")
+        self.assertEqual(result.tool_calls_made, 1)
+
     def test_unknown_tool_notifies_model(self):
         """未知工具名 → 通知模型后继续。"""
         loop = _make_loop([
