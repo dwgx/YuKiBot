@@ -3276,6 +3276,7 @@ class ToolVideoMixin:
         is_youku = "youku.com" in host
         is_acfun = "acfun.cn" in host or "acfun.com" in host
         is_youtube = "youtube.com" in host or host.endswith("youtu.be")
+        is_iqiyi = "iqiyi.com" in host or "qiyi.com" in host or "iq.com" in host
         is_tencent = "v.qq.com" in host or (
             "qq.com" in host
             and "/x/" in normalize_text(urlparse(source_url).path).lower()
@@ -3394,6 +3395,15 @@ class ToolVideoMixin:
                 "best[ext=mp4]",
                 "best",
             ]
+        elif is_iqiyi:
+            # 爱奇艺/iQ.com: 旧 extractor 常返回 HLS，优先低清晰度，避免长视频直接超体积。
+            format_candidates = [
+                f"best[ext=mp4][height<=360][filesize<{self._video_download_max_mb}M]/best[height<=360]",
+                f"best[ext=mp4][height<=480][filesize<{self._video_download_max_mb}M]/best[height<=480]",
+                "best[ext=mp4][height<=720]/best[height<=720]",
+                "best[ext=mp4]",
+                "best",
+            ]
         elif is_youtube:
             # YouTube: 优先有音频的渐进式小 mp4；必要时再让 ffmpeg 合并 720p 内视频+音频。
             format_candidates = [
@@ -3423,6 +3433,7 @@ class ToolVideoMixin:
             or is_youku
             or is_acfun
             or is_tencent
+            or is_iqiyi
             or is_youtube
         )
         no_audio_fallback: Path | None = None
