@@ -69,7 +69,7 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(app_helpers, "_compress_video_if_needed", passthrough),
                 patch.object(app_helpers, "_ensure_qq_preview_video", passthrough),
                 patch.object(app_helpers, "_probe_local_video_health", healthy),
-                patch.object(app_helpers, "_generate_video_thumbnail", thumbnail, create=True),
+                patch.object(app_helpers, "_generate_video_thumbnail", thumbnail),
             ):
                 segment = await app_helpers._video_seg_with_thumb(video)
 
@@ -95,6 +95,12 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
             info = app_helpers._read_media_stream_info_sync(Path("missing.mp4"))
 
         self.assertEqual(info, {"video_codec": "", "audio_codec": "", "pix_fmt": ""})
+
+    async def test_generate_video_thumbnail_tolerates_missing_ffmpeg(self) -> None:
+        with patch.object(app_helpers, "_FFMPEG_BIN", None):
+            thumb = await app_helpers._generate_video_thumbnail(Path("missing.mp4"))
+
+        self.assertIsNone(thumb)
 
     async def test_private_video_upload_fallback_uses_private_file_api(self) -> None:
         class FakeBot:

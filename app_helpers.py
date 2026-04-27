@@ -1440,6 +1440,52 @@ def _should_upload_video_file_first(video_url: str) -> bool:
         return False
 
 
+def _generate_video_thumbnail_sync(path: Path) -> Path | None:
+    """Generate a small jpg thumbnail beside the video for NapCat preview."""
+    if not _FFMPEG_BIN:
+        return None
+    try:
+        src = path.expanduser().resolve()
+        if not src.exists() or not src.is_file():
+            return None
+        thumb = src.with_suffix(".jpg")
+        if thumb.exists() and thumb.stat().st_mtime >= src.stat().st_mtime and thumb.stat().st_size > 0:
+            return thumb
+        cmd = [
+            _FFMPEG_BIN,
+            "-y",
+            "-ss",
+            "00:00:01",
+            "-i",
+            str(src),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale='min(640,iw)':-2",
+            "-q:v",
+            "3",
+            str(thumb),
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=30, check=False)
+        if proc.returncode == 0 and thumb.exists() and thumb.stat().st_size > 0:
+            return thumb
+        thumb.unlink(missing_ok=True)
+        _log.debug(
+            "video_thumbnail_fail | file=%s | rc=%s | stderr=%s",
+            src.name,
+            proc.returncode,
+            (proc.stderr or b"")[:300],
+        )
+        return None
+    except Exception as exc:
+        _log.debug("video_thumbnail_error | file=%s | %s", path, exc)
+        return None
+
+
+async def _generate_video_thumbnail(path: Path) -> Path | None:
+    return await asyncio.to_thread(_generate_video_thumbnail_sync, path)
+
+
 def _read_media_stream_info_sync(path: Path) -> dict[str, str]:
     """尽量读取视频/音频编码信息（优先 ffprobe，缺失时回退 ffmpeg -i 文本解析）。"""
     info = {"video_codec": "", "audio_codec": "", "pix_fmt": ""}
