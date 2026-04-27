@@ -3658,7 +3658,7 @@ class ToolVideoMixin:
             self._last_video_download_error[source_url] = normalize_text(str(exc))
             return None
 
-        fallback = self._pick_downloaded_video_fallback(digest)
+        fallback = self._pick_iqiyi_subprocess_output(digest)
         if fallback is not None:
             if not self._video_has_audio_stream(fallback):
                 _ytdlp_log.warning(
@@ -3686,6 +3686,76 @@ class ToolVideoMixin:
             proc.returncode,
             clip_text(self._last_video_download_error[source_url], 180),
         )
+        return None
+
+    def _pick_iqiyi_subprocess_output(self, digest: str) -> Path | None:
+        candidates = sorted(
+            self._video_cache_dir.glob(f"{digest}_*"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        max_bytes = self._video_download_max_mb * 1024 * 1024
+        for path in candidates:
+            if not path.is_file() or path.suffix.lower() in {".part", ".ytdl"}:
+                continue
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if not (0 < size <= max_bytes) or not self._is_video_file_path(path):
+                self._safe_unlink(path)
+                continue
+            if self._is_video_size_ok(path):
+                return path
+            remuxed = self._remux_iqiyi_downloaded_video(path)
+            if remuxed is not None:
+                self._safe_unlink(path)
+                return remuxed
+            self._safe_unlink(path)
+        return None
+
+    def _remux_iqiyi_downloaded_video(self, path: Path) -> Path | None:
+        ffmpeg_bin = normalize_text(getattr(self, "_ffmpeg_bin", ""))
+        if not ffmpeg_bin:
+            return None
+        output = path.with_name(f"{path.stem}.remux.mp4")
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg_bin,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(path),
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=45,
+                check=False,
+            )
+        except Exception:
+            self._safe_unlink(output)
+            return None
+        if proc.returncode != 0 or not output.exists():
+            self._safe_unlink(output)
+            return None
+        if self._is_video_size_ok(output):
+            _ytdlp_log.info(
+                "iqiyi_subprocess_remux_ok%s | src=%s | out=%s | size=%d",
+                _tool_trace_tag(),
+                path.name,
+                output.name,
+                output.stat().st_size,
+            )
+            return output
+        self._safe_unlink(output)
         return None
 
     def _pick_downloaded_video_fallback(self, digest: str) -> Path | None:
