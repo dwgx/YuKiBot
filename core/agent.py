@@ -928,7 +928,10 @@ class AgentLoop:
                     if (
                         strict_tool_routing
                         and tool_calls_made == 0
-                        and not steps
+                        and (
+                            not steps
+                            or self._has_only_navigator_tool_policy_blocks(steps)
+                        )
                     ):
                         fallback_tool = self._navigator_timeout_fallback_tool(ctx)
                     if fallback_tool:
@@ -2128,6 +2131,19 @@ class AgentLoop:
             ):
                 return "web_search", {"query": query, "mode": self._infer_search_mode(query)}
         return None
+
+    @staticmethod
+    def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:
+        if not steps:
+            return False
+        for step in steps:
+            if not isinstance(step, dict):
+                return False
+            if step.get("tool") != "policy_guard":
+                return False
+            if step.get("error") != "navigator_tool_required_before_final_answer":
+                return False
+        return True
 
     def _apply_prompt_navigator_scope(
         self,
