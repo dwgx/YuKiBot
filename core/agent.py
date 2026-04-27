@@ -137,6 +137,7 @@ class AgentContext:
     runtime_admin_policy: dict[str, Any] = field(default_factory=dict)
     media_summary: list[str] = field(default_factory=list)
     reply_media_summary: list[str] = field(default_factory=list)
+    recent_media_artifact: dict[str, Any] = field(default_factory=dict)
     at_other_user_ids: list[str] = field(default_factory=list)
     at_other_user_names: dict[str, str] = field(default_factory=dict)  # {qq_id: name}
     verbosity: str = "medium"  # verbose / medium / brief / minimal
@@ -804,10 +805,14 @@ class AgentLoop:
         """执行 Agent 循环，返回最终结果。"""
         t0 = time.monotonic()
         steps: list[dict[str, Any]] = []
-        forced_media_tool = self._select_forced_media_tool(
-            ctx
-        ) or self._select_forced_web_tool(ctx)
-        force_tool_first = self._should_force_tool_first(ctx)
+        strict_tool_routing = self._strict_tool_routing_enabled()
+        forced_media_tool = None
+        force_tool_first = False
+        if not strict_tool_routing:
+            forced_media_tool = self._select_forced_media_tool(
+                ctx
+            ) or self._select_forced_web_tool(ctx)
+            force_tool_first = self._should_force_tool_first(ctx)
         model_client = getattr(self, "model_client", None)
         native_tool_calling = bool(
             getattr(model_client, "supports_native_tool_calling", lambda: False)()
@@ -833,6 +838,7 @@ class AgentLoop:
         total_timeout = self._resolve_total_timeout_seconds(ctx, has_media)
         deadline_ts = t0 + total_timeout
         forced_media_tool_consumed = False
+        strict_tool_policy_blocked = False
 
         # 工具超时不计入步骤预算（最多 3 次免费），避免慢工具浪费推理机会
         _tool_timeout_free_budget = 3
@@ -1042,6 +1048,38 @@ class AgentLoop:
                         step_idx,
                     )
                     break
+                if (
+                    strict_tool_routing
+                    and not strict_tool_policy_blocked
+                    and self._requires_tool_review_before_final(ctx)
+                ):
+                    strict_tool_policy_blocked = True
+                    _log.info(
+                        "navigator_tool_policy_block | trace=%s | step=%d | reason=direct_text_without_tool | evidence=%s",
+                        ctx.trace_id,
+                        step_idx,
+                        ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
+                    )
+                    steps.append(
+                        {
+                            "step": step_idx,
+                            "tool": "policy_guard",
+                            "error": "navigator_tool_required_before_direct_reply",
+                        }
+                    )
+                    self._append_tool_result(
+                        messages,
+                        parsed,
+                        assistant_msg,
+                        response_text,
+                        {
+                            "tool": "policy_guard",
+                            "ok": False,
+                            "error": "当前消息带有结构化链接/媒体/待投递 artifact，不能直接自然语言作答。请先在当前 Prompt Navigator 分区调用最合适的工具；如果分区不对，先 navigate_section。",
+                            "display": "请先调用当前分区工具完成处理，再 final_answer。",
+                        },
+                    )
+                    continue
                 if force_tool_first and tool_calls_made == 0:
                     _log.info(
                         "agent_force_tool_first_direct_text_block | trace=%s | step=%d | text=%s",
@@ -1186,6 +1224,39 @@ class AgentLoop:
                     video_url = self._last_success_video_url(steps)
                 if video_url:
                     text = self._sanitize_final_text_for_local_media(text, video_url)
+                if (
+                    strict_tool_routing
+                    and tool_calls_made == 0
+                    and not strict_tool_policy_blocked
+                    and self._requires_tool_review_before_final(ctx)
+                ):
+                    strict_tool_policy_blocked = True
+                    _log.info(
+                        "navigator_tool_policy_block | trace=%s | step=%d | reason=final_answer_without_tool | evidence=%s",
+                        ctx.trace_id,
+                        step_idx,
+                        ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
+                    )
+                    steps.append(
+                        {
+                            "step": step_idx,
+                            "tool": "policy_guard",
+                            "error": "navigator_tool_required_before_final_answer",
+                        }
+                    )
+                    self._append_tool_result(
+                        messages,
+                        parsed,
+                        assistant_msg,
+                        response_text,
+                        {
+                            "tool": "policy_guard",
+                            "ok": False,
+                            "error": "当前消息带有结构化链接/媒体/待投递 artifact，不能直接 final_answer。请先调用当前 Prompt Navigator 分区中的真实工具；如果分区不对，先 navigate_section。",
+                            "display": "请先调用当前分区工具完成处理，再 final_answer。",
+                        },
+                    )
+                    continue
                 # 防止工具 JSON 泄漏给用户
                 if text.startswith("{") and text.endswith("}"):
                     try:
@@ -1928,6 +1999,35 @@ class AgentLoop:
     def _load_prompt_navigator(self) -> PromptNavigator:
         return PromptNavigator.from_payload(_pl.get_section("prompt_navigator"))
 
+    def _strict_tool_routing_enabled(self) -> bool:
+        navigator = self._load_prompt_navigator()
+        return bool(navigator.enabled and navigator.config.strict_tool_routing)
+
+    def _requires_tool_review_before_final(self, ctx: AgentContext) -> bool:
+        state = ctx.navigator_state
+        evidence = set(state.evidence if state is not None else [])
+        if evidence & {
+            "video_url",
+            "url",
+            "message_or_reply_media",
+            "download_file_extension",
+            "recent_media_artifact",
+        }:
+            return True
+        if ctx.media_summary or ctx.reply_media_summary:
+            return True
+        if isinstance(ctx.recent_media_artifact, dict) and ctx.recent_media_artifact:
+            return True
+        merged = "\n".join(
+            normalize_text(str(item or ""))
+            for item in (
+                ctx.message_text,
+                ctx.original_message_text,
+                ctx.reply_to_text,
+            )
+        )
+        return bool(self._extract_first_url(merged))
+
     def _apply_prompt_navigator_scope(
         self,
         ctx: AgentContext,
@@ -2589,6 +2689,14 @@ class AgentLoop:
             if normalize_text(line):
                 parts.append(line)
 
+        if isinstance(ctx.recent_media_artifact, dict) and ctx.recent_media_artifact:
+            compact_artifact = self._clip_json_for_prompt(
+                ctx.recent_media_artifact,
+                max_chars=900,
+            )
+            if compact_artifact:
+                parts.append(f"[最近可复用媒体 artifact]\n{compact_artifact}")
+
         if ctx.media_summary:
             image_count = sum(1 for m in ctx.media_summary if m.startswith("image:"))
             video_count = sum(1 for m in ctx.media_summary if m.startswith("video:"))
@@ -3125,6 +3233,23 @@ class AgentLoop:
     @classmethod
     def _extract_recent_media_url(cls, ctx: AgentContext, media_type: str) -> str:
         wanted = normalize_text(media_type).lower()
+        artifact = ctx.recent_media_artifact if isinstance(ctx.recent_media_artifact, dict) else {}
+        if artifact:
+            if wanted == "video":
+                for key in ("video_url", "video_file", "path", "url"):
+                    value = normalize_text(str(artifact.get(key, "")))
+                    if value:
+                        return value
+            if wanted == "image":
+                value = normalize_text(str(artifact.get("image_url", "")))
+                if value:
+                    return value
+                image_urls = artifact.get("image_urls", [])
+                if isinstance(image_urls, list):
+                    for item in image_urls:
+                        value = normalize_text(str(item))
+                        if value:
+                            return value
         summary_rows = list(ctx.reply_media_summary or []) + list(
             ctx.media_summary or []
         )

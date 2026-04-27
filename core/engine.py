@@ -2443,6 +2443,7 @@ class YukikoEngine:
                 runtime_admin_policy=runtime_admin_policy or {},
                 media_summary=media_summary,
                 reply_media_summary=reply_media_summary,
+                recent_media_artifact=self._recent_media_artifact_for_agent(message),
                 at_other_user_ids=message.at_other_user_ids or [],
                 at_other_user_names=at_other_user_names or {},
                 verbosity=self.get_verbosity(message.group_id),
@@ -2476,11 +2477,14 @@ class YukikoEngine:
             # 明确可由本地工具直接处理的媒体任务，跳过 Agent 循环，避免慢思考超时。
             # 注意：browser.resolve_video 不再跳过 Agent，因为 Agent 的 parse_video
             # 有更完善的抖音视频/图文判断逻辑和 douyin_share 回退。
-            if forced_method in {
-                "video.analyze",
-                "media.analyze_image",
-                "media.pick_video_from_message",
-            }:
+            if (
+                not self._strict_prompt_navigator_enabled()
+                and forced_method in {
+                    "video.analyze",
+                    "media.analyze_image",
+                    "media.pick_video_from_message",
+                }
+            ):
                 self.logger.info(
                     "agent_bypass_local_tool | trace=%s | method=%s | reason=%s",
                     message.trace_id,
@@ -5111,6 +5115,90 @@ class YukikoEngine:
         callbacks = bridge.get("stream_callbacks", {})
         return callbacks.get(conversation_id)
 
+    @staticmethod
+    def _strict_prompt_navigator_enabled() -> bool:
+        raw = _pl.get_section("prompt_navigator")
+        if not isinstance(raw, dict):
+            return False
+        if not bool(raw.get("enable", True)):
+            return False
+        return bool(raw.get("strict_tool_routing", True))
+
+    def _recent_media_artifact_for_agent(self, message: EngineMessage) -> dict[str, Any]:
+        """Return the latest bot media result when this turn replies to the bot."""
+        if normalize_text(str(message.reply_to_user_id)) != normalize_text(str(message.bot_id)):
+            return {}
+        if not bool(getattr(self, "search_followup_cache_enable", True)):
+            return {}
+        key = f"{message.conversation_id}:{message.user_id}"
+        cached = self._recent_search_cache.get(key, {})
+        if not isinstance(cached, dict):
+            return {}
+        cached_ts = cached.get("timestamp")
+        now = message.timestamp if isinstance(message.timestamp, datetime) else datetime.now(timezone.utc)
+        if isinstance(cached_ts, datetime):
+            try:
+                if (now - cached_ts).total_seconds() > float(
+                    getattr(self, "search_followup_cache_ttl_seconds", 1800)
+                ):
+                    return {}
+            except Exception:
+                return {}
+        choices = cached.get("choices", [])
+        if not isinstance(choices, list):
+            choices = []
+        source_url = ""
+        evidence = cached.get("evidence", [])
+        if isinstance(evidence, list):
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                source = normalize_text(str(item.get("source", "")))
+                if source:
+                    source_url = source
+                    break
+        for item in choices:
+            if not isinstance(item, dict):
+                continue
+            video_url = normalize_text(str(item.get("video_url", "")))
+            image_url = normalize_text(str(item.get("image_url", "")))
+            image_urls = [
+                normalize_text(str(url))
+                for url in (item.get("image_urls", []) if isinstance(item.get("image_urls", []), list) else [])
+                if normalize_text(str(url))
+            ]
+            if not video_url and not image_url and not image_urls:
+                candidate_url = normalize_text(str(item.get("url", "")))
+                if candidate_url and self._looks_like_direct_video_url(candidate_url):
+                    video_url = candidate_url
+            if video_url:
+                artifact = {
+                    "type": "video",
+                    "video_url": video_url,
+                    "source_url": source_url,
+                    "title": normalize_text(str(item.get("title", ""))),
+                    "summary": clip_text(normalize_text(str(cached.get("summary", ""))), 500),
+                    "reply_to_message_id": normalize_text(str(message.reply_to_message_id)),
+                }
+                self.logger.info(
+                    "navigator_context_artifact | trace=%s | type=video | video=%s | source=%s",
+                    message.trace_id,
+                    clip_text(video_url, 160),
+                    clip_text(source_url, 160),
+                )
+                return artifact
+            if image_url or image_urls:
+                return {
+                    "type": "image",
+                    "image_url": image_url or (image_urls[0] if image_urls else ""),
+                    "image_urls": image_urls,
+                    "source_url": source_url,
+                    "title": normalize_text(str(item.get("title", ""))),
+                    "summary": clip_text(normalize_text(str(cached.get("summary", ""))), 500),
+                    "reply_to_message_id": normalize_text(str(message.reply_to_message_id)),
+                }
+        return {}
+
     def _index_message_media(
         self, message_id: str, raw_segments: list[dict[str, Any]]
     ) -> None:
@@ -7623,6 +7711,9 @@ class YukikoEngine:
                 "search_download_resources",
                 "smart_download",
                 "download_file",
+                "parse_video",
+                "analyze_video",
+                "split_video",
             }:
                 continue
 
@@ -7630,6 +7721,15 @@ class YukikoEngine:
             raw_evidence = step_data.get("evidence", [])
             if isinstance(raw_evidence, list):
                 evidence = [item for item in raw_evidence if isinstance(item, dict)]
+            source_url = normalize_text(str(step_data.get("source_url", "")))
+            if source_url:
+                evidence.append(
+                    {
+                        "title": "媒体来源",
+                        "point": "解析/分析使用的原始链接",
+                        "source": source_url,
+                    }
+                )
             if tool_name in {"smart_download", "download_file"}:
                 source_url = normalize_text(str(step_data.get("source_url", "")))
                 download_url = normalize_text(str(step_data.get("download_url", "")))

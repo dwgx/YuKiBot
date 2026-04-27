@@ -122,6 +122,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "voice_send_music_force_full": True,
             "voice_send_music_disable_split": False,
             "video_send_strategy": "direct_first",
+            "napcat_media_stage_dir": "",
             "mention_only_reply_mode": "ai",
             "mention_only_reply_template": "在。",
             "mention_only_reply_template_with_name": "{name}，在。",

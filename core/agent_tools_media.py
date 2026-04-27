@@ -424,6 +424,7 @@ async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> 
             ok=True,
             data={
                 "video_url": video_url,
+                "source_url": url,
                 "text": text,
                 "platform": platform,
                 "qq_safety": safety,
@@ -439,6 +440,7 @@ async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> 
             data={
                 "image_url": image_url,
                 "image_urls": image_urls if isinstance(image_urls, list) else [],
+                "source_url": url,
                 "text": text,
                 "platform": platform,
                 "post_type": "image_text",
@@ -1409,4 +1411,3 @@ async def _handle_analyze_local_video(args: dict[str, Any], context: dict[str, A
         error=error_text,
         display=text or f"视频分析失败: {error_text}",
     )
-

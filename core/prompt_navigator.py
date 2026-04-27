@@ -52,6 +52,7 @@ class PromptSection:
 class PromptNavigatorConfig:
     enable: bool = True
     mode: str = "local_prefilter_llm_review"
+    strict_tool_routing: bool = True
     default_section: str = "general_chat"
     max_switches: int = 3
     root_prompt: str = ""
@@ -100,6 +101,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
     return {
         "enable": True,
         "mode": "local_prefilter_llm_review",
+        "strict_tool_routing": True,
         "default_section": "general_chat",
         "max_switches": 3,
         "root_prompt": (
@@ -365,6 +367,10 @@ def load_prompt_navigator_config(raw: Any) -> PromptNavigatorConfig:
         enable=_as_bool(merged.get("enable", True), default=True),
         mode=normalize_text(str(merged.get("mode", "local_prefilter_llm_review")))
         or "local_prefilter_llm_review",
+        strict_tool_routing=_as_bool(
+            merged.get("strict_tool_routing", True),
+            default=True,
+        ),
         default_section=default_section,
         max_switches=max_switches,
         root_prompt=normalize_text(str(merged.get("root_prompt", ""))),
@@ -522,6 +528,21 @@ class PromptNavigator:
 
         urls = self._collect_urls(ctx)
         segment_kinds = self._collect_segment_kinds(ctx)
+        recent_artifact = getattr(ctx, "recent_media_artifact", None)
+        if isinstance(recent_artifact, dict):
+            artifact_type = normalize_text(str(recent_artifact.get("type", ""))).lower()
+            artifact_video = normalize_text(
+                str(
+                    recent_artifact.get("video_url", "")
+                    or recent_artifact.get("video_file", "")
+                    or recent_artifact.get("path", "")
+                )
+            )
+            artifact_images = recent_artifact.get("image_urls", [])
+            if artifact_type == "video" or artifact_video:
+                add("video_url", "recent_media_artifact")
+            elif artifact_type in {"image", "images"} or artifact_images:
+                add("multimodal_media", "recent_media_artifact")
         if {"image", "voice", "audio", "video"} & segment_kinds:
             add("multimodal_media", "message_or_reply_media")
         if any(self._looks_like_video_url(url) for url in urls):
@@ -575,6 +596,18 @@ class PromptNavigator:
                 text = normalize_text(str(item))
                 if text:
                     parts.append(text)
+        recent_artifact = getattr(ctx, "recent_media_artifact", None)
+        if isinstance(recent_artifact, dict):
+            for key in ("video_url", "video_file", "image_url", "url", "source_url", "path"):
+                text = normalize_text(str(recent_artifact.get(key, "")))
+                if text:
+                    parts.append(text)
+            raw_image_urls = recent_artifact.get("image_urls", [])
+            if isinstance(raw_image_urls, list):
+                for item in raw_image_urls:
+                    text = normalize_text(str(item))
+                    if text:
+                        parts.append(text)
         for attr in ("raw_segments", "reply_media_segments"):
             for segment in getattr(ctx, attr, None) or []:
                 if not isinstance(segment, dict):

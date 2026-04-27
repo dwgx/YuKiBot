@@ -346,8 +346,8 @@ class AgentLoopSmokeTests(unittest.TestCase):
         self.assertIn("搜索完成", result.reply_text)
         self.assertEqual(result.tool_calls_made, 1)
 
-    def test_forced_image_tool_runs_before_first_model_response(self):
-        """图片消息应先走本地识图工具，模型首轮异常时仍能用工具结果兜底。"""
+    def test_strict_image_tool_does_not_run_before_model_response(self):
+        """严格 Navigator 模式下，图片工具不再由本地硬路由抢跑。"""
         registry = _RecordingRegistry()
         loop = _make_loop(
             [],
@@ -360,13 +360,12 @@ class AgentLoopSmokeTests(unittest.TestCase):
             raw_segments=[{"type": "image", "data": {"url": "https://example.com/a.png"}}],
         )))
 
-        self.assertEqual(registry.calls[0][0], "analyze_image")
-        self.assertEqual(result.reason, "agent_fallback_llm_error")
-        self.assertIn("白色猫", result.reply_text)
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertEqual(result.tool_calls_made, 0)
 
-    def test_forced_recent_image_summary_passes_url_to_tool(self):
-        """最近图片追问只有媒体摘要时，也应把 URL 带给识图工具。"""
+    def test_strict_recent_image_summary_waits_for_model_tool_choice(self):
+        """最近图片追问只提供结构信号，具体工具由 LLM/Navigator 决定。"""
         registry = _RecordingRegistry()
         loop = _make_loop(
             [],
@@ -379,12 +378,12 @@ class AgentLoopSmokeTests(unittest.TestCase):
             raw_segments=[],
         )))
 
-        self.assertEqual(registry.calls[0][0], "analyze_image")
-        self.assertEqual(registry.calls[0][1]["url"], "https://example.com/recent.png")
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertEqual(result.tool_calls_made, 0)
 
-    def test_forced_bare_domain_webpage_fetch_runs_before_model_response(self):
-        """裸域名网页请求应先抓网页，避免首轮模型超时导致不执行工具。"""
+    def test_strict_bare_domain_webpage_fetch_waits_for_model_tool_choice(self):
+        """裸域名只进入 Navigator 候选分区，不再本地合成 fetch_webpage。"""
         registry = _RecordingRegistry({"fetch_webpage", "final_answer", "think"})
         loop = _make_loop(
             [],
@@ -397,12 +396,12 @@ class AgentLoopSmokeTests(unittest.TestCase):
             raw_segments=[],
         )))
 
-        self.assertEqual(registry.calls[0][0], "fetch_webpage")
-        self.assertEqual(registry.calls[0][1]["url"], "https://skiapi.dev")
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertEqual(result.tool_calls_made, 0)
 
-    def test_forced_video_parse_runs_before_first_model_response(self):
-        """视频链接解析请求应先走 parse_video，避免首轮模型超时导致不解析。"""
+    def test_strict_video_parse_waits_for_model_tool_choice(self):
+        """视频链接解析不再由本地硬路由抢跑 parse_video。"""
         registry = _RecordingRegistry({"parse_video", "final_answer", "think"})
         loop = _make_loop(
             [],
@@ -415,15 +414,12 @@ class AgentLoopSmokeTests(unittest.TestCase):
             raw_segments=[],
         )))
 
-        self.assertEqual(registry.calls[0][0], "parse_video")
-        self.assertEqual(
-            registry.calls[0][1]["url"],
-            "https://www.bilibili.com/video/BV16aw4zAEqD/?spm_id_from=333.337.search-card.all.click",
-        )
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertEqual(result.tool_calls_made, 0)
 
-    def test_forced_douyin_parse_prefers_parse_over_analysis_cue(self):
-        """“解析...看看”这类分享文案仍应先解析直链。"""
+    def test_strict_douyin_parse_prefers_navigator_over_local_cue(self):
+        """“解析...看看”这类分享文案也不再由关键词硬选 parse_video。"""
         registry = _RecordingRegistry({"parse_video", "analyze_video", "final_answer", "think"})
         loop = _make_loop(
             [],
@@ -436,12 +432,12 @@ class AgentLoopSmokeTests(unittest.TestCase):
             raw_segments=[],
         )))
 
-        self.assertEqual(registry.calls[0][0], "parse_video")
-        self.assertEqual(registry.calls[0][1]["url"], "https://v.douyin.com/hskaBb36Hfg/")
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertEqual(result.tool_calls_made, 0)
 
-    def test_forced_douyin_parse_uses_current_url_over_recent_video_context(self):
-        """当前消息有视频链接时，不能拿上一轮视频 URL 去执行强制工具。"""
+    def test_strict_douyin_parse_does_not_use_recent_context_for_forced_tool(self):
+        """严格模式下不会用历史视频上下文本地合成强制工具。"""
         registry = _RecordingRegistry({"parse_video", "split_video", "final_answer", "think"})
         loop = _make_loop(
             [],
@@ -457,9 +453,9 @@ class AgentLoopSmokeTests(unittest.TestCase):
             ],
         )))
 
-        self.assertEqual(registry.calls[0][0], "parse_video")
-        self.assertEqual(registry.calls[0][1]["url"], "https://v.douyin.com/hskaBb36Hfg/")
-        self.assertEqual(result.tool_calls_made, 1)
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_error")
+        self.assertEqual(result.tool_calls_made, 0)
 
     def test_unknown_tool_notifies_model(self):
         """未知工具名 → 通知模型后继续。"""

@@ -202,6 +202,7 @@ verbosity:
 prompt_navigator:
   enable: true
   mode: local_prefilter_llm_review
+  strict_tool_routing: true
   default_section: general_chat
   max_switches: 3
   root_prompt: 当前使用 Prompt Navigator。先看分区目录和当前分区提示；如果当前分区缺少工具或任务更适合其他分区，先调用 navigate_section(section_id, reason) 切换，再继续执行。不要伪造工具结果。

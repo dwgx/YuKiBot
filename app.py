@@ -1294,6 +1294,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             "multi_image_max_count": max(1, _as_int(bot_cfg_rt.get("multi_image_max_count", 9), 9)),
             "multi_image_interval_ms": max(0, _as_int(bot_cfg_rt.get("multi_image_interval_ms", 150), 150)),
             "video_send_strategy": normalize_text(str(bot_cfg_rt.get("video_send_strategy", "direct_first"))).lower(),
+            "napcat_media_stage_dir": normalize_text(str(bot_cfg_rt.get("napcat_media_stage_dir", ""))),
             "chat_split_mode": normalize_text(
                 str(chat_split_cfg_rt.get("mode", control_cfg_rt.get("split_mode", "semantic")))
             ).lower() or "semantic",
@@ -1632,6 +1633,7 @@ def register_handlers(engine: YukikoEngine) -> None:
             multi_image_max_count = int(send_opts["multi_image_max_count"])
             multi_image_interval_ms = int(send_opts["multi_image_interval_ms"])
             video_send_strategy = str(send_opts["video_send_strategy"])
+            napcat_media_stage_dir = str(send_opts["napcat_media_stage_dir"])
             chat_split_mode = str(send_opts["chat_split_mode"])
             send_rate_max_per_window = int(send_opts["send_rate_max_per_window"])
             send_rate_window_seconds = int(send_opts["send_rate_window_seconds"])
@@ -2101,7 +2103,10 @@ def register_handlers(engine: YukikoEngine) -> None:
                             cover_seg = await _build_image_segment(str(thumb.resolve()))
 
                 # 1) 先尝试发视频本体（或文件上传）
-                prefer_upload_first = video_send_strategy in {"upload_file_first", "upload_only"}
+                prefer_upload_first = (
+                    video_send_strategy in {"upload_file_first", "upload_only"}
+                    or _should_upload_video_file_first(video_url)
+                )
                 video_delivered = False
                 fallback_sent = False
                 if prefer_upload_first:
@@ -2109,6 +2114,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                         bot=bot,
                         event=event,
                         video_url=video_url,
+                        stage_dir=napcat_media_stage_dir,
                     )
                     if uploaded:
                         _log.info("video_send_via_upload_file | strategy=%s", video_send_strategy)
@@ -2128,16 +2134,43 @@ def register_handlers(engine: YukikoEngine) -> None:
                 if video_delivered or video_send_strategy == "upload_only":
                     seg = None
                 else:
-                    seg = None if video_issue else await _build_video_segment(video_url)
+                    seg = None if video_issue else await _build_video_segment(
+                        video_url,
+                        stage_dir=napcat_media_stage_dir,
+                        prefer_plain_path=True,
+                    )
                 if video_delivered:
                     pass
                 elif seg is not None:
                     sent_video = False
                     send_exc: Exception | None = None
                     try:
+                        _log.info(
+                            "media_delivery_inline_attempt | channel=video_segment | ref=%s",
+                            clip_text(str((getattr(seg, "data", {}) or {}).get("file", "")), 180),
+                        )
                         sent_video = await send_msg(Message(seg))
                     except Exception as exc:
                         send_exc = exc
+                    if not sent_video:
+                        uri_seg = None if video_issue else await _build_video_segment(
+                            video_url,
+                            stage_dir=napcat_media_stage_dir,
+                            prefer_plain_path=False,
+                        )
+                        if uri_seg is not None:
+                            try:
+                                _log.info(
+                                    "media_delivery_inline_attempt | channel=video_segment_file_uri | ref=%s",
+                                    clip_text(str((getattr(uri_seg, "data", {}) or {}).get("file", "")), 180),
+                                )
+                                sent_video = await send_msg(Message(uri_seg))
+                            except Exception as exc:
+                                send_exc = exc
+                        if sent_video:
+                            video_delivered = True
+                            delivered = True
+                            seg = None
                     if not sent_video:
                         if send_exc is not None:
                             _log.warning("video_send_fail | %s | trying upload_file fallback", send_exc)
@@ -2145,7 +2178,10 @@ def register_handlers(engine: YukikoEngine) -> None:
                             _log.warning("video_send_fail | safe_send_failed | trying upload_file fallback")
                         # 尝试用 NapCat 文件 API 上传（适合大文件）
                         uploaded = await _try_upload_video_file(
-                            bot=bot, event=event, video_url=video_url,
+                            bot=bot,
+                            event=event,
+                            video_url=video_url,
+                            stage_dir=napcat_media_stage_dir,
                         )
                         if uploaded:
                             _log.info("video_send_via_upload_file | strategy=fallback")
@@ -2164,7 +2200,11 @@ def register_handlers(engine: YukikoEngine) -> None:
                     if re.match(r"^https?://", direct_url, flags=re.IGNORECASE):
                         fallback_msg += Message(f"视频暂时不能直发，来源链接：{direct_url}")
                     else:
-                        fallback_msg += Message("视频暂时不能直发，你换一个分享链接我再试。")
+                        _log.warning(
+                            "media_delivery_failed_exact | channel=video_all | video=%s",
+                            clip_text(direct_url, 180),
+                        )
+                        fallback_msg += Message("视频解析成功了，但 NapCat/QQ 发送失败：我已经尝试视频直发和文件上传。请检查 NapCat 对 QQ 容器暂存目录的读取权限。")
                     await send_msg(fallback_msg)
                     delivered = True
                     fallback_sent = True

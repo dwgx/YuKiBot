@@ -78,6 +78,18 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(segment.data["file"].startswith("file://"))
             self.assertTrue(segment.data["thumb"].startswith("file://"))
 
+    def test_stage_media_for_napcat_copies_to_configured_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stage_dir:
+            video = Path(src_dir) / "demo.mp4"
+            video.write_bytes(b"video")
+
+            staged = app_helpers._stage_media_for_napcat(video, stage_dir)
+
+            self.assertIsNotNone(staged)
+            self.assertEqual(staged.read_bytes(), b"video")
+            self.assertEqual(staged.parent.resolve(), Path(stage_dir).resolve())
+            self.assertNotEqual(staged.resolve(), video.resolve())
+
     async def test_private_video_upload_fallback_uses_private_file_api(self) -> None:
         class FakeBot:
             def __init__(self) -> None:
@@ -100,13 +112,20 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
             video = Path(tmpdir) / "demo.mp4"
             video.write_bytes(b"video")
             bot = FakeBot()
+            stage_dir = Path(tmpdir) / "stage"
             with patch.object(app_helpers, "_probe_local_video_health", healthy):
-                uploaded = await app_helpers._try_upload_video_file(bot, FakePrivateEvent(), str(video))
+                uploaded = await app_helpers._try_upload_video_file(
+                    bot,
+                    FakePrivateEvent(),
+                    str(video),
+                    stage_dir=str(stage_dir),
+                )
 
         self.assertTrue(uploaded)
         self.assertEqual(bot.calls[0][0], "upload_private_file")
         self.assertEqual(bot.calls[0][1]["user_id"], "123456")
         self.assertEqual(bot.calls[0][1]["name"], "demo.mp4")
+        self.assertTrue(str(bot.calls[0][1]["file"]).startswith(str(stage_dir)))
 
 
 if __name__ == "__main__":

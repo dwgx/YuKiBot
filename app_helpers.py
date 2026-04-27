@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import time
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -1234,7 +1235,11 @@ async def _build_image_segment_from_remote_url(url: str) -> MessageSegment | Non
     return MessageSegment.image(f"base64://{b64}")
 
 
-async def _video_seg_with_thumb(local_path: Path) -> MessageSegment | None:
+async def _video_seg_with_thumb(
+    local_path: Path,
+    *,
+    prefer_plain_path: bool = False,
+) -> MessageSegment | None:
     """构建本地视频 MessageSegment，优先附带本地缩略图。"""
     # 大视频先压缩，避免 NapCat WebSocket 超时
     actual_path = (await _compress_video_if_needed(local_path)).expanduser().resolve()
@@ -1246,12 +1251,13 @@ async def _video_seg_with_thumb(local_path: Path) -> MessageSegment | None:
         return None
     thumb_path = await _generate_video_thumbnail(actual_path)
 
-    video_ref = build_napcat_file_reference(actual_path, require_exists=True)
+    video_ref = str(actual_path) if prefer_plain_path else build_napcat_file_reference(actual_path, require_exists=True)
     if not video_ref:
         return None
     data: dict[str, Any] = {"file": video_ref}
     if thumb_path is not None and thumb_path.exists():
-        thumb_ref = build_napcat_file_reference(thumb_path.expanduser().resolve(), require_exists=True)
+        thumb_resolved = thumb_path.expanduser().resolve()
+        thumb_ref = str(thumb_resolved) if prefer_plain_path else build_napcat_file_reference(thumb_resolved, require_exists=True)
         if thumb_ref:
             data["thumb"] = thumb_ref
         _log.info("video_seg_with_thumb | video=%s | thumb=%s", actual_path.name, thumb_path.name)
@@ -1260,7 +1266,12 @@ async def _video_seg_with_thumb(local_path: Path) -> MessageSegment | None:
     return MessageSegment("video", data)
 
 
-async def _build_video_segment(url: str) -> MessageSegment | None:
+async def _build_video_segment(
+    url: str,
+    *,
+    stage_dir: str = "",
+    prefer_plain_path: bool = False,
+) -> MessageSegment | None:
     target = str(url or "").strip()
     if not target:
         return None
@@ -1273,7 +1284,8 @@ async def _build_video_segment(url: str) -> MessageSegment | None:
             ok, _ = await _probe_local_video_health(local_path)
             if not ok:
                 return None
-            return await _video_seg_with_thumb(local_path)
+            staged = _stage_media_for_napcat(local_path, stage_dir) or local_path
+            return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
         return None
 
     local_path = Path(target)
@@ -1281,7 +1293,8 @@ async def _build_video_segment(url: str) -> MessageSegment | None:
         ok, _ = await _probe_local_video_health(local_path)
         if not ok:
             return None
-        return await _video_seg_with_thumb(local_path)
+        staged = _stage_media_for_napcat(local_path, stage_dir) or local_path
+        return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
 
     if not re.match(r"^https?://", target, flags=re.IGNORECASE):
         return None
@@ -1296,7 +1309,8 @@ async def _build_video_segment(url: str) -> MessageSegment | None:
         ok, _ = await _probe_local_video_health(local_tmp)
         if not ok:
             return None
-        return await _video_seg_with_thumb(local_tmp)
+        staged = _stage_media_for_napcat(local_tmp, stage_dir) or local_tmp
+        return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
     # 下载失败则回退，让调用方走文本链接兜底
     return None
 
@@ -1348,6 +1362,80 @@ _VIDEO_DOWNLOAD_MAX_BYTES = 64 * 1024 * 1024  # 64MB
 _VIDEO_DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _VIDEO_SEND_COMPRESS_THRESHOLD = 8 * 1024 * 1024  # 超过 8MB 自动压缩
 _VIDEO_SEND_MAX_BYTES = 25 * 1024 * 1024  # 压缩后仍超 25MB 走文件上传
+_NAPCAT_INLINE_VIDEO_MAX_BYTES = 100 * 1024 * 1024
+
+
+def _default_napcat_media_stage_dir() -> Path:
+    home = Path.home()
+    qq_container_tmp = (
+        home
+        / "Library"
+        / "Containers"
+        / "com.tencent.qq"
+        / "Data"
+        / "tmp"
+        / "napcat-plugin-uploads"
+        / "yukiko"
+    )
+    if qq_container_tmp.parent.exists():
+        return qq_container_tmp
+    return Path(tempfile.gettempdir()) / "yukiko-napcat-media"
+
+
+def _resolve_napcat_media_stage_dir(stage_dir: str = "") -> Path:
+    configured = normalize_text(stage_dir)
+    if configured:
+        return Path(configured).expanduser()
+    return _default_napcat_media_stage_dir()
+
+
+def _stage_media_for_napcat(local_path: Path, stage_dir: str = "") -> Path | None:
+    """Copy media into a NapCat/QQ-readable staging directory before sending."""
+    try:
+        src = local_path.expanduser().resolve()
+        if not src.exists() or not src.is_file():
+            return None
+        target_dir = _resolve_napcat_media_stage_dir(stage_dir).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        if target_dir.resolve() in src.parents:
+            staged = src
+        else:
+            suffix = src.suffix or ".bin"
+            stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", src.stem).strip("._") or "media"
+            stat = src.stat()
+            fingerprint = f"{stat.st_size:x}_{int(stat.st_mtime):x}"
+            staged = (target_dir / f"{stem}_{fingerprint}{suffix}").resolve()
+            if not staged.exists() or staged.stat().st_size != stat.st_size:
+                shutil.copy2(src, staged)
+        try:
+            staged.chmod(0o644)
+        except Exception:
+            pass
+        _log.info(
+            "media_stage_for_napcat | src=%s | staged=%s | size=%d",
+            clip_text(str(src), 180),
+            clip_text(str(staged), 180),
+            staged.stat().st_size,
+        )
+        return staged
+    except Exception as exc:
+        _log.warning(
+            "media_stage_for_napcat_fail | src=%s | stage_dir=%s | err=%s",
+            clip_text(str(local_path), 180),
+            clip_text(stage_dir, 120),
+            exc,
+        )
+        return None
+
+
+def _should_upload_video_file_first(video_url: str) -> bool:
+    path = _as_local_video_path(video_url)
+    if path is None:
+        return False
+    try:
+        return path.stat().st_size > _NAPCAT_INLINE_VIDEO_MAX_BYTES
+    except Exception:
+        return False
 
 
 def _read_media_stream_info_sync(path: Path) -> dict[str, str]:
@@ -1696,21 +1784,36 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
     return src
 
 
-async def _try_upload_video_file(bot: Bot, event: MessageEvent, video_url: str) -> bool:
+async def _try_upload_video_file(
+    bot: Bot,
+    event: MessageEvent,
+    video_url: str,
+    *,
+    stage_dir: str = "",
+) -> bool:
     """用 NapCat 文件 API 发送本地视频：群聊走群文件，私聊走私聊文件。"""
     local_path = _as_local_video_path(video_url)
     if local_path is None:
         return False
+    original_file_name = local_path.name
+    staged_path = _stage_media_for_napcat(local_path, stage_dir)
+    if staged_path is not None:
+        local_path = staged_path
     ok, reason = await _probe_local_video_health(local_path)
     if not ok:
         _log.warning("upload_group_file_skip_unhealthy | file=%s | reason=%s", local_path.name, reason)
         return False
 
     abs_path = str(local_path.resolve())
-    file_name = local_path.name
+    file_name = original_file_name or local_path.name
     group_id = getattr(event, "group_id", 0)
     if group_id:
         try:
+            _log.info(
+                "media_delivery_upload_attempt | channel=upload_group_file | group=%s | file=%s",
+                group_id,
+                clip_text(abs_path, 180),
+            )
             await call_napcat_bot_api(
                 bot,
                 "upload_group_file",
@@ -1722,6 +1825,11 @@ async def _try_upload_video_file(bot: Bot, event: MessageEvent, video_url: str) 
             return True
         except Exception as exc:
             _log.warning("upload_group_file_fail | %s", exc)
+            _log.warning(
+                "media_delivery_failed_exact | channel=upload_group_file | file=%s | error=%s",
+                clip_text(abs_path, 180),
+                exc,
+            )
             return False
 
     user_id = getattr(event, "user_id", 0)
@@ -1732,6 +1840,11 @@ async def _try_upload_video_file(bot: Bot, event: MessageEvent, video_url: str) 
     if not user_id:
         return False
     try:
+        _log.info(
+            "media_delivery_upload_attempt | channel=upload_private_file | user=%s | file=%s",
+            user_id,
+            clip_text(abs_path, 180),
+        )
         await call_napcat_bot_api(
             bot,
             "upload_private_file",
@@ -1743,6 +1856,11 @@ async def _try_upload_video_file(bot: Bot, event: MessageEvent, video_url: str) 
         return True
     except Exception as exc:
         _log.warning("upload_private_file_fail | %s", exc)
+        _log.warning(
+            "media_delivery_failed_exact | channel=upload_private_file | file=%s | error=%s",
+            clip_text(abs_path, 180),
+            exc,
+        )
         return False
 
 
