@@ -3962,6 +3962,10 @@ class AgentLoop:
             first_url = self._extract_first_url(ctx.message_text)
             if first_url and self._looks_like_image_url(first_url):
                 forced_args["url"] = first_url
+            else:
+                recent_image_url = self._extract_recent_media_url(ctx, "image")
+                if recent_image_url:
+                    forced_args["url"] = recent_image_url
             question = normalize_text(ctx.message_text)
             if question:
                 forced_args["question"] = question

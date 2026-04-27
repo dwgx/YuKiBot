@@ -316,6 +316,24 @@ class AgentLoopSmokeTests(unittest.TestCase):
         self.assertIn("白色猫", result.reply_text)
         self.assertEqual(result.tool_calls_made, 1)
 
+    def test_forced_recent_image_summary_passes_url_to_tool(self):
+        """最近图片追问只有媒体摘要时，也应把 URL 带给识图工具。"""
+        registry = _RecordingRegistry()
+        loop = _make_loop(
+            [],
+            registry=registry,
+        )
+
+        result = asyncio.run(loop.run(_make_ctx(
+            message_text="直接cyber掉",
+            media_summary=["image:https://example.com/recent.png"],
+            raw_segments=[],
+        )))
+
+        self.assertEqual(registry.calls[0][0], "analyze_image")
+        self.assertEqual(registry.calls[0][1]["url"], "https://example.com/recent.png")
+        self.assertEqual(result.tool_calls_made, 1)
+
     def test_unknown_tool_notifies_model(self):
         """未知工具名 → 通知模型后继续。"""
         loop = _make_loop([

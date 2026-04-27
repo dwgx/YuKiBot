@@ -74,6 +74,60 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         )
         self.assertTrue(engine._looks_like_bot_call("yukiko?"))
 
+    def test_recent_user_image_followup_can_wake_from_not_directed(self) -> None:
+        class _RecentMediaTools:
+            def __init__(self) -> None:
+                self._recent_media_by_conversation = {
+                    "group:901:user:347": {
+                        "image": ["https://example.com/a.png"],
+                    },
+                    "group:901:user:999": {
+                        "image": ["https://example.com/other.png"],
+                    },
+                }
+
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.tools = _RecentMediaTools()
+        message = EngineMessage(
+            conversation_id="group:901",
+            group_id=901,
+            user_id="347",
+            text="\u76f4\u63a5cyber\u6389",
+            mentioned=False,
+            is_private=False,
+        )
+
+        self.assertTrue(
+            engine._looks_like_recent_media_followup_instruction(message.text)
+        )
+        self.assertTrue(engine._looks_like_recent_media_followup(message, message.text))
+        self.assertEqual(
+            engine._build_recent_media_summary_for_followup(message),
+            ["image:https://example.com/a.png"],
+        )
+
+        quiet = EngineMessage(
+            conversation_id="group:901",
+            group_id=901,
+            user_id="347",
+            text="\u968f\u4fbf\u804a\u804a",
+            mentioned=False,
+            is_private=False,
+        )
+        self.assertFalse(engine._looks_like_recent_media_followup(quiet, quiet.text))
+
+        cross_user = EngineMessage(
+            conversation_id="group:901",
+            group_id=901,
+            user_id="555",
+            text="\u76f4\u63a5cyber\u6389",
+            mentioned=False,
+            is_private=False,
+        )
+        self.assertFalse(
+            engine._looks_like_recent_media_followup(cross_user, cross_user.text)
+        )
+
     def test_agent_context_and_inference_helpers_require_structure(self) -> None:
         self.assertFalse(
             AgentLoop._looks_like_reference_to_previous_link("\u90a3\u4e2a\u94fe\u63a5")

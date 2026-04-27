@@ -1043,6 +1043,11 @@ class YukikoEngine:
         self.tools.remember_incoming_media(
             message.conversation_id, message.raw_segments
         )
+        scoped_media_conversation = self._scoped_user_conversation_id(message)
+        if scoped_media_conversation and scoped_media_conversation != message.conversation_id:
+            self.tools.remember_incoming_media(
+                scoped_media_conversation, message.raw_segments
+            )
         if message.reply_media_segments:
             self.tools.remember_incoming_media(
                 message.conversation_id, message.reply_media_segments
@@ -1220,14 +1225,32 @@ class YukikoEngine:
             normalize_text(str(trigger.reason)).lower() == "ai_router_candidate"
         )
         if not trigger.should_handle and not trigger_candidate:
-            self.logger.info(
-                "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
-                message.conversation_id,
-                message.user_id,
-                trigger.reason,
-                clip_text(text, 80),
-            )
-            return EngineResponse(action="ignore", reason=trigger.reason)
+            if self._looks_like_recent_media_followup(message, text):
+                self.logger.info(
+                    "recent_media_followup_trigger | trace=%s | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
+                    message.trace_id,
+                    message.conversation_id,
+                    message.user_id,
+                    trigger.reason,
+                    clip_text(text, 80),
+                )
+                trigger.should_handle = True
+                trigger.reason = "recent_media_followup"
+                trigger.followup_candidate = True
+                trigger.scene_hint = "media_followup"
+                trigger.priority = max(int(getattr(trigger, "priority", 0) or 0), 68)
+            else:
+                self.logger.info(
+                    "消息已忽略 | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
+                    message.conversation_id,
+                    message.user_id,
+                    trigger.reason,
+                    clip_text(text, 80),
+                )
+                return EngineResponse(action="ignore", reason=trigger.reason)
+        trigger_candidate = (
+            normalize_text(str(trigger.reason)).lower() == "ai_router_candidate"
+        )
 
         if trigger_candidate:
             # 仅作为候选进入 router/self_check，不代表可直接回复。
@@ -1665,6 +1688,13 @@ class YukikoEngine:
                 if agent_result is not None:
                     return agent_result
 
+        router_media_summary = self._build_media_summary(message.raw_segments)
+        if (
+            not router_media_summary
+            and normalize_text(str(getattr(trigger, "reason", ""))).lower()
+            == "recent_media_followup"
+        ):
+            router_media_summary = self._build_recent_media_summary_for_followup(message)
         router_input = RouterInput(
             text=text,
             conversation_id=message.conversation_id,
@@ -1680,7 +1710,7 @@ class YukikoEngine:
             reply_to_user_name=message.reply_to_user_name,
             reply_to_text=message.reply_to_text,
             raw_segments=message.raw_segments,
-            media_summary=self._build_media_summary(message.raw_segments),
+            media_summary=router_media_summary,
             recent_messages=recent_user_lines,
             recent_bot_replies=recent_bot_replies,
             user_profile_summary=user_profile_summary,
@@ -2318,6 +2348,12 @@ class YukikoEngine:
 
         try:
             media_summary = self._build_media_summary(message.raw_segments)
+            if (
+                not media_summary
+                and normalize_text(str(getattr(trigger, "reason", ""))).lower()
+                == "recent_media_followup"
+            ):
+                media_summary = self._build_recent_media_summary_for_followup(message)
             reply_media_summary = self._build_media_summary(
                 message.reply_media_segments
             )
@@ -3687,6 +3723,153 @@ class YukikoEngine:
 
     def _looks_like_media_instruction(self, text: str) -> bool:
         return self._has_structural_media_locator(text)
+
+    @staticmethod
+    def _scoped_user_conversation_id(message: EngineMessage) -> str:
+        conv = normalize_text(str(message.conversation_id))
+        user_id = normalize_text(str(message.user_id))
+        if not conv or not user_id:
+            return ""
+        if re.fullmatch(r"group:[^:]+:user:[^:]+", conv, flags=re.IGNORECASE):
+            return conv
+        group_id = normalize_text(str(message.group_id or ""))
+        if not group_id or group_id == "0":
+            match = re.match(r"^group:([^:]+)", conv, flags=re.IGNORECASE)
+            group_id = normalize_text(match.group(1)) if match else ""
+        if not group_id:
+            return ""
+        return f"group:{group_id}:user:{user_id}"
+
+    def _get_recent_media_for_followup(
+        self, message: EngineMessage, media_type: str = "image"
+    ) -> list[str]:
+        tools = getattr(self, "tools", None)
+        field = normalize_text(media_type).lower()
+        if not tools or not field:
+            return []
+
+        cleanup = getattr(tools, "_cleanup_recent_media_cache", None)
+        if callable(cleanup):
+            try:
+                cleanup()
+            except Exception:
+                pass
+
+        cache = getattr(tools, "_recent_media_by_conversation", None)
+
+        def _read_exact(conversation_id: str) -> list[str]:
+            if not isinstance(cache, dict):
+                return []
+            state = cache.get(conversation_id, {})
+            if not isinstance(state, dict):
+                return []
+            rows = state.get(field, [])
+            if not isinstance(rows, list):
+                return []
+            out: list[str] = []
+            seen: set[str] = set()
+            for item in rows:
+                value = normalize_text(str(item))
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                out.append(value)
+            return out
+
+        scoped = self._scoped_user_conversation_id(message)
+        if not message.is_private and scoped:
+            scoped_rows = _read_exact(scoped)
+            if scoped_rows:
+                return scoped_rows
+            if isinstance(cache, dict):
+                return []
+
+        conv = normalize_text(str(message.conversation_id))
+        exact_rows = _read_exact(conv)
+        if exact_rows:
+            return exact_rows
+
+        getter = getattr(tools, "_get_recent_media", None)
+        if callable(getter) and conv:
+            try:
+                return [
+                    normalize_text(str(item))
+                    for item in getter(conv, field)
+                    if normalize_text(str(item))
+                ]
+            except Exception:
+                return []
+        return []
+
+    def _build_recent_media_summary_for_followup(
+        self, message: EngineMessage
+    ) -> list[str]:
+        summaries: list[str] = []
+        for url in self._get_recent_media_for_followup(message, "image")[:3]:
+            summaries.append(f"image:{url}")
+        for url in self._get_recent_media_for_followup(message, "video")[:2]:
+            summaries.append(f"video:{url}")
+        return summaries[:5]
+
+    def _looks_like_recent_media_followup_instruction(self, text: str) -> bool:
+        content = normalize_text(self._extract_multimodal_user_text(text) or text)
+        if not content or self._is_passive_multimodal_text(text):
+            return False
+        compact = re.sub(r"\s+", "", content.lower())
+        if not compact or len(compact) > 160:
+            return False
+        cues = (
+            "cyber",
+            "cyberpunk",
+            "赛博",
+            "p图",
+            "p一下",
+            "修图",
+            "改成",
+            "改一下",
+            "换成",
+            "变成",
+            "做成",
+            "整成",
+            "转成",
+            "画成",
+            "风格",
+            "滤镜",
+            "高清",
+            "放大",
+            "识别",
+            "分析",
+            "看看",
+            "看下",
+            "这张",
+            "这个图",
+            "刚才那张",
+            "刚刚那张",
+            "刚发的图",
+            "图里",
+            "图片",
+            "表情包",
+        )
+        if any(cue in compact for cue in cues):
+            return True
+        return bool(
+            re.search(
+                r"\b(analyze|describe|ocr|read|edit|remix|style|filter)\b",
+                content,
+                flags=re.IGNORECASE,
+            )
+        )
+
+    def _looks_like_recent_media_followup(
+        self, message: EngineMessage, text: str
+    ) -> bool:
+        if message.is_private or message.mentioned:
+            return False
+        if message.raw_segments or message.reply_media_segments:
+            return False
+        if not self._looks_like_recent_media_followup_instruction(text):
+            return False
+        return bool(self._get_recent_media_for_followup(message, "image"))
 
     def _has_recent_reply_to_user(
         self, message: EngineMessage, within_seconds: int = 120
