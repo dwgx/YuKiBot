@@ -971,49 +971,72 @@ class AgentLoop:
                         step_idx,
                         exc,
                     )
-                    if steps:
-                        # 有之前的步骤结果，用最后一步的信息兜底
+                    fallback_tool = None
+                    if (
+                        strict_tool_routing
+                        and tool_calls_made == 0
+                        and (
+                            not steps
+                            or self._has_only_navigator_tool_policy_blocks(steps)
+                        )
+                    ):
+                        fallback_tool = self._navigator_timeout_fallback_tool(ctx)
+                    if fallback_tool:
+                        tool_name_fb, tool_args_fb = fallback_tool
+                        parsed = {"tool": tool_name_fb, "args": dict(tool_args_fb)}
+                        response_text = json.dumps(parsed, ensure_ascii=False)
+                        assistant_msg = {"role": "assistant", "content": response_text}
+                        synthetic_tool_call = True
+                        _log.info(
+                            "navigator_llm_error_tool_fallback | trace=%s | step=%d | section=%s | tool=%s | evidence=%s",
+                            ctx.trace_id,
+                            step_idx,
+                            ctx.navigator_state.active_section if ctx.navigator_state else "",
+                            tool_name_fb,
+                            ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
+                        )
+                    elif steps:
                         return await self._build_fallback_result(
                             ctx, steps, tool_calls_made, t0, "llm_error"
                         )
-                    # undirected 场景可按配置静默，默认不静默，避免用户感知“装死”。
-                    if (
-                        self.allow_silent_on_llm_error
-                        and not ctx.mentioned
-                        and not ctx.is_private
-                    ):
+                    else:
+                        # undirected 场景可按配置静默，默认不静默，避免用户感知“装死”。
+                        if (
+                            self.allow_silent_on_llm_error
+                            and not ctx.mentioned
+                            and not ctx.is_private
+                        ):
+                            return AgentResult(
+                                reply_text="",
+                                action="reply",
+                                reason="agent_llm_error_silent",
+                                total_time_ms=self._elapsed(t0),
+                            )
+                        err_text = normalize_text(str(exc)).lower()
+                        if (
+                            "http 401" in err_text
+                            or "invalid token" in err_text
+                            or "unauthorized" in err_text
+                            or "无效的令牌" in err_text
+                            or "认证失败" in err_text
+                        ):
+                            fallback = _pl.get_message(
+                                "llm_auth_error_fallback",
+                                "AI 服务鉴权失败（令牌无效/过期），请管理员检查 API Key 后重试。",
+                            )
+                        else:
+                            fallback = _pl.get_message(
+                                "llm_error_fallback",
+                                _pl.get_message(
+                                    "generic_error", "我这边接口抖了，稍等我再试一次。"
+                                ),
+                            )
                         return AgentResult(
-                            reply_text="",
+                            reply_text=fallback,
                             action="reply",
-                            reason="agent_llm_error_silent",
+                            reason="agent_llm_error",
                             total_time_ms=self._elapsed(t0),
                         )
-                    err_text = normalize_text(str(exc)).lower()
-                    if (
-                        "http 401" in err_text
-                        or "invalid token" in err_text
-                        or "unauthorized" in err_text
-                        or "无效的令牌" in err_text
-                        or "认证失败" in err_text
-                    ):
-                        fallback = _pl.get_message(
-                            "llm_auth_error_fallback",
-                            "AI 服务鉴权失败（令牌无效/过期），请管理员检查 API Key 后重试。",
-                        )
-                    else:
-                        fallback = _pl.get_message(
-                            "llm_error_fallback",
-                            _pl.get_message(
-                                "generic_error", "我这边接口抖了，稍等我再试一次。"
-                            ),
-                        )
-                    return AgentResult(
-                        reply_text=fallback,
-                        action="reply",
-                        reason="agent_llm_error",
-                        total_time_ms=self._elapsed(t0),
-                    )
-
             if not synthetic_tool_call and native_tool_calling:
                 assistant_msg = (
                     raw_response.get("choices", [{}])[0].get("message", {})
