@@ -90,6 +90,12 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(staged.parent.resolve(), Path(stage_dir).resolve())
             self.assertNotEqual(staged.resolve(), video.resolve())
 
+    def test_video_probe_helpers_tolerate_missing_ffmpeg_binaries(self) -> None:
+        with patch.object(app_helpers, "_FFPROBE_BIN", None), patch.object(app_helpers, "_FFMPEG_BIN", None):
+            info = app_helpers._read_media_stream_info_sync(Path("missing.mp4"))
+
+        self.assertEqual(info, {"video_codec": "", "audio_codec": "", "pix_fmt": ""})
+
     async def test_private_video_upload_fallback_uses_private_file_api(self) -> None:
         class FakeBot:
             def __init__(self) -> None:

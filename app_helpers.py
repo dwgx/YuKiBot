@@ -1363,6 +1363,8 @@ _VIDEO_DOWNLOAD_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 _VIDEO_SEND_COMPRESS_THRESHOLD = 8 * 1024 * 1024  # 超过 8MB 自动压缩
 _VIDEO_SEND_MAX_BYTES = 25 * 1024 * 1024  # 压缩后仍超 25MB 走文件上传
 _NAPCAT_INLINE_VIDEO_MAX_BYTES = 100 * 1024 * 1024
+_FFMPEG_BIN = shutil.which("ffmpeg")
+_FFPROBE_BIN = shutil.which("ffprobe")
 
 
 def _default_napcat_media_stage_dir() -> Path:
