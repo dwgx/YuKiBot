@@ -14,6 +14,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
+
 _log = logging.getLogger("yukiko.media")
 
 # ---------------------------------------------------------------------------
@@ -81,6 +83,7 @@ async def run_ffmpeg(
     ffmpeg = get_ffmpeg()
     if not ffmpeg:
         return False, "ffmpeg not found"
+    ffmpeg = resolve_executable_for_spawn(ffmpeg)
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "warning"] + args
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -88,6 +91,7 @@ async def run_ffmpeg(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(cwd) if cwd else None,
+            **macos_subprocess_kwargs(),
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         ok = proc.returncode == 0
@@ -107,6 +111,7 @@ async def run_ffprobe_json(
     ffprobe = get_ffprobe()
     if not ffprobe:
         return {}
+    ffprobe = resolve_executable_for_spawn(ffprobe)
     cmd = [
         ffprobe, "-v", "quiet",
         "-print_format", "json",
@@ -118,6 +123,7 @@ async def run_ffprobe_json(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **macos_subprocess_kwargs(),
         )
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         if proc.returncode != 0:

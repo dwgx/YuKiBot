@@ -25,6 +25,7 @@ from utils.text import clip_text, normalize_text
 from utils.intent import looks_like_video_request as _shared_video_request
 from core.tools_types import ToolResult
 from core.tools_types import _unwrap_redirect_url, _normalize_multimodal_query, _is_known_image_signature
+from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
 import logging as _logging
 from core.tools_types import _SilentYTDLPLogger, _prompt_cues, _tool_trace_tag, _write_netscape_cookie_file
 from core.video_analyzer import VideoAnalysisResult, VideoAnalyzer
@@ -3626,7 +3627,7 @@ class ToolVideoMixin:
         env = os.environ.copy()
         timeout = max(45, min(180, int(self._video_download_timeout_seconds) + 45))
         cmd = [
-            sys.executable,
+            resolve_executable_for_spawn(sys.executable),
             "-m",
             "yt_dlp",
             "--no-warnings",
@@ -3653,6 +3654,7 @@ class ToolVideoMixin:
                 timeout=timeout,
                 check=False,
                 env=env,
+                **macos_subprocess_kwargs(),
             )
         except Exception as exc:
             self._last_video_download_error[source_url] = normalize_text(str(exc))
@@ -3718,6 +3720,7 @@ class ToolVideoMixin:
         ffmpeg_bin = normalize_text(getattr(self, "_ffmpeg_bin", ""))
         if not ffmpeg_bin:
             return None
+        ffmpeg_bin = resolve_executable_for_spawn(ffmpeg_bin)
         output = path.with_name(f"{path.stem}.remux.mp4")
         try:
             proc = subprocess.run(
@@ -3739,6 +3742,7 @@ class ToolVideoMixin:
                 text=True,
                 timeout=45,
                 check=False,
+                **macos_subprocess_kwargs(),
             )
         except Exception:
             self._safe_unlink(output)
@@ -4057,6 +4061,7 @@ class ToolVideoMixin:
 
         if ffprobe_bin:
             try:
+                ffprobe_bin = resolve_executable_for_spawn(ffprobe_bin)
                 cmd = [
                     ffprobe_bin,
                     "-v",
@@ -4068,7 +4073,12 @@ class ToolVideoMixin:
                     target,
                 ]
                 proc = subprocess.run(
-                    cmd, capture_output=True, text=True, timeout=10, check=False
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    **macos_subprocess_kwargs(),
                 )
                 if proc.returncode == 0:
                     payload = json.loads(proc.stdout or "{}")
@@ -4086,9 +4096,19 @@ class ToolVideoMixin:
         if not self._ffmpeg_bin:
             return False
         try:
-            cmd = [self._ffmpeg_bin, "-hide_banner", "-i", target]
+            cmd = [
+                resolve_executable_for_spawn(self._ffmpeg_bin),
+                "-hide_banner",
+                "-i",
+                target,
+            ]
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=10, check=False
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+                **macos_subprocess_kwargs(),
             )
             text = normalize_text((proc.stderr or "") + "\n" + (proc.stdout or ""))
             return bool(

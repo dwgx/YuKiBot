@@ -22,6 +22,7 @@ from core.recalled_messages import (
     record_recalled_message as _record_recalled_message,
 )
 from utils.learning_guard import assess_preferred_name_learning, looks_like_preferred_name_knowledge
+from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
 from utils.text import clip_text, normalize_matching_text, normalize_text, tokenize
 
 _log = logging.getLogger("yukiko.agent_tools")
@@ -976,12 +977,14 @@ def _probe_stream_flags_fallback(video_path: Path) -> tuple[bool, bool]:
     try:
         import subprocess
 
+        ffmpeg = resolve_executable_for_spawn(ffmpeg)
         proc = subprocess.run(
             [ffmpeg, "-hide_banner", "-i", str(video_path)],
             capture_output=True,
             text=True,
             timeout=12,
             check=False,
+            **macos_subprocess_kwargs(),
         )
         text = normalize_text((proc.stdout or "") + "\n" + (proc.stderr or ""))
         has_video = bool(re.search(r"\bvideo\b", text, flags=re.IGNORECASE))

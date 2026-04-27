@@ -19,6 +19,7 @@ import httpx
 
 from core.prompt_policy import PromptPolicy
 from core.system_prompts import SystemPromptRelay
+from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn
 from utils.text import clip_text, normalize_text
 
 _log = logging.getLogger("yukiko.video_analyzer")
@@ -199,8 +200,10 @@ class VideoAnalyzer:
         self._keyframe_dir = self._cache_dir / "keyframes"
         self._keyframe_dir.mkdir(parents=True, exist_ok=True)
 
-        self._ffmpeg_available = bool(_find_ffmpeg_path("ffmpeg"))
-        self._ffprobe_available = bool(_find_ffmpeg_path("ffprobe"))
+        self._ffmpeg_bin = resolve_executable_for_spawn(_find_ffmpeg_path("ffmpeg"))
+        self._ffprobe_bin = resolve_executable_for_spawn(_find_ffmpeg_path("ffprobe"))
+        self._ffmpeg_available = bool(self._ffmpeg_bin)
+        self._ffprobe_available = bool(self._ffprobe_bin)
         self._prompt_policy = PromptPolicy.from_config(config)
 
     # ── 平台检测 ──
@@ -1419,9 +1422,11 @@ class VideoAnalyzer:
         self, path: Path, digest: str, scale_filter: str
     ) -> list[Path]:
         """用 ffmpeg select='gt(scene,0.3)' 提取场景切换帧。"""
+        if not self._ffmpeg_bin:
+            return []
         pattern = str(self._keyframe_dir / f"{digest}_sc_%02d.jpg")
         cmd = [
-            "ffmpeg", "-y",
+            self._ffmpeg_bin, "-y",
             "-i", str(path),
             "-vf", f"select='gt(scene,0.3)',{scale_filter}",
             "-vsync", "vfr",
@@ -1434,6 +1439,7 @@ class VideoAnalyzer:
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                **macos_subprocess_kwargs(),
             )
             await asyncio.wait_for(proc.wait(), timeout=30)
         except Exception:
@@ -1444,10 +1450,12 @@ class VideoAnalyzer:
         self, path: Path, digest: str, duration: int, scale_filter: str
     ) -> list[Path]:
         """均匀采样 N 帧作为兜底。"""
+        if not self._ffmpeg_bin:
+            return []
         pattern = str(self._keyframe_dir / f"{digest}_kf_%02d.jpg")
         interval = max(1, duration // (self._keyframe_count + 1))
         cmd = [
-            "ffmpeg", "-y",
+            self._ffmpeg_bin, "-y",
             "-i", str(path),
             "-vf", f"fps=1/{interval},{scale_filter}",
             "-frames:v", str(self._keyframe_count),
@@ -1459,6 +1467,7 @@ class VideoAnalyzer:
                 *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                **macos_subprocess_kwargs(),
             )
             await asyncio.wait_for(proc.wait(), timeout=30)
         except Exception:
@@ -1471,12 +1480,13 @@ class VideoAnalyzer:
             return 0
         try:
             proc = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "quiet",
+                self._ffprobe_bin, "-v", "quiet",
                 "-show_entries", "format=duration",
                 "-of", "default=noprint_wrappers=1:nokey=1",
                 video_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
+                **macos_subprocess_kwargs(),
             )
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             return int(float(stdout.decode().strip()))
@@ -1488,30 +1498,36 @@ class VideoAnalyzer:
     async def _extract_embedded_subtitles(self, video_path: str) -> str:
         """用 ffmpeg 提取视频内嵌字幕流（SRT/ASS/text），超时 10s。"""
         try:
+            if not self._ffprobe_bin:
+                return ""
             # 先用 ffprobe 检查是否有字幕流
             probe_proc = await asyncio.create_subprocess_exec(
-                "ffprobe", "-v", "quiet",
+                self._ffprobe_bin, "-v", "quiet",
                 "-select_streams", "s",
                 "-show_entries", "stream=index,codec_name",
                 "-of", "csv=p=0",
                 video_path,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **macos_subprocess_kwargs(),
             )
             probe_out, _ = await asyncio.wait_for(probe_proc.communicate(), timeout=8)
             probe_text = probe_out.decode("utf-8", errors="replace").strip()
             if not probe_text:
                 return ""
+            if not self._ffmpeg_bin:
+                return ""
 
             # 提取第一条字幕流为 SRT 格式
             proc = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-y",
+                self._ffmpeg_bin, "-y",
                 "-i", video_path,
                 "-map", "0:s:0",
                 "-f", "srt",
                 "pipe:1",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                **macos_subprocess_kwargs(),
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             raw_srt = out.decode("utf-8", errors="replace").strip()
