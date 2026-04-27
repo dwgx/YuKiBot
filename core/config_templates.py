@@ -192,6 +192,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
             "tool_timeout_seconds_media": 45,
             "llm_step_timeout_seconds": 30,
             "llm_step_timeout_seconds_after_tool": 36,
+            "navigator_obvious_tool_timeout_seconds": 5,
             "total_timeout_seconds": 0,
             "queue_timeout_margin_seconds": 8,
             "high_risk_control": {

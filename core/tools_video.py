@@ -10,6 +10,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import subprocess
 
 from html import unescape
@@ -2989,6 +2990,29 @@ class ToolVideoMixin:
             )
         return "这条视频这次没解析出来。你换个链接我继续试。"
 
+    @staticmethod
+    def _ensure_legacy_phantomjs_path() -> None:
+        """Expose user-local PhantomJS installs to yt-dlp legacy extractors."""
+        if shutil.which("phantomjs"):
+            return
+        executable = "phantomjs.exe" if os.name == "nt" else "phantomjs"
+        candidates = [
+            Path.home() / ".local" / "bin",
+            Path.home() / ".npm-global" / "bin",
+            Path.cwd() / "node_modules" / ".bin",
+            Path.cwd() / ".runtime" / "node_modules" / ".bin",
+        ]
+        for directory in candidates:
+            try:
+                if not (directory / executable).exists():
+                    continue
+                current_path = os.environ.get("PATH", "")
+                os.environ["PATH"] = f"{directory}{os.pathsep}{current_path}" if current_path else str(directory)
+                _tool_log.info("video_phantomjs_path_added | path=%s", directory)
+                return
+            except OSError:
+                continue
+
     async def _resolve_platform_video(self, source_url: str) -> str:
         url = _unwrap_redirect_url(source_url)
         self._last_video_resolve_diagnostic.pop(url, None)
@@ -3001,6 +3025,15 @@ class ToolVideoMixin:
         if not self._is_platform_video_detail_url(url):
             self._last_video_resolve_diagnostic[url] = "video_detail_url_required"
             return ""
+
+        parsed_for_resolver = urlparse(url)
+        host_for_resolver = normalize_text(parsed_for_resolver.netloc).lower()
+        if (
+            "iqiyi.com" in host_for_resolver
+            or "qiyi.com" in host_for_resolver
+            or "iq.com" in host_for_resolver
+        ):
+            self._ensure_legacy_phantomjs_path()
 
         if self._video_parse_enable and self._video_parse_api_base:
             parsed_url = await self._resolve_platform_video_via_parse_api(url)

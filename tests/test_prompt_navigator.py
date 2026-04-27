@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import unittest
 
 from core.agent import AgentContext, AgentLoop
@@ -163,6 +164,26 @@ class _ErrorModelClient:
     async def chat_text_with_retry(self, messages, max_tokens=0, retries=0, backoff=0.0):
         _ = (messages, max_tokens, retries, backoff)
         raise RuntimeError("HTTP 401: 无效的令牌")
+
+
+class _SlowFirstThenFinalModelClient:
+    enabled = True
+
+    def __init__(self):
+        self.calls = 0
+
+    def supports_native_tool_calling(self) -> bool:
+        return False
+
+    async def chat_text_with_retry(self, messages, max_tokens=0, retries=0, backoff=0.0):
+        _ = (messages, max_tokens, retries, backoff)
+        self.calls += 1
+        if self.calls == 1:
+            await asyncio.sleep(2)
+        return json.dumps(
+            {"tool": "final_answer", "args": {"text": "解析好了。"}},
+            ensure_ascii=False,
+        )
 
 
 class _Registry:
@@ -360,6 +381,43 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
         self.assertEqual(result.tool_calls_made, 1)
+
+    def test_obvious_navigator_tool_caps_initial_llm_wait(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SlowFirstThenFinalModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {
+                    "enable": True,
+                    "max_steps": 5,
+                    "fallback_on_parse_error": True,
+                    "navigator_obvious_tool_timeout_seconds": 0.05,
+                },
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="解析 https://v.douyin.com/demo/",
+            trace_id="navigator-obvious-tool-cap-test",
+        )
+
+        started = time.perf_counter()
+        result = asyncio.run(loop.run(ctx))
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
+        self.assertEqual(result.reply_text, "解析好了。")
 
     def test_video_url_llm_error_falls_back_to_parse_tool(self):
         registry = _Registry()

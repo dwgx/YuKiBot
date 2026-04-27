@@ -252,6 +252,7 @@ class AgentLoop:
         self.tool_timeout_seconds_media = 45
         self.llm_step_timeout_seconds = 22
         self.llm_step_timeout_seconds_after_tool = 32
+        self.navigator_obvious_tool_timeout_seconds = 5.0
         self.total_timeout_seconds = 0
         self.queue_timeout_margin_seconds = 8
         self.prompt_policy = PromptPolicy.from_config({})
@@ -350,6 +351,15 @@ class AgentLoop:
                     )
                 ),
             ),
+        )
+        try:
+            navigator_obvious_tool_timeout = float(
+                agent_cfg.get("navigator_obvious_tool_timeout_seconds", 5.0)
+            )
+        except (TypeError, ValueError):
+            navigator_obvious_tool_timeout = 5.0
+        self.navigator_obvious_tool_timeout_seconds = max(
+            0.0, min(30.0, navigator_obvious_tool_timeout)
         )
         self.total_timeout_seconds = max(
             0, int(agent_cfg.get("total_timeout_seconds", 0))
@@ -890,6 +900,30 @@ class AgentLoop:
                         llm_budget, float(self.llm_step_timeout_seconds_after_tool)
                     )
                 llm_timeout = min(llm_budget, max(6.0, remaining - 1.5))
+                fallback_tool_candidate = None
+                if (
+                    strict_tool_routing
+                    and tool_calls_made == 0
+                    and (
+                        not steps
+                        or self._has_only_navigator_tool_policy_blocks(steps)
+                    )
+                ):
+                    fallback_tool_candidate = self._navigator_timeout_fallback_tool(ctx)
+                if (
+                    fallback_tool_candidate
+                    and self.navigator_obvious_tool_timeout_seconds > 0
+                    and llm_timeout > self.navigator_obvious_tool_timeout_seconds
+                ):
+                    llm_timeout = self.navigator_obvious_tool_timeout_seconds
+                    _log.info(
+                        "navigator_obvious_tool_timeout_cap | trace=%s | step=%d | section=%s | tool=%s | timeout=%.1fs",
+                        ctx.trace_id,
+                        step_idx,
+                        ctx.navigator_state.active_section if ctx.navigator_state else "",
+                        fallback_tool_candidate[0],
+                        llm_timeout,
+                    )
                 schemas: list[dict[str, Any]] = []
                 if native_tool_calling and ctx.native_tools:
                     schemas = self.tool_registry.get_schemas_for_native_tools(
@@ -925,16 +959,7 @@ class AgentLoop:
                         step_idx,
                         llm_timeout,
                     )
-                    fallback_tool = None
-                    if (
-                        strict_tool_routing
-                        and tool_calls_made == 0
-                        and (
-                            not steps
-                            or self._has_only_navigator_tool_policy_blocks(steps)
-                        )
-                    ):
-                        fallback_tool = self._navigator_timeout_fallback_tool(ctx)
+                    fallback_tool = fallback_tool_candidate
                     if fallback_tool:
                         tool_name_fb, tool_args_fb = fallback_tool
                         parsed = {"tool": tool_name_fb, "args": dict(tool_args_fb)}
