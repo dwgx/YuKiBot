@@ -551,6 +551,8 @@ class PromptNavigator:
             add("download_resources", "download_file_extension")
         if urls:
             add("web_research", "url")
+        if self._looks_like_web_research_request(ctx):
+            add("web_research", "external_research_request")
         if getattr(ctx, "at_other_user_ids", None):
             add("qq_admin_social", "mention_target")
 
@@ -644,6 +646,42 @@ class PromptNavigator:
         if not host:
             return False
         return any(host == domain or host.endswith("." + domain) for domain in _VIDEO_DOMAINS)
+
+    @staticmethod
+    def _looks_like_web_research_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        cues = (
+            "搜索",
+            "搜一下",
+            "搜下",
+            "查一下",
+            "查下",
+            "查查",
+            "找一下",
+            "找下",
+            "你找",
+            "找啊",
+            "去找",
+            "帮我找",
+            "帮我查",
+            "网络时光机",
+            "wayback",
+            "官网",
+            "教程",
+            "攻略",
+            "资料",
+            "新闻",
+            "最新",
+            "下载地址",
+        )
+        return any(cue in text for cue in cues)
 
 
 def _dedupe(items: list[str]) -> list[str]:

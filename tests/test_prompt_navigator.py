@@ -43,6 +43,14 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertEqual(state.active_section, "web_research")
         self.assertIn("url", state.evidence)
 
+    def test_research_request_preselects_web_research_without_url(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "我要看异环的新手教程"
+        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "web_search"])
+        self.assertEqual(state.active_section, "web_research")
+        self.assertIn("external_research_request", state.evidence)
+
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         samples = [
@@ -139,7 +147,7 @@ class _Registry:
     tool_count = 4
 
     def __init__(self):
-        self.names = ["web_search", "parse_video", "think", "final_answer", "navigate_section"]
+        self.names = ["web_search", "fetch_webpage", "parse_video", "think", "final_answer", "navigate_section"]
         self.calls: list[tuple[str, dict]] = []
 
     def has_tool(self, name: str) -> bool:
@@ -185,6 +193,10 @@ class _Registry:
                     "text": "demo",
                 },
             )
+        if name == "fetch_webpage":
+            return ToolCallResult(ok=True, display="fetch ok", data={"url": args.get("url", "")})
+        if name == "web_search":
+            return ToolCallResult(ok=True, display="search ok", data={"query": args.get("query", "")})
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
 
 
@@ -310,6 +322,66 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
         self.assertEqual(result.tool_calls_made, 1)
+
+    def test_web_research_llm_timeout_falls_back_to_search_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="我要看异环的新手教程",
+            trace_id="navigator-web-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["web_search"])
+        self.assertEqual(registry.calls[0][1]["query"], "异环的新手教程")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_web_url_llm_timeout_falls_back_to_fetch_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="网络时光机看 skiapi.dev",
+            trace_id="navigator-fetch-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["fetch_webpage"])
+        self.assertEqual(registry.calls[0][1]["url"], "https://skiapi.dev")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
 
 if __name__ == "__main__":

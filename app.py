@@ -1649,12 +1649,11 @@ def register_handlers(engine: YukikoEngine) -> None:
             latest_trace = normalize_text(str(latest_ctx.get("trace_id", ""))) if isinstance(latest_ctx, dict) else ""
             if latest_trace and latest_trace != payload.trace_id:
                 _log.info(
-                    "send_skip_stale_trace | trace=%s | latest=%s | conversation=%s",
+                    "send_allow_stale_trace | trace=%s | latest=%s | conversation=%s",
                     payload.trace_id,
                     latest_trace,
                     payload.conversation_id,
                 )
-                return
             if getattr(result, "action", "") == "ignore":
                 _log.info(
                     "send_skip_ignore | trace=%s | conversation=%s | reason=%s | mentioned=%s | private=%s | text=%s",

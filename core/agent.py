@@ -2096,6 +2096,37 @@ class AgentLoop:
                 )
             if url:
                 return "parse_video", {"url": url}
+        if active == "web_research" and evidence & {"url", "external_research_request"}:
+            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+                " ".join(
+                    str(item or "")
+                    for item in (
+                        ctx.message_text,
+                        ctx.original_message_text,
+                        ctx.reply_to_text,
+                    )
+                )
+            )
+            url = self._extract_first_web_url(merged) or self._extract_first_url(merged)
+            if (
+                url
+                and "fetch_webpage" in visible_tools
+                and self.tool_registry.has_tool("fetch_webpage")
+            ):
+                return "fetch_webpage", {"url": url}
+            query = normalize_text(_RE_URL_STRIP.sub(" ", merged))
+            query = re.sub(
+                r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我|我想看|我要看|想看|看一下|看下|我想|我要|搜索|搜一下|搜下|查一下|查下|找一下|找下|找|你找啊|你找)\s*",
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+            if (
+                query
+                and "web_search" in visible_tools
+                and self.tool_registry.has_tool("web_search")
+            ):
+                return "web_search", {"query": query, "mode": self._infer_search_mode(query)}
         return None
 
     def _apply_prompt_navigator_scope(
@@ -3633,6 +3664,19 @@ class AgentLoop:
             return True
         if len(t) <= 16 and re.fullmatch(r"[?？!！,，.。~\-\s]*", t):
             return True
+        if len(t) <= 12 and any(
+            cue in t
+            for cue in (
+                "继续找",
+                "你找",
+                "找啊",
+                "查啊",
+                "搜啊",
+                "去找",
+                "那你找",
+            )
+        ):
+            return True
         return False
 
     @staticmethod
@@ -3661,7 +3705,7 @@ class AgentLoop:
             if self._is_context_continuation_phrase(row):
                 continue
             cleaned = re.sub(
-                r"^(帮我|给我|请|麻烦|你去|你帮我|我想|我要|搜一下|搜索|查一下|查下|找一下|找)\s*",
+                r"^(帮我|给我|请|麻烦|你去|你帮我|我想看|我要看|想看|看一下|看下|我想|我要|搜一下|搜索|查一下|查下|找一下|找)\s*",
                 "",
                 row,
             ).strip()

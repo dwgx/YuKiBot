@@ -33,7 +33,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import Request
 
-from core.napcat_compat import build_napcat_diagnostics, call_napcat_bot_api
+from core.napcat_compat import build_napcat_diagnostics, call_napcat_bot_api, napcat_file_uri_to_path
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     list_recalled_messages as _list_recalled_messages,
@@ -3442,17 +3442,106 @@ async def chat_agent_text(request: Request):
             await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
 
     if video_url:
-        cq = f"[CQ:video,file={video_url}]"
-        try:
+        from app_helpers import _build_video_segment
+
+        staged_video_ref = ""
+        delivery_errors: list[str] = []
+
+        async def _send_video_segment(*, prefer_plain_path: bool) -> bool:
+            nonlocal staged_video_ref, sent_message_id
+            segment = await _build_video_segment(video_url, prefer_plain_path=prefer_plain_path)
+            if segment is None:
+                delivery_errors.append("build_video_segment_returned_none")
+                return False
+            seg_type = normalize_text(str(getattr(segment, "type", ""))) or "video"
+            seg_data = dict(getattr(segment, "data", {}) or {})
+            staged_video_ref = normalize_text(str(seg_data.get("file", "") or staged_video_ref))
+            payload = [{"type": seg_type, "data": seg_data}]
+            _log.info(
+                "media_delivery_inline_attempt | source=webui_agent_text | chat=%s | peer=%s | file=%s",
+                resolved_type,
+                peer_id,
+                clip_text(staged_video_ref, 180),
+            )
             if resolved_type == "group":
-                await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+                sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
             else:
-                await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
-        except Exception:
+                sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+            if isinstance(sent, dict):
+                sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "") or sent_message_id))
+            elif isinstance(sent, int):
+                sent_message_id = str(sent)
+            return True
+
+        video_delivered = False
+        for prefer_plain in (True, False):
+            try:
+                if await _send_video_segment(prefer_plain_path=prefer_plain):
+                    video_delivered = True
+                    break
+            except Exception as exc:
+                delivery_errors.append(str(exc))
+                _log.warning(
+                    "media_delivery_failed_exact | source=webui_agent_text | channel=inline_video | plain=%s | peer=%s | error=%s",
+                    prefer_plain,
+                    peer_id,
+                    exc,
+                )
+
+        if not video_delivered:
+            upload_ref = staged_video_ref or video_url
+            upload_path = napcat_file_uri_to_path(upload_ref) if upload_ref.lower().startswith("file://") else Path(upload_ref)
+            if upload_path is not None and upload_path.exists() and upload_path.is_file():
+                abs_path = str(upload_path.expanduser().resolve())
+                filename = Path(video_url).name or upload_path.name
+                try:
+                    if resolved_type == "group":
+                        _log.info(
+                            "media_delivery_upload_attempt | source=webui_agent_text | channel=upload_group_file | group=%s | file=%s",
+                            peer_num,
+                            clip_text(abs_path, 180),
+                        )
+                        await _onebot_call(
+                            "upload_group_file",
+                            bot_id=bot_id,
+                            group_id=peer_num,
+                            file=abs_path,
+                            name=filename,
+                        )
+                    else:
+                        _log.info(
+                            "media_delivery_upload_attempt | source=webui_agent_text | channel=upload_private_file | user=%s | file=%s",
+                            peer_num,
+                            clip_text(abs_path, 180),
+                        )
+                        await _onebot_call(
+                            "upload_private_file",
+                            bot_id=bot_id,
+                            user_id=peer_num,
+                            file=abs_path,
+                            name=filename,
+                        )
+                    video_delivered = True
+                except Exception as exc:
+                    delivery_errors.append(str(exc))
+                    _log.warning(
+                        "media_delivery_failed_exact | source=webui_agent_text | channel=upload_file | peer=%s | file=%s | error=%s",
+                        peer_id,
+                        clip_text(abs_path, 180),
+                        exc,
+                    )
+
+        if not video_delivered:
+            _log.warning(
+                "media_delivery_failed_exact | source=webui_agent_text | channel=all | peer=%s | errors=%s",
+                peer_id,
+                clip_text(" | ".join(delivery_errors), 500),
+            )
+            failure_text = "视频解析成功，但投递失败；NapCat 具体错误已经写进日志 media_delivery_failed_exact。"
             if resolved_type == "group":
-                await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=f"视频链接: {video_url}")
+                await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=failure_text)
             else:
-                await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=f"视频链接: {video_url}")
+                await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=failure_text)
 
     if audio_file:
         cq = f"[CQ:record,file={audio_file}]"

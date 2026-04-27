@@ -104,7 +104,7 @@ export function clampThinkingIslandOffset(
   if (typeof window === "undefined") return offset;
   const islandWidth = getThinkingIslandRenderWidth(width);
   const maxX = Math.max(0, Math.floor((window.innerWidth - islandWidth) / 2) - 8);
-  const maxY = Math.max(0, Math.floor(window.innerHeight * 0.42));
+  const maxY = Math.max(0, Math.floor(window.innerHeight - 160));
   return {
     x: Math.max(-maxX, Math.min(maxX, Number.isFinite(offset.x) ? offset.x : 0)),
     y: Math.max(-8, Math.min(maxY, Number.isFinite(offset.y) ? offset.y : 0)),

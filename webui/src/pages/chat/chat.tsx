@@ -10,6 +10,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
 } from "react";
+import { createPortal } from "react-dom";
 import { Button, Card, CardBody, CardHeader, Chip, Input, Spinner, Textarea } from "@heroui/react";
 import { BrainCircuit, ChevronDown, ChevronUp, Copy, ImagePlus, MessageSquare, Minus, Pause, Play, Plus, Quote, RefreshCw, SendHorizontal, SmilePlus, Sparkles, Square, Star, Trash2, UserRound, X } from "lucide-react";
 import { AnimatePresence, motion, useDragControls } from "framer-motion";
@@ -1434,7 +1435,8 @@ export default function ChatPage() {
                 </Button>
               </div>
             )}
-            <AnimatePresence mode="wait">
+            {typeof document !== "undefined" && createPortal(
+              <AnimatePresence mode="wait">
               {thinkingIslandVisible && (
                 <motion.div
                   initial={{ opacity: 0, y: -20, scale: 0.92 }}
@@ -1446,7 +1448,7 @@ export default function ChatPage() {
                     damping: 24,
                     mass: 0.75
                   }}
-                  className="pointer-events-none fixed inset-x-0 top-3 z-[90] flex justify-center px-3"
+                  className="pointer-events-none fixed inset-x-0 top-3 z-[120] flex justify-center px-3"
                 >
                   <motion.div
                     drag
@@ -1687,7 +1689,9 @@ export default function ChatPage() {
                   </motion.div>
                 </motion.div>
               )}
-            </AnimatePresence>
+              </AnimatePresence>,
+              document.body
+            )}
           </Card>
 
           <Card className="stapxs-composer-card border border-primary/15 bg-content1">
