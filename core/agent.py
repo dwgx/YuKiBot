@@ -2596,7 +2596,7 @@ class AgentLoop:
         navigator = self._load_prompt_navigator()
         if not navigator.enabled:
             return None
-        timeout = min(10.0, max(3.0, remaining - 2.0))
+        timeout = min(20.0, max(3.0, remaining - 2.0))
         if timeout <= 2.5:
             return None
         lines = [
