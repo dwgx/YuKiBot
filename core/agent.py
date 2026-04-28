@@ -983,13 +983,38 @@ class AgentLoop:
                             ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
                         )
                     else:
-                        retry_section = await self._navigator_timeout_section_retry(
+                        retry_tool = await self._navigator_timeout_tool_retry(
                             ctx=ctx,
                             step_idx=step_idx,
                             tool_calls_made=tool_calls_made,
                             steps=steps,
                             remaining=remaining,
                         )
+                        if retry_tool:
+                            tool_name_retry, tool_args_retry = retry_tool
+                            parsed = {"tool": tool_name_retry, "args": dict(tool_args_retry)}
+                            response_text = json.dumps(parsed, ensure_ascii=False)
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": response_text,
+                            }
+                            synthetic_tool_call = True
+                            _log.info(
+                                "navigator_timeout_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
+                                ctx.trace_id,
+                                step_idx,
+                                ctx.navigator_state.active_section if ctx.navigator_state else "",
+                                tool_name_retry,
+                            )
+                        retry_section = None
+                        if not synthetic_tool_call:
+                            retry_section = await self._navigator_timeout_section_retry(
+                                ctx=ctx,
+                                step_idx=step_idx,
+                                tool_calls_made=tool_calls_made,
+                                steps=steps,
+                                remaining=remaining,
+                            )
                         if retry_section:
                             parsed = {
                                 "tool": NAVIGATE_SECTION_TOOL,
@@ -1011,11 +1036,11 @@ class AgentLoop:
                                 retry_section[0],
                                 clip_text(retry_section[1], 120),
                             )
-                        elif steps:
+                        elif not synthetic_tool_call and steps:
                             return await self._build_fallback_result(
                                 ctx, steps, tool_calls_made, t0, "llm_timeout"
                             )
-                        else:
+                        elif not synthetic_tool_call:
                             fallback = _pl.get_message(
                                 "llm_timeout_fallback",
                                 "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
@@ -2322,6 +2347,176 @@ class AgentLoop:
                 return "fetch_webpage", {"url": url}
         return None
 
+    async def _navigator_timeout_tool_retry(
+        self,
+        *,
+        ctx: AgentContext,
+        step_idx: int,
+        tool_calls_made: int,
+        steps: list[dict[str, Any]],
+        remaining: float,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Ask a tiny prompt for the next tool when the active section stalls.
+
+        This is still Prompt Navigator driven: the retry can only choose from
+        tools already exposed by the active section, and it receives the same
+        section instructions plus tool schemas.
+        """
+        if tool_calls_made > 0:
+            return None
+        if not self._has_only_navigator_retry_steps(steps):
+            return None
+        state = ctx.navigator_state
+        if state is None:
+            return None
+        active = normalize_text(state.active_section)
+        if not active or active == "general_chat":
+            return None
+        navigator = self._load_prompt_navigator()
+        if not navigator.enabled:
+            return None
+        section = navigator.config.sections.get(active)
+        if section is None:
+            return None
+        visible_tools = [
+            normalize_text(str(name))
+            for name in (ctx.native_tools or [])
+            if normalize_text(str(name))
+        ]
+        domain_tools = [
+            name
+            for name in visible_tools
+            if name not in {"think", "final_answer", NAVIGATE_SECTION_TOOL}
+            and self.tool_registry.has_tool(name)
+        ]
+        if not domain_tools:
+            return None
+        timeout = min(10.0, max(3.0, remaining - 2.0))
+        if timeout <= 2.5:
+            return None
+        tool_docs = ""
+        try:
+            tool_docs = self.tool_registry.get_schemas_for_prompt_filtered(domain_tools)
+        except Exception:
+            tool_docs = "\n".join(f"- {name}" for name in domain_tools)
+        lines = [
+            "你是 YuKiKo 的 Prompt Navigator 工具决策器。",
+            '只输出 JSON: {"tool":"工具名","args":{...}}。',
+            "不能回答用户，不能输出 final_answer/think，只能从当前分区已暴露的真实工具中选一个下一步工具。",
+            f"当前分区: {active}",
+            f"分区适用: {section.when_to_use or section.name or active}",
+            f"分区指令: {clip_text(section.instructions, 900)}",
+            "可用工具: " + ", ".join(domain_tools),
+        ]
+        if tool_docs:
+            lines.append("工具 schema/说明:\n" + clip_text(tool_docs, 3600))
+        if section.fallback_sections:
+            lines.append(
+                "如果当前分区明显不适合，本轮不要硬答；返回当前分区里最接近的探索工具，"
+                "后续主 Agent 会根据 observation 再跳分区。"
+            )
+        user_parts = [
+            f"当前消息: {clip_text(normalize_text(ctx.message_text), 300)}",
+        ]
+        original = normalize_text(ctx.original_message_text)
+        if original and original != normalize_text(ctx.message_text):
+            user_parts.append(f"原始消息: {clip_text(original, 300)}")
+        if normalize_text(ctx.reply_to_text):
+            user_parts.append(
+                f"引用文本: {clip_text(normalize_text(ctx.reply_to_text), 300)}"
+            )
+        if ctx.media_summary or ctx.reply_media_summary:
+            user_parts.append(
+                "媒体结构: "
+                + ", ".join(
+                    [*list(ctx.media_summary or []), *list(ctx.reply_media_summary or [])][
+                        :8
+                    ]
+                )
+            )
+        if isinstance(ctx.recent_media_artifact, dict) and ctx.recent_media_artifact:
+            artifact = {
+                key: ctx.recent_media_artifact.get(key)
+                for key in (
+                    "type",
+                    "source_url",
+                    "url",
+                    "video_url",
+                    "image_url",
+                    "title",
+                    "send_status",
+                )
+                if ctx.recent_media_artifact.get(key)
+            }
+            if artifact:
+                user_parts.append(
+                    "最近媒体 artifact: "
+                    + clip_text(json.dumps(artifact, ensure_ascii=False), 500)
+                )
+        try:
+            raw = await asyncio.wait_for(
+                self.model_client.chat_text_with_retry(
+                    [
+                        {"role": "system", "content": "\n".join(lines)},
+                        {"role": "user", "content": "\n".join(user_parts)},
+                    ],
+                    max_tokens=260,
+                    retries=0,
+                    backoff=0.0,
+                ),
+                timeout=timeout,
+            )
+        except Exception as exc:
+            _log.info(
+                "navigator_timeout_tool_retry_failed | trace=%s | step=%d | section=%s | %s",
+                ctx.trace_id,
+                step_idx,
+                active,
+                exc,
+            )
+            return None
+        payload = self._parse_json_object_from_text(str(raw or ""))
+        if not isinstance(payload, dict):
+            return None
+        tool_name = normalize_text(
+            str(
+                payload.get("tool")
+                or payload.get("name")
+                or payload.get("tool_name")
+                or ""
+            )
+        )
+        args = payload.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+        if tool_name not in domain_tools:
+            _log.info(
+                "navigator_timeout_tool_retry_invalid | trace=%s | step=%d | section=%s | tool=%s | allowed=%s",
+                ctx.trace_id,
+                step_idx,
+                active,
+                tool_name or "-",
+                ",".join(domain_tools),
+            )
+            return None
+        return tool_name, args
+
+    @staticmethod
+    def _has_only_navigator_retry_steps(steps: list[dict[str, Any]]) -> bool:
+        for step in steps:
+            if not isinstance(step, dict):
+                return False
+            tool = step.get("tool")
+            if tool == NAVIGATE_SECTION_TOOL:
+                continue
+            if tool == "policy_guard" and step.get("error") in {
+                "navigator_tool_required_before_final_answer",
+                "navigator_tool_required_before_direct_reply",
+            }:
+                continue
+            return False
+        return True
+
     async def _navigator_timeout_section_retry(
         self,
         *,
@@ -3522,8 +3717,8 @@ class AgentLoop:
             "github_search": ["query"],
             "douyin_search": ["query"],
             "search_knowledge": ["query"],
-            "search_media": ["query"],
-            "search_web_media": ["query"],
+            "search_media": ["query", "media_type"],
+            "search_web_media": ["query", "media_type"],
             "search_download_resources": ["query"],
             "cli_invoke": ["prompt"],
             "generate_image": ["prompt"],

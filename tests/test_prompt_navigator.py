@@ -853,6 +853,51 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(registry.calls, [])
         self.assertEqual(result.reason, "agent_llm_timeout")
 
+    def test_web_research_timeout_uses_tiny_tool_retry_for_wayback(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "tool": "wayback_lookup",
+                            "args": {"url": "https://dwgx.top"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {"tool": "final_answer", "args": {"text": "查到归档了。"}},
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="网络时光机 看 dwgx.top以前有什么",
+            trace_id="navigator-web-wayback-tool-retry-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["wayback_lookup"])
+        self.assertEqual(registry.calls[0][1]["url"], "https://dwgx.top")
+        self.assertEqual(result.reply_text, "查到归档了。")
+
     def test_general_chat_timeout_uses_tiny_navigator_retry_before_giving_up(self):
         registry = _Registry()
         loop = AgentLoop(
@@ -882,6 +927,63 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
         self.assertEqual(registry.calls, [])
+
+    def test_general_timeout_can_switch_section_then_tiny_tool_retry(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "section_id": "media_search",
+                            "reason": "用户要找并发送视频",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "tool": "search_media",
+                            "args": {"query": "异环宣传片", "media_type": "video"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {"tool": "final_answer", "args": {"text": "找到视频。"}},
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="给我发一个异环的视频",
+            trace_id="navigator-section-then-tool-retry-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
+        self.assertEqual(
+            registry.calls[0][1],
+            {"query": "异环宣传片", "media_type": "video"},
+        )
+        self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
+        self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
 
     def test_media_search_llm_timeout_falls_back_to_search_media_tool(self):
         registry = _Registry()
