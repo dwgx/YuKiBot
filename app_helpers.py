@@ -2109,7 +2109,13 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     except Exception:
         return True, ""
     if proc.returncode != 0:
-        return False, "ffprobe 无法解析该视频（可能损坏）"
+        _log.warning(
+            "video_health_probe_soft_fail | file=%s | rc=%d | stderr=%s",
+            path.name,
+            proc.returncode,
+            clip_text(proc.stderr or "", 240),
+        )
+        return True, ""
 
     try:
         payload = json.loads(proc.stdout or "{}")
