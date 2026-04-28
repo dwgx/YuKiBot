@@ -404,6 +404,49 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             payload,
         )
 
+    def test_vision_describe_can_use_model_fallback_client(self) -> None:
+        executor = _DummyExecutor()
+        calls: list[str] = []
+
+        async def fake_anthropic(**kwargs):
+            calls.append(str(kwargs.get("model_name", "")))
+            return "这张图里是一只猫"
+
+        executor._vision_describe_via_anthropic = fake_anthropic  # type: ignore[method-assign]
+        model_client = SimpleNamespace(
+            provider="newapi",
+            _primary_provider="newapi",
+            _active_provider="newapi",
+            _fallback_providers=["anthropic"],
+            _fallback_clients={
+                "anthropic": SimpleNamespace(
+                    enabled=True,
+                    api_key="sk-test",
+                    base_url="https://anthropic.example",
+                    model="claude-vision",
+                    timeout_seconds=8,
+                    temperature=0.2,
+                    max_tokens=512,
+                    prefer_v1=True,
+                    anthropic_version="2023-06-01",
+                    config={},
+                )
+            },
+        )
+
+        result = asyncio.run(
+            executor._vision_describe_via_model_fallbacks(
+                image_ref="data:image/png;base64,aaa",
+                prompt="看图",
+                model_client=model_client,
+                tried_provider="newapi",
+                tried_model="gpt-5.4",
+            )
+        )
+
+        self.assertEqual(result, "这张图里是一只猫")
+        self.assertEqual(calls, ["claude-vision"])
+
     def test_memory_followups_require_structure_not_local_link_words(self) -> None:
         self.assertFalse(
             YukikoEngine._looks_like_ambiguous_link_memory_query(

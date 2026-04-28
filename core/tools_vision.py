@@ -1503,6 +1503,249 @@ class ToolVisionMixin:
                     _tool_trace_tag(),
                 )
                 return anthro_text
+        fallback_text = await self._vision_describe_via_model_fallbacks(
+            image_ref=image_ref,
+            prompt=prompt,
+            model_client=model_client,
+            tried_provider=provider,
+            tried_model=model_name,
+        )
+        if fallback_text:
+            return fallback_text
+        return ""
+
+    async def _vision_describe_via_model_fallbacks(
+        self,
+        image_ref: str,
+        prompt: str,
+        model_client: Any,
+        tried_provider: str = "",
+        tried_model: str = "",
+    ) -> str:
+        if model_client is None:
+            return ""
+
+        fallback_clients = getattr(model_client, "_fallback_clients", {}) or {}
+        fallback_providers = list(getattr(model_client, "_fallback_providers", []) or [])
+        active_provider = normalize_text(
+            str(getattr(model_client, "_active_provider", ""))
+        ).lower()
+        primary_provider = normalize_text(
+            str(getattr(model_client, "_primary_provider", getattr(model_client, "provider", "")))
+        ).lower()
+
+        ordered: list[tuple[str, Any, str]] = []
+        if active_provider and active_provider != primary_provider:
+            active_getter = getattr(model_client, "_get_active_client", None)
+            try:
+                active_client = active_getter() if callable(active_getter) else None
+            except Exception:
+                active_client = None
+            if active_client is not None:
+                ordered.append((active_provider, active_client, "active"))
+        for provider_name in fallback_providers:
+            provider = normalize_text(str(provider_name)).lower()
+            client_obj = fallback_clients.get(provider)
+            if client_obj is not None:
+                ordered.append((provider, client_obj, "fallback"))
+
+        seen: set[tuple[str, str, str]] = set()
+        openai_compatible = {
+            "openai",
+            "newapi",
+            "deepseek",
+            "skiapi",
+            "openrouter",
+            "xai",
+            "qwen",
+            "moonshot",
+            "mistral",
+            "zhipu",
+            "siliconflow",
+        }
+        image_ref_kind = (
+            "data_uri"
+            if image_ref.startswith("data:image")
+            else ("http_url" if image_ref.startswith("http") else "other")
+        )
+
+        for provider, client_obj, source in ordered:
+            provider_text = normalize_text(provider).lower()
+            api_key = normalize_text(str(getattr(client_obj, "api_key", "")))
+            base_url = normalize_text(str(getattr(client_obj, "base_url", ""))).rstrip("/")
+            model_name = self._vision_model or normalize_text(str(getattr(client_obj, "model", "")))
+            if not provider_text or not api_key or not base_url or not model_name:
+                continue
+            marker = (provider_text, base_url, model_name)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if (
+                provider_text == normalize_text(tried_provider).lower()
+                and model_name == normalize_text(tried_model)
+            ):
+                continue
+
+            timeout_seconds = float(
+                getattr(client_obj, "timeout_seconds", self._vision_timeout_seconds)
+            )
+            temperature = float(
+                getattr(client_obj, "temperature", self._vision_temperature)
+            )
+            max_tokens = int(getattr(client_obj, "max_tokens", self._vision_max_tokens))
+            prefer_v1 = bool(getattr(client_obj, "prefer_v1", self._vision_prefer_v1))
+            model_candidates = self._candidate_vision_models(model_name, client_obj)
+
+            _tool_log.info(
+                "vision_request_fallback%s | provider=%s | model=%s | source=%s | image_ref=%s | timeout=%.1fs",
+                _tool_trace_tag(),
+                provider_text or "-",
+                ",".join(model_candidates) or model_name or "-",
+                source,
+                image_ref_kind,
+                timeout_seconds,
+            )
+
+            if provider_text == "anthropic":
+                text = await self._vision_describe_via_anthropic(
+                    image_ref=image_ref,
+                    prompt=prompt,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model_name=model_name,
+                    timeout_seconds=timeout_seconds,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    prefer_v1=prefer_v1,
+                    anthropic_version=normalize_text(
+                        str(getattr(client_obj, "anthropic_version", "2023-06-01"))
+                    ),
+                )
+                if text:
+                    _tool_log.info(
+                        "vision_provider_failover_ok%s | provider=%s | source=%s",
+                        _tool_trace_tag(),
+                        provider_text,
+                        source,
+                    )
+                    return text
+                continue
+
+            if provider_text == "gemini":
+                text = await self._vision_describe_via_gemini(
+                    image_ref=image_ref,
+                    prompt=prompt,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model_name=model_name,
+                    timeout_seconds=timeout_seconds,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    api_version=normalize_text(str(getattr(client_obj, "api_version", "v1beta"))) or "v1beta",
+                )
+                if text:
+                    _tool_log.info(
+                        "vision_provider_failover_ok%s | provider=%s | source=%s",
+                        _tool_trace_tag(),
+                        provider_text,
+                        source,
+                    )
+                    return text
+                continue
+
+            if provider_text not in openai_compatible:
+                continue
+
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            }
+            bases = self._candidate_openai_bases(
+                base_url=base_url, prefer_v1=prefer_v1
+            )
+            for candidate_model in model_candidates:
+                payload = {
+                    "model": candidate_model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": SystemPromptRelay.vision_system_prompt_detailed(),
+                        },
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": prompt},
+                                {
+                                    "type": "image_url",
+                                    "image_url": {"url": image_ref, "detail": "auto"},
+                                },
+                            ],
+                        },
+                    ],
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
+                }
+                for base in bases:
+                    url = f"{base}/chat/completions"
+                    try:
+                        async with httpx.AsyncClient(timeout=timeout_seconds) as client_http:
+                            resp = await client_http.post(url, headers=headers, json=payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                    except Exception as exc:
+                        _tool_log.warning(
+                            "vision_provider_failed_exact%s | provider=%s | model=%s | url=%s | source=%s | err=%s",
+                            _tool_trace_tag(),
+                            provider_text or "-",
+                            candidate_model or "-",
+                            url,
+                            source,
+                            str(exc)[:240],
+                        )
+                        continue
+
+                    choices = data.get("choices") if isinstance(data, dict) else None
+                    if not isinstance(choices, list) or not choices:
+                        _tool_log.warning(
+                            "vision_provider_failed_exact%s | provider=%s | model=%s | url=%s | source=%s | err=empty_choices",
+                            _tool_trace_tag(),
+                            provider_text or "-",
+                            candidate_model or "-",
+                            url,
+                            source,
+                        )
+                        continue
+                    message = (
+                        choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+                    )
+                    content = message.get("content", "")
+                    if isinstance(content, str):
+                        text = normalize_text(content)
+                        if text:
+                            _tool_log.info(
+                                "vision_provider_failover_ok%s | provider=%s | source=%s",
+                                _tool_trace_tag(),
+                                provider_text,
+                                source,
+                            )
+                            return text
+                        continue
+                    if isinstance(content, list):
+                        parts = [
+                            normalize_text(str(item.get("text", "")))
+                            for item in content
+                            if isinstance(item, dict)
+                        ]
+                        text = normalize_text("".join(parts))
+                        if text:
+                            _tool_log.info(
+                                "vision_provider_failover_ok%s | provider=%s | source=%s",
+                                _tool_trace_tag(),
+                                provider_text,
+                                source,
+                            )
+                            return text
+
         return ""
 
     async def _vision_describe_via_anthropic(

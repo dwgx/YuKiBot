@@ -3,7 +3,7 @@ import { clip } from "./chat-utils";
 
 export const THINKING_ISLAND_STORAGE_KEY = "yukiko-thinking-island-offset-v1";
 export const THINKING_ISLAND_SIZE_STORAGE_KEY = "yukiko-thinking-island-size-v1";
-export const THINKING_ISLAND_WIDTH_STORAGE_KEY = "yukiko-thinking-island-width-v2";
+export const THINKING_ISLAND_WIDTH_STORAGE_KEY = "yukiko-thinking-island-width-v3";
 export const THINKING_ISLAND_HEIGHT_STORAGE_KEY = "yukiko-thinking-island-height-v1";
 
 export type ThinkingIslandOffset = { x: number; y: number };
@@ -11,11 +11,11 @@ export type PendingThinkingLog = { raw: string; at: number };
 export type ThinkingIslandSize = "sm" | "md" | "lg";
 export type ThinkingStage = "idle" | "routing" | "planning" | "executing" | "replying" | "done" | "cancelled" | "error";
 
-export const THINKING_ISLAND_DEFAULT_WIDTH: Record<ThinkingIslandSize, number> = { sm: 480, md: 720, lg: 980 };
+export const THINKING_ISLAND_DEFAULT_WIDTH: Record<ThinkingIslandSize, number> = { sm: 560, md: 860, lg: 1180 };
 export const THINKING_ISLAND_MIN_WIDTH = 360;
-export const THINKING_ISLAND_MAX_WIDTH = 1280;
+export const THINKING_ISLAND_MAX_WIDTH = 1440;
 export const THINKING_ISLAND_MIN_HEIGHT = 100;
-export const THINKING_ISLAND_MAX_HEIGHT = 500;
+export const THINKING_ISLAND_MAX_HEIGHT = 640;
 export const THINKING_ISLAND_DEFAULT_HEIGHT = 160;
 
 export const THINKING_STAGE_STEPS: Array<{ key: "routing" | "planning" | "executing" | "replying"; label: string }> = [
