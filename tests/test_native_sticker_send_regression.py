@@ -56,6 +56,13 @@ class NativeStickerManagerRegressionTests(unittest.TestCase):
         self.assertEqual(seg2["data"]["emoji_package_id"], "321")
         self.assertEqual(meta2["fallback"], "native")
 
+    def test_classic_faces_fallback_when_qq_config_missing(self) -> None:
+        count = self.manager._scan_classic_faces(Path(self._tmpdir.name) / "missing-qq")
+
+        self.assertGreater(count, 0)
+        self.assertIn(76, self.manager._faces)
+        self.assertEqual(self.manager.get_face_segment(76)["data"]["id"], "76")
+
     def test_preferred_segment_falls_back_to_face_before_image(self) -> None:
         self.manager._faces[76] = FaceInfo(face_id=76, desc="/赞")
         key = self.manager._save_chat_emoji(

@@ -1102,16 +1102,16 @@ class StickerManager:
         root = self._find_qq_root(qq_data_path)
         if not root:
             _log.debug("qq_data_root_not_found")
-            return 0
+            return self._load_builtin_classic_faces()
         cfg = root / "nt_qq" / "global" / "nt_data" / "Emoji" / "emoji-resource" / "face_config.json"
         if not cfg.exists():
             _log.warning("face_config_not_found | path=%s", cfg)
-            return 0
+            return self._load_builtin_classic_faces()
         try:
             data = json.loads(cfg.read_text("utf-8"))
         except Exception as e:
             _log.error("face_config_parse | %s", e)
-            return 0
+            return self._load_builtin_classic_faces()
         count = 0
         for item in data.get("sysface", []):
             sid = item.get("QSid", "")
@@ -1127,6 +1127,19 @@ class StickerManager:
             )
             count += 1
         _log.info("classic_faces | count=%d", count)
+        return count
+
+    def _load_builtin_classic_faces(self) -> int:
+        """Fallback classic QQ faces when the local QQ face_config is unavailable."""
+        desc_by_id: dict[int, str] = {}
+        for desc, face_ids in _EMOTION_MAP.items():
+            for fid in face_ids:
+                if fid <= 300 and fid not in desc_by_id:
+                    desc_by_id[fid] = desc
+        for fid, desc in sorted(desc_by_id.items()):
+            self._faces[fid] = FaceInfo(face_id=fid, desc=desc, hidden=False)
+        count = len(desc_by_id)
+        _log.info("classic_faces_fallback | count=%d", count)
         return count
 
     def _scan_local_emojis(self) -> int:
