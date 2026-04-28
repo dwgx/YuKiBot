@@ -1647,13 +1647,6 @@ def register_handlers(engine: YukikoEngine) -> None:
             voice_send_music_disable_split = bool(send_opts["voice_send_music_disable_split"])
             latest_ctx = _latest_queue_task_ctx.get(payload.conversation_id, {})
             latest_trace = normalize_text(str(latest_ctx.get("trace_id", ""))) if isinstance(latest_ctx, dict) else ""
-            if latest_trace and latest_trace != payload.trace_id:
-                _log.info(
-                    "send_allow_stale_trace | trace=%s | latest=%s | conversation=%s",
-                    payload.trace_id,
-                    latest_trace,
-                    payload.conversation_id,
-                )
             if getattr(result, "action", "") == "ignore":
                 _log.info(
                     "send_skip_ignore | trace=%s | conversation=%s | reason=%s | mentioned=%s | private=%s | text=%s",
@@ -1691,28 +1684,67 @@ def register_handlers(engine: YukikoEngine) -> None:
                 and normalize_text(str(payload.reply_to_user_id or ""))
                 == normalize_text(str(payload.bot_id or ""))
             )
-            if (
+            latest_seq = 0
+            if isinstance(latest_ctx, dict):
+                try:
+                    latest_seq = int(latest_ctx.get("seq", 0) or 0)
+                except (TypeError, ValueError):
+                    latest_seq = 0
+            payload_seq = int(payload.seq or 0)
+            latest_user_id = (
+                normalize_text(str(latest_ctx.get("user_id", "")))
+                if isinstance(latest_ctx, dict)
+                else ""
+            )
+            latest_text = (
+                normalize_text(str(latest_ctx.get("text", "")))
+                if isinstance(latest_ctx, dict)
+                else ""
+            )
+            stale_trace = bool(
                 latest_trace
                 and latest_trace != payload.trace_id
+                and (not latest_seq or not payload_seq or latest_seq > payload_seq)
+            )
+            same_user_newer_turn = bool(
+                stale_trace
+                and latest_user_id
+                and latest_user_id == normalize_text(str(payload.user_id))
+            )
+            cancel_newer_turn = bool(stale_trace and _looks_like_cancel_previous_request(latest_text))
+            stale_plain_reply = (
+                stale_trace
                 and action == "reply"
-                and not payload.mentioned
                 and not payload.is_private
-                and not reply_to_bot
                 and reply_text
                 and not image_urls
                 and not video_url
                 and not cover_url
                 and not record_b64
                 and not audio_file
-            ):
+            )
+            if stale_plain_reply and (same_user_newer_turn or cancel_newer_turn):
                 _log.info(
-                    "send_drop_stale_plain_reply | trace=%s | latest=%s | conversation=%s | text=%s",
+                    "send_drop_stale_plain_reply | trace=%s | latest=%s | conversation=%s | seq=%s | latest_seq=%s | text=%s",
                     payload.trace_id,
                     latest_trace,
                     payload.conversation_id,
+                    payload.seq,
+                    latest_seq or "-",
                     clip_text(reply_text, 120),
                 )
                 return
+            if stale_trace:
+                _log.info(
+                    "send_allow_stale_trace | trace=%s | latest=%s | conversation=%s | seq=%s | latest_seq=%s | has_media=%s | same_user=%s",
+                    payload.trace_id,
+                    latest_trace,
+                    payload.conversation_id,
+                    payload.seq,
+                    latest_seq or "-",
+                    bool(image_urls or video_url or cover_url or record_b64 or audio_file),
+                    same_user_newer_turn,
+                )
             if not is_music_voice_action and audio_file:
                 audio_hint = normalize_text(audio_file).replace("\\", "/").lower()
                 looks_like_music_cache = (
@@ -2449,10 +2481,20 @@ def register_handlers(engine: YukikoEngine) -> None:
                 reason,
                 str(getattr(dispatch, "pending_count", 0)),
             )
-            latest_ctx = _latest_queue_task_ctx.get(conversation_id)
-            if isinstance(latest_ctx, dict) and int(latest_ctx.get("seq", -1) or -1) == dispatch_seq:
-                _latest_queue_task_ctx.pop(conversation_id, None)
             pending_count = int(getattr(dispatch, "pending_count", 0) or 0)
+            latest_ctx = _latest_queue_task_ctx.get(conversation_id)
+            if isinstance(latest_ctx, dict):
+                latest_seq_for_cleanup = int(latest_ctx.get("seq", -1) or -1)
+                if latest_seq_for_cleanup == dispatch_seq:
+                    latest_ctx["completed_at"] = datetime.now(timezone.utc)
+                    latest_ctx["completed_status"] = status
+                    latest_ctx["completed_reason"] = reason
+                elif (
+                    latest_seq_for_cleanup > dispatch_seq
+                    and pending_count <= 0
+                    and latest_ctx.get("completed_at")
+                ):
+                    _latest_queue_task_ctx.pop(conversation_id, None)
             if status == "cancelled" and reason in {"process_timeout", "process_error"}:
                 # 队列里还有后续任务时，避免对每条超时都刷屏报错。
                 if pending_count > 0:
@@ -2587,6 +2629,8 @@ def register_handlers(engine: YukikoEngine) -> None:
                 "user_id": payload.user_id,
                 "text": text,
                 "timestamp": payload.timestamp,
+                "high_priority": high_priority,
+                "reply_to_bot": reply_to_bot,
             }
         if dispatch_result.status == "cancelled":
             engine.logger.info(

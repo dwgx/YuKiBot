@@ -4933,6 +4933,15 @@ class YukikoEngine:
                     "acfun.cn/v/ac",
                     "acfun.com/v/ac",
                     "m.acfun.cn/v/",
+                    "v.qq.com/",
+                    "m.v.qq.com/",
+                    "iqiyi.com/",
+                    "iq.com/",
+                    "qiyi.com/",
+                    "youtube.com/",
+                    "youtu.be/",
+                    "tiktok.com/",
+                    "ixigua.com/",
                 )
             ):
                 return url
@@ -5429,7 +5438,7 @@ class YukikoEngine:
             ]
             if not video_url and not image_url and not image_urls:
                 candidate_url = normalize_text(str(item.get("url", "")))
-                if candidate_url and self._looks_like_direct_video_url(candidate_url):
+                if candidate_url and self._looks_like_video_url(candidate_url):
                     video_url = candidate_url
             if video_url:
                 artifact = {
@@ -7266,6 +7275,15 @@ class YukikoEngine:
                     "acfun.cn/v/ac",
                     "acfun.com/v/ac",
                     "m.acfun.cn/v/",
+                    "v.qq.com/",
+                    "m.v.qq.com/",
+                    "iqiyi.com/",
+                    "iq.com/",
+                    "qiyi.com/",
+                    "youtube.com/",
+                    "youtu.be/",
+                    "tiktok.com/",
+                    "ixigua.com/",
                 )
             )
         )
@@ -7365,7 +7383,7 @@ class YukikoEngine:
         if (
             not video_url
             and source_url
-            and self._looks_like_direct_video_url(source_url)
+            and self._looks_like_video_url(source_url)
         ):
             video_url = source_url
         if image_url and image_url not in image_urls:
@@ -7686,7 +7704,7 @@ class YukikoEngine:
                             source if self._looks_like_image_url(source) else ""
                         ),
                         "video_url": (
-                            source if self._looks_like_direct_video_url(source) else ""
+                            source if self._looks_like_video_url(source) else ""
                         ),
                         "snippet": clip_text(
                             normalize_text(str(item.get("point", ""))), 90

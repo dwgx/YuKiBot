@@ -197,6 +197,40 @@ class ToolArgValidationTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertNotIn("unknown_param", sanitized)
 
+    def test_wayback_extract_accepts_snapshot_url_alias(self):
+        """LLM 常把 Wayback 快照参数写成 snapshot_url，应兼容到 url。"""
+        reg = AgentToolRegistry()
+
+        async def _dummy_handler(args: dict, context: dict) -> ToolCallResult:
+            return ToolCallResult(ok=True, display="ok")
+
+        reg.register(
+            ToolSchema(
+                name="wayback_extract",
+                description="提取 Wayback 快照",
+                parameters={
+                    "properties": {
+                        "url": {"type": "string", "description": "快照 URL"},
+                    },
+                    "required": ["url"],
+                },
+                category="web",
+            ),
+            _dummy_handler,
+        )
+
+        sanitized, err = reg._sanitize_and_validate_args(
+            "wayback_extract",
+            {"snapshot_url": "https://web.archive.org/web/20100101000000/https://example.com/"},
+        )
+
+        self.assertEqual(err, "")
+        self.assertEqual(
+            sanitized["url"],
+            "https://web.archive.org/web/20100101000000/https://example.com/",
+        )
+        self.assertNotIn("snapshot_url", sanitized)
+
     def test_string_to_integer_coercion(self):
         """字符串 "12345" 应被转为 int。"""
         reg = _make_registry_with_tools()

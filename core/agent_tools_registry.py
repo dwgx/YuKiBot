@@ -40,6 +40,7 @@ class AgentToolRegistry:
         "memory_audit": {"id": "record_id"},
         "analyze_image": {"image_url": "url", "image": "url"},
         "web_search": {"q": "query", "keyword": "query"},
+        "wayback_extract": {"snapshot_url": "url", "snapshot": "url"},
         "music_play": {"query": "keyword", "song": "keyword", "name": "keyword"},
         "music_search": {"query": "keyword", "song": "keyword", "name": "keyword"},
     }

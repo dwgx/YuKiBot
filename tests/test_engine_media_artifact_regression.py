@@ -61,6 +61,47 @@ class EngineMediaArtifactRegressionTests(unittest.TestCase):
         self.assertEqual(artifact["source_url"], "https://v.douyin.com/demo/")
         self.assertEqual(engine._recent_media_artifact_for_agent(normal_turn), {})
 
+    def test_recent_video_page_artifact_is_not_treated_as_generic_web(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+        engine.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
+        engine.search_followup_cache_enable = True
+        engine.search_followup_cache_ttl_seconds = 1800
+        now = datetime.now(UTC)
+        engine._recent_search_cache = {
+            "group:1:42": {
+                "timestamp": now,
+                "query": "pig god 哔哩哔哩",
+                "summary": "视频信息：来源：https://www.bilibili.com/video/BV1MimxBrEyg",
+                "evidence": [
+                    {
+                        "title": "B站视频",
+                        "source": "https://www.bilibili.com/video/BV1MimxBrEyg",
+                    }
+                ],
+                "choices": [
+                    {
+                        "title": "Pig God",
+                        "url": "https://www.bilibili.com/video/BV1MimxBrEyg",
+                    }
+                ],
+            }
+        }
+        reply_to_bot = EngineMessage(
+            conversation_id="group:1",
+            user_id="42",
+            text="给我",
+            bot_id="bot",
+            reply_to_user_id="bot",
+            reply_to_message_id="100",
+            timestamp=now,
+            trace_id="video-page-artifact-test",
+        )
+
+        artifact = engine._recent_media_artifact_for_agent(reply_to_bot)
+
+        self.assertEqual(artifact["type"], "video")
+        self.assertEqual(artifact["video_url"], "https://www.bilibili.com/video/BV1MimxBrEyg")
+
     def test_recent_web_artifact_injected_for_reply_to_bot(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)
         engine.logger = SimpleNamespace(info=lambda *args, **kwargs: None)
