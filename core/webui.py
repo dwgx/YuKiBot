@@ -3462,7 +3462,7 @@ async def chat_agent_text(request: Request):
             flags=re.IGNORECASE,
         )
         if local_video_ref or local_video_pattern.search(reply_text):
-            reply_text = "解析好了，我直接把视频发出来。"
+            reply_text = "解析好了，正在投递视频。"
 
     sent_message_id = ""
     if reply_text:

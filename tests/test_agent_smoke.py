@@ -596,6 +596,28 @@ class AgentProtectionTests(unittest.TestCase):
         self.assertNotIn("/Users/dwgx", normalized)
         self.assertIn("本地文件路径已隐藏", normalized)
 
+    def test_local_video_final_answer_drops_tool_contradiction(self):
+        video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/4e38bdc60d72_10315127.mp4"
+        text = (
+            "已解析到本地视频文件了，但我这轮可见工具里没有“发送视频/上传文件”的发送类工具，"
+            "所以没法真的把这个 mp4 直接发到群里。 拿到的文件是： "
+            f"`{video_path}` 补一句关键信息：这是非平台 CDN 直链来源，QQ 侧可能不预览。"
+        )
+
+        sanitized = AgentLoop._sanitize_final_text_for_local_media(text, video_path)
+
+        self.assertNotIn("/Users/dwgx", sanitized)
+        self.assertNotIn("没有“发送视频/上传文件”", sanitized)
+        self.assertNotIn("没法真的", sanitized)
+        self.assertIn("投递视频", sanitized)
+
+    def test_local_video_final_answer_keeps_non_contradictory_text(self):
+        video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/a.mp4"
+
+        sanitized = AgentLoop._sanitize_final_text_for_local_media("发你了。", video_path)
+
+        self.assertEqual(sanitized, "发你了。")
+
 
 if __name__ == "__main__":
     unittest.main()

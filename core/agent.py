@@ -5387,26 +5387,60 @@ class AgentLoop:
         path = normalize_text(media_path)
         if not content or not path or not cls._is_local_media_path(path):
             return content
+        delivery_text = "解析好了，正在投递视频。"
+        lower_content = content.lower()
+        contradiction_markers = (
+            "没有“发送视频/上传文件”",
+            "没有发送视频",
+            "没有上传文件",
+            "没有发送类工具",
+            "没有发送工具",
+            "没有上传工具",
+            "没法真的",
+            "没法直接",
+            "没法发",
+            "不能直接",
+            "无法直接",
+            "只能给你路径",
+            "只能把路径",
+            "qq 侧可能不预览",
+            "qq里可能不能",
+            "qq 里可能不能",
+            "不是平台 cdn 直链",
+            "非平台 cdn 直链",
+        )
+        has_local_path = bool(_RE_LOCAL_FILE_REF.search(content))
+        has_contradiction = any(marker in lower_content for marker in contradiction_markers)
+        if has_local_path and has_contradiction:
+            return delivery_text
         slash_path = path.replace("\\", "/")
         variants = {
             path,
             slash_path,
             path.replace("/", "\\"),
+            f"file://{path}",
+            f"file://{slash_path}",
             f"`{path}`",
             f"`{slash_path}`",
+            f"`file://{path}`",
+            f"`file://{slash_path}`",
         }
         cleaned = content
         for variant in sorted(variants, key=len, reverse=True):
             if variant:
                 cleaned = cleaned.replace(variant, "视频文件")
+        cleaned = _RE_LOCAL_FILE_REF.sub("视频文件", cleaned)
         cleaned = re.sub(
             r"(?:直链|路径|本地缓存文件路径)\s*(?:在这|是)?\s*[:：]?\s*`?视频文件`?",
-            "视频我直接发出来了",
+            delivery_text,
             cleaned,
             flags=re.IGNORECASE,
         )
         cleaned = re.sub(r"`?视频文件`?\s*`?视频文件`?", "视频文件", cleaned)
-        return normalize_text(cleaned) or content
+        cleaned = normalize_text(cleaned)
+        if not cleaned or ("视频文件" in cleaned and has_contradiction):
+            return delivery_text
+        return cleaned or content
 
     def _extract_embedded_tool_call_from_text(self, text: str) -> dict[str, Any] | None:
         """从 final_answer 文本中恢复误包裹的工具调用 JSON。"""
