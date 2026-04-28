@@ -60,6 +60,14 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertEqual(state.active_section, "media_search")
         self.assertIn("media_search_request", state.evidence)
 
+    def test_music_request_preselects_music_section_without_url(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "点歌 Never Gonna Give You Up - Rick Astley，直接发语音"
+        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "music_play"])
+        self.assertEqual(state.active_section, "music_audio")
+        self.assertIn("music_request", state.evidence)
+
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         samples = [
@@ -195,6 +203,7 @@ class _Registry:
             "fetch_webpage",
             "parse_video",
             "search_media",
+            "music_play",
             "think",
             "final_answer",
             "navigate_section",
@@ -256,6 +265,12 @@ class _Registry:
             else:
                 data["image_url"] = "https://example.test/image.jpg"
             return ToolCallResult(ok=True, display="media ok", data=data)
+        if name == "music_play":
+            return ToolCallResult(
+                ok=True,
+                display="music ok",
+                data={"audio_file": "/tmp/yukiko/song.mp3", "text": "music ok"},
+            )
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
 
 
@@ -559,6 +574,84 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(registry.calls[0][1]["media_type"], "video")
         self.assertIn("异环新手教程视频", registry.calls[0][1]["query"])
         self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_media_search_tool_image_survives_text_only_final_answer(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    json.dumps(
+                        {
+                            "tool": "search_media",
+                            "args": {"query": "猫咪", "media_type": "image"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "tool": "final_answer",
+                            "args": {"text": "先给你一张猫咪图。"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="找一张猫咪图片发出来",
+            trace_id="navigator-media-image-final-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
+        self.assertEqual(result.image_url, "https://example.test/image.jpg")
+        self.assertEqual(result.image_urls, ["https://example.test/image.jpg"])
+
+    def test_music_llm_timeout_falls_back_to_music_play_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="点歌 Never Gonna Give You Up - Rick Astley，直接发语音",
+            trace_id="navigator-music-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["music_play"])
+        self.assertIn("Never Gonna Give You Up", registry.calls[0][1]["keyword"])
+        self.assertEqual(result.audio_file, "/tmp/yukiko/song.mp3")
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_web_url_llm_timeout_falls_back_to_fetch_tool(self):

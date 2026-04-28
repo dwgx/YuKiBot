@@ -1276,6 +1276,19 @@ class AgentLoop:
             if tool_name == "final_answer":
                 text = str(tool_args.get("text", "")).strip()
                 image_url = str(tool_args.get("image_url", "")).strip()
+                raw_image_urls = tool_args.get("image_urls", [])
+                image_urls: list[str] = []
+                if isinstance(raw_image_urls, list):
+                    image_urls = [
+                        str(u).strip() for u in raw_image_urls if str(u).strip()
+                    ]
+                if image_url and image_url not in image_urls:
+                    image_urls.insert(0, image_url)
+                if image_urls and not image_url:
+                    image_url = image_urls[0]
+                if not image_url and not image_urls:
+                    image_urls = self._last_success_image_urls(steps)
+                    image_url = image_urls[0] if image_urls else ""
                 video_url = str(tool_args.get("video_url", "")).strip()
                 audio_file = str(tool_args.get("audio_file", "")).strip()
                 cover_url = str(tool_args.get("cover_url", "")).strip()
@@ -1342,17 +1355,6 @@ class AgentLoop:
                             )
                     except (json.JSONDecodeError, ValueError):
                         pass
-                # 提取 image_urls（多图）
-                raw_image_urls = tool_args.get("image_urls", [])
-                image_urls: list[str] = []
-                if isinstance(raw_image_urls, list):
-                    image_urls = [
-                        str(u).strip() for u in raw_image_urls if str(u).strip()
-                    ]
-                if image_url and image_url not in image_urls:
-                    image_urls.insert(0, image_url)
-                if image_urls and not image_url:
-                    image_url = image_urls[0]
                 # 禁止占位/伪造媒体链接直接落地，强制模型回到工具链拿真实可发送 URL。
                 invalid_media_urls: list[str] = []
                 for candidate in [image_url, *image_urls, video_url, audio_file]:
@@ -2176,6 +2178,15 @@ class AgentLoop:
             media_type = self._infer_media_type(merged) or "image"
             if query:
                 return "search_media", {"query": query, "media_type": media_type}
+        if (
+            active == "music_audio"
+            and "music_play" in visible_tools
+            and self.tool_registry.has_tool("music_play")
+            and evidence & {"music_request"}
+        ):
+            query = self._extract_music_query_for_fallback(ctx)
+            if query:
+                return "music_play", {"keyword": query}
         if active == "web_research" and evidence & {"url", "external_research_request"}:
             merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
                 " ".join(
@@ -2208,6 +2219,36 @@ class AgentLoop:
             ):
                 return "web_search", {"query": query, "mode": self._infer_search_mode(query)}
         return None
+
+    @staticmethod
+    def _extract_music_query_for_fallback(ctx: AgentContext) -> str:
+        merged = normalize_text(
+            " ".join(
+                str(item or "")
+                for item in (
+                    ctx.message_text,
+                    ctx.original_message_text,
+                    ctx.reply_to_text,
+                )
+            )
+        )
+        merged = _RE_URL_STRIP.sub(" ", merged)
+        merged = normalize_text(merged)
+        merged = re.sub(r"^【[^】]{1,40}】", "", merged).strip()
+        merged = re.sub(
+            r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我)?\s*"
+            r"(点歌|點歌|来首|來首|放歌|播放|播一下|唱一首|听歌|聽歌|找歌|搜索歌曲|发语音|直接发语音)\s*",
+            "",
+            merged,
+            flags=re.IGNORECASE,
+        ).strip()
+        merged = re.sub(
+            r"(直接)?(发|發)?语音[。.!！]*$",
+            "",
+            merged,
+            flags=re.IGNORECASE,
+        ).strip(" ，,。.!！")
+        return clip_text(merged, 120)
 
     @staticmethod
     def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:

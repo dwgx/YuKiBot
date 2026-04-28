@@ -9,6 +9,7 @@ import asyncio
 import base64
 import contextlib
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -33,7 +34,12 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.requests import Request
 
-from core.napcat_compat import build_napcat_diagnostics, call_napcat_bot_api, napcat_file_uri_to_path
+from core.napcat_compat import (
+    build_napcat_diagnostics,
+    build_napcat_file_reference,
+    call_napcat_bot_api,
+    napcat_file_uri_to_path,
+)
 from core.recalled_messages import (
     build_conversation_id as _build_recall_conversation_id,
     list_recalled_messages as _list_recalled_messages,
@@ -3446,11 +3452,84 @@ async def chat_agent_text(request: Request):
 
     # 轻量媒体下发（避免 404 后完全无反馈）
     for img in image_urls[:3]:
-        cq = f"[CQ:image,file={img}]"
+        payload: Any = f"[CQ:image,file={img}]"
+        try:
+            from app_helpers import _build_image_segment
+
+            seg = await _build_image_segment(img)
+            if seg is not None:
+                seg_type = normalize_text(str(getattr(seg, "type", ""))) or "image"
+                seg_data = dict(getattr(seg, "data", {}) or {})
+                payload = [{"type": seg_type, "data": seg_data}]
+        except Exception as exc:
+            _log.warning(
+                "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=image_build | peer=%s | image=%s | error=%s",
+                trace_id,
+                peer_id,
+                clip_text(img, 180),
+                exc,
+            )
         if resolved_type == "group":
-            await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+            await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
         else:
-            await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
+            await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+
+    if audio_file:
+        audio_ref = audio_file
+        lower_audio = audio_file.lower()
+        if not lower_audio.startswith(("http://", "https://", "base64://", "data:")):
+            try:
+                audio_path = (
+                    napcat_file_uri_to_path(audio_file)
+                    if lower_audio.startswith("file://")
+                    else Path(audio_file)
+                )
+                if audio_path is not None and audio_path.exists() and audio_path.is_file():
+                    from app_helpers import _stage_media_for_napcat
+
+                    staged_audio = _stage_media_for_napcat(audio_path, trace_id=trace_id) or audio_path
+                    audio_ref = build_napcat_file_reference(staged_audio, require_exists=True) or str(staged_audio)
+            except Exception as exc:
+                _log.warning(
+                    "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=record_stage | peer=%s | file=%s | error=%s",
+                    trace_id,
+                    peer_id,
+                    clip_text(audio_file, 180),
+                    exc,
+                )
+        if audio_ref:
+            payload = [{"type": "record", "data": {"file": audio_ref}}]
+            try:
+                _log.info(
+                    "media_delivery_record_attempt | source=webui_agent_text | trace=%s | chat=%s | peer=%s | file=%s",
+                    trace_id,
+                    resolved_type,
+                    peer_id,
+                    clip_text(audio_ref, 180),
+                )
+                if resolved_type == "group":
+                    sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
+                else:
+                    sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+                if isinstance(sent, dict):
+                    sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "") or sent_message_id))
+                elif isinstance(sent, int):
+                    sent_message_id = str(sent)
+                _log.info(
+                    "media_delivery_record_ok | source=webui_agent_text | trace=%s | peer=%s | message_id=%s | file=%s",
+                    trace_id,
+                    peer_id,
+                    sent_message_id,
+                    clip_text(audio_ref, 180),
+                )
+            except Exception as exc:
+                _log.warning(
+                    "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=record | peer=%s | file=%s | error=%s",
+                    trace_id,
+                    peer_id,
+                    clip_text(audio_ref, 180),
+                    exc,
+                )
 
     if video_url:
         from app_helpers import _build_video_segment, _stage_media_for_napcat
@@ -3634,7 +3713,7 @@ async def chat_send_image(request: Request):
     if image_url:
         file_value = image_url
     elif image_base64:
-        file_value = image_base64 if image_base64.startswith("base64://") else f"base64://{image_base64}"
+        file_value = _stage_webui_base64_image_for_napcat(image_base64)
     if not file_value:
         raise HTTPException(400, "image_url 或 image_base64 至少提供一个")
 
@@ -3643,17 +3722,74 @@ async def chat_send_image(request: Request):
     except Exception as exc:
         raise HTTPException(400, "peer_id 必须是数字") from exc
 
-    cq = f"[CQ:image,file={file_value}]"
+    message_payload = [{"type": "image", "data": {"file": file_value}}]
     if resolved_type == "group":
-        result = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=cq)
+        result = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=message_payload)
     else:
-        result = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=cq)
+        result = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=message_payload)
     message_id = ""
     if isinstance(result, dict):
         message_id = normalize_text(str(result.get("message_id", "") or result.get("id", "")))
     elif isinstance(result, int):
         message_id = str(result)
     return {"ok": True, "message_id": message_id}
+
+
+def _stage_webui_base64_image_for_napcat(image_base64: str) -> str:
+    raw = normalize_text(image_base64)
+    if raw.startswith("data:image") and ";base64," in raw:
+        raw = raw.split(";base64,", 1)[1]
+    elif raw.startswith("base64://"):
+        raw = raw[len("base64://") :]
+    try:
+        blob = base64.b64decode(raw, validate=True)
+    except Exception as exc:
+        raise HTTPException(400, "image_base64 不是有效 base64") from exc
+    max_bytes = 8 * 1024 * 1024
+    if not blob or len(blob) > max_bytes:
+        raise HTTPException(400, "image_base64 图片为空或超过 8MB")
+    if blob.startswith(b"\xff\xd8\xff"):
+        suffix = ".jpg"
+    elif blob.startswith(b"GIF8"):
+        suffix = ".gif"
+    elif blob.startswith(b"RIFF") and len(blob) >= 12 and blob[8:12] == b"WEBP":
+        suffix = ".webp"
+    elif blob.startswith(b"BM"):
+        suffix = ".bmp"
+    else:
+        suffix = ".png"
+    bot_cfg = {}
+    if _engine is not None and isinstance(getattr(_engine, "config", None), dict):
+        raw_cfg = _engine.config.get("bot", {})
+        if isinstance(raw_cfg, dict):
+            bot_cfg = raw_cfg
+    stage_dir_raw = normalize_text(str(bot_cfg.get("napcat_media_stage_dir", "")))
+    try:
+        from app_helpers import _resolve_napcat_media_stage_dir
+
+        target_dir = _resolve_napcat_media_stage_dir(stage_dir_raw).expanduser()
+        target_dir.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(blob).hexdigest()[:16]
+        target = (target_dir / f"webui_image_{digest}{suffix}").resolve()
+        if not target.exists() or target.stat().st_size != len(blob):
+            target.write_bytes(blob)
+        try:
+            target.chmod(0o644)
+        except Exception:
+            pass
+        _log.info(
+            "media_stage_for_napcat | trace=webui_send_image | src=base64 | staged=%s | size=%d",
+            clip_text(str(target), 180),
+            len(blob),
+        )
+        ref = build_napcat_file_reference(target, require_exists=True)
+        if ref:
+            return ref
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.warning("media_stage_for_napcat_fail | trace=webui_send_image | src=base64 | err=%s", exc)
+    return f"base64://{raw}"
 
 
 @router.post("/chat/message/recall", dependencies=[Depends(_check_auth)])

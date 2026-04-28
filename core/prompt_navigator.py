@@ -577,6 +577,8 @@ class PromptNavigator:
             add("web_research", "url")
         if self._looks_like_media_search_request(ctx):
             add("media_search", "media_search_request")
+        if self._looks_like_music_request(ctx):
+            add("music_audio", "music_request")
         if self._looks_like_web_research_request(ctx):
             add("web_research", "external_research_request")
         if getattr(ctx, "at_other_user_ids", None):
@@ -765,6 +767,34 @@ class PromptNavigator:
             "search",
         )
         return any(cue in text for cue in media_cues) and any(cue in text for cue in action_cues)
+
+    @staticmethod
+    def _looks_like_music_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text or _URL_RE.search(text):
+            return False
+        cues = (
+            "点歌",
+            "點歌",
+            "来首",
+            "來首",
+            "放歌",
+            "播放音乐",
+            "播首",
+            "播一下",
+            "听歌",
+            "聽歌",
+            "找歌",
+            "搜索歌曲",
+            "music",
+            "song",
+        )
+        return any(cue in text for cue in cues)
 
 
 def _dedupe(items: list[str]) -> list[str]:
