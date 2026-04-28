@@ -23,6 +23,7 @@ import httpx
 
 from utils.text import clip_text, normalize_text
 from utils.intent import looks_like_video_request as _shared_video_request
+from core import prompt_loader as _pl
 from core.tools_types import ToolResult
 from core.tools_types import _unwrap_redirect_url, _normalize_multimodal_query, _is_known_image_signature
 from utils.process_compat import macos_subprocess_kwargs, resolve_executable_for_spawn

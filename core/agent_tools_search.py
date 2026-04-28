@@ -223,51 +223,63 @@ def _infer_media_search_type(query: str, explicit: str = "") -> str:
     compact = re.sub(r"\s+", "", text)
     if any(cue in compact for cue in ("gif", "动图", "表情动图")):
         return "gif"
-    if any(
-        cue in compact
-        for cue in (
-            "视频",
-            "影片",
-            "短片",
-            "片段",
-            "教程视频",
-            "youtube",
-            "b站",
-            "bilibili",
-            "抖音",
-            "douyin",
-            "快手",
-            "kuaishou",
-            "acfun",
-            "爱奇艺",
-            "iqiyi",
-            "腾讯视频",
-        )
-    ):
+    video_cues = (
+        "视频",
+        "影片",
+        "短片",
+        "片段",
+        "教程视频",
+        "youtube",
+        "b站",
+        "bilibili",
+        "抖音",
+        "douyin",
+        "快手",
+        "kuaishou",
+        "acfun",
+        "爱奇艺",
+        "iqiyi",
+        "腾讯视频",
+    )
+    image_cues = (
+        "图片",
+        "图",
+        "搜图",
+        "找图",
+        "来张",
+        "壁纸",
+        "头像",
+        "配图",
+        "照片",
+        "梗图",
+        "猫图",
+        "表情包",
+        "贴图",
+    )
+    video_compact = re.sub(
+        r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
+        r"(?:视频|影片|短片|片段|video|clip)",
+        "",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    image_compact = re.sub(
+        r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
+        r"(?:图片|图|壁纸|头像|配图|照片|image|photo|picture|wallpaper|avatar)",
+        "",
+        compact,
+        flags=re.IGNORECASE,
+    )
+    video_hit = any(cue in video_compact for cue in video_cues) or bool(
+        re.search(r"\b(?:video|movie|clip)\b", video_compact)
+    )
+    image_hit = any(cue in image_compact for cue in image_cues) or bool(
+        re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", image_compact)
+    )
+    if video_hit:
         return "video"
-    if any(
-        cue in compact
-        for cue in (
-            "图片",
-            "图",
-            "搜图",
-            "找图",
-            "来张",
-            "壁纸",
-            "头像",
-            "配图",
-            "照片",
-            "梗图",
-            "猫图",
-            "表情包",
-            "贴图",
-        )
-    ):
+    if image_hit:
         return "image"
-    if re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", text):
-        return "image"
-    if re.search(r"\b(?:video|movie|clip)\b", text):
-        return "video"
     return "image"
 
 

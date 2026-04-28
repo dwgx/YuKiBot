@@ -604,7 +604,7 @@ class AgentPromptNavigatorTests(unittest.TestCase):
             bot_id="bot",
             is_private=False,
             mentioned=True,
-            message_text="那张猫图发一下",
+            message_text="那张猫图发一下，不要发视频",
             reply_to_text="解析好了，我直接把视频发出来。",
             trace_id="navigator-media-image-reply-video-test",
         )
