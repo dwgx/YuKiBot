@@ -1288,7 +1288,21 @@ class YukikoEngine:
             normalize_text(str(trigger.reason)).lower() == "ai_router_candidate"
         )
         if not trigger.should_handle and not trigger_candidate:
-            if self._looks_like_recent_media_followup(message, text):
+            if self._looks_like_structural_video_entrypoint(message, text):
+                self.logger.info(
+                    "structural_video_trigger | trace=%s | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
+                    message.trace_id,
+                    message.conversation_id,
+                    message.user_id,
+                    trigger.reason,
+                    clip_text(text, 80),
+                )
+                trigger.should_handle = True
+                trigger.reason = "structural_video_link"
+                trigger.followup_candidate = True
+                trigger.scene_hint = "video_url"
+                trigger.priority = max(int(getattr(trigger, "priority", 0) or 0), 72)
+            elif self._looks_like_recent_media_followup(message, text):
                 self.logger.info(
                     "recent_media_followup_trigger | trace=%s | 会话=%s | 用户=%s | 原因=%s | 文本=%s",
                     message.trace_id,
@@ -3042,6 +3056,22 @@ class YukikoEngine:
     ) -> tuple[str, dict[str, Any], str]:
         _ = (message, text)
         return "", {}, ""
+
+    def _looks_like_structural_video_entrypoint(
+        self, message: EngineMessage, text: str
+    ) -> bool:
+        """Allow concrete video links into Prompt Navigator even without @."""
+
+        if message.is_private or message.mentioned:
+            return False
+        if message.at_other_user_only:
+            return False
+
+        content = normalize_text(self._extract_multimodal_user_text(text) or text)
+        if not content:
+            return False
+
+        return bool(self._extract_first_video_url_from_text(content))
 
     def _should_prefer_router_for_plain_text(
         self, message: EngineMessage, text: str, trigger: Any

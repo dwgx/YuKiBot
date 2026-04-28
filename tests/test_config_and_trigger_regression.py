@@ -5,6 +5,7 @@ import unittest
 
 from core.config_templates import _built_in_config_defaults
 from core.engine import YukikoEngine
+from core.engine_types import EngineMessage
 from core.sticker import _QQ_DATA_ROOTS
 from core.trigger import TriggerEngine, TriggerInput
 
@@ -156,6 +157,34 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
             any(item.endswith("/.config/QQ") for item in normalized),
             normalized,
         )
+
+    def test_structural_video_link_can_wake_without_mention(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+
+        message = EngineMessage(
+            conversation_id="group:901738883",
+            user_id="136666451",
+            text="7.17 复制打开抖音，看看【刚满十八的老登的作品】 https://v.douyin.com/iI54zStBq0w/",
+            mentioned=False,
+            is_private=False,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        self.assertTrue(engine._looks_like_structural_video_entrypoint(message, message.text))
+
+    def test_structural_video_wake_does_not_match_plain_web_link(self) -> None:
+        engine = YukikoEngine.__new__(YukikoEngine)
+
+        message = EngineMessage(
+            conversation_id="group:901738883",
+            user_id="136666451",
+            text="看看 https://skiapi.dev",
+            mentioned=False,
+            is_private=False,
+            timestamp=datetime.now(timezone.utc),
+        )
+
+        self.assertFalse(engine._looks_like_structural_video_entrypoint(message, message.text))
 
 
 if __name__ == "__main__":
