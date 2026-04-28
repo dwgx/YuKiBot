@@ -76,6 +76,17 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertEqual(state.active_section, "music_audio")
         self.assertIn("music_request", state.evidence)
 
+    def test_sticker_request_preselects_sticker_section(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "发一个点赞 QQ 表情"
+        state = nav.initial_state(
+            ctx, ["think", "final_answer", "navigate_section", "send_face"]
+        )
+        self.assertEqual(state.active_section, "sticker_emoji")
+        self.assertIn("sticker_request", state.evidence)
+        self.assertIn("send_face", nav.scoped_tools(state))
+
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         samples = [
@@ -212,6 +223,9 @@ class _Registry:
             "parse_video",
             "search_media",
             "music_play",
+            "send_face",
+            "send_emoji",
+            "send_sticker",
             "think",
             "final_answer",
             "navigate_section",
@@ -278,6 +292,12 @@ class _Registry:
                 ok=True,
                 display="music ok",
                 data={"audio_file": "/tmp/yukiko/song.mp3", "text": "music ok"},
+            )
+        if name in {"send_face", "send_emoji", "send_sticker"}:
+            return ToolCallResult(
+                ok=True,
+                display=f"{name} ok",
+                data={"sent": True, "query": args.get("query", "")},
             )
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
 
@@ -694,6 +714,35 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(registry.calls[0][1]["title"], "Never Gonna Give You Up")
         self.assertEqual(registry.calls[0][1]["artist"], "Rick Astley")
         self.assertEqual(result.audio_file, "/tmp/yukiko/song.mp3")
+
+    def test_sticker_llm_timeout_falls_back_to_send_face_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="发一个点赞 QQ 表情",
+            trace_id="navigator-sticker-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["send_face"])
+        self.assertEqual(registry.calls[0][1]["query"], "赞")
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_web_url_llm_timeout_falls_back_to_fetch_tool(self):

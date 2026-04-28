@@ -218,6 +218,7 @@ prompt_navigator:
       fallback_sections:
       - web_research
       - multimodal_media
+      - sticker_emoji
       - memory_knowledge
       - fallback_debug
       failure_policy: 不确定任务类型时，用一句话澄清；发现缺工具时切分区。
@@ -230,12 +231,15 @@ prompt_navigator:
       - analyze_voice
       - analyze_local_video
       - split_video
+      - learn_sticker
+      - correct_sticker
       - think
       - final_answer
       - navigate_section
-      instructions: 图片理解用 analyze_image，提取文字用 ocr_image，语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。
+      instructions: 图片理解用 analyze_image，提取文字用 ocr_image，语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。用户明确说学习/纠正表情包时用 learn_sticker/correct_sticker。
       fallback_sections:
       - video_url
+      - sticker_emoji
       - creative_generation
       - fallback_debug
       failure_policy: 媒体缺失或无法读取时，说明缺少哪类媒体并请求用户重发或改发直链。
@@ -279,6 +283,28 @@ prompt_navigator:
       - memory_knowledge
       - fallback_debug
       failure_policy: 搜索无结果时换一个更具体查询；仍失败就说明查不到的范围和原因。
+    sticker_emoji:
+      name: QQ 表情与表情包
+      when_to_use: 用户要发送 QQ 经典表情、表情包、贴纸、随机表情，或学习/纠正表情包。
+      tools:
+      - send_face
+      - send_emoji
+      - send_sticker
+      - list_faces
+      - list_emojis
+      - browse_sticker_categories
+      - learn_sticker
+      - correct_sticker
+      - set_msg_emoji_like
+      - think
+      - final_answer
+      - navigate_section
+      instructions: 独立发送 QQ 经典表情用 send_face；发送表情包/贴纸用 send_emoji 或 send_sticker。不确定可用内容时先 list_faces/list_emojis/browse_sticker_categories。引用某条消息点表情回应时用 set_msg_emoji_like。学习或纠正表情包用 learn_sticker/correct_sticker。
+      fallback_sections:
+      - multimodal_media
+      - media_search
+      - fallback_debug
+      failure_policy: 表情未命中时先查列表或换随机表情包，不要把表情请求当普通文本回复。
     media_search:
       name: 图片视频检索与推送
       when_to_use: 用户想看、找、发某个主题的视频、图片、壁纸、头像、GIF，但没有给出具体可解析链接。

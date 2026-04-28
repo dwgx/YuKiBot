@@ -124,6 +124,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 "fallback_sections": [
                     "web_research",
                     "multimodal_media",
+                    "sticker_emoji",
                     "memory_knowledge",
                     "fallback_debug",
                 ],
@@ -138,6 +139,8 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                     "analyze_voice",
                     "analyze_local_video",
                     "split_video",
+                    "learn_sticker",
+                    "correct_sticker",
                     "think",
                     "final_answer",
                     "navigate_section",
@@ -145,8 +148,9 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 "instructions": (
                     "优先针对用户当前附带媒体或引用媒体。图片理解用 analyze_image，提取文字用 ocr_image，"
                     "语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。"
+                    "用户明确说学习/纠正表情包时用 learn_sticker/correct_sticker。"
                 ),
-                "fallback_sections": ["video_url", "creative_generation", "fallback_debug"],
+                "fallback_sections": ["video_url", "sticker_emoji", "creative_generation", "fallback_debug"],
                 "failure_policy": "媒体缺失或无法读取时，说明缺少哪类媒体并请求用户重发或改发直链。",
             },
             "video_url": {
@@ -191,6 +195,31 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 ),
                 "fallback_sections": ["video_url", "download_resources", "memory_knowledge", "fallback_debug"],
                 "failure_policy": "搜索无结果时换一个更具体查询；仍失败就说明查不到的范围和原因。",
+            },
+            "sticker_emoji": {
+                "name": "QQ 表情与表情包",
+                "when_to_use": "用户要发送 QQ 经典表情、表情包、贴纸、随机表情，或学习/纠正表情包。",
+                "tools": [
+                    "send_face",
+                    "send_emoji",
+                    "send_sticker",
+                    "list_faces",
+                    "list_emojis",
+                    "browse_sticker_categories",
+                    "learn_sticker",
+                    "correct_sticker",
+                    "set_msg_emoji_like",
+                    "think",
+                    "final_answer",
+                    "navigate_section",
+                ],
+                "instructions": (
+                    "独立发送 QQ 经典表情用 send_face；发送表情包/贴纸用 send_emoji 或 send_sticker。"
+                    "不确定可用内容时先 list_faces/list_emojis/browse_sticker_categories。"
+                    "引用某条消息点表情回应时用 set_msg_emoji_like。学习或纠正表情包用 learn_sticker/correct_sticker。"
+                ),
+                "fallback_sections": ["multimodal_media", "media_search", "fallback_debug"],
+                "failure_policy": "表情未命中时先查列表或换随机表情包，不要把表情请求当普通文本回复。",
             },
             "media_search": {
                 "name": "图片视频检索与推送",
@@ -575,6 +604,8 @@ class PromptNavigator:
             add("download_resources", "download_file_extension")
         if urls:
             add("web_research", "url")
+        if self._looks_like_sticker_request(ctx):
+            add("sticker_emoji", "sticker_request")
         if self._looks_like_media_search_request(ctx):
             add("media_search", "media_search_request")
         if self._looks_like_music_request(ctx):
@@ -772,6 +803,58 @@ class PromptNavigator:
             "search",
         )
         return any(cue in text for cue in media_cues) and any(cue in text for cue in action_cues)
+
+    @staticmethod
+    def _looks_like_sticker_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        sticker_cues = (
+            "表情包",
+            "表情",
+            "贴纸",
+            "貼紙",
+            "emoji",
+            "emote",
+            "mface",
+            "qq表情",
+            "经典表情",
+            "經典表情",
+            "doge",
+            "吃瓜",
+            "点赞",
+            "點讚",
+            "点个赞",
+        )
+        action_cues = (
+            "发",
+            "發",
+            "来",
+            "來",
+            "给我",
+            "給我",
+            "整",
+            "随机",
+            "隨機",
+            "学习",
+            "學習",
+            "添加",
+            "收录",
+            "收錄",
+            "纠正",
+            "糾正",
+            "扫描",
+            "掃描",
+            "list",
+            "send",
+            "random",
+        )
+        return any(cue in text for cue in sticker_cues) and any(cue in text for cue in action_cues)
 
     @staticmethod
     def _looks_like_music_request(ctx: Any) -> bool:

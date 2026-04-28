@@ -2102,6 +2102,7 @@ class AgentLoop:
             "download_file_extension",
             "recent_media_artifact",
             "media_search_request",
+            "sticker_request",
         }:
             return True
         if ctx.media_summary or ctx.reply_media_summary:
@@ -2192,6 +2193,14 @@ class AgentLoop:
             music_args = self._extract_music_args_for_fallback(ctx)
             if music_args.get("keyword") or music_args.get("title"):
                 return "music_play", music_args
+        if active == "sticker_emoji" and evidence & {"sticker_request"}:
+            sticker_tool, sticker_args = self._extract_sticker_args_for_fallback(ctx)
+            if (
+                sticker_tool in visible_tools
+                and self.tool_registry.has_tool(sticker_tool)
+                and sticker_args
+            ):
+                return sticker_tool, sticker_args
         if active == "web_research" and evidence & {"url", "external_research_request"}:
             merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
                 " ".join(
@@ -2259,6 +2268,45 @@ class AgentLoop:
         if artist:
             args["artist"] = clip_text(artist, 80)
         return args
+
+    @staticmethod
+    def _extract_sticker_args_for_fallback(ctx: AgentContext) -> tuple[str, dict[str, str]]:
+        text = normalize_text(str(ctx.message_text or ctx.original_message_text or ctx.reply_to_text or ""))
+        text = re.sub(r"【[^】]{1,40}】", " ", text)
+        compact = re.sub(r"\s+", "", text.lower())
+        if any(cue in compact for cue in ("点赞", "點讚", "点个赞", "讚", "赞", "like")):
+            return "send_face", {"query": "赞"}
+        if any(cue in compact for cue in ("doge", "吃瓜", "玫瑰", "爱心", "ok", "微笑", "哭", "开心")):
+            query = normalize_text(
+                re.sub(
+                    r"(发|發|来|來|给我|給我|一个|一個|表情包|表情|qq|经典|經典|贴纸|貼紙)",
+                    " ",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            ).strip(" ，,。.!！")
+            return "send_face", {"query": query or "随机"}
+        if any(cue in compact for cue in ("qq表情", "经典表情", "經典表情")):
+            query = normalize_text(
+                re.sub(
+                    r"(发|發|来|來|给我|給我|一个|一個|qq|经典|經典|表情)",
+                    " ",
+                    text,
+                    flags=re.IGNORECASE,
+                )
+            ).strip(" ，,。.!！")
+            return "send_face", {"query": query or "随机"}
+        query = normalize_text(
+            re.sub(
+                r"(发|發|来|來|给我|給我|一个|一個|表情包|表情|贴纸|貼紙|emoji|emote)",
+                " ",
+                text,
+                flags=re.IGNORECASE,
+            )
+        ).strip(" ，,。.!！")
+        if not query or any(cue in compact for cue in ("随机", "隨機", "random")):
+            query = "随机"
+        return "send_emoji", {"query": clip_text(query, 80)}
 
     @staticmethod
     def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:
