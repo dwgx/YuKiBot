@@ -3495,6 +3495,7 @@ async def chat_agent_text(request: Request):
 
     if audio_file:
         audio_ref = audio_file
+        audio_ref_plain = ""
         lower_audio = audio_file.lower()
         if not lower_audio.startswith(("http://", "https://", "base64://", "data:")):
             try:
@@ -3504,10 +3505,24 @@ async def chat_agent_text(request: Request):
                     else Path(audio_file)
                 )
                 if audio_path is not None and audio_path.exists() and audio_path.is_file():
+                    if audio_path.suffix.lower() != ".silk":
+                        silk_sibling = audio_path.with_suffix(".silk")
+                        try:
+                            if silk_sibling.exists() and silk_sibling.is_file() and silk_sibling.stat().st_size > 1024:
+                                _log.info(
+                                    "media_delivery_record_silk_prefer | source=webui_agent_text | trace=%s | src=%s | silk=%s",
+                                    trace_id,
+                                    clip_text(str(audio_path), 160),
+                                    clip_text(str(silk_sibling), 160),
+                                )
+                                audio_path = silk_sibling
+                        except Exception:
+                            pass
                     from app_helpers import _stage_media_for_napcat
 
                     staged_audio = _stage_media_for_napcat(audio_path, trace_id=trace_id) or audio_path
                     audio_ref = build_napcat_file_reference(staged_audio, require_exists=True) or str(staged_audio)
+                    audio_ref_plain = str(staged_audio.expanduser().resolve())
             except Exception as exc:
                 _log.warning(
                     "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=record_stage | peer=%s | file=%s | error=%s",
@@ -3517,37 +3532,55 @@ async def chat_agent_text(request: Request):
                     exc,
                 )
         if audio_ref:
-            payload = [{"type": "record", "data": {"file": audio_ref}}]
-            try:
+            refs = [audio_ref]
+            if audio_ref_plain and audio_ref_plain not in refs:
+                refs.append(audio_ref_plain)
+            for ref_index, ref in enumerate(refs, 1):
+                payload = [{"type": "record", "data": {"file": ref}}]
+                try:
+                    _log.info(
+                        "media_delivery_record_attempt | source=webui_agent_text | trace=%s | chat=%s | peer=%s | attempt=%d/%d | file=%s",
+                        trace_id,
+                        resolved_type,
+                        peer_id,
+                        ref_index,
+                        len(refs),
+                        clip_text(ref, 180),
+                    )
+                    if resolved_type == "group":
+                        sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
+                    else:
+                        sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+                    if isinstance(sent, dict):
+                        sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "") or sent_message_id))
+                    elif isinstance(sent, int):
+                        sent_message_id = str(sent)
+                    _log.info(
+                        "media_delivery_record_ok | source=webui_agent_text | trace=%s | peer=%s | message_id=%s | file=%s",
+                        trace_id,
+                        peer_id,
+                        sent_message_id,
+                        clip_text(ref, 180),
+                    )
+                    break
+                except Exception as exc:
+                    _log.warning(
+                        "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=record | peer=%s | attempt=%d/%d | file=%s | error=%s",
+                        trace_id,
+                        peer_id,
+                        ref_index,
+                        len(refs),
+                        clip_text(ref, 180),
+                        exc,
+                    )
+                    continue
+            else:
                 _log.info(
-                    "media_delivery_record_attempt | source=webui_agent_text | trace=%s | chat=%s | peer=%s | file=%s",
+                    "media_delivery_record_give_up | source=webui_agent_text | trace=%s | chat=%s | peer=%s | file=%s",
                     trace_id,
                     resolved_type,
                     peer_id,
                     clip_text(audio_ref, 180),
-                )
-                if resolved_type == "group":
-                    sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
-                else:
-                    sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
-                if isinstance(sent, dict):
-                    sent_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "") or sent_message_id))
-                elif isinstance(sent, int):
-                    sent_message_id = str(sent)
-                _log.info(
-                    "media_delivery_record_ok | source=webui_agent_text | trace=%s | peer=%s | message_id=%s | file=%s",
-                    trace_id,
-                    peer_id,
-                    sent_message_id,
-                    clip_text(audio_ref, 180),
-                )
-            except Exception as exc:
-                _log.warning(
-                    "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=record | peer=%s | file=%s | error=%s",
-                    trace_id,
-                    peer_id,
-                    clip_text(audio_ref, 180),
-                    exc,
                 )
 
     if video_url:
