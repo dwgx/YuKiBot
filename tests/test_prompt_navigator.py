@@ -1120,6 +1120,23 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(registry.calls, [])
         self.assertEqual(result.reason, "agent_llm_timeout")
 
+    def test_search_media_uses_media_tool_timeout_budget(self):
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=_Registry(),
+            config={
+                "agent": {
+                    "enable": True,
+                    "tool_timeout_seconds": 30,
+                    "tool_timeout_seconds_media": 60,
+                },
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+
+        self.assertGreaterEqual(loop._resolve_tool_timeout_seconds("search_media", False), 120.0)
+
     def test_media_search_fallback_prefers_current_image_request_over_reply_video_text(self):
         registry = _Registry()
         loop = AgentLoop(

@@ -4439,6 +4439,8 @@ class AgentLoop:
             return float(max(float(self.tool_timeout_seconds_media), 55.0))
         if tool_name == "parse_video":
             return float(max(float(self.tool_timeout_seconds_media), 120.0))
+        if tool_name == "search_media":
+            return float(max(float(self.tool_timeout_seconds_media), 120.0))
         if has_media or tool_name in heavy_tools:
             return float(self.tool_timeout_seconds_media)
         return float(self.tool_timeout_seconds)
