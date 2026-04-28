@@ -492,6 +492,18 @@ class _FailParseRegistry(_Registry):
         return await super().call(name, args, context)
 
 
+class _WaybackTimelineFailRegistry(_Registry):
+    async def call(self, name: str, args: dict, context: dict) -> ToolCallResult:
+        if name == "wayback_timeline":
+            self.calls.append((name, dict(args)))
+            return ToolCallResult(
+                ok=False,
+                display="timeline failed:",
+                error="timeline_failed",
+            )
+        return await super().call(name, args, context)
+
+
 class AgentPromptNavigatorTests(unittest.TestCase):
     def test_agent_can_switch_section_then_call_new_tool(self):
         registry = _Registry()
@@ -898,6 +910,48 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(registry.calls[0][1]["url"], "https://dwgx.top")
         self.assertEqual(result.reply_text, "查到归档了。")
 
+    def test_wayback_timeline_failure_falls_back_to_lookup(self):
+        registry = _WaybackTimelineFailRegistry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    json.dumps(
+                        {
+                            "tool": "wayback_timeline",
+                            "args": {"url": "gov.cn", "limit": 500},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="网络时光机 看 gov.cn 以前有什么",
+            trace_id="navigator-wayback-timeline-fallback-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["wayback_timeline", "wayback_lookup"])
+        self.assertEqual(registry.calls[1][1]["url"], "gov.cn")
+        self.assertEqual(registry.calls[1][1]["limit"], 20)
+        self.assertIn("wayback ok", result.reply_text)
+
     def test_general_chat_timeout_uses_tiny_navigator_retry_before_giving_up(self):
         registry = _Registry()
         loop = AgentLoop(
@@ -981,6 +1035,58 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(
             registry.calls[0][1],
             {"query": "异环宣传片", "media_type": "video"},
+        )
+        self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
+        self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
+
+    def test_general_timeout_section_retry_can_seed_next_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    asyncio.TimeoutError(),
+                    json.dumps(
+                        {
+                            "section_id": "media_search",
+                            "reason": "用户要找并发送视频",
+                            "tool": "search_media",
+                            "args": {
+                                "query": "你会选择什么男孩",
+                                "media_type": "video",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                    asyncio.TimeoutError(),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="发一个 你会选择什么男孩的视频",
+            trace_id="navigator-section-seeded-tool-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
+        self.assertEqual(
+            registry.calls[0][1],
+            {"query": "你会选择什么男孩", "media_type": "video"},
         )
         self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
         self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))

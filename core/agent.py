@@ -133,6 +133,7 @@ class AgentContext:
     related_memories: list[str] = field(default_factory=list)
     native_tools: list[str] = field(default_factory=list)
     navigator_state: NavigatorState | None = None
+    navigator_pending_tool_retry: tuple[str, dict[str, Any]] | None = None
     user_profile_summary: str = ""
     preferred_name: str = ""
     recent_speakers: list[tuple[str, str, str]] = field(default_factory=list)
@@ -983,13 +984,23 @@ class AgentLoop:
                             ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
                         )
                     else:
-                        retry_tool = await self._navigator_timeout_tool_retry(
-                            ctx=ctx,
-                            step_idx=step_idx,
-                            tool_calls_made=tool_calls_made,
-                            steps=steps,
-                            remaining=remaining,
-                        )
+                        retry_tool = self._consume_navigator_pending_tool_retry(ctx)
+                        if retry_tool:
+                            _log.info(
+                                "navigator_pending_tool_retry | trace=%s | step=%d | section=%s | tool=%s",
+                                ctx.trace_id,
+                                step_idx,
+                                ctx.navigator_state.active_section if ctx.navigator_state else "",
+                                retry_tool[0],
+                            )
+                        else:
+                            retry_tool = await self._navigator_timeout_tool_retry(
+                                ctx=ctx,
+                                step_idx=step_idx,
+                                tool_calls_made=tool_calls_made,
+                                steps=steps,
+                                remaining=remaining,
+                            )
                         if retry_tool:
                             tool_name_retry, tool_args_retry = retry_tool
                             parsed = {"tool": tool_name_retry, "args": dict(tool_args_retry)}
@@ -1016,6 +1027,11 @@ class AgentLoop:
                                 remaining=remaining,
                             )
                         if retry_section:
+                            if retry_section[2]:
+                                ctx.navigator_pending_tool_retry = (
+                                    retry_section[2],
+                                    dict(retry_section[3] or {}),
+                                )
                             parsed = {
                                 "tool": NAVIGATE_SECTION_TOOL,
                                 "args": {
@@ -2347,6 +2363,35 @@ class AgentLoop:
                 return "fetch_webpage", {"url": url}
         return None
 
+    def _consume_navigator_pending_tool_retry(
+        self, ctx: AgentContext
+    ) -> tuple[str, dict[str, Any]] | None:
+        pending = ctx.navigator_pending_tool_retry
+        ctx.navigator_pending_tool_retry = None
+        if not pending:
+            return None
+        tool_name, tool_args = pending
+        tool_name = normalize_text(str(tool_name))
+        if not tool_name or not isinstance(tool_args, dict):
+            return None
+        visible_tools = [
+            normalize_text(str(name))
+            for name in (ctx.native_tools or [])
+            if normalize_text(str(name))
+        ]
+        if tool_name not in visible_tools or not self.tool_registry.has_tool(tool_name):
+            _log.info(
+                "navigator_pending_tool_retry_invalid | trace=%s | section=%s | tool=%s | visible=%s",
+                ctx.trace_id,
+                ctx.navigator_state.active_section if ctx.navigator_state else "",
+                tool_name or "-",
+                ",".join(visible_tools),
+            )
+            return None
+        if tool_name in {"think", "final_answer", NAVIGATE_SECTION_TOOL}:
+            return None
+        return tool_name, dict(tool_args)
+
     async def _navigator_timeout_tool_retry(
         self,
         *,
@@ -2410,6 +2455,11 @@ class AgentLoop:
         ]
         if tool_docs:
             lines.append("工具 schema/说明:\n" + clip_text(tool_docs, 3600))
+        if active == "web_research" and "wayback_lookup" in domain_tools:
+            lines.append(
+                "网络时光机/历史网页/Wayback 任务默认先调用 wayback_lookup；"
+                "只有用户明确要求按年份统计/时间线时才用 wayback_timeline。"
+            )
         if section.fallback_sections:
             lines.append(
                 "如果当前分区明显不适合，本轮不要硬答；返回当前分区里最接近的探索工具，"
@@ -2525,11 +2575,12 @@ class AgentLoop:
         tool_calls_made: int,
         steps: list[dict[str, Any]],
         remaining: float,
-    ) -> tuple[str, str] | None:
+    ) -> tuple[str, str, str, dict[str, Any]] | None:
         """Use a tiny LLM router prompt when the full Agent prompt stalls before any tool.
 
-        This keeps free-text routing prompt-driven: the retry can only choose a
-        Navigator section, never synthesize a domain tool call.
+        This keeps free-text routing prompt-driven: the retry can choose a
+        Navigator section and, when it is confident, a first tool from that
+        target section. The Agent validates both before execution.
         """
         if tool_calls_made > 0 or steps or step_idx != 0:
             return None
@@ -2546,12 +2597,27 @@ class AgentLoop:
             return None
         lines = [
             "你是 YuKiKo 的 Prompt Navigator 分区选择器。",
-            '只输出 JSON: {"section_id":"分区ID","reason":"一句话原因"}。',
-            "不能回答用户，不能选择具体工具，只能选择最合适的分区。",
+            '只输出 JSON: {"section_id":"分区ID","reason":"一句话原因","tool":"可选工具名","args":{}}。',
+            "不能回答用户。先选择最合适分区；如果目标分区需要马上调用工具且参数足够，就填该分区真实工具名和 args。",
+            "tool 可以为空；不能填 think、final_answer、navigate_section；不能选择目标分区 tools 以外的工具。",
             "分区目录:",
         ]
+        visible = {
+            normalize_text(str(name))
+            for name in (state.visible_tools or [])
+            if normalize_text(str(name))
+        }
         for sid, section in navigator.config.sections.items():
-            lines.append(f"- {sid}: {section.when_to_use or section.name or sid}")
+            tools = [
+                name
+                for name in section.tools
+                if name in visible and self.tool_registry.has_tool(name)
+            ]
+            lines.append(
+                f"- {sid}: {section.when_to_use or section.name or sid} | "
+                f"tools={', '.join(tools) if tools else '-'} | "
+                f"instructions={clip_text(section.instructions, 240)}"
+            )
         user_parts = [
             f"当前消息: {clip_text(normalize_text(ctx.message_text), 240)}",
         ]
@@ -2568,6 +2634,12 @@ class AgentLoop:
                     ]
                 )
             )
+        artifact = ctx.recent_media_artifact if isinstance(ctx.recent_media_artifact, dict) else {}
+        if artifact:
+            user_parts.append(
+                "最近媒体 artifact: "
+                + clip_text(json.dumps(artifact, ensure_ascii=False, default=str), 360)
+            )
         try:
             raw = await asyncio.wait_for(
                 self.model_client.chat_text_with_retry(
@@ -2575,7 +2647,7 @@ class AgentLoop:
                         {"role": "system", "content": "\n".join(lines)},
                         {"role": "user", "content": "\n".join(user_parts)},
                     ],
-                    max_tokens=120,
+                    max_tokens=220,
                     retries=0,
                     backoff=0.0,
                 ),
@@ -2598,7 +2670,43 @@ class AgentLoop:
             return None
         if section_id not in navigator.config.sections:
             return None
-        return section_id, reason
+        tool_name = normalize_text(
+            str(
+                payload.get("tool")
+                or payload.get("name")
+                or payload.get("tool_name")
+                or ""
+            )
+        )
+        tool_args = payload.get("args", {})
+        if not isinstance(tool_args, dict):
+            tool_args = {}
+        if tool_name.lower() in {"", "none", "null", "无", "不调用"}:
+            tool_name = ""
+            tool_args = {}
+        if tool_name:
+            target = navigator.config.sections[section_id]
+            allowed = {
+                normalize_text(str(name))
+                for name in target.tools
+                if normalize_text(str(name))
+            }
+            if (
+                tool_name not in allowed
+                or tool_name not in visible
+                or tool_name in {"think", "final_answer", NAVIGATE_SECTION_TOOL}
+                or not self.tool_registry.has_tool(tool_name)
+            ):
+                _log.info(
+                    "navigator_timeout_section_retry_tool_invalid | trace=%s | step=%d | section=%s | tool=%s",
+                    ctx.trace_id,
+                    step_idx,
+                    section_id,
+                    tool_name or "-",
+                )
+                tool_name = ""
+                tool_args = {}
+        return section_id, reason, tool_name, tool_args
 
     @staticmethod
     def _parse_json_object_from_text(text: str) -> dict[str, Any] | None:
@@ -4246,6 +4354,23 @@ class AgentLoop:
     ) -> tuple[str, dict[str, Any]] | None:
         query = normalize_text(str(args.get("query", "")))
         err = normalize_text(error).lower()
+        if tool_name == "wayback_timeline":
+            url = normalize_text(str(args.get("url", "")))
+            if url:
+                payload: dict[str, Any] = {"url": url}
+                limit_raw = args.get("limit", 8)
+                try:
+                    limit = int(limit_raw)
+                except (TypeError, ValueError):
+                    limit = 8
+                payload["limit"] = min(max(limit, 1), 20)
+                year_raw = args.get("year")
+                if year_raw not in (None, ""):
+                    try:
+                        payload["year"] = int(year_raw)
+                    except (TypeError, ValueError):
+                        pass
+                return "wayback_lookup", payload
         if tool_name in {"smart_download", "download_file"} and err.startswith(
             "download_untrusted_source"
         ):
