@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import urlparse
 
 from core.agent_tools import _handle_send_emoji, _make_learn_sticker_handler
 from core.sticker import FaceInfo, StickerManager
@@ -93,7 +94,9 @@ class NativeStickerManagerRegressionTests(unittest.TestCase):
         seg, mode, meta = self.manager.get_preferred_emoji_segment(key)
         self.assertEqual(mode, "image")
         self.assertEqual(seg["type"], "image")
-        self.assertIn("file:///", seg["data"]["file"])
+        parsed = urlparse(seg["data"]["file"])
+        self.assertEqual(parsed.scheme, "file")
+        self.assertTrue(parsed.path.replace("\\", "/").endswith(".png"))
         self.assertEqual(meta["fallback"], "image")
 
 

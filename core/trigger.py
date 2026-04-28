@@ -430,6 +430,21 @@ class TriggerEngine:
                 priority=70,
             )
 
+        if active_session:
+
+            return TriggerResult(
+                should_handle=True,
+                reason="active_session",
+                active_session=True,
+                followup_candidate=False,
+                listen_probe=False,
+                overload_active=False,
+                busy_messages=busy_messages,
+                busy_users=busy_users,
+                ai_gate=True,
+                priority=60,
+            )
+
         if listen_probe:
 
             return TriggerResult(

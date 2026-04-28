@@ -61,6 +61,32 @@ class ConfigAndTriggerRegressionTests(unittest.TestCase):
         self.assertFalse(high_result.should_handle)
         self.assertEqual(high_result.reason, "ai_router_candidate")
 
+    def test_active_session_reaches_router_instead_of_not_directed_drop(self) -> None:
+        trigger = TriggerEngine(
+            trigger_config={
+                "active_session_timeout_minutes": 8,
+            },
+            bot_config={"name": "YuKiKo"},
+        )
+        ts = datetime.now(timezone.utc)
+        trigger.activate_session("group:901738883", "136666451", False, now=ts)
+
+        result = trigger.evaluate(
+            TriggerInput(
+                conversation_id="group:901738883",
+                user_id="136666451",
+                text="你发送继续就行了",
+                mentioned=False,
+                is_private=False,
+                timestamp=ts,
+            ),
+            recent_messages=[],
+        )
+
+        self.assertTrue(result.should_handle)
+        self.assertEqual(result.reason, "active_session")
+        self.assertTrue(result.active_session)
+
     def test_memory_keywords_can_trigger_ai_listen_probe(self) -> None:
         trigger = TriggerEngine(
             trigger_config={

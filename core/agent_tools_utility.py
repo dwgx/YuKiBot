@@ -228,7 +228,13 @@ async def _load_reply_message_segments_for_sticker(context: dict[str, Any]) -> l
             segments = _extract_message_segments_from_onebot_payload(raw)
             if segments:
                 return segments
-        except Exception:
+        except Exception as exc:
+            _log.warning(
+                "learn_sticker_get_msg_failed | reply_to_message_id=%s | tried=%s | error=%s",
+                reply_to_message_id,
+                message_id,
+                exc,
+            )
             continue
     return []
 

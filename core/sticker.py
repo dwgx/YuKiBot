@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from core.napcat_compat import build_napcat_file_reference
 from utils.text import normalize_text
 
 _log = logging.getLogger("yukiko.sticker")
@@ -1015,8 +1016,10 @@ class StickerManager:
         p = self._resolve_emoji_path(key, e)
         if not p.exists():
             return None
-        # 用 file:// 本地路径发送
-        return {"type": "image", "data": {"file": f"file:///{p.resolve()}"}}
+        file_ref = build_napcat_file_reference(p, require_exists=True)
+        if not file_ref:
+            return None
+        return {"type": "image", "data": {"file": file_ref}}
 
     def emoji_image_b64(self, key: str) -> str | None:
         """Read emoji as base64 for LLM vision."""
