@@ -988,7 +988,7 @@ class AdminEngine:
             try:
                 if name == "bilibili":
                     data = await asyncio.to_thread(extract_bilibili_cookies, browser, force)
-                    sess = normalize_text(str((data or {}).get("SESSDATA", "")))
+                    sess = normalize_text(str((data or {}).get("sessdata", "") or (data or {}).get("SESSDATA", "")))
                     jct = normalize_text(str((data or {}).get("bili_jct", "")))
                     if sess:
                         tools = getattr(engine, "tools", None)
@@ -996,6 +996,10 @@ class AdminEngine:
                             setattr(tools, "_bilibili_sessdata", sess)
                             setattr(tools, "_bilibili_jct", jct)
                             setattr(tools, "_bilibili_cookie", f"SESSDATA={sess}; bili_jct={jct}" if jct else f"SESSDATA={sess}")
+                            hybrid = getattr(tools, "_hybrid_resolver", None)
+                            bilix = getattr(hybrid, "bilix_resolver", None) if hybrid is not None else None
+                            if bilix is not None:
+                                setattr(bilix, "sess_data", sess)
                         ok.append("bilibili")
                     else:
                         fail.append("bilibili(empty)")

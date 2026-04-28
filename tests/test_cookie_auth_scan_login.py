@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from core.admin import AdminEngine
 from core import cookie_auth
 
 
@@ -70,6 +73,23 @@ class CookieAuthScanLoginTests(unittest.TestCase):
 
         self.assertEqual(mock_qr_login.call_count, 1)
         self.assertEqual(result, {"sessdata": "", "bili_jct": ""})
+
+
+class CookieAdminRegressionTests(unittest.IsolatedAsyncioTestCase):
+    @patch("core.cookie_auth.extract_bilibili_cookies", return_value={"sessdata": "sess", "bili_jct": "csrf"})
+    async def test_cookie_command_accepts_lowercase_bilibili_sessdata(self, _extract) -> None:
+        admin = AdminEngine({}, Path("."))
+        bilix = SimpleNamespace(sess_data="")
+        engine = SimpleNamespace(
+            tools=SimpleNamespace(_hybrid_resolver=SimpleNamespace(bilix_resolver=bilix))
+        )
+
+        result = await admin._act_cookie(engine=engine, arg="bilibili edge")
+
+        self.assertIn("bilibili", result)
+        self.assertEqual(engine.tools._bilibili_sessdata, "sess")
+        self.assertEqual(engine.tools._bilibili_jct, "csrf")
+        self.assertEqual(bilix.sess_data, "sess")
 
 
 if __name__ == "__main__":
