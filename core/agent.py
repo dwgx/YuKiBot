@@ -964,7 +964,8 @@ class AgentLoop:
                             timeout=llm_timeout,
                         )
                 except asyncio.TimeoutError:
-                    _log.warning(
+                    timeout_log = _log.info if fallback_tool_candidate else _log.warning
+                    timeout_log(
                         "agent_llm_timeout | trace=%s | step=%d | timeout=%.1fs",
                         ctx.trace_id,
                         step_idx,
