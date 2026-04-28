@@ -18,9 +18,10 @@ _log = logging.getLogger("yukiko.video_resolver")
 class BilixResolver:
     """B站专用解析器 - 使用bilix实现高速异步下载"""
 
-    def __init__(self, cache_dir: Path, ffmpeg_location: str = ""):
+    def __init__(self, cache_dir: Path, ffmpeg_location: str = "", sess_data: str = ""):
         self.cache_dir = cache_dir
         self.ffmpeg_location = ffmpeg_location
+        self.sess_data = sess_data
         self._bilix_available = False
         try:
             from bilix.sites.bilibili import DownloaderBilibili
@@ -46,13 +47,13 @@ class BilixResolver:
 
             # 使用bilix下载
             async with DownloaderBilibili(
-                sess_data=None,  # 可以从配置读取Cookie
+                sess_data=self.sess_data or None,
                 video_concurrency=1,  # 限制并发
             ) as d:
                 # 下载视频到指定目录（bilix会自动处理音视频合并）
                 await d.get_video(
                     url,
-                    path=output_dir,
+                    path=str(output_dir),
                     quality=720,  # 限制720p
                     image=False,
                     subtitle=False,
@@ -60,7 +61,7 @@ class BilixResolver:
                 )
 
             # 查找下载的文件
-            video_files = list(output_dir.glob("*.mp4"))
+            video_files = list(output_dir.rglob("*.mp4"))
             if video_files:
                 result = video_files[0]
                 # 移动到标准缓存目录
@@ -82,7 +83,7 @@ class BilixResolver:
             return None
 
         except Exception as e:
-            _log.warning("bilix_download_error | error=%s", str(e)[:200])
+            _log.warning("bilix_download_error | type=%s | error=%s", type(e).__name__, str(e)[:200])
             return None
 
 
@@ -251,9 +252,9 @@ class HybridVideoResolver:
     3. 其他平台使用yt-dlp
     """
 
-    def __init__(self, ytdlp_resolver, cache_dir: Path, ffmpeg_location: str = ""):
+    def __init__(self, ytdlp_resolver, cache_dir: Path, ffmpeg_location: str = "", bilibili_sessdata: str = ""):
         self.ytdlp_resolver = ytdlp_resolver
-        self.bilix_resolver = BilixResolver(cache_dir, ffmpeg_location)
+        self.bilix_resolver = BilixResolver(cache_dir, ffmpeg_location, sess_data=bilibili_sessdata)
         self.douyin_resolver = DouyinResolver(cache_dir)
         _log.info("hybrid_resolver_init | bilix=%s | douyin=%s",
                     self.bilix_resolver._bilix_available, self.douyin_resolver._available)
@@ -319,7 +320,12 @@ class HybridVideoResolver:
             return await asyncio.to_thread(self.ytdlp_resolver, url)
 
 
-def create_hybrid_resolver(ytdlp_download_func, cache_dir: Path, ffmpeg_location: str = "") -> HybridVideoResolver:
+def create_hybrid_resolver(
+    ytdlp_download_func,
+    cache_dir: Path,
+    ffmpeg_location: str = "",
+    bilibili_sessdata: str = "",
+) -> HybridVideoResolver:
     """
     创建混合解析器实例
 
@@ -331,4 +337,4 @@ def create_hybrid_resolver(ytdlp_download_func, cache_dir: Path, ffmpeg_location
     Returns:
         HybridVideoResolver实例
     """
-    return HybridVideoResolver(ytdlp_download_func, cache_dir, ffmpeg_location)
+    return HybridVideoResolver(ytdlp_download_func, cache_dir, ffmpeg_location, bilibili_sessdata=bilibili_sessdata)

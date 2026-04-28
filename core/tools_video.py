@@ -3305,7 +3305,7 @@ class ToolVideoMixin:
             bili_headers = dict(common_options.get("http_headers") or {})
             bili_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             bili_headers["Referer"] = "https://www.bilibili.com/"
-            bili_headers["Cookie"] = "BUVID3=infoc;"
+            bili_headers["Cookie"] = self._bilibili_cookie or "BUVID3=infoc;"
             common_options["http_headers"] = bili_headers
         if self._ffmpeg_available:
             common_options["merge_output_format"] = "mp4"

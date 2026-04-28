@@ -226,24 +226,7 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         self._music_engine = MusicEngine(raw_cfg)
         self._prompt_policy = PromptPolicy.from_config(raw_cfg)
 
-        # 初始化混合视频解析器（bilix + yt-dlp）
-        self._hybrid_resolver = None
-        try:
-            from core.video_resolver_hybrid import create_hybrid_resolver
-
-            self._hybrid_resolver = create_hybrid_resolver(
-                ytdlp_download_func=self._download_platform_video_sync,
-                cache_dir=self._video_cache_dir,
-                ffmpeg_location=self._ffmpeg_location,
-            )
-            _tool_log.info(
-                "hybrid_resolver_enabled | bilix_available=%s",
-                self._hybrid_resolver.bilix_resolver._bilix_available,
-            )
-        except Exception as e:
-            _tool_log.warning("hybrid_resolver_init_failed | error=%s", str(e)[:100])
-
-        # 平台专属 cookie（抖音/快手）
+        # 平台专属 cookie（B站/抖音/快手）
         va_cfg = (
             raw_cfg.get("video_analysis", search_cfg.get("video_analysis", {})) or {}
         )
@@ -258,6 +241,25 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         self._douyin_cookie = normalize_text(str(dy_cfg.get("cookie", "")))
         ks_cfg = va_cfg.get("kuaishou", {}) or {}
         self._kuaishou_cookie = normalize_text(str(ks_cfg.get("cookie", "")))
+
+        # 初始化混合视频解析器（bilix + yt-dlp）
+        self._hybrid_resolver = None
+        try:
+            from core.video_resolver_hybrid import create_hybrid_resolver
+
+            self._hybrid_resolver = create_hybrid_resolver(
+                ytdlp_download_func=self._download_platform_video_sync,
+                cache_dir=self._video_cache_dir,
+                ffmpeg_location=self._ffmpeg_location,
+                bilibili_sessdata=self._bilibili_sessdata,
+            )
+            _tool_log.info(
+                "hybrid_resolver_enabled | bilix_available=%s",
+                self._hybrid_resolver.bilix_resolver._bilix_available,
+            )
+        except Exception as e:
+            _tool_log.warning("hybrid_resolver_init_failed | error=%s", str(e)[:100])
+
         vision_cfg = raw_cfg.get("vision", search_cfg.get("vision", {}))
         if not isinstance(vision_cfg, dict):
             vision_cfg = {}

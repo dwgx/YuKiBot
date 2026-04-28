@@ -42,6 +42,17 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             )
         )
 
+    def test_bilibili_cookie_reaches_hybrid_resolver(self) -> None:
+        executor = ToolExecutor(
+            None,
+            None,
+            lambda *args, **kwargs: None,
+            {"video_analysis": {"bilibili": {"sessdata": "sess", "bili_jct": "csrf"}}},
+        )
+
+        self.assertEqual(executor._bilibili_sessdata, "sess")
+        self.assertEqual(getattr(executor._hybrid_resolver.bilix_resolver, "sess_data", ""), "sess")
+
     def test_directed_image_still_enters_agent(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)
         engine._recent_directed_hints = {}
