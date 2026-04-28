@@ -299,6 +299,11 @@ class HybridVideoResolver:
             _log.info("hybrid_resolve | platform=tencent | method=ytdlp")
             return await asyncio.to_thread(self.ytdlp_resolver, url)
 
+        # AcFun：yt-dlp
+        elif "acfun.cn" in host or "acfun.com" in host:
+            _log.info("hybrid_resolve | platform=acfun | method=ytdlp")
+            return await asyncio.to_thread(self.ytdlp_resolver, url)
+
         # 优酷：yt-dlp
         elif "youku.com" in host or "v.youku.com" in host:
             _log.info("hybrid_resolve | platform=youku | method=ytdlp")

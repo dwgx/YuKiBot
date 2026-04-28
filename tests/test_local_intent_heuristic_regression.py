@@ -53,6 +53,13 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertEqual(executor._bilibili_sessdata, "sess")
         self.assertEqual(getattr(executor._hybrid_resolver.bilix_resolver, "sess_data", ""), "sess")
 
+    def test_acfun_silent_video_is_allowed_for_delivery(self) -> None:
+        executor = _DummyExecutor()
+
+        self.assertTrue(executor._video_require_audio_for_send)
+        self.assertTrue(executor._allow_silent_video_for_url("https://www.acfun.cn/v/ac10315127"))
+        self.assertFalse(executor._allow_silent_video_for_url("https://www.bilibili.com/video/BV1xx411c7mD/"))
+
     def test_directed_image_still_enters_agent(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)
         engine._recent_directed_hints = {}

@@ -295,7 +295,11 @@ class ToolVideoMixin:
                     error="resolved_direct_validate_failed",
                 )
 
-        if resolved_local is not None and self._video_require_audio_for_send:
+        if (
+            resolved_local is not None
+            and self._video_require_audio_for_send
+            and not self._allow_silent_video_for_url(url)
+        ):
             if not self._video_has_audio_stream(resolved_local):
                 self._last_video_resolve_diagnostic[url] = "video_no_audio_all_formats"
                 return ToolResult(
@@ -2731,6 +2735,16 @@ class ToolVideoMixin:
             parts.extend(["CURRENT_FNVAL=4048", "CURRENT_QUALITY=80"])
         return "; ".join(parts)
 
+    def _allow_silent_video_for_url(self, url: str) -> bool:
+        if self._video_allow_silent_fallback:
+            return True
+        try:
+            host = normalize_text(urlparse(url).netloc).lower()
+        except Exception:
+            host = ""
+        # AcFun 部分公开视频只暴露 video-only HLS；能发画面比直接失败更符合解析/投递请求。
+        return "acfun.cn" in host or "acfun.com" in host
+
     def _inject_platform_cookiefile(
         self, options: dict[str, Any], source_url: str
     ) -> str:
@@ -3444,11 +3458,10 @@ class ToolVideoMixin:
             or is_douyin
             or is_kuaishou
             or is_youku
-            or is_acfun
             or is_tencent
             or is_iqiyi
             or is_youtube
-        )
+        ) and not self._allow_silent_video_for_url(source_url)
         no_audio_fallback: Path | None = None
         try:
             for fmt in format_candidates:
