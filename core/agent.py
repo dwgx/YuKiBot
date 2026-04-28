@@ -1240,13 +1240,26 @@ class AgentLoop:
                 tool_name = forced_name
                 tool_args = dict(forced_args)
             missing_args = self._missing_required_tool_args(tool_name, tool_args)
+            log_tool_args = tool_args
+            if tool_name == "final_answer" and isinstance(tool_args, dict):
+                log_tool_args = dict(tool_args)
+                log_video_url = normalize_text(
+                    str(log_tool_args.get("video_url", "") or self._last_success_video_url(steps))
+                )
+                if log_video_url:
+                    log_tool_args["text"] = self._sanitize_final_text_for_local_media(
+                        str(log_tool_args.get("text", "")),
+                        log_video_url,
+                    )
+                    if self._is_local_media_path(log_video_url) and "video_url" in log_tool_args:
+                        log_tool_args["video_url"] = "[local_media_artifact]"
 
             _log.info(
                 "agent_tool_call | trace=%s | step=%d | tool=%s | args=%s",
                 ctx.trace_id,
                 step_idx,
                 tool_name,
-                self._truncate_tool_args_for_log(tool_args),
+                self._truncate_tool_args_for_log(log_tool_args),
             )
 
             if missing_args:
@@ -5411,7 +5424,12 @@ class AgentLoop:
         )
         has_local_path = bool(_RE_LOCAL_FILE_REF.search(content))
         has_contradiction = any(marker in lower_content for marker in contradiction_markers)
-        if has_local_path and has_contradiction:
+        has_delivery_noise = (
+            "直链文件" in lower_content
+            or ("cdn" in lower_content and "非平台" in lower_content)
+            or ("qq" in lower_content and "预览" in lower_content)
+        )
+        if has_local_path and (has_contradiction or has_delivery_noise):
             return delivery_text
         slash_path = path.replace("\\", "/")
         variants = {

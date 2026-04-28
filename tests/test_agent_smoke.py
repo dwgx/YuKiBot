@@ -611,6 +611,19 @@ class AgentProtectionTests(unittest.TestCase):
         self.assertNotIn("没法真的", sanitized)
         self.assertIn("投递视频", sanitized)
 
+    def test_local_video_final_answer_drops_preview_warning_path(self):
+        video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/4e38bdc60d72_10315127.mp4"
+        text = (
+            f"解析好了，直链文件在这： `{video_path}` 标题是《APP登录界面录屏》，时长 8 秒。"
+            "不过这条是非平台 CDN 形式，QQ 里可能不一定能直接预览。"
+        )
+
+        sanitized = AgentLoop._sanitize_final_text_for_local_media(text, video_path)
+
+        self.assertNotIn("/Users/dwgx", sanitized)
+        self.assertNotIn("QQ 里可能", sanitized)
+        self.assertEqual(sanitized, "解析好了，正在投递视频。")
+
     def test_local_video_final_answer_keeps_non_contradictory_text(self):
         video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/a.mp4"
 
