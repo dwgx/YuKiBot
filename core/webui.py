@@ -3469,10 +3469,29 @@ async def chat_agent_text(request: Request):
                 clip_text(img, 180),
                 exc,
             )
+        _log.info(
+            "media_delivery_image_attempt | source=webui_agent_text | trace=%s | chat=%s | peer=%s | image=%s",
+            trace_id,
+            resolved_type,
+            peer_id,
+            clip_text(img, 180),
+        )
         if resolved_type == "group":
-            await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
+            sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
         else:
-            await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+            sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+        image_message_id = ""
+        if isinstance(sent, dict):
+            image_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "")))
+        elif isinstance(sent, int):
+            image_message_id = str(sent)
+        _log.info(
+            "media_delivery_image_ok | source=webui_agent_text | trace=%s | peer=%s | message_id=%s | image=%s",
+            trace_id,
+            peer_id,
+            image_message_id,
+            clip_text(img, 180),
+        )
 
     if audio_file:
         audio_ref = audio_file

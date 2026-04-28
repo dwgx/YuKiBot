@@ -650,7 +650,9 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         result = asyncio.run(loop.run(ctx))
 
         self.assertEqual([name for name, _ in registry.calls], ["music_play"])
-        self.assertIn("Never Gonna Give You Up", registry.calls[0][1]["keyword"])
+        self.assertEqual(registry.calls[0][1]["keyword"], "Never Gonna Give You Up - Rick Astley")
+        self.assertEqual(registry.calls[0][1]["title"], "Never Gonna Give You Up")
+        self.assertEqual(registry.calls[0][1]["artist"], "Rick Astley")
         self.assertEqual(result.audio_file, "/tmp/yukiko/song.mp3")
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 

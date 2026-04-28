@@ -2184,9 +2184,9 @@ class AgentLoop:
             and self.tool_registry.has_tool("music_play")
             and evidence & {"music_request"}
         ):
-            query = self._extract_music_query_for_fallback(ctx)
-            if query:
-                return "music_play", {"keyword": query}
+            music_args = self._extract_music_args_for_fallback(ctx)
+            if music_args.get("keyword") or music_args.get("title"):
+                return "music_play", music_args
         if active == "web_research" and evidence & {"url", "external_research_request"}:
             merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
                 " ".join(
@@ -2221,20 +2221,18 @@ class AgentLoop:
         return None
 
     @staticmethod
-    def _extract_music_query_for_fallback(ctx: AgentContext) -> str:
-        merged = normalize_text(
-            " ".join(
-                str(item or "")
-                for item in (
-                    ctx.message_text,
-                    ctx.original_message_text,
-                    ctx.reply_to_text,
-                )
-            )
-        )
+    def _extract_music_args_for_fallback(ctx: AgentContext) -> dict[str, str]:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for item in (ctx.message_text, ctx.original_message_text, ctx.reply_to_text):
+            text = normalize_text(str(item or ""))
+            if text and text not in seen:
+                seen.add(text)
+                parts.append(text)
+        merged = normalize_text(" ".join(parts))
         merged = _RE_URL_STRIP.sub(" ", merged)
         merged = normalize_text(merged)
-        merged = re.sub(r"^【[^】]{1,40}】", "", merged).strip()
+        merged = re.sub(r"【[^】]{1,40}】", " ", merged).strip()
         merged = re.sub(
             r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我)?\s*"
             r"(点歌|點歌|来首|來首|放歌|播放|播一下|唱一首|听歌|聽歌|找歌|搜索歌曲|发语音|直接发语音)\s*",
@@ -2242,13 +2240,20 @@ class AgentLoop:
             merged,
             flags=re.IGNORECASE,
         ).strip()
-        merged = re.sub(
-            r"(直接)?(发|發)?语音[。.!！]*$",
-            "",
-            merged,
-            flags=re.IGNORECASE,
-        ).strip(" ，,。.!！")
-        return clip_text(merged, 120)
+        merged = re.sub(r"(直接)?(发|發)?语音[。.!！]*$", "", merged, flags=re.IGNORECASE)
+        merged = normalize_text(merged).strip(" ，,。.!！")
+        title = ""
+        artist = ""
+        match = re.match(r"(.{2,80}?)\s*[-—–]\s*(.{2,80})$", merged)
+        if match:
+            title = normalize_text(match.group(1)).strip(" ，,。.!！")
+            artist = normalize_text(match.group(2)).strip(" ，,。.!！")
+        args = {"keyword": clip_text(merged, 120)}
+        if title:
+            args["title"] = clip_text(title, 80)
+        if artist:
+            args["artist"] = clip_text(artist, 80)
+        return args
 
     @staticmethod
     def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:
