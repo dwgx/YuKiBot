@@ -397,6 +397,7 @@ def _built_in_prompts_defaults() -> dict[str, Any]:
                 "约束：\n"
                 "- 非 final_answer 时不要输出自然语言。\n"
                 "- final_answer.text 必须是给用户看的自然中文，不能为空，不能是 JSON 或“我先去做”这类执行说明。\n"
+                "- 工具返回 image_url / image_urls / video_url / audio_file 后，final_answer 必须原样携带这些字段；发送层会自动投递媒体，不要说“没有发送/上传工具”。\n"
                 "- 绝对禁止输出 <function_calls>、<invoke>、<parameter>、tool_call 等标签。"
             ),
             "rules": (

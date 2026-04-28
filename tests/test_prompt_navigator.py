@@ -76,6 +76,39 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertEqual(state.active_section, "music_audio")
         self.assertIn("music_request", state.evidence)
 
+    def test_download_request_preselects_download_section_without_url(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "帮我找一下 OBS Windows 安装包 exe 下载"
+        state = nav.initial_state(
+            ctx,
+            ["think", "final_answer", "navigate_section", "search_download_resources"],
+        )
+        self.assertEqual(state.active_section, "download_resources")
+        self.assertIn("download_request", state.evidence)
+
+    def test_creative_generation_request_preselects_creative_section(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "帮我画一张赛博猫娘头像"
+        state = nav.initial_state(
+            ctx,
+            ["think", "final_answer", "navigate_section", "generate_image_enhanced"],
+        )
+        self.assertEqual(state.active_section, "creative_generation")
+        self.assertIn("creative_generation_request", state.evidence)
+
+    def test_memory_request_preselects_memory_section(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "你记得我是谁吗"
+        state = nav.initial_state(
+            ctx,
+            ["think", "final_answer", "navigate_section", "recall_about_user"],
+        )
+        self.assertEqual(state.active_section, "memory_knowledge")
+        self.assertIn("memory_request", state.evidence)
+
     def test_sticker_request_preselects_sticker_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         ctx = _Ctx()
@@ -262,12 +295,17 @@ class _Registry:
             "fetch_webpage",
             "parse_video",
             "search_media",
+            "search_download_resources",
+            "smart_download",
             "music_play",
             "send_face",
             "send_emoji",
             "send_sticker",
             "analyze_image",
             "resolve_image",
+            "generate_image_enhanced",
+            "remember_user_fact",
+            "recall_about_user",
             "think",
             "final_answer",
             "navigate_section",
@@ -329,6 +367,22 @@ class _Registry:
             else:
                 data["image_url"] = "https://example.test/image.jpg"
             return ToolCallResult(ok=True, display="media ok", data=data)
+        if name == "search_download_resources":
+            return ToolCallResult(
+                ok=True,
+                display="download candidates ok",
+                data={
+                    "query": args.get("query", ""),
+                    "file_type": args.get("file_type", ""),
+                    "items": [{"title": "demo", "url": "https://example.test/demo.exe"}],
+                },
+            )
+        if name == "smart_download":
+            return ToolCallResult(
+                ok=True,
+                display="download ok",
+                data={"path": "/tmp/yukiko/demo.exe", "url": args.get("url", "")},
+            )
         if name == "music_play":
             return ToolCallResult(
                 ok=True,
@@ -353,6 +407,24 @@ class _Registry:
                 ok=True,
                 display="image resolved",
                 data={"image_url": url, "image_urls": [url]},
+            )
+        if name == "generate_image_enhanced":
+            return ToolCallResult(
+                ok=True,
+                display="image generated",
+                data={"image_url": "https://example.test/generated.png"},
+            )
+        if name == "remember_user_fact":
+            return ToolCallResult(
+                ok=True,
+                display="remember ok",
+                data={"fact": args.get("fact", "")},
+            )
+        if name == "recall_about_user":
+            return ToolCallResult(
+                ok=True,
+                display="recall ok",
+                data={"items": 1},
             )
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
 
@@ -812,6 +884,98 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual([name for name, _ in registry.calls], ["search_media"])
         self.assertEqual(result.image_url, "https://example.test/image.jpg")
         self.assertEqual(result.image_urls, ["https://example.test/image.jpg"])
+
+    def test_download_llm_timeout_falls_back_to_download_search_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="帮我找一下 OBS Windows 安装包 exe 下载",
+            trace_id="navigator-download-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_download_resources"])
+        self.assertIn("OBS Windows 安装包 exe", registry.calls[0][1]["query"])
+        self.assertEqual(registry.calls[0][1]["file_type"], "exe")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_creative_generation_llm_timeout_falls_back_to_image_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="帮我画一张赛博猫娘头像",
+            trace_id="navigator-image-gen-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["generate_image_enhanced"])
+        self.assertIn("赛博猫娘头像", registry.calls[0][1]["prompt"])
+        self.assertEqual(result.image_url, "https://example.test/generated.png")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_memory_llm_timeout_falls_back_to_recall_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="你记得我是谁吗",
+            trace_id="navigator-memory-recall-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["recall_about_user"])
+        self.assertEqual(result.reply_text, "recall ok")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_music_llm_timeout_falls_back_to_music_play_tool(self):
         registry = _Registry()

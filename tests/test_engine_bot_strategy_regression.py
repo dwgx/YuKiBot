@@ -5,7 +5,9 @@ import logging
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+from core.agent import AgentResult
 from core.admin import AdminEngine
 from core.engine import YukikoEngine
 from core.engine_types import EngineMessage
@@ -23,6 +25,8 @@ class EngineBotStrategyDirectiveTests(unittest.TestCase):
             "control": {},
         }
         engine.logger = logging.getLogger("test.yukiko.engine")
+        engine._recent_directed_hints = {}
+        engine.directed_grace_seconds = 90
         engine.trigger = TriggerEngine(
             trigger_config=engine.config["trigger"],
             bot_config=engine.config["bot"],
@@ -128,3 +132,87 @@ class EngineBotStrategyDirectiveTests(unittest.TestCase):
         self.assertEqual(response.reason, "bot_strategy_directive_non_admin")
         self.assertNotIn("ai_listen_enable", engine.config["trigger"])
         self.assertEqual(engine.trigger._active_sessions, {})
+
+    def test_blocks_undirected_agent_plain_reply_from_listen_probe(self) -> None:
+        engine = self._engine()
+        message = EngineMessage(
+            conversation_id="group:1",
+            user_id="100",
+            text="吃哪个",
+            mentioned=False,
+            group_id=1,
+            bot_id="200",
+        )
+        trigger = SimpleNamespace(reason="ai_listen_probe_score")
+        result = AgentResult(
+            action="reply",
+            reply_text="黄油那个吧。",
+            tool_calls_made=0,
+        )
+
+        self.assertTrue(
+            engine._should_block_undirected_agent_plain_reply(
+                message=message,
+                text=message.text,
+                trigger=trigger,
+                agent_result=result,
+            )
+        )
+
+    def test_keeps_directed_or_artifact_agent_results(self) -> None:
+        engine = self._engine()
+        trigger = SimpleNamespace(reason="active_session")
+        mentioned_message = EngineMessage(
+            conversation_id="group:1",
+            user_id="100",
+            text="@30秒 吃哪个",
+            mentioned=True,
+            group_id=1,
+            bot_id="200",
+        )
+        reply_to_bot_message = EngineMessage(
+            conversation_id="group:1",
+            user_id="100",
+            text="那你发",
+            mentioned=False,
+            group_id=1,
+            bot_id="200",
+            reply_to_user_id="200",
+        )
+        artifact_message = EngineMessage(
+            conversation_id="group:1",
+            user_id="100",
+            text="解析这个视频",
+            mentioned=False,
+            group_id=1,
+            bot_id="200",
+        )
+
+        self.assertFalse(
+            engine._should_block_undirected_agent_plain_reply(
+                message=mentioned_message,
+                text=mentioned_message.text,
+                trigger=trigger,
+                agent_result=AgentResult(action="reply", reply_text="可以。"),
+            )
+        )
+        self.assertFalse(
+            engine._should_block_undirected_agent_plain_reply(
+                message=reply_to_bot_message,
+                text=reply_to_bot_message.text,
+                trigger=trigger,
+                agent_result=AgentResult(action="reply", reply_text="发。"),
+            )
+        )
+        self.assertFalse(
+            engine._should_block_undirected_agent_plain_reply(
+                message=artifact_message,
+                text=artifact_message.text,
+                trigger=trigger,
+                agent_result=AgentResult(
+                    action="reply",
+                    reply_text="解析好了。",
+                    video_url="/tmp/video.mp4",
+                ),
+            )
+        )

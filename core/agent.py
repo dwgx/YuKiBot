@@ -2129,6 +2129,10 @@ class AgentLoop:
             "recent_media_artifact",
             "media_search_request",
             "sticker_request",
+            "download_request",
+            "creative_generation_request",
+            "memory_request",
+            "bot_strategy_request",
         }:
             return True
         if ctx.media_summary or ctx.reply_media_summary:
@@ -2210,6 +2214,93 @@ class AgentLoop:
             )
             if query:
                 return "search_media", {"query": query, "media_type": media_type}
+        if active == "download_resources" and evidence & {
+            "download_request",
+            "download_file_extension",
+        }:
+            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+                " ".join(
+                    str(item or "")
+                    for item in (
+                        ctx.message_text,
+                        ctx.original_message_text,
+                        ctx.reply_to_text,
+                    )
+                )
+            )
+            url = self._extract_first_url(merged)
+            file_type = self._infer_resource_file_type(merged)
+            if (
+                url
+                and "smart_download" in visible_tools
+                and self.tool_registry.has_tool("smart_download")
+            ):
+                payload: dict[str, Any] = {"url": url, "query": merged, "kind": "auto"}
+                if file_type:
+                    payload["prefer_ext"] = file_type
+                return "smart_download", payload
+            query = normalize_text(_RE_URL_STRIP.sub(" ", merged))
+            query = re.sub(
+                r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我|我要|我想要|"
+                r"找一下|找下|找|搜索|搜一下|搜下|下载|下載|求)\s*",
+                "",
+                query,
+                flags=re.IGNORECASE,
+            ).strip()
+            if (
+                query
+                and "search_download_resources" in visible_tools
+                and self.tool_registry.has_tool("search_download_resources")
+            ):
+                payload = {"query": query, "limit": 8}
+                if file_type:
+                    payload["file_type"] = file_type
+                return "search_download_resources", payload
+        if (
+            active == "creative_generation"
+            and evidence & {"creative_generation_request"}
+        ):
+            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+                " ".join(
+                    str(item or "")
+                    for item in (
+                        ctx.message_text,
+                        ctx.original_message_text,
+                        ctx.reply_to_text,
+                    )
+                )
+            )
+            prompt = self._infer_image_generation_prompt(merged)
+            for tool_name in ("generate_image_enhanced", "generate_image"):
+                if (
+                    prompt
+                    and tool_name in visible_tools
+                    and self.tool_registry.has_tool(tool_name)
+                ):
+                    return tool_name, {"prompt": prompt}
+        if active == "memory_knowledge" and evidence & {"memory_request"}:
+            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+                " ".join(
+                    str(item or "")
+                    for item in (
+                        ctx.message_text,
+                        ctx.original_message_text,
+                        ctx.reply_to_text,
+                    )
+                )
+            )
+            fact = self._extract_memory_fact_for_fallback(merged)
+            if (
+                fact
+                and "remember_user_fact" in visible_tools
+                and self.tool_registry.has_tool("remember_user_fact")
+            ):
+                return "remember_user_fact", {"fact": fact}
+            if (
+                "recall_about_user" in visible_tools
+                and self.tool_registry.has_tool("recall_about_user")
+            ):
+                return "recall_about_user", {}
         if (
             active == "multimodal_media"
             and evidence & {"message_or_reply_media", "image_url", "url"}
@@ -3920,7 +4011,11 @@ class AgentLoop:
             return "apk"
         if "prefer_ext=ipa" in plain or re.search(r"\.ipa(?:\?|#|$)", t):
             return "ipa"
-        if "prefer_ext=exe" in plain or re.search(r"\.exe(?:\?|#|$)", t):
+        if (
+            "prefer_ext=exe" in plain
+            or re.search(r"\.exe(?:\?|#|$)", t)
+            or re.search(r"(?<![a-z0-9])exe(?![a-z0-9])", t)
+        ):
             return "exe"
 
         mapping = (
@@ -4550,14 +4645,40 @@ class AgentLoop:
                 if stripped.lower().startswith(prefix.lower()):
                     stripped = normalize_text(stripped[len(prefix) :])
                     changed = True
-        stripped = re.sub(
-            r"(图片|圖片|图|圖|照片|头像|頭像|壁纸|壁紙)\s*$",
-            "",
-            stripped,
-            flags=re.IGNORECASE,
-        )
+        stripped = re.sub(r"(图片|圖片|图|圖|照片)\s*$", "", stripped, flags=re.IGNORECASE)
         stripped = normalize_text(stripped)
         return stripped or content
+
+    @staticmethod
+    def _extract_memory_fact_for_fallback(text: str) -> str:
+        content = normalize_text(text)
+        if not content:
+            return ""
+        compact = _RE_WHITESPACE.sub("", content)
+        if not any(
+            cue in compact
+            for cue in (
+                "记住",
+                "記住",
+                "帮我记",
+                "幫我記",
+                "记一下",
+                "記一下",
+                "写入记忆",
+                "寫入記憶",
+            )
+        ):
+            return ""
+        stripped = re.sub(
+            r"^(请|請|麻烦|麻煩|帮我|幫我)?\s*(记住|記住|记一下|記一下|帮我记|幫我記|写入记忆|寫入記憶)\s*[：:，,。 ]*",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        ).strip()
+        stripped = re.sub(r"(这件事|這件事|这条|這條|这个|這個)?\s*(吧|。|！|!)*$", "", stripped).strip()
+        if len(stripped) < 2 or len(stripped) > 240:
+            return ""
+        return stripped
 
     def _should_force_tool_first(self, ctx: AgentContext) -> bool:
         """判断当前请求是否必须先进行工具调用。"""

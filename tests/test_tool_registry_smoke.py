@@ -245,6 +245,36 @@ class ToolArgValidationTests(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertEqual(sanitized.get("query"), "python")
 
+    def test_analyze_image_url_alias_resolution(self):
+        """analyze_image 应接受模型常见的 image_url 参数别名。"""
+        reg = AgentToolRegistry()
+
+        async def _dummy_handler(args: dict, context: dict) -> ToolCallResult:
+            return ToolCallResult(ok=True, display="ok")
+
+        reg.register(
+            ToolSchema(
+                name="analyze_image",
+                description="分析图片",
+                parameters={
+                    "properties": {
+                        "url": {"type": "string", "description": "图片 URL"},
+                        "question": {"type": "string", "description": "问题"},
+                    },
+                    "required": [],
+                },
+                category="media",
+            ),
+            _dummy_handler,
+        )
+        sanitized, err = reg._sanitize_and_validate_args(
+            "analyze_image",
+            {"image_url": "https://example.test/cat.png", "question": "看图"},
+        )
+        self.assertEqual(err, "")
+        self.assertEqual(sanitized.get("url"), "https://example.test/cat.png")
+        self.assertNotIn("image_url", sanitized)
+
     def test_boolean_coercion(self):
         """字符串 "true"/"false" 应被转为 bool。"""
         coerced, ok = AgentToolRegistry._coerce_basic_type("true", "boolean")

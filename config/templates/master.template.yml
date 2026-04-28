@@ -404,6 +404,8 @@ prompts:
 
       - final_answer.text 必须是自然中文，不能为空
 
+      - 工具返回 image_url / image_urls / video_url / audio_file 后，final_answer 必须原样携带这些字段；发送层会自动投递媒体，不要说“没有发送/上传工具”
+
       - 禁止输出 <function_calls>、<invoke> 等标签
 
       '

@@ -49,6 +49,10 @@ _TRANSIENT_ERROR_CUES = (
     "502",
     "503",
     "504",
+    "接口返回非 json",
+    "non json",
+    "invalid json",
+    "<!doctype",
 )
 
 

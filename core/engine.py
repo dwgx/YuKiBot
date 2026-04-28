@@ -1216,6 +1216,19 @@ class YukikoEngine:
                 else []
             ),
         )
+        self.logger.info(
+            "trigger_decision | trace=%s | conversation=%s | user=%s | should=%s | reason=%s | active=%s | followup=%s | listen=%s | busy=%s/%s",
+            message.trace_id,
+            message.conversation_id,
+            message.user_id,
+            bool(getattr(trigger, "should_handle", False)),
+            normalize_text(str(getattr(trigger, "reason", ""))) or "-",
+            bool(getattr(trigger, "active_session", False)),
+            bool(getattr(trigger, "followup_candidate", False)),
+            bool(getattr(trigger, "listen_probe", False)),
+            int(getattr(trigger, "busy_messages", 0) or 0),
+            int(getattr(trigger, "busy_users", 0) or 0),
+        )
         if trigger.reason == "overload_notice":
             notice = self.markdown.render(
                 self._limit_reply_text(
@@ -2592,6 +2605,26 @@ class YukikoEngine:
                 agent_result.total_time_ms,
                 agent_result.reason,
             )
+            if self._should_block_undirected_agent_plain_reply(
+                message=message,
+                text=text,
+                trigger=trigger,
+                agent_result=agent_result,
+            ):
+                self.logger.info(
+                    "agent_undirected_plain_reply_block | trace=%s | conversation=%s | user=%s | trigger_reason=%s | text=%s | reply=%s",
+                    message.trace_id,
+                    message.conversation_id,
+                    message.user_id,
+                    normalize_text(str(getattr(trigger, "reason", ""))) or "-",
+                    clip_text(text, 100),
+                    clip_text(normalize_text(agent_result.reply_text), 120),
+                )
+                return EngineResponse(
+                    action="ignore",
+                    reason="agent_undirected_plain_reply_block",
+                    meta={"trace_id": message.trace_id},
+                )
             # Agent 路径也写入 followup 候选缓存，确保候选结果可被后续追问稳定复用。
             self._remember_agent_followup_cache(
                 message=message, agent_result=agent_result
@@ -3690,6 +3723,48 @@ class YukikoEngine:
         if any(cue in compact for cue in quiet_cues):
             return "quiet"
         return ""
+
+    def _should_block_undirected_agent_plain_reply(
+        self,
+        *,
+        message: EngineMessage,
+        text: str,
+        trigger: Any,
+        agent_result: AgentResult,
+    ) -> bool:
+        if message.is_private or message.mentioned:
+            return False
+        reply_to_bot = bool(
+            normalize_text(str(message.reply_to_user_id or ""))
+            and normalize_text(str(message.reply_to_user_id or ""))
+            == normalize_text(str(message.bot_id or ""))
+        )
+        if reply_to_bot:
+            return False
+        text_norm = normalize_text(text)
+        if self._looks_like_bot_call(text_norm) or self._has_recent_directed_hint(message):
+            return False
+        if normalize_text(str(agent_result.action)).lower() != "reply":
+            return False
+        if int(getattr(agent_result, "tool_calls_made", 0) or 0) > 0:
+            return False
+        if (
+            getattr(agent_result, "image_url", "")
+            or getattr(agent_result, "image_urls", [])
+            or getattr(agent_result, "video_url", "")
+            or getattr(agent_result, "audio_file", "")
+        ):
+            return False
+        reason = normalize_text(str(getattr(trigger, "reason", ""))).lower()
+        guarded = reason in {
+            "active_session",
+            "followup_window",
+            "ai_router_candidate",
+            "ai_router_gate",
+        } or reason.startswith("ai_listen_probe")
+        if not guarded:
+            return False
+        return True
 
     async def _handle_bot_strategy_directive(
         self,

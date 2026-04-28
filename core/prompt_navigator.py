@@ -611,6 +611,10 @@ class PromptNavigator:
             add("multimodal_media", "message_or_reply_media")
         if any(_DOWNLOAD_EXT_RE.search(url) for url in urls):
             add("download_resources", "download_file_extension")
+        if self._looks_like_download_request(ctx):
+            add("download_resources", "download_request")
+        if self._looks_like_creative_generation_request(ctx):
+            add("creative_generation", "creative_generation_request")
         if urls:
             add("web_research", "url")
         if self._looks_like_sticker_request(ctx):
@@ -621,6 +625,8 @@ class PromptNavigator:
             add("music_audio", "music_request")
         if self._looks_like_web_research_request(ctx):
             add("web_research", "external_research_request")
+        if self._looks_like_memory_request(ctx):
+            add("memory_knowledge", "memory_request")
         if self._looks_like_bot_strategy_request(ctx):
             add("qq_admin_social", "bot_strategy_request")
         if getattr(ctx, "at_other_user_ids", None):
@@ -772,6 +778,135 @@ class PromptNavigator:
             "下载地址",
         )
         return any(cue in text for cue in cues)
+
+    @staticmethod
+    def _looks_like_download_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        compact = re.sub(r"\s+", "", text)
+        if any(token in compact for token in ("/download", "download=1", "prefer_ext=")):
+            return True
+        resource_cues = (
+            "下载",
+            "下載",
+            "安装包",
+            "安裝包",
+            "资源包",
+            "資源包",
+            "压缩包",
+            "壓縮包",
+            "直链",
+            "直鏈",
+            "apk",
+            "ipa",
+            "exe",
+            "msi",
+            "zip",
+            "rar",
+            "7z",
+            "pdf",
+            "download",
+            "installer",
+            "package",
+        )
+        action_cues = (
+            "找",
+            "搜",
+            "给我",
+            "給我",
+            "发",
+            "發",
+            "下",
+            "要",
+            "need",
+            "find",
+            "send",
+        )
+        return any(cue in compact for cue in resource_cues) and any(
+            cue in compact for cue in action_cues
+        )
+
+    @staticmethod
+    def _looks_like_creative_generation_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        compact = re.sub(r"\s+", "", text)
+        direct_cues = (
+            "生图",
+            "生圖",
+            "画图",
+            "畫圖",
+            "绘图",
+            "繪圖",
+            "作图",
+            "作圖",
+            "出图",
+            "出圖",
+            "生成图片",
+            "生成圖片",
+            "生成一张图",
+            "生成一張圖",
+            "画一张",
+            "畫一張",
+            "画个",
+            "畫個",
+            "帮我画",
+            "幫我畫",
+            "ai绘画",
+            "ai繪畫",
+            "generateimage",
+            "drawapicture",
+            "makeanimage",
+        )
+        return any(cue in compact for cue in direct_cues)
+
+    @staticmethod
+    def _looks_like_memory_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        compact = re.sub(r"\s+", "", text)
+        cues = (
+            "记住",
+            "記住",
+            "帮我记",
+            "幫我記",
+            "记一下",
+            "記一下",
+            "写入记忆",
+            "寫入記憶",
+            "我的记忆",
+            "我的記憶",
+            "你记得",
+            "你記得",
+            "还记得",
+            "還記得",
+            "回忆",
+            "回憶",
+            "你知道我是谁",
+            "你知道我是誰",
+            "rememberthis",
+            "recall",
+            "memory",
+        )
+        return any(cue in compact for cue in cues)
 
     @staticmethod
     def _looks_like_bot_strategy_request(ctx: Any) -> bool:

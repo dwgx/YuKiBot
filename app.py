@@ -1686,6 +1686,33 @@ def register_handlers(engine: YukikoEngine) -> None:
             cover_url = str(getattr(result, "cover_url", "") or "")
             record_b64 = str(getattr(result, "record_b64", "") or "")
             audio_file = str(getattr(result, "audio_file", "") or "")
+            reply_to_bot = bool(
+                normalize_text(str(payload.reply_to_user_id or ""))
+                and normalize_text(str(payload.reply_to_user_id or ""))
+                == normalize_text(str(payload.bot_id or ""))
+            )
+            if (
+                latest_trace
+                and latest_trace != payload.trace_id
+                and action == "reply"
+                and not payload.mentioned
+                and not payload.is_private
+                and not reply_to_bot
+                and reply_text
+                and not image_urls
+                and not video_url
+                and not cover_url
+                and not record_b64
+                and not audio_file
+            ):
+                _log.info(
+                    "send_drop_stale_plain_reply | trace=%s | latest=%s | conversation=%s | text=%s",
+                    payload.trace_id,
+                    latest_trace,
+                    payload.conversation_id,
+                    clip_text(reply_text, 120),
+                )
+                return
             if not is_music_voice_action and audio_file:
                 audio_hint = normalize_text(audio_file).replace("\\", "/").lower()
                 looks_like_music_cache = (

@@ -89,6 +89,23 @@ class _OpenAIModelFallbackClient(OpenAICompatibleClient):
         return {"choices": [{"message": {"role": "assistant", "content": "model-ok"}}]}
 
 
+class _OpenAIModelFallbackHtmlClient(_OpenAIModelFallbackClient):
+    async def _post_with_base_candidates(
+        self,
+        endpoint: str,
+        payload: dict,
+        headers: dict,
+        prefer_v1: bool,
+        stream_response: bool = False,
+    ) -> dict:
+        _ = endpoint, headers, prefer_v1, stream_response
+        model = str(payload.get("model", ""))
+        self.models_seen.append(model)
+        if model == "bad-model":
+            raise RuntimeError("接口返回非 JSON：<!doctype html><html>")
+        return {"choices": [{"message": {"role": "assistant", "content": "model-ok"}}]}
+
+
 class ModelClientFailoverRegressionTests(unittest.TestCase):
     def _build_client(self) -> ModelClient:
         cfg = {
@@ -177,6 +194,16 @@ class ModelClientFailoverRegressionTests(unittest.TestCase):
 
     def test_openai_compatible_can_fallback_between_models(self) -> None:
         client = _OpenAIModelFallbackClient()
+
+        result = asyncio.run(
+            client.chat_text(messages=[{"role": "user", "content": "ping"}])
+        )
+
+        self.assertEqual(result, "model-ok")
+        self.assertEqual(client.models_seen, ["bad-model", "good-model"])
+
+    def test_openai_compatible_can_fallback_when_gateway_returns_html(self) -> None:
+        client = _OpenAIModelFallbackHtmlClient()
 
         result = asyncio.run(
             client.chat_text(messages=[{"role": "user", "content": "ping"}])

@@ -38,6 +38,7 @@ class AgentToolRegistry:
         "memory_update": {"id": "record_id", "text": "content"},
         "memory_delete": {"id": "record_id"},
         "memory_audit": {"id": "record_id"},
+        "analyze_image": {"image_url": "url", "image": "url"},
         "web_search": {"q": "query", "keyword": "query"},
         "music_play": {"query": "keyword", "song": "keyword", "name": "keyword"},
         "music_search": {"query": "keyword", "song": "keyword", "name": "keyword"},

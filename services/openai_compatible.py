@@ -244,6 +244,10 @@ class OpenAICompatibleClient(BaseLLMClient):
                 "service unavailable",
                 "responses 返回为空",
                 "返回为空",
+                "接口返回非 json",
+                "non json",
+                "invalid json",
+                "<!doctype",
             )
         )
 
