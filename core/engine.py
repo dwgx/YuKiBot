@@ -872,6 +872,20 @@ class YukikoEngine:
 
             self._reload_sync_lock.release()
 
+    def refresh_runtime_policy_components(self, *, reason: str = "") -> None:
+        """Refresh lightweight runtime policy objects after in-memory config changes."""
+        self._init_from_config()
+        self.trigger = TriggerEngine(
+            trigger_config=self._build_effective_trigger_config(),
+            bot_config=self.config.get("bot", {}),
+        )
+        self.router = RouterEngine(
+            config=self.config,
+            personality=self.personality,
+            model_client=self.model_client,
+        )
+        self.logger.info("runtime_policy_components_refreshed | reason=%s", reason or "-")
+
     @staticmethod
     def _deep_merge_plain(base: Any, patch: Any) -> Any:
         if not isinstance(base, dict) or not isinstance(patch, dict):
@@ -1260,6 +1274,18 @@ class YukikoEngine:
             or message.mentioned
             or self._looks_like_bot_call(message.text)
         )
+        strategy_mode = self._detect_bot_strategy_directive(
+            text,
+            message=message,
+            explicit_bot_addressed=explicit_bot_addressed,
+            followup_candidate=bool(getattr(trigger, "followup_candidate", False)),
+        )
+        if strategy_mode:
+            return await self._handle_bot_strategy_directive(
+                message=message,
+                text=text,
+                mode=strategy_mode,
+            )
         alias_call_hint = ""
         text, alias_token = self._strip_edge_bot_alias_tokens(text)
         if alias_token:
@@ -3603,6 +3629,129 @@ class YukikoEngine:
 
         aliases = self._get_bot_aliases()
         return any(alias in content for alias in aliases)
+
+    def _detect_bot_strategy_directive(
+        self,
+        text: str,
+        *,
+        message: EngineMessage,
+        explicit_bot_addressed: bool,
+        followup_candidate: bool = False,
+    ) -> str:
+        content = normalize_text(text).lower()
+        if not content:
+            return ""
+        reply_to_bot = bool(
+            normalize_text(str(message.reply_to_user_id or ""))
+            and normalize_text(str(message.reply_to_user_id or ""))
+            == normalize_text(str(message.bot_id or ""))
+        )
+        directed_like = bool(
+            explicit_bot_addressed
+            or reply_to_bot
+            or followup_candidate
+            or message.is_private
+        )
+        if not directed_like:
+            return ""
+        compact = re.sub(r"\s+", "", content)
+        if len(compact) > 48 and not any(
+            cue in compact
+            for cue in (
+                "你闭嘴",
+                "机器人闭嘴",
+                "bot闭嘴",
+                "别回复了",
+                "别回了",
+                "停止回复",
+            )
+        ):
+            return ""
+        active_cues = ("可以说话", "恢复说话", "别闭嘴", "不用闭嘴", "不要闭嘴", "活跃模式")
+        if any(cue in compact for cue in active_cues):
+            return "active"
+        cold_cues = (
+            "闭嘴",
+            "别说话",
+            "不要说话",
+            "不说话",
+            "别回复",
+            "别回了",
+            "别回",
+            "停止回复",
+            "沉默一下",
+            "先别回",
+            "先别说",
+            "冷漠模式",
+        )
+        if any(cue in compact for cue in cold_cues):
+            return "cold"
+        quiet_cues = ("少说话", "安静点", "安静一下", "消停点", "消停", "别插嘴", "安静模式")
+        if any(cue in compact for cue in quiet_cues):
+            return "quiet"
+        return ""
+
+    async def _handle_bot_strategy_directive(
+        self,
+        *,
+        message: EngineMessage,
+        text: str,
+        mode: str,
+    ) -> EngineResponse:
+        self.logger.info(
+            "bot_strategy_directive | trace=%s | conversation=%s | user=%s | mode=%s | text=%s",
+            message.trace_id,
+            message.conversation_id,
+            message.user_id,
+            mode,
+            clip_text(text, 80),
+        )
+        self.trigger.close_session(
+            message.conversation_id,
+            message.user_id,
+            message.is_private,
+        )
+        if not self.admin.is_super_admin(message.user_id):
+            self.logger.info(
+                "bot_strategy_directive_non_admin | trace=%s | conversation=%s | user=%s",
+                message.trace_id,
+                message.conversation_id,
+                message.user_id,
+            )
+            return EngineResponse(action="ignore", reason="bot_strategy_directive_non_admin")
+
+        command_arg = {
+            "cold": "冷漠",
+            "quiet": "安静",
+            "active": "活跃",
+        }.get(mode, "冷漠")
+        result = await self.admin.handle_command(
+            text=f"/yuki 行为 {command_arg}",
+            user_id=message.user_id,
+            group_id=message.group_id,
+            sender_role=message.sender_role or "",
+            engine=self,
+            api_call=message.api_call,
+        )
+        reply_map = {
+            "cold": "收到，已切到冷漠模式。",
+            "quiet": "收到，已切到安静模式。",
+            "active": "收到，已恢复活跃模式。",
+        }
+        reply_text = reply_map.get(mode, result or "收到。")
+        self.logger.info(
+            "bot_strategy_directive_applied | trace=%s | conversation=%s | user=%s | mode=%s | result=%s",
+            message.trace_id,
+            message.conversation_id,
+            message.user_id,
+            mode,
+            clip_text(str(result or ""), 100),
+        )
+        return EngineResponse(
+            action="reply",
+            reason="bot_strategy_directive",
+            reply_text=reply_text,
+        )
 
     def _is_bot_alias_only_message(self, text: str) -> bool:
         content = normalize_text(text).lower()

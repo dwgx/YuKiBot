@@ -404,12 +404,13 @@ prompt_navigator:
       - get_qzone_albums
       - get_qzone_photos
       - analyze_qzone
+      - admin_command
       - send_poke
       - send_like
       - think
       - final_answer
       - navigate_section
-      instructions: 严格使用当前用户权限和本轮对象解析。@对象通常是操作对象；回复消息通常是引用对象。群管理操作需要明确点名机器人，并遵守高风险确认。
+      instructions: 严格使用当前用户权限和本轮对象解析。@对象通常是操作对象；回复消息通常是引用对象。用户要求机器人少说话、闭嘴、安静、恢复活跃时，用 admin_command 调整行为模式或关闭当前会话，不要当普通闲聊回复。群管理操作需要明确点名机器人，并遵守高风险确认。
       fallback_sections:
       - memory_knowledge
       - web_research

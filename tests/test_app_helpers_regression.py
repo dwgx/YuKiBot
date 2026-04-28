@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -159,6 +160,49 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
             info = app_helpers._read_media_stream_info_sync(Path("missing.mp4"))
 
         self.assertEqual(info, {"video_codec": "", "audio_codec": "", "pix_fmt": ""})
+
+    def test_video_health_allows_silent_video_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video = Path(tmpdir) / "silent.mp4"
+            video.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\0" * (181 * 1024))
+
+            def fake_run(*args, **kwargs):
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=json.dumps(
+                        {
+                            "format": {"duration": "3.0", "size": str(video.stat().st_size)},
+                            "streams": [
+                                {
+                                    "codec_type": "video",
+                                    "codec_name": "h264",
+                                    "width": 720,
+                                    "height": 1280,
+                                    "duration": "3.0",
+                                }
+                            ],
+                        }
+                    ),
+                    stderr="",
+                )
+
+            with (
+                patch.object(app_helpers, "_FFPROBE_BIN", "ffprobe"),
+                patch.object(app_helpers, "_FFMPEG_BIN", "ffmpeg"),
+                patch.object(app_helpers, "_read_media_stream_info_sync", lambda path: {"video_codec": "h264", "audio_codec": "", "pix_fmt": "yuv420p"}),
+                patch.object(app_helpers.subprocess, "run", fake_run),
+            ):
+                ok, reason = app_helpers._probe_local_video_health_sync(video)
+
+        self.assertTrue(ok, reason)
+        self.assertEqual(reason, "")
+
+    def test_silent_h264_video_does_not_force_qq_compat_transcode(self) -> None:
+        with patch.object(app_helpers, "_read_media_stream_info_sync", lambda path: {"video_codec": "h264", "audio_codec": "", "pix_fmt": "yuv420p"}):
+            need, reason, _ = app_helpers._needs_qq_video_compat(Path("silent.mp4"))
+
+        self.assertFalse(need)
+        self.assertEqual(reason, "")
 
     async def test_generate_video_thumbnail_tolerates_missing_ffmpeg(self) -> None:
         with patch.object(app_helpers, "_FFMPEG_BIN", None):

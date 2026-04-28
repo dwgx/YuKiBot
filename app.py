@@ -2136,7 +2136,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                     seg = None if video_issue else await _build_video_segment(
                         video_url,
                         stage_dir=napcat_media_stage_dir,
-                        prefer_plain_path=True,
+                        prefer_plain_path=False,
                     )
                 if video_delivered:
                     pass
@@ -2145,7 +2145,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                     send_exc: Exception | None = None
                     try:
                         _log.info(
-                            "media_delivery_inline_attempt | channel=video_segment | ref=%s",
+                            "media_delivery_inline_attempt | channel=video_segment_file_uri | ref=%s",
                             clip_text(str((getattr(seg, "data", {}) or {}).get("file", "")), 180),
                         )
                         sent_video = await send_msg(Message(seg))
@@ -2155,12 +2155,12 @@ def register_handlers(engine: YukikoEngine) -> None:
                         uri_seg = None if video_issue else await _build_video_segment(
                             video_url,
                             stage_dir=napcat_media_stage_dir,
-                            prefer_plain_path=False,
+                            prefer_plain_path=True,
                         )
                         if uri_seg is not None:
                             try:
                                 _log.info(
-                                    "media_delivery_inline_attempt | channel=video_segment_file_uri | ref=%s",
+                                    "media_delivery_inline_attempt | channel=video_segment_plain_path | ref=%s",
                                     clip_text(str((getattr(uri_seg, "data", {}) or {}).get("file", "")), 180),
                                 )
                                 sent_video = await send_msg(Message(uri_seg))

@@ -87,6 +87,17 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertIn("sticker_request", state.evidence)
         self.assertIn("send_face", nav.scoped_tools(state))
 
+    def test_bot_strategy_request_preselects_admin_section(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "@YuKiKo 闭嘴一下"
+        state = nav.initial_state(
+            ctx, ["think", "final_answer", "navigate_section", "admin_command"]
+        )
+        self.assertEqual(state.active_section, "qq_admin_social")
+        self.assertIn("bot_strategy_request", state.evidence)
+        self.assertIn("admin_command", nav.scoped_tools(state))
+
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         samples = [

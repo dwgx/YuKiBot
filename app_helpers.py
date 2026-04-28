@@ -1580,10 +1580,8 @@ def _needs_qq_video_compat(path: Path) -> tuple[bool, str, dict[str, str]]:
         return True, f"video_codec_{vcodec}", info
     if pix_fmt and not (pix_fmt.startswith("yuv420") or pix_fmt in {"nv12", "yuvj420p"}):
         return True, f"pix_fmt_{pix_fmt}", info
-    # 无音轨或音轨非 AAC 时统一转 AAC，避免客户端兼容问题。
-    if not acodec:
-        return True, "audio_missing", info
-    if acodec not in {"aac", "mp3", "mp2"}:
+    # 无音轨视频仍可以作为 QQ 短视频预览发送；只有存在音轨但编码不友好时才转码。
+    if acodec and acodec not in {"aac", "mp3", "mp2"}:
         return True, f"audio_codec_{acodec}", info
     return False, "", info
 
@@ -1620,7 +1618,7 @@ def _ensure_qq_preview_video_sync(src: Path) -> Path:
         pass
 
     src_has_audio = bool(normalize_text(info.get("audio_codec", "")))
-    # 始终保留原始音轨映射；不再注入静音轨，避免误判后无声。
+    # 始终保留原始音轨映射；无音轨视频允许直接作为静音预览发送。
     cmd: list[str] = [
         _FFMPEG_BIN,
         "-y",
@@ -1997,8 +1995,6 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     has_audio = bool(normalize_text(stream_info.get("audio_codec", "")))
     can_detect_audio = bool(_FFPROBE_BIN or _FFMPEG_BIN)
     if not _FFPROBE_BIN:
-        if can_detect_audio and not has_audio:
-            return False, "视频无音轨（发送会没声音）"
         return True, ""
 
     cmd = [
@@ -2016,8 +2012,6 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
     except Exception:
-        if can_detect_audio and not has_audio:
-            return False, "视频无音轨（发送会没声音）"
         return True, ""
     if proc.returncode != 0:
         return False, "ffprobe 无法解析该视频（可能损坏）"
@@ -2064,7 +2058,7 @@ def _probe_local_video_health_sync(path: Path) -> tuple[bool, str]:
     if width > 0 and height > 0 and (width < 64 or height < 64):
         return False, f"视频分辨率异常（{width}x{height}）"
     if can_detect_audio and not has_audio:
-        return False, "视频无音轨（发送会没声音）"
+        _log.info("video_health_no_audio_allowed | file=%s", path.name)
     return True, ""
 
 

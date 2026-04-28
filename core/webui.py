@@ -3667,7 +3667,7 @@ async def chat_agent_text(request: Request):
             return True
 
         video_delivered = False
-        for prefer_plain in (True, False):
+        for prefer_plain in (False, True):
             try:
                 if await _send_video_segment(prefer_plain_path=prefer_plain):
                     video_delivered = True

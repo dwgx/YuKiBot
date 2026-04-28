@@ -330,6 +330,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                     "get_qzone_albums",
                     "get_qzone_photos",
                     "analyze_qzone",
+                    "admin_command",
                     "send_poke",
                     "send_like",
                     "think",
@@ -338,7 +339,8 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 ],
                 "instructions": (
                     "严格使用当前用户权限和本轮对象解析。@对象通常是操作对象；回复消息通常是引用对象。"
-                    "群管理操作需要明确点名机器人，并遵守高风险确认。"
+                    "用户要求机器人少说话、闭嘴、安静、恢复活跃时，用 admin_command 调整行为模式或关闭当前会话，"
+                    "不要当普通闲聊回复。群管理操作需要明确点名机器人，并遵守高风险确认。"
                 ),
                 "fallback_sections": ["memory_knowledge", "web_research", "fallback_debug"],
                 "failure_policy": "权限不足或对象不明确时，不执行，先说明需要的权限或目标。",
@@ -619,6 +621,8 @@ class PromptNavigator:
             add("music_audio", "music_request")
         if self._looks_like_web_research_request(ctx):
             add("web_research", "external_research_request")
+        if self._looks_like_bot_strategy_request(ctx):
+            add("qq_admin_social", "bot_strategy_request")
         if getattr(ctx, "at_other_user_ids", None):
             add("qq_admin_social", "mention_target")
 
@@ -768,6 +772,34 @@ class PromptNavigator:
             "下载地址",
         )
         return any(cue in text for cue in cues)
+
+    @staticmethod
+    def _looks_like_bot_strategy_request(ctx: Any) -> bool:
+        parts: list[str] = []
+        for attr in ("message_text", "original_message_text", "reply_to_text"):
+            text = normalize_text(str(getattr(ctx, attr, "") or ""))
+            if text:
+                parts.append(text)
+        text = normalize_text(" ".join(parts)).lower()
+        if not text:
+            return False
+        resume_cues = ("可以说话", "恢复说话", "别闭嘴", "不用闭嘴", "不要闭嘴", "活跃")
+        quiet_cues = (
+            "闭嘴",
+            "别说话",
+            "不要说话",
+            "别回复",
+            "别回",
+            "少说话",
+            "安静点",
+            "安静一下",
+            "沉默一下",
+            "消停",
+            "回复频率",
+            "冷漠模式",
+            "安静模式",
+        )
+        return any(cue in text for cue in resume_cues + quiet_cues)
 
     @staticmethod
     def _looks_like_media_search_request(ctx: Any) -> bool:

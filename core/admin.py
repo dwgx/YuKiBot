@@ -32,7 +32,8 @@ _FUZZY_COMMAND_MAP: dict[str, str] = {
     "音乐": "music_card", "点歌": "music_card", "音乐卡片": "music_card",
     "json": "json_card", "卡片": "json_card",
     "行为": "behavior", "模式": "behavior", "冷漠": "behavior_cold",
-    "安静": "behavior_quiet", "活跃": "behavior_active",
+    "闭嘴": "behavior_cold", "别说话": "behavior_cold", "别回复": "behavior_cold",
+    "安静": "behavior_quiet", "少说话": "behavior_quiet", "活跃": "behavior_active",
     "插件": "plugins", "plugins": "plugins",
     "群信息": "group_info",
     "cookie": "cookie", "cookies": "cookie",
@@ -103,9 +104,17 @@ class AdminEngine:
         "json": "json_card",
         "jsoncard": "json_card",
         "行为": "behavior",
+        "behavior": "behavior",
         "冷漠": "behavior_cold",
+        "cold": "behavior_cold",
+        "闭嘴": "behavior_cold",
+        "别说话": "behavior_cold",
+        "别回复": "behavior_cold",
         "安静": "behavior_quiet",
+        "quiet": "behavior_quiet",
+        "少说话": "behavior_quiet",
         "活跃": "behavior_active",
+        "active": "behavior_active",
         "定海神针": "clear_screen",
         "刷屏": "clear_screen",
         "学习表情包": "learn_sticker",
@@ -1328,6 +1337,17 @@ class AdminEngine:
             return "行为系统未就绪"
         return self._set_behavior_mode(engine, "active")
 
+    def _refresh_behavior_runtime(self, engine: Any, mode: str) -> None:
+        refresh = getattr(engine, "refresh_runtime_policy_components", None)
+        if not callable(refresh):
+            return
+        try:
+            refresh(reason=f"behavior_mode:{mode}")
+        except TypeError:
+            refresh()
+        except Exception:
+            _log.warning("behavior_runtime_refresh_fail | mode=%s", mode, exc_info=True)
+
     def _set_behavior_mode(self, engine: Any, mode: str) -> str:
         trigger_cfg = engine.config.setdefault("trigger", {}) if isinstance(engine.config, dict) else {}
         routing_cfg = engine.config.setdefault("routing", {}) if isinstance(engine.config, dict) else {}
@@ -1351,6 +1371,7 @@ class AdminEngine:
                 "non_directed_min_confidence": 0.90,
                 "ai_gate_min_confidence": 0.84,
             })
+            self._refresh_behavior_runtime(engine, mode)
             return "已切换到冷漠模式"
         if mode == "quiet":
             trigger_cfg.update({
@@ -1367,6 +1388,7 @@ class AdminEngine:
                 "non_directed_min_confidence": 0.86,
                 "ai_gate_min_confidence": 0.80,
             })
+            self._refresh_behavior_runtime(engine, mode)
             return "已切换到安静模式"
         if mode == "active":
             trigger_cfg.update({
@@ -1383,6 +1405,7 @@ class AdminEngine:
                 "non_directed_min_confidence": 0.64,
                 "ai_gate_min_confidence": 0.54,
             })
+            self._refresh_behavior_runtime(engine, mode)
             return "已切换到活跃模式"
 
         trigger_cfg.update({
@@ -1399,6 +1422,7 @@ class AdminEngine:
             "non_directed_min_confidence": 0.72,
             "ai_gate_min_confidence": 0.66,
         })
+        self._refresh_behavior_runtime(engine, mode)
         return "已恢复默认行为模式"
 
     async def _send_segment(self, kwargs: dict[str, Any], seg_type: str, data: dict[str, Any]) -> str | None:
