@@ -195,6 +195,9 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                     "github_search",
                     "github_readme",
                     "douyin_search",
+                    "wayback_lookup",
+                    "wayback_extract",
+                    "wayback_timeline",
                     "think",
                     "final_answer",
                     "navigate_section",
@@ -202,6 +205,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 "instructions": (
                     "外部事实先工具验证。搜索 query 要具体；打开已有 URL 用 fetch_webpage；"
                     "网页内容复杂时再用 scrape_extract/summarize/structured/follow_links。"
+                    "历史网页、归档、网络时光机、Wayback 任务用 wayback_lookup/wayback_extract。"
                 ),
                 "fallback_sections": ["video_url", "download_resources", "memory_knowledge", "fallback_debug"],
                 "failure_policy": "搜索无结果时换一个更具体查询；仍失败就说明查不到的范围和原因。",

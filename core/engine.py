@@ -5457,6 +5457,38 @@ class YukikoEngine:
                     "summary": clip_text(normalize_text(str(cached.get("summary", ""))), 500),
                     "reply_to_message_id": normalize_text(str(message.reply_to_message_id)),
                 }
+        web_url = source_url
+        web_title = ""
+        if not web_url:
+            for item in choices:
+                if not isinstance(item, dict):
+                    continue
+                candidate = normalize_text(str(item.get("url", "")))
+                if candidate:
+                    web_url = candidate
+                    web_title = normalize_text(str(item.get("title", "")))
+                    break
+        if not web_url:
+            for field in ("query", "summary", "full_text"):
+                urls = self._extract_urls_from_text(str(cached.get(field, "")))
+                if urls:
+                    web_url = urls[0]
+                    break
+        if web_url:
+            artifact = {
+                "type": "web",
+                "url": web_url,
+                "source_url": web_url,
+                "title": web_title,
+                "summary": clip_text(normalize_text(str(cached.get("summary", ""))), 500),
+                "reply_to_message_id": normalize_text(str(message.reply_to_message_id)),
+            }
+            self.logger.info(
+                "navigator_context_artifact | trace=%s | type=web | source=%s",
+                message.trace_id,
+                clip_text(web_url, 160),
+            )
+            return artifact
         return {}
 
     def _index_message_media(
@@ -5876,6 +5908,7 @@ class YukikoEngine:
                 content,
                 flags=re.DOTALL | re.IGNORECASE,
             )
+            content = re.sub(r"^\s*用户\d{2,12}\s*[，,、:：]\s*", "", content).strip()
             # 兜底：剥离未闭合的 ```json tool call 片段。
             content = re.sub(
                 rf"```(?:json)?\s*\{{(?=[\s\S]*?\"(?:name|tool)\"\s*:\s*\"{tool_payload_name_pattern}\")(?=[\s\S]*?{tool_payload_args_pattern})[\s\S]*$",
@@ -6302,6 +6335,8 @@ class YukikoEngine:
             return reply_text
 
         name = normalize_text(strip_invisible_format_chars(user_name))
+        if re.fullmatch(r"\d{5,12}", name):
+            return reply_text
         if not name or len(name) > 24:
             return reply_text
 

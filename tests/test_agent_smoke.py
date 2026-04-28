@@ -596,6 +596,12 @@ class AgentProtectionTests(unittest.TestCase):
         self.assertNotIn("/Users/dwgx", normalized)
         self.assertIn("本地文件路径已隐藏", normalized)
 
+    def test_final_answer_strips_synthetic_user_number_prefix(self):
+        text = "用户6451，先说结论：现在这个站返回 502。"
+        normalized = AgentLoop._normalize_final_answer_text(text)
+
+        self.assertEqual(normalized, "先说结论：现在这个站返回 502。")
+
     def test_local_video_final_answer_drops_tool_contradiction(self):
         video_path = "/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/4e38bdc60d72_10315127.mp4"
         text = (

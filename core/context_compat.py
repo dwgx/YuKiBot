@@ -248,7 +248,7 @@ def _build_thread_line(
         else:
             actor = _lookup_recent_speaker_name(last_user_id, payload.recent_speakers)
             if not actor:
-                actor = f"用户{last_user_id[-4:]}" if last_user_id else ""
+                actor = "群成员" if last_user_id else ""
     parts: list[str] = []
     if last_topic:
         parts.append(f"上一轮主线话题={last_topic}")
@@ -278,5 +278,5 @@ def _display_name(user_id: str, display_name: str = "", fallback_name: str = "")
         return name
     uid = normalize_text(user_id)
     if uid:
-        return f"用户{uid[-4:]}"
+        return "群成员"
     return "当前用户"

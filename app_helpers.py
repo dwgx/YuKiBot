@@ -487,10 +487,10 @@ def _resolve_other_user_targets(
     return at_other_user_ids, at_other_user_only
 
 
-def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict[str, Any]]]:
+def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict[str, Any]], list[str]]:
     """解析 get_msg 或 event.reply 负载，返回 (uid, name, text, media)。"""
     if payload is None:
-        return "", "", "", []
+        return "", "", "", [], []
 
     data: dict[str, Any] = {}
     if isinstance(payload, dict):
@@ -538,6 +538,7 @@ def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict
 
     reply_text_parts: list[str] = []
     reply_media: list[dict[str, Any]] = []
+    nested_reply_ids: list[str] = []
 
     def _iter_segments_list(items: list[Any]) -> None:
         for seg in items:
@@ -554,6 +555,11 @@ def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict
                 if isinstance(raw_data, dict):
                     seg_data = dict(raw_data)
             if not seg_type:
+                continue
+            if seg_type == "reply":
+                nested_id = normalize_text(str(seg_data.get("id", "")))
+                if nested_id and nested_id not in nested_reply_ids:
+                    nested_reply_ids.append(nested_id)
                 continue
             if seg_type == "text":
                 text_piece = normalize_text(str(seg_data.get("text", "")))
@@ -575,9 +581,18 @@ def _parse_reply_context_payload(payload: Any) -> tuple[str, str, str, list[dict
             seg_type = m.group(1)
             pairs = dict(kv.split("=", 1) for kv in m.group(2).split(",") if "=" in kv)
             reply_media.append({"type": seg_type, "data": pairs})
+        for m in _re.finditer(r"\[CQ:reply,([^\]]+)\]", message_content):
+            pairs = dict(kv.split("=", 1) for kv in m.group(1).split(",") if "=" in kv)
+            nested_id = normalize_text(str(pairs.get("id", "")))
+            if nested_id and nested_id not in nested_reply_ids:
+                nested_reply_ids.append(nested_id)
 
     reply_text = _normalize_reply_text("\n".join(reply_text_parts))
-    return user_id, user_name, reply_text, reply_media
+    return user_id, user_name, reply_text, reply_media, nested_reply_ids
+
+
+def _reply_text_has_url(text: str) -> bool:
+    return bool(re.search(r"https?://|(?<![@\w.-])(?:[A-Za-z0-9-]+\.)+(?:com|net|org|dev|io|ai|app|site|xyz|me|co|cn|jp|tv|gg|cc|info|wiki|top)\b", str(text or ""), re.I))
 
 
 async def _resolve_reply_context(
@@ -588,7 +603,8 @@ async def _resolve_reply_context(
     """解析被引用消息，返回 (发送者user_id, 发送者昵称, 被引用文本, 被引用消息的媒体segments列表)。"""
     mid = str(reply_message_id or "").strip()
     event_reply = getattr(event, "reply", None) if event is not None else None
-    event_ctx = _parse_reply_context_payload(event_reply) if event_reply else ("", "", "", [])
+    event_ctx_full = _parse_reply_context_payload(event_reply) if event_reply else ("", "", "", [], [])
+    event_ctx = event_ctx_full[:4]
 
     if not mid:
         return event_ctx
@@ -604,13 +620,39 @@ async def _resolve_reply_context(
     if not isinstance(data, dict):
         return event_ctx
 
-    user_id, user_name, reply_text, reply_media = _parse_reply_context_payload(data)
+    user_id, user_name, reply_text, reply_media, nested_reply_ids = _parse_reply_context_payload(data)
     if not (user_id or user_name or reply_text or reply_media):
         return event_ctx
     if not reply_text and event_ctx[2]:
         reply_text = event_ctx[2]
     if not reply_media and event_ctx[3]:
         reply_media = event_ctx[3]
+    if not nested_reply_ids and len(event_ctx_full) >= 5:
+        nested_reply_ids = list(event_ctx_full[4] or [])
+
+    if nested_reply_ids and not _reply_text_has_url(reply_text):
+        for nested_id in nested_reply_ids[:2]:
+            if not nested_id or nested_id == mid:
+                continue
+            nested_data: Any = None
+            try:
+                nested_data = await call_napcat_bot_api(bot, "get_msg", message_id=int(nested_id))
+            except Exception:
+                try:
+                    nested_data = await call_napcat_bot_api(bot, "get_msg", message_id=nested_id)
+                except Exception:
+                    nested_data = None
+            if not isinstance(nested_data, dict):
+                continue
+            _nested_uid, _nested_name, nested_text, nested_media, _nested_ids = _parse_reply_context_payload(nested_data)
+            if nested_text:
+                reply_text = _normalize_reply_text(
+                    "\n".join(part for part in (reply_text, f"[被引用消息继续引用的原文] {nested_text}") if part)
+                )
+            if nested_media and not reply_media:
+                reply_media = nested_media
+            if _reply_text_has_url(reply_text):
+                break
 
     if reply_media:
         _log.debug(
@@ -795,7 +837,7 @@ async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> bool:
 def _extract_user_name(event: MessageEvent) -> str:
     sender = getattr(event, "sender", None)
     if sender is None:
-        return str(event.get_user_id())
+        return ""
 
     for field in ("card", "nickname"):
         value = getattr(sender, field, None)
@@ -808,7 +850,7 @@ def _extract_user_name(event: MessageEvent) -> str:
             if value:
                 return str(value)
 
-    return str(event.get_user_id())
+    return ""
 
 
 def _extract_sender_role(event: MessageEvent) -> str:

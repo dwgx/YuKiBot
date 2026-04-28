@@ -19,6 +19,23 @@ from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
 
 class AppHelpersRegressionTests(unittest.TestCase):
+    def test_reply_context_payload_keeps_nested_reply_id(self) -> None:
+        payload = {
+            "sender": {"user_id": 3223915831, "nickname": "30秒"},
+            "message": [
+                {"type": "reply", "data": {"id": "643619804"}},
+                {"type": "text", "data": {"text": "查完了"}},
+            ],
+        }
+
+        user_id, user_name, reply_text, media, nested_ids = app_helpers._parse_reply_context_payload(payload)
+
+        self.assertEqual(user_id, "3223915831")
+        self.assertEqual(user_name, "30秒")
+        self.assertEqual(reply_text, "查完了")
+        self.assertEqual(media, [])
+        self.assertEqual(nested_ids, ["643619804"])
+
     def test_video_heavy_detects_platform_parse_requests(self) -> None:
         self.assertTrue(
             _looks_like_video_heavy_request(

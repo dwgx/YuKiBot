@@ -76,6 +76,7 @@ _RE_LOCAL_FILE_REF = re.compile(
     r"|/(?:Users|home|tmp|private|var|mnt|Volumes)/[^\s`'\"，。；、]+"
     r")"
 )
+_RE_SYNTHETIC_USER_PREFIX = re.compile(r"^\s*用户\d{2,12}\s*[，,、:：]\s*")
 
 
 def _strip_trailing_url_noise(url: str) -> str:
@@ -982,6 +983,50 @@ class AgentLoop:
                             ",".join((ctx.navigator_state.evidence if ctx.navigator_state else [])[:6]),
                         )
                     else:
+                        retry_section = await self._navigator_timeout_section_retry(
+                            ctx=ctx,
+                            step_idx=step_idx,
+                            tool_calls_made=tool_calls_made,
+                            steps=steps,
+                            remaining=remaining,
+                        )
+                        if retry_section:
+                            parsed = {
+                                "tool": NAVIGATE_SECTION_TOOL,
+                                "args": {
+                                    "section_id": retry_section[0],
+                                    "reason": retry_section[1],
+                                },
+                            }
+                            response_text = json.dumps(parsed, ensure_ascii=False)
+                            assistant_msg = {
+                                "role": "assistant",
+                                "content": response_text,
+                            }
+                            synthetic_tool_call = True
+                            _log.info(
+                                "navigator_timeout_section_retry | trace=%s | step=%d | section=%s | reason=%s",
+                                ctx.trace_id,
+                                step_idx,
+                                retry_section[0],
+                                clip_text(retry_section[1], 120),
+                            )
+                        elif steps:
+                            return await self._build_fallback_result(
+                                ctx, steps, tool_calls_made, t0, "llm_timeout"
+                            )
+                        else:
+                            fallback = _pl.get_message(
+                                "llm_timeout_fallback",
+                                "我这边处理超时了。你可以把问题再精简一点，我马上继续。",
+                            )
+                            return AgentResult(
+                                reply_text=fallback,
+                                action="reply",
+                                reason="agent_llm_timeout",
+                                total_time_ms=self._elapsed(t0),
+                            )
+                    if not synthetic_tool_call and parsed is None:
                         if steps:
                             return await self._build_fallback_result(
                                 ctx, steps, tool_calls_made, t0, "llm_timeout"
@@ -2267,6 +2312,8 @@ class AgentLoop:
                 )
             )
             url = self._extract_first_web_url(merged) or self._extract_first_url(merged)
+            if self._has_non_url_instruction_text(ctx):
+                return None
             if (
                 url
                 and "fetch_webpage" in visible_tools
@@ -2274,6 +2321,128 @@ class AgentLoop:
             ):
                 return "fetch_webpage", {"url": url}
         return None
+
+    async def _navigator_timeout_section_retry(
+        self,
+        *,
+        ctx: AgentContext,
+        step_idx: int,
+        tool_calls_made: int,
+        steps: list[dict[str, Any]],
+        remaining: float,
+    ) -> tuple[str, str] | None:
+        """Use a tiny LLM router prompt when the full Agent prompt stalls before any tool.
+
+        This keeps free-text routing prompt-driven: the retry can only choose a
+        Navigator section, never synthesize a domain tool call.
+        """
+        if tool_calls_made > 0 or steps or step_idx != 0:
+            return None
+        state = ctx.navigator_state
+        if state is None:
+            return None
+        if normalize_text(state.active_section) != "general_chat":
+            return None
+        navigator = self._load_prompt_navigator()
+        if not navigator.enabled:
+            return None
+        timeout = min(10.0, max(3.0, remaining - 2.0))
+        if timeout <= 2.5:
+            return None
+        lines = [
+            "你是 YuKiKo 的 Prompt Navigator 分区选择器。",
+            '只输出 JSON: {"section_id":"分区ID","reason":"一句话原因"}。',
+            "不能回答用户，不能选择具体工具，只能选择最合适的分区。",
+            "分区目录:",
+        ]
+        for sid, section in navigator.config.sections.items():
+            lines.append(f"- {sid}: {section.when_to_use or section.name or sid}")
+        user_parts = [
+            f"当前消息: {clip_text(normalize_text(ctx.message_text), 240)}",
+        ]
+        if normalize_text(ctx.reply_to_text):
+            user_parts.append(
+                f"引用文本: {clip_text(normalize_text(ctx.reply_to_text), 240)}"
+            )
+        if ctx.media_summary or ctx.reply_media_summary:
+            user_parts.append(
+                "媒体结构: "
+                + ", ".join(
+                    [*list(ctx.media_summary or []), *list(ctx.reply_media_summary or [])][
+                        :8
+                    ]
+                )
+            )
+        try:
+            raw = await asyncio.wait_for(
+                self.model_client.chat_text_with_retry(
+                    [
+                        {"role": "system", "content": "\n".join(lines)},
+                        {"role": "user", "content": "\n".join(user_parts)},
+                    ],
+                    max_tokens=120,
+                    retries=0,
+                    backoff=0.0,
+                ),
+                timeout=timeout,
+            )
+        except Exception as exc:
+            _log.info(
+                "navigator_timeout_section_retry_failed | trace=%s | step=%d | %s",
+                ctx.trace_id,
+                step_idx,
+                exc,
+            )
+            return None
+        payload = self._parse_json_object_from_text(str(raw or ""))
+        if not isinstance(payload, dict):
+            return None
+        section_id = normalize_text(str(payload.get("section_id", "")))
+        reason = normalize_text(str(payload.get("reason", ""))) or "full prompt timed out; tiny navigator selected this section"
+        if not section_id or section_id == state.active_section:
+            return None
+        if section_id not in navigator.config.sections:
+            return None
+        return section_id, reason
+
+    @staticmethod
+    def _parse_json_object_from_text(text: str) -> dict[str, Any] | None:
+        raw = normalize_text(text)
+        if not raw:
+            return None
+        block = _RE_CODE_BLOCK.search(raw)
+        if block:
+            raw = block.group(1).strip()
+        else:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start >= 0 and end > start:
+                raw = raw[start : end + 1]
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+    @classmethod
+    def _has_non_url_instruction_text(cls, ctx: AgentContext) -> bool:
+        for raw in (ctx.message_text, ctx.original_message_text):
+            text = normalize_text(str(raw or ""))
+            if text and cls._strip_urls_and_hosts(text):
+                return True
+        if normalize_text(ctx.reply_to_text) and normalize_text(ctx.message_text):
+            return True
+        return False
+
+    @staticmethod
+    def _strip_urls_and_hosts(text: str) -> str:
+        stripped = _RE_URL_STRIP.sub(" ", normalize_text(text))
+        stripped = _RE_BARE_WEB_HOST.sub(" ", stripped)
+        stripped = re.sub(r"\[CQ:[^\]]+\]", " ", stripped)
+        stripped = re.sub(r"@\S+", " ", stripped)
+        stripped = _RE_PUNCTUATION_CJK.sub(" ", stripped)
+        stripped = _RE_WHITESPACE.sub(" ", stripped).strip()
+        return stripped
 
     @staticmethod
     def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:
@@ -2462,7 +2631,7 @@ class AgentLoop:
             for uid, name, preview in ctx.recent_speakers[:8]:
                 user_label = normalize_text(name)
                 if not user_label:
-                    user_label = f"用户{uid[-4:]}" if uid else "某人"
+                    user_label = "群成员" if uid else "某人"
                 tail = (
                     f" 最近说: {clip_text(normalize_text(preview), 60)}"
                     if normalize_text(preview)
@@ -2635,10 +2804,13 @@ class AgentLoop:
         now_local = datetime.now().astimezone()
         now_label = now_local.strftime("%Y-%m-%d %H:%M:%S %z")
         tz_name = now_local.tzname() or "local"
+        safe_env_user_name = normalize_text(ctx.user_name)
+        if safe_env_user_name == normalize_text(str(ctx.user_id)):
+            safe_env_user_name = ""
         prompt += (
             f"## 环境\n"
             f"{'私聊' if ctx.is_private else f'群聊 {ctx.group_id}'} | "
-            f"用户: {ctx.user_name}(QQ:{ctx.user_id}) | @我: {ctx.mentioned} | 当前时间: {now_label} ({tz_name})\n\n"
+            f"当前说话人: {safe_env_user_name or '当前用户'}(QQ:{ctx.user_id}) | @我: {ctx.mentioned} | 当前时间: {now_label} ({tz_name})\n\n"
             f"## 上下文\n{context_block}\n\n"
             f"## 可用工具\n{tool_docs}"
         )
@@ -2775,8 +2947,10 @@ class AgentLoop:
     def _build_turn_target_line(ctx: AgentContext) -> str:
         current_uid = normalize_text(str(ctx.user_id))
         current_name = normalize_text(ctx.user_name) or (
-            f"用户{current_uid[-4:]}" if current_uid else "当前用户"
+            "当前用户" if current_uid else "当前用户"
         )
+        if current_name == current_uid:
+            current_name = "当前用户"
         bot_uid = normalize_text(str(ctx.bot_id))
         reply_uid = normalize_text(str(ctx.reply_to_user_id))
 
@@ -2806,7 +2980,7 @@ class AgentLoop:
             source = "current_speaker"
 
         target_name = target_name or (
-            f"用户{target_uid[-4:]}" if target_uid else current_name
+            "被提及成员" if target_uid else current_name
         )
         if target_uid:
             return f"[本轮主要对象: {target_name}(QQ:{target_uid}) | 来源: {source}]"
@@ -2817,8 +2991,10 @@ class AgentLoop:
         runtime_templates = _pl.get_dict("agent_runtime")
         rebuilt_query = self._rebuild_query_with_context(ctx.message_text, ctx)
         speaker_name = normalize_text(ctx.user_name) or (
-            f"用户{str(ctx.user_id)[-4:]}" if normalize_text(str(ctx.user_id)) else "当前用户"
+            "当前用户" if normalize_text(str(ctx.user_id)) else "当前用户"
         )
+        if speaker_name == normalize_text(str(ctx.user_id)):
+            speaker_name = "当前用户"
         speaker_line = f"[当前说话人: {speaker_name}(QQ:{ctx.user_id})]"
         if normalize_text(ctx.sender_role):
             speaker_line = f"{speaker_line[:-1]} | role={normalize_text(ctx.sender_role)}]"
@@ -5522,6 +5698,7 @@ class AgentLoop:
         if not content:
             return ""
         content = _RE_LOCAL_FILE_REF.sub("[本地文件路径已隐藏，发送层会直接投递]", content)
+        content = _RE_SYNTHETIC_USER_PREFIX.sub("", content).strip()
         if cls._looks_like_english_refusal_text(content):
             return "这个请求我不能帮你处理（涉及不当或露骨内容）。你可以换个健康、合规的话题，我继续帮你。"
         # 弱模型防护: 纯标点/空白检测（去掉所有标点和空白后为空）

@@ -40,9 +40,22 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         ctx = _Ctx()
         ctx.message_text = "网络是时光机 看skiapi.dev"
-        state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "fetch_webpage"])
+        state = nav.initial_state(
+            ctx,
+            [
+                "think",
+                "final_answer",
+                "navigate_section",
+                "fetch_webpage",
+                "wayback_lookup",
+                "wayback_extract",
+            ],
+        )
         self.assertEqual(state.active_section, "web_research")
         self.assertIn("url", state.evidence)
+        scoped = nav.scoped_tools(state)
+        self.assertIn("wayback_lookup", scoped)
+        self.assertIn("wayback_extract", scoped)
 
     def test_research_request_preselects_web_research_without_url(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -261,6 +274,29 @@ class _TimeoutModelClient:
         raise asyncio.TimeoutError()
 
 
+class _TimeoutThenSectionModelClient:
+    enabled = True
+
+    def __init__(self, section_id: str):
+        self.section_id = section_id
+        self.calls = 0
+
+    def supports_native_tool_calling(self) -> bool:
+        return False
+
+    async def chat_text_with_retry(self, messages, max_tokens=0, retries=0, backoff=0.0):
+        _ = (messages, max_tokens, retries, backoff)
+        self.calls += 1
+        if self.calls == 1:
+            raise asyncio.TimeoutError()
+        if self.calls > 2:
+            raise asyncio.TimeoutError()
+        return json.dumps(
+            {"section_id": self.section_id, "reason": "tiny navigator retry"},
+            ensure_ascii=False,
+        )
+
+
 class _ErrorModelClient:
     enabled = True
 
@@ -303,6 +339,9 @@ class _Registry:
             "search_media",
             "search_download_resources",
             "smart_download",
+            "wayback_lookup",
+            "wayback_extract",
+            "wayback_timeline",
             "music_play",
             "send_face",
             "send_emoji",
@@ -365,6 +404,12 @@ class _Registry:
             return ToolCallResult(ok=True, display="fetch ok", data={"url": args.get("url", "")})
         if name == "web_search":
             return ToolCallResult(ok=True, display="search ok", data={"query": args.get("query", "")})
+        if name.startswith("wayback_"):
+            return ToolCallResult(
+                ok=True,
+                display="wayback ok",
+                data={"url": args.get("url", ""), "text": "wayback ok"},
+            )
         if name == "search_media":
             media_type = args.get("media_type", "")
             data = {"query": args.get("query", ""), "media_type": media_type, "text": "media ok"}
@@ -779,6 +824,65 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(registry.calls, [])
         self.assertEqual(result.reason, "agent_llm_timeout")
 
+    def test_web_research_url_with_extra_instruction_does_not_force_fetch_on_timeout(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="网络时光机 看 skiapi.dev",
+            trace_id="navigator-web-wayback-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
+
+    def test_general_chat_timeout_uses_tiny_navigator_retry_before_giving_up(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutThenSectionModelClient("media_search"),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="给我发一个异环的视频",
+            trace_id="navigator-tiny-retry-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+
     def test_media_search_llm_timeout_falls_back_to_search_media_tool(self):
         registry = _Registry()
         loop = AgentLoop(
@@ -1164,7 +1268,7 @@ class AgentPromptNavigatorTests(unittest.TestCase):
             bot_id="bot",
             is_private=False,
             mentioned=True,
-            message_text="网络时光机看 skiapi.dev",
+            message_text="skiapi.dev",
             trace_id="navigator-fetch-timeout-test",
         )
 
