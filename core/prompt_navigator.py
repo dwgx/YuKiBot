@@ -17,6 +17,7 @@ _BARE_WEB_HOST_RE = re.compile(
     re.IGNORECASE,
 )
 _DOWNLOAD_EXT_RE = re.compile(r"\.(?:apk|exe|msi|zip|7z|rar|ipa|dmg)(?:[?#]|$)", re.IGNORECASE)
+_IMAGE_EXT_RE = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?=$|[?#&!@_/])", re.IGNORECASE)
 _VIDEO_EXT_RE = re.compile(r"\.(?:mp4|webm|mov|m4v|mkv)(?:[?#]|$)", re.IGNORECASE)
 _VIDEO_DOMAINS = (
     "bilibili.com",
@@ -135,6 +136,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 "when_to_use": "当前消息或引用消息携带图片、语音、视频文件等媒体结构。",
                 "tools": [
                     "analyze_image",
+                    "resolve_image",
                     "ocr_image",
                     "analyze_voice",
                     "analyze_local_video",
@@ -146,7 +148,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                     "navigate_section",
                 ],
                 "instructions": (
-                    "优先针对用户当前附带媒体或引用媒体。图片理解用 analyze_image，提取文字用 ocr_image，"
+                    "优先针对用户当前附带媒体、引用媒体或直链图片。直链图片要发出/验证用 resolve_image，图片理解用 analyze_image，提取文字用 ocr_image，"
                     "语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。"
                     "用户明确说学习/纠正表情包时用 learn_sticker/correct_sticker。"
                 ),
@@ -579,10 +581,17 @@ class PromptNavigator:
             if why and why not in evidence:
                 evidence.append(why)
 
+        current_urls = self._collect_urls(ctx, include_recent_artifact=False)
         urls = self._collect_urls(ctx)
         segment_kinds = self._collect_segment_kinds(ctx)
+        has_current_video_url = any(self._looks_like_video_url(url) for url in current_urls)
+        has_current_image_url = any(self._looks_like_image_url(url) for url in current_urls)
+        if has_current_video_url:
+            add("video_url", "video_url")
+        if has_current_image_url:
+            add("multimodal_media", "image_url")
         recent_artifact = getattr(ctx, "recent_media_artifact", None)
-        if isinstance(recent_artifact, dict):
+        if isinstance(recent_artifact, dict) and not (has_current_video_url or has_current_image_url):
             artifact_type = normalize_text(str(recent_artifact.get("type", ""))).lower()
             artifact_video = normalize_text(
                 str(
@@ -598,8 +607,6 @@ class PromptNavigator:
                 add("multimodal_media", "recent_media_artifact")
         if {"image", "voice", "audio", "video"} & segment_kinds:
             add("multimodal_media", "message_or_reply_media")
-        if any(self._looks_like_video_url(url) for url in urls):
-            add("video_url", "video_url")
         if any(_DOWNLOAD_EXT_RE.search(url) for url in urls):
             add("download_resources", "download_file_extension")
         if urls:
@@ -655,7 +662,7 @@ class PromptNavigator:
         return kinds
 
     @staticmethod
-    def _collect_urls(ctx: Any) -> list[str]:
+    def _collect_urls(ctx: Any, include_recent_artifact: bool = True) -> list[str]:
         parts: list[str] = []
         for attr in ("message_text", "original_message_text", "reply_to_text"):
             text = normalize_text(str(getattr(ctx, attr, "") or ""))
@@ -667,7 +674,7 @@ class PromptNavigator:
                 if text:
                     parts.append(text)
         recent_artifact = getattr(ctx, "recent_media_artifact", None)
-        if isinstance(recent_artifact, dict):
+        if include_recent_artifact and isinstance(recent_artifact, dict):
             for key in ("video_url", "video_file", "image_url", "url", "source_url", "path"):
                 text = normalize_text(str(recent_artifact.get(key, "")))
                 if text:
@@ -714,6 +721,17 @@ class PromptNavigator:
         if not host:
             return False
         return any(host == domain or host.endswith("." + domain) for domain in _VIDEO_DOMAINS)
+
+    @staticmethod
+    def _looks_like_image_url(url: str) -> bool:
+        text = normalize_text(url).lower()
+        if not text:
+            return False
+        if text.startswith("data:image/"):
+            return True
+        if "multimedia.nt.qq.com.cn/download" in text:
+            return True
+        return bool(_IMAGE_EXT_RE.search(text))
 
     @staticmethod
     def _looks_like_web_research_request(ctx: Any) -> bool:

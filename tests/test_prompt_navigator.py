@@ -109,6 +109,35 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         self.assertEqual(state.active_section, "multimodal_media")
         self.assertIn("analyze_image", nav.scoped_tools(state))
 
+    def test_decorated_image_url_preselects_multimodal_section(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "发这张图 https://imgs.699pic.com/images/601/562/786.jpg!detail.v1"
+        state = nav.initial_state(
+            ctx,
+            ["think", "final_answer", "navigate_section", "resolve_image", "parse_video"],
+        )
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("image_url", state.evidence)
+        self.assertIn("resolve_image", nav.scoped_tools(state))
+
+    def test_current_image_url_overrides_recent_video_artifact(self):
+        nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
+        ctx = _Ctx()
+        ctx.message_text = "发这张图 https://imgs.699pic.com/images/601/562/786.jpg!detail.v1"
+        ctx.recent_media_artifact = {
+            "type": "video",
+            "video_url": "/tmp/yukiko/demo.mp4",
+            "source_url": "https://v.douyin.com/demo/",
+        }
+        state = nav.initial_state(
+            ctx,
+            ["think", "final_answer", "navigate_section", "resolve_image", "parse_video"],
+        )
+        self.assertEqual(state.active_section, "multimodal_media")
+        self.assertIn("image_url", state.evidence)
+        self.assertNotIn("recent_media_artifact", state.evidence)
+
     def test_recent_video_artifact_preselects_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         ctx = _Ctx()
@@ -227,6 +256,7 @@ class _Registry:
             "send_emoji",
             "send_sticker",
             "analyze_image",
+            "resolve_image",
             "think",
             "final_answer",
             "navigate_section",
@@ -306,7 +336,26 @@ class _Registry:
                 display="image analysis ok",
                 data={"analysis": "image analysis ok"},
             )
+        if name == "resolve_image":
+            url = args.get("url", "")
+            return ToolCallResult(
+                ok=True,
+                display="image resolved",
+                data={"image_url": url, "image_urls": [url]},
+            )
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
+
+
+class _FailParseRegistry(_Registry):
+    async def call(self, name: str, args: dict, context: dict) -> ToolCallResult:
+        if name == "parse_video":
+            self.calls.append((name, dict(args)))
+            return ToolCallResult(
+                ok=False,
+                display="B站限流了（412），稍等一会儿再试就好。",
+                error="bilibili_412_throttled",
+            )
+        return await super().call(name, args, context)
 
 
 class AgentPromptNavigatorTests(unittest.TestCase):
@@ -431,6 +480,69 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
         self.assertEqual(result.tool_calls_made, 1)
+
+    def test_failed_tool_display_survives_llm_timeout_fallback(self):
+        registry = _FailParseRegistry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="解析 https://www.bilibili.com/video/BV1xx411c7mD/",
+            trace_id="navigator-failed-tool-display-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["parse_video"])
+        self.assertIn("B站限流了（412）", result.reply_text)
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_direct_image_url_llm_timeout_falls_back_to_resolve_image(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        image_url = "https://imgs.699pic.com/images/601/562/786.jpg!detail.v1"
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text=f"发这张图 {image_url}",
+            trace_id="navigator-direct-image-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["resolve_image"])
+        self.assertEqual(registry.calls[0][1]["url"], image_url)
+        self.assertEqual(result.image_url, image_url)
+        self.assertEqual(result.image_urls, [image_url])
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_obvious_navigator_tool_caps_initial_llm_wait(self):
         registry = _Registry()

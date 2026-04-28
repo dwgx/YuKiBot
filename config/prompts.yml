@@ -227,6 +227,7 @@ prompt_navigator:
       when_to_use: 当前消息或引用消息携带图片、语音、视频文件等媒体结构。
       tools:
       - analyze_image
+      - resolve_image
       - ocr_image
       - analyze_voice
       - analyze_local_video
@@ -236,7 +237,7 @@ prompt_navigator:
       - think
       - final_answer
       - navigate_section
-      instructions: 图片理解用 analyze_image，提取文字用 ocr_image，语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。用户明确说学习/纠正表情包时用 learn_sticker/correct_sticker。
+      instructions: 直链图片要发出/验证用 resolve_image；图片理解用 analyze_image，提取文字用 ocr_image，语音用 analyze_voice，本地视频内容理解用 analyze_local_video，切片/抽音频/封面/关键帧用 split_video。用户明确说学习/纠正表情包时用 learn_sticker/correct_sticker。
       fallback_sections:
       - video_url
       - sticker_emoji

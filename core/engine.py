@@ -6951,7 +6951,7 @@ class YukikoEngine:
         if "multimedia.nt.qq.com.cn" in value:
             return True
 
-        return bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp)(?:\?|$)", value))
+        return bool(re.search(r"\.(?:jpg|jpeg|png|gif|webp|bmp)(?=$|[?#&!@_/])", value))
 
     @staticmethod
     def _looks_like_video_url(url: str) -> bool:

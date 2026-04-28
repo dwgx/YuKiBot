@@ -48,7 +48,7 @@ _RE_BARE_WEB_HOST = re.compile(
     r"(?::\d{2,5})?(?:/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]*)?)",
     re.IGNORECASE,
 )
-_RE_IMAGE_EXT = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?:\?|$)")
+_RE_IMAGE_EXT = re.compile(r"\.(?:jpg|jpeg|png|gif|webp|bmp|heic|heif|avif)(?=$|[?#&!@_/])")
 _RE_VIDEO_EXT = re.compile(r"\.(?:mp4|webm|mov|m4v)(?:\?|$)")
 _RE_QQ_NUMBER = re.compile(r"(?<!\d)([1-9]\d{5,11})(?!\d)")
 # 弱模型防护用的宽范围 CJK 标点匹配（见下方 L59）
@@ -2110,6 +2110,7 @@ class AgentLoop:
             "video_url",
             "url",
             "message_or_reply_media",
+            "image_url",
             "download_file_extension",
             "recent_media_artifact",
             "media_search_request",
@@ -2197,8 +2198,34 @@ class AgentLoop:
                 return "search_media", {"query": query, "media_type": media_type}
         if (
             active == "multimodal_media"
-            and evidence & {"message_or_reply_media", "url"}
+            and evidence & {"message_or_reply_media", "image_url", "url"}
         ):
+            merged = "\n".join(
+                normalize_text(str(item or ""))
+                for item in (
+                    ctx.message_text,
+                    ctx.original_message_text,
+                    ctx.reply_to_text,
+                )
+            )
+            image_url = self._extract_first_image_url(merged)
+            if image_url:
+                if (
+                    "analyze_image" in visible_tools
+                    and self.tool_registry.has_tool("analyze_image")
+                    and self._looks_like_image_question(merged)
+                ):
+                    return "analyze_image", {
+                        "url": image_url,
+                        "question": normalize_text(ctx.message_text)
+                        or "请简短说明这张图片内容",
+                        "allow_recent_fallback": False,
+                    }
+                if (
+                    "resolve_image" in visible_tools
+                    and self.tool_registry.has_tool("resolve_image")
+                ):
+                    return "resolve_image", {"url": image_url}
             summaries = list(ctx.reply_media_summary or []) + list(ctx.media_summary or [])
             summary_text = "\n".join(normalize_text(str(item)) for item in summaries)
             if (
@@ -3356,6 +3383,14 @@ class AgentLoop:
                 or self._infer_media_type(ctx.original_message_text)
                 or self._infer_media_type(contextual_query or text),
             )
+        elif tool_name == "resolve_image":
+            _set_if_empty(
+                "url",
+                self._extract_first_image_url(full_text)
+                or self._extract_first_url(text)
+                or self._extract_first_url(ctx.original_message_text)
+                or self._extract_first_url(ctx.reply_to_text),
+            )
         elif tool_name == "analyze_local_video":
             explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
                 normalize_text(ctx.reply_to_text)
@@ -3472,6 +3507,14 @@ class AgentLoop:
         url = cls._extract_first_url(text)
         if url and cls._looks_like_video_url(url):
             return url
+        return ""
+
+    @classmethod
+    def _extract_first_image_url(cls, text: str) -> str:
+        for match in _RE_URL_EXTRACT.finditer(text or ""):
+            url = _strip_trailing_url_noise(match.group(0))
+            if url and cls._looks_like_image_url(url):
+                return url
         return ""
 
     @classmethod
@@ -5545,6 +5588,29 @@ class AgentLoop:
                     total_time_ms=self._elapsed(t0),
                     steps=steps,
                 )
+        # 工具失败但已经给出了可读原因时，直接把原因反馈给用户，避免二次 LLM 超时后丢失真实错误。
+        for step in reversed(steps):
+            if bool(step.get("ok")):
+                continue
+            display = normalize_text(str(step.get("display", "")))
+            if not display:
+                continue
+            tool_name = normalize_text(str(step.get("tool", ""))).lower()
+            if self._skip_raw_tool_display_in_fallback(tool_name, display):
+                continue
+            if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
+                continue
+            if len(display) > 280:
+                display = clip_text(display, 280)
+            return AgentResult(
+                reply_text=display,
+                action="reply",
+                reason=f"agent_fallback_{reason}",
+                tool_calls_made=tool_calls_made,
+                total_time_ms=self._elapsed(t0),
+                steps=steps,
+            )
+
         # 没有可用的步骤结果 → 用 AI 生成自然回复
         failed_tools = [
             f"{step.get('tool')}:{step.get('error')}"

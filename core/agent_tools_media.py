@@ -128,6 +128,25 @@ def _register_media_tools(registry: AgentToolRegistry, model_client: Any, config
         _handle_analyze_image,
     )
 
+    registry.register(
+        ToolSchema(
+            name="resolve_image",
+            description=(
+                "验证并返回可直接发送的图片 URL。\n"
+                "使用场景: 用户给了图片直链或 Markdown 图片，要求直接发图、预览或转发时使用。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "图片 URL；不传则从当前消息/引用文本中提取"},
+                },
+                "required": [],
+            },
+            category="media",
+        ),
+        _handle_resolve_image,
+    )
+
     # ── 语音分析工具 ──
     registry.register(
         ToolSchema(
@@ -453,6 +472,53 @@ async def _handle_parse_video(args: dict[str, Any], context: dict[str, Any]) -> 
     error_text = result.error or "解析失败"
     display = text or f"视频解析失败: {error_text}"
     return ToolCallResult(ok=False, error=error_text, display=display)
+
+
+async def _handle_resolve_image(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
+    """Validate a direct image URL and expose it to final_answer delivery."""
+    url = normalize_text(str(args.get("url", "") or ""))
+    if not url:
+        merged = "\n".join(
+            normalize_text(str(context.get(key, "") or ""))
+            for key in ("message_text", "original_message_text", "reply_to_text")
+        )
+        match = re.search(r"https?://[^\s<>\"]+", merged, flags=re.IGNORECASE)
+        if match:
+            url = normalize_text(match.group(0)).rstrip(").,，。!?！？】》」』")
+    if not url:
+        return ToolCallResult(ok=False, error="missing url", display="没有拿到图片链接。")
+    if not re.match(r"^https?://", url, flags=re.IGNORECASE):
+        return ToolCallResult(ok=False, error="invalid_url", display="请给完整 http/https 图片链接。")
+
+    tool_executor = context.get("tool_executor")
+    if not tool_executor:
+        return ToolCallResult(ok=False, error="tool_executor unavailable", display="图片发送模块未初始化。")
+
+    try:
+        if (
+            callable(getattr(tool_executor, "_is_blocked_image_url", None))
+            and tool_executor._is_blocked_image_url(url)
+        ):
+            return ToolCallResult(ok=False, error="blocked_image_request", display="这类图片我不能发。")
+        if (
+            callable(getattr(tool_executor, "_is_safe_public_http_url", None))
+            and not tool_executor._is_safe_public_http_url(url)
+        ):
+            return ToolCallResult(ok=False, error="unsafe_url", display="这个图片链接命中了安全限制。")
+        if not (
+            callable(getattr(tool_executor, "_is_sendable_image_url", None))
+            and await tool_executor._is_sendable_image_url(url)
+        ):
+            return ToolCallResult(ok=False, error="not_sendable_image_url", display="这个链接不是可直发图片。")
+    except Exception as exc:
+        _log.warning("resolve_image_error | url=%s | %s", clip_text(url, 100), exc)
+        return ToolCallResult(ok=False, error=f"resolve_image_error: {exc}", display="图片链接验证失败。")
+
+    return ToolCallResult(
+        ok=True,
+        data={"image_url": url, "image_urls": [url], "source_url": url, "text": "图片可发送。"},
+        display=f"图片可发送，来源：{url}",
+    )
 
 
 async def _handle_analyze_video(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
