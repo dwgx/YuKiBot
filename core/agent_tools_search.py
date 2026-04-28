@@ -245,7 +245,24 @@ def _infer_media_search_type(query: str, explicit: str = "") -> str:
         )
     ):
         return "video"
-    if any(cue in compact for cue in ("图片", "搜图", "找图", "壁纸", "头像", "配图", "照片")):
+    if any(
+        cue in compact
+        for cue in (
+            "图片",
+            "图",
+            "搜图",
+            "找图",
+            "来张",
+            "壁纸",
+            "头像",
+            "配图",
+            "照片",
+            "梗图",
+            "猫图",
+            "表情包",
+            "贴图",
+        )
+    ):
         return "image"
     if re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", text):
         return "image"

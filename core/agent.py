@@ -2175,7 +2175,12 @@ class AgentLoop:
                 query,
                 flags=re.IGNORECASE,
             ).strip()
-            media_type = self._infer_media_type(merged) or "image"
+            media_type = (
+                self._infer_media_type(ctx.message_text)
+                or self._infer_media_type(ctx.original_message_text)
+                or self._infer_media_type(merged)
+                or "image"
+            )
             if query:
                 return "search_media", {"query": query, "media_type": media_type}
         if (
@@ -3253,7 +3258,10 @@ class AgentLoop:
         elif tool_name in {"search_web_media", "search_media"}:
             _set_if_empty("query", contextual_query or text)
             _set_if_empty(
-                "media_type", self._infer_media_type(contextual_query or text)
+                "media_type",
+                self._infer_media_type(text)
+                or self._infer_media_type(ctx.original_message_text)
+                or self._infer_media_type(contextual_query or text),
             )
         elif tool_name == "analyze_local_video":
             explicit_video_url = self._extract_first_video_url(text) or self._extract_first_video_url(
@@ -3707,7 +3715,24 @@ class AgentLoop:
             )
         ):
             return "video"
-        if any(cue in plain for cue in ("图片", "壁纸", "头像", "配图", "照片", "搜图", "找图")):
+        if any(
+            cue in plain
+            for cue in (
+                "图片",
+                "图",
+                "壁纸",
+                "头像",
+                "配图",
+                "照片",
+                "搜图",
+                "找图",
+                "来张",
+                "梗图",
+                "猫图",
+                "表情包",
+                "贴图",
+            )
+        ):
             return "image"
         if re.search(r"\b(?:video|movie|clip)\b", t):
             return "video"
