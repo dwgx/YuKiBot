@@ -1091,6 +1091,58 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
         self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
 
+    def test_preflight_can_switch_plain_text_before_full_prompt_timeout(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    json.dumps(
+                        {
+                            "section_id": "media_search",
+                            "reason": "用户要找并发送视频",
+                            "tool": "search_media",
+                            "args": {
+                                "query": "你会选择什么男孩",
+                                "media_type": "video",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    asyncio.TimeoutError(),
+                    asyncio.TimeoutError(),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {
+                    "enable": True,
+                    "max_steps": 5,
+                    "fallback_on_parse_error": True,
+                    "navigator_preflight_plain_text": True,
+                },
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="发一个 你会选择什么男孩的视频",
+            trace_id="navigator-preflight-plain-text-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
+        self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
+        self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
+
     def test_media_search_llm_timeout_falls_back_to_search_media_tool(self):
         registry = _Registry()
         loop = AgentLoop(

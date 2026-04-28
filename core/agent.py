@@ -266,6 +266,7 @@ class AgentLoop:
         self.llm_step_timeout_seconds = 22
         self.llm_step_timeout_seconds_after_tool = 32
         self.navigator_obvious_tool_timeout_seconds = 5.0
+        self.navigator_preflight_plain_text = False
         self.total_timeout_seconds = 0
         self.queue_timeout_margin_seconds = 8
         self.prompt_policy = PromptPolicy.from_config({})
@@ -373,6 +374,9 @@ class AgentLoop:
             navigator_obvious_tool_timeout = 5.0
         self.navigator_obvious_tool_timeout_seconds = max(
             0.0, min(30.0, navigator_obvious_tool_timeout)
+        )
+        self.navigator_preflight_plain_text = bool(
+            agent_cfg.get("navigator_preflight_plain_text", False)
         )
         self.total_timeout_seconds = max(
             0, int(agent_cfg.get("total_timeout_seconds", 0))
@@ -882,7 +886,47 @@ class AgentLoop:
             response_text = ""
             parsed = None
             synthetic_tool_call = False
+            preflight_section = None
             if (
+                strict_tool_routing
+                and self.navigator_preflight_plain_text
+                and step_idx == 0
+                and tool_calls_made == 0
+                and not steps
+                and ctx.navigator_state is not None
+                and normalize_text(ctx.navigator_state.active_section) == "general_chat"
+            ):
+                preflight_section = await self._navigator_timeout_section_retry(
+                    ctx=ctx,
+                    step_idx=step_idx,
+                    tool_calls_made=tool_calls_made,
+                    steps=steps,
+                    remaining=remaining,
+                )
+            if preflight_section:
+                if preflight_section[2]:
+                    ctx.navigator_pending_tool_retry = (
+                        preflight_section[2],
+                        dict(preflight_section[3] or {}),
+                    )
+                parsed = {
+                    "tool": NAVIGATE_SECTION_TOOL,
+                    "args": {
+                        "section_id": preflight_section[0],
+                        "reason": preflight_section[1],
+                    },
+                }
+                response_text = json.dumps(parsed, ensure_ascii=False)
+                assistant_msg = {"role": "assistant", "content": response_text}
+                synthetic_tool_call = True
+                _log.info(
+                    "navigator_preflight_section | trace=%s | step=%d | section=%s | reason=%s",
+                    ctx.trace_id,
+                    step_idx,
+                    preflight_section[0],
+                    clip_text(preflight_section[1], 120),
+                )
+            elif (
                 forced_media_tool
                 and not forced_media_tool_consumed
                 and tool_calls_made == 0
