@@ -3361,6 +3361,30 @@ async def chat_agent_text(request: Request):
         payload = await call_napcat_bot_api(bot_runtime, api, **kwargs)
         return _unwrap_onebot_payload(payload)
 
+    resolved_reply_user_id = context_user_id
+    resolved_reply_user_name = context_user_name
+    resolved_reply_text = ""
+    resolved_reply_media: list[dict[str, Any]] = []
+    if reply_to_message_id:
+        try:
+            from app_helpers import _resolve_reply_context
+
+            (
+                reply_user_id,
+                reply_user_name,
+                resolved_reply_text,
+                resolved_reply_media,
+            ) = await _resolve_reply_context(bot_runtime, reply_to_message_id)
+            resolved_reply_user_id = reply_user_id or resolved_reply_user_id
+            resolved_reply_user_name = reply_user_name or resolved_reply_user_name
+        except Exception as exc:
+            _log.warning(
+                "webui_reply_context_resolve_failed | trace=%s | message_id=%s | error=%s",
+                trace_id,
+                reply_to_message_id,
+                clip_text(normalize_text(str(exc)), 180),
+            )
+
     try:
         from core.engine import EngineMessage
 
@@ -3379,8 +3403,10 @@ async def chat_agent_text(request: Request):
                 group_id=peer_num if resolved_type == "group" else 0,
                 bot_id=bot_self_id,
                 reply_to_message_id=reply_to_message_id,
-                reply_to_user_id=context_user_id,
-                reply_to_user_name=context_user_name,
+                reply_to_user_id=resolved_reply_user_id,
+                reply_to_user_name=resolved_reply_user_name,
+                reply_to_text=resolved_reply_text,
+                reply_media_segments=resolved_reply_media,
                 api_call=runtime_api_call,
                 trace_id=trace_id,
                 sender_role=context_sender_role,
