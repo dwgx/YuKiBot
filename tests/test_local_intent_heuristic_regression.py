@@ -351,6 +351,10 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             ["platform=douyin cat site:douyin.com/video"],
         )
         for url in (
+            "https://www.bilibili.com/video/BV1xx411c7mD/",
+            "https://b23.tv/abc123",
+            "https://www.acfun.cn/v/ac12345678",
+            "https://v.douyin.com/hskaBb36Hfg/",
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
             "https://youtu.be/dQw4w9WgXcQ",
             "https://v.qq.com/x/page/m3534f3t3hb.html",

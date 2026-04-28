@@ -2272,12 +2272,15 @@ def register_handlers(engine: YukikoEngine) -> None:
                         prefixed_sent = True
                     msg += Message(chunk)
                     # 单图场景：把图片段合并到最后一条文本消息里（一条消息 = 文字 + 图片）
+                    attached_single_image = False
                     if idx == last_chunk_idx and single_image_seg is not None:
                         msg += single_image_seg
-                        single_image_seg = None  # 标记已发送
+                        attached_single_image = True
                     ok = await send_msg(msg)
                     if ok:
                         delivered = True
+                        if attached_single_image:
+                            single_image_seg = None
                     else:
                         failed_index = idx
                         _log.warning(
@@ -2303,8 +2306,10 @@ def register_handlers(engine: YukikoEngine) -> None:
                         msg += prefix
                         prefixed_sent = True
                     msg += single_image_seg
-                    await send_msg(msg)
-                    delivered = True
+                    if await send_msg(msg):
+                        delivered = True
+                    else:
+                        _log.warning("image_send_fail | trace=%s | mode=single", payload.trace_id)
 
                 # 多图场景：保持原逻辑，合并多图到单条消息
                 if image_urls and len(image_urls) > 1:
@@ -2334,8 +2339,15 @@ def register_handlers(engine: YukikoEngine) -> None:
                             failed_count += 1
                     if failed_count > 0:
                         combined_msg += Message(f"\n（{failed_count} 张图片发送失败，链接受限）")
-                    await send_msg(combined_msg)
-                    delivered = True
+                    if await send_msg(combined_msg):
+                        delivered = True
+                    else:
+                        _log.warning(
+                            "image_send_fail | trace=%s | mode=multi | requested=%d | build_failed=%d",
+                            payload.trace_id,
+                            send_count,
+                            failed_count,
+                        )
 
                     if len(image_urls) > send_count:
                         tip_more = Message()

@@ -589,6 +589,13 @@ class AgentProtectionTests(unittest.TestCase):
         if hasattr(AgentLoop, '_normalize_final_answer_text'):
             self.assertTrue(bool(normalized))
 
+    def test_final_answer_redacts_local_file_paths(self):
+        text = "解析好了，直链在这：/Users/dwgx/Documents/Project/YuKiKo/storage/cache/videos/a.mp4"
+        normalized = AgentLoop._normalize_final_answer_text(text)
+
+        self.assertNotIn("/Users/dwgx", normalized)
+        self.assertIn("本地文件路径已隐藏", normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

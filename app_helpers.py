@@ -709,9 +709,21 @@ def _strip_reply_segments(message: Message) -> Message:
     return clean
 
 
+def _message_has_media_segments(message: Message) -> bool:
+    try:
+        for seg in message:
+            seg_type = str(getattr(seg, "type", "")).lower()
+            if seg_type in {"image", "video", "record", "file", "music"}:
+                return True
+    except Exception:
+        return False
+    return False
+
+
 async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> bool:
     group_id = int(getattr(event, "group_id", 0) or 0)
     bot_id = str(getattr(bot, "self_id", "") or "")
+    has_media_segments = _message_has_media_segments(message)
     suspended, suspend_reason = _check_bot_send_suspended(bot_id)
     if suspended:
         _log.warning(
@@ -779,6 +791,14 @@ async def _safe_send(bot: Bot, event: MessageEvent, message: Message) -> bool:
                 return False
 
     # Fallback 2: plain text only (strip all non-text segments, replace special chars)
+    if has_media_segments:
+        _log.warning(
+            "safe_send_media_payload_failed_no_plain_fallback | bot=%s | group=%s | msg=%s",
+            bot_id or "-",
+            group_id,
+            clip_text(str(message), 200),
+        )
+        return False
     plain = message.extract_plain_text().strip()
     if plain:
         try:

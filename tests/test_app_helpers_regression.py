@@ -14,6 +14,7 @@ from app_helpers import (
     _looks_like_video_heavy_request,
     _looks_like_web_heavy_request,
 )
+from nonebot.adapters.onebot.v11 import Message, MessageSegment
 
 
 class AppHelpersRegressionTests(unittest.TestCase):
@@ -51,6 +52,41 @@ class AppHelpersRegressionTests(unittest.TestCase):
 
 
 class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_safe_send_does_not_count_media_plain_text_fallback_as_success(self) -> None:
+        class FakeBot:
+            self_id = "3223915831"
+
+            def __init__(self) -> None:
+                self.sent: list[Message] = []
+
+            async def send(self, *, event, message):
+                self.sent.append(message)
+                raise RuntimeError("bad request: invalid segment")
+
+        class FakeEvent:
+            group_id = 901738883
+
+        async def noop(*args, **kwargs) -> None:
+            return None
+
+        bot = FakeBot()
+        message = Message("解析好了，我直接把视频发出来。")
+        message += MessageSegment.image("https://example.com/cat.jpg")
+
+        with (
+            patch.object(app_helpers, "_check_bot_send_suspended", lambda bot_id: (False, ""), create=True),
+            patch.object(app_helpers, "_check_group_send_block", lambda group_id: (False, ""), create=True),
+            patch.object(app_helpers, "_maybe_block_group_send_on_error", noop, create=True),
+            patch.object(app_helpers, "_is_hard_send_channel_error", lambda exc: False, create=True),
+            patch.object(app_helpers, "_is_transient_send_error", lambda exc: False, create=True),
+            patch.object(app_helpers, "_is_payload_send_error", lambda exc: True, create=True),
+        ):
+            ok = await app_helpers._safe_send(bot=bot, event=FakeEvent(), message=message)
+
+        self.assertFalse(ok)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("image", str(bot.sent[0]))
+
     async def test_remote_image_segment_downloads_to_base64_before_direct_url(self) -> None:
         class FakeAsyncClient:
             def __init__(self, *args, **kwargs) -> None:

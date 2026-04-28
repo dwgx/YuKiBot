@@ -1607,7 +1607,8 @@ async def _handle_upload_group_file(args: dict[str, Any], context: dict[str, Any
     if not any(str(resolved).lower().startswith(str(d.resolve()).lower()) for d in allowed_dirs):
         return ToolCallResult(ok=False, error="安全限制: 只能上传 storage/tmp 或 NapCat temp 目录下的文件")
     if not resolved.is_file():
-        return ToolCallResult(ok=False, error=f"文件不存在: {file_path}")
+        _log.warning("upload_group_file_missing | file=%s", clip_text(str(resolved), 180))
+        return ToolCallResult(ok=False, error="文件不存在或当前进程不可读")
     kwargs: dict[str, Any] = {"group_id": group_id, "file": str(resolved), "name": name}
     if folder:
         kwargs["folder"] = folder
@@ -3761,7 +3762,8 @@ async def _handle_smart_download(args: dict[str, Any], context: dict[str, Any]) 
 
     staged_path = _stage_download_file(raw_path, candidate_url, file_name=file_name)
     if not staged_path:
-        return ToolCallResult(ok=False, error="stage_download_file_failed", display=f"下载到 {raw_path}，但整理到上传目录失败")
+        _log.warning("stage_download_file_failed | raw_path=%s | source=%s", clip_text(raw_path, 180), clip_text(candidate_url, 180))
+        return ToolCallResult(ok=False, error="stage_download_file_failed", display="下载完成，但整理到上传目录失败")
 
     payload = {
         "source_url": original_url,

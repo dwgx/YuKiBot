@@ -70,6 +70,12 @@ _RE_PUNCTUATION_CJK = re.compile(
     r"[\s\u3000-\u303f\uff01-\uff0f\uff1a-\uff20\uff3b-\uff40\uff5b-\uff65"
     r"\u2000-\u206f\u2e00-\u2e7f!-/:-@\[-`{-~。，、；：？！…—·''""〈〉《》「」『』【】〔〕〖〗]+"
 )
+_RE_LOCAL_FILE_REF = re.compile(
+    r"(?i)(?:file://)?(?:"
+    r"[A-Z]:[\\/][^\s`'\"，。；、]+"
+    r"|/(?:Users|home|tmp|private|var|mnt|Volumes)/[^\s`'\"，。；、]+"
+    r")"
+)
 
 
 def _strip_trailing_url_noise(url: str) -> str:
@@ -187,6 +193,11 @@ class AgentLoop:
             "send_emoji",
             "send_sticker",
             "learn_sticker",
+            "upload_group_file",
+            "upload_private_file",
+            "send_group_ai_record",
+            "send_group_forward_msg",
+            "send_private_forward_msg",
         }
     )
     # 这些工具完成后应直接 final_answer，不再调用其他工具
@@ -1928,7 +1939,7 @@ class AgentLoop:
             if result.ok and result_tool_name in self._SIDE_EFFECT_SEND_TOOLS:
                 # 从工具返回的 data 中提取媒体 URL
                 if result.data and isinstance(result.data, dict):
-                    for key in ["image_url", "video_url", "audio_url"]:
+                    for key in ["image_url", "video_url", "audio_url", "audio_file", "file", "local_file"]:
                         url = normalize_text(str(result.data.get(key, "")))
                         if url:
                             tool_sent_media.add(url)
@@ -5831,6 +5842,7 @@ class AgentLoop:
         content = normalize_text(text)
         if not content:
             return ""
+        content = _RE_LOCAL_FILE_REF.sub("[本地文件路径已隐藏，发送层会直接投递]", content)
         if cls._looks_like_english_refusal_text(content):
             return "这个请求我不能帮你处理（涉及不当或露骨内容）。你可以换个健康、合规的话题，我继续帮你。"
         # 弱模型防护: 纯标点/空白检测（去掉所有标点和空白后为空）
