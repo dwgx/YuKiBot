@@ -626,6 +626,15 @@ class PromptNavigator:
     @staticmethod
     def _collect_segment_kinds(ctx: Any) -> set[str]:
         kinds: set[str] = set()
+        for attr in ("media_summary", "reply_media_summary"):
+            for item in getattr(ctx, attr, None) or []:
+                text = normalize_text(str(item)).lower()
+                if text.startswith("image:"):
+                    kinds.add("image")
+                elif text.startswith(("record:", "audio:", "voice:")):
+                    kinds.add("voice")
+                elif text.startswith("video:"):
+                    kinds.add("video")
         for attr in ("raw_segments", "reply_media_segments"):
             for segment in getattr(ctx, attr, None) or []:
                 if not isinstance(segment, dict):

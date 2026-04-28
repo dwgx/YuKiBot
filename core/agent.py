@@ -2185,6 +2185,40 @@ class AgentLoop:
             if query:
                 return "search_media", {"query": query, "media_type": media_type}
         if (
+            active == "multimodal_media"
+            and evidence & {"message_or_reply_media", "url"}
+        ):
+            summaries = list(ctx.reply_media_summary or []) + list(ctx.media_summary or [])
+            summary_text = "\n".join(normalize_text(str(item)) for item in summaries)
+            if (
+                "analyze_image" in visible_tools
+                and self.tool_registry.has_tool("analyze_image")
+                and "image:" in summary_text
+            ):
+                return "analyze_image", {
+                    "question": normalize_text(ctx.message_text)
+                    or "请简短说明这张图片内容",
+                    "allow_recent_fallback": True,
+                }
+            if (
+                "analyze_voice" in visible_tools
+                and self.tool_registry.has_tool("analyze_voice")
+                and ("record:" in summary_text or "audio:" in summary_text)
+            ):
+                return "analyze_voice", {
+                    "question": normalize_text(ctx.message_text)
+                    or "请转录并总结这段语音",
+                }
+            if (
+                "analyze_local_video" in visible_tools
+                and self.tool_registry.has_tool("analyze_local_video")
+                and "video:" in summary_text
+            ):
+                return "analyze_local_video", {
+                    "question": normalize_text(ctx.message_text)
+                    or "请简短分析这个视频",
+                }
+        if (
             active == "music_audio"
             and "music_play" in visible_tools
             and self.tool_registry.has_tool("music_play")

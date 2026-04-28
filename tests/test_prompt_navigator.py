@@ -226,6 +226,7 @@ class _Registry:
             "send_face",
             "send_emoji",
             "send_sticker",
+            "analyze_image",
             "think",
             "final_answer",
             "navigate_section",
@@ -298,6 +299,12 @@ class _Registry:
                 ok=True,
                 display=f"{name} ok",
                 data={"sent": True, "query": args.get("query", "")},
+            )
+        if name == "analyze_image":
+            return ToolCallResult(
+                ok=True,
+                display="image analysis ok",
+                data={"analysis": "image analysis ok"},
             )
         return ToolCallResult(ok=True, display=f"{name} ok", data={"name": name})
 
@@ -743,6 +750,38 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         self.assertEqual([name for name, _ in registry.calls], ["send_face"])
         self.assertEqual(registry.calls[0][1]["query"], "赞")
+        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+
+    def test_multimodal_llm_timeout_falls_back_to_analyze_image_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="分析一下引用的这张图",
+            reply_media_summary=["image:https://example.test/cat.png"],
+            trace_id="navigator-image-timeout-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["analyze_image"])
+        self.assertIn("引用的这张图", registry.calls[0][1]["question"])
+        self.assertEqual(result.reply_text, "image analysis ok")
         self.assertEqual(result.reason, "agent_fallback_llm_timeout")
 
     def test_web_url_llm_timeout_falls_back_to_fetch_tool(self):
