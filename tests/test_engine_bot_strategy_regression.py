@@ -4,6 +4,7 @@ import asyncio
 import logging
 import tempfile
 import unittest
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,9 @@ class EngineBotStrategyDirectiveTests(unittest.TestCase):
         engine.logger = logging.getLogger("test.yukiko.engine")
         engine._recent_directed_hints = {}
         engine.directed_grace_seconds = 90
+        engine._async_init_done = True
+        engine._seen_message_ids = OrderedDict()
+        engine._seen_message_ids_max = 1024
         engine.trigger = TriggerEngine(
             trigger_config=engine.config["trigger"],
             bot_config=engine.config["bot"],
@@ -132,6 +136,24 @@ class EngineBotStrategyDirectiveTests(unittest.TestCase):
         self.assertEqual(response.reason, "bot_strategy_directive_non_admin")
         self.assertNotIn("ai_listen_enable", engine.config["trigger"])
         self.assertEqual(engine.trigger._active_sessions, {})
+
+    def test_directed_silence_control_runs_before_non_whitelist_silent_gate(self) -> None:
+        engine = self._engine()
+        message = EngineMessage(
+            conversation_id="group:901738883",
+            user_id="100",
+            text="@30秒 闭嘴",
+            mentioned=True,
+            group_id=901738883,
+            bot_id="200",
+            message_id="m-1",
+        )
+
+        response = asyncio.run(engine.handle_message(message))
+
+        self.assertEqual(response.action, "reply")
+        self.assertEqual(response.reason, "bot_strategy_directive")
+        self.assertFalse(engine.config["trigger"]["ai_listen_enable"])
 
     def test_blocks_undirected_agent_plain_reply_from_listen_probe(self) -> None:
         engine = self._engine()

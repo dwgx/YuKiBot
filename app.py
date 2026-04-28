@@ -2130,9 +2130,11 @@ def register_handlers(engine: YukikoEngine) -> None:
 
                 # 1) 先尝试发视频本体（或文件上传）
                 prefer_upload_first = (
-                    video_send_strategy in {"upload_file_first", "upload_only"}
+                    _video_strategy_upload_first(video_send_strategy)
                     or _should_upload_video_file_first(video_url)
                 )
+                upload_only = _video_strategy_upload_only(video_send_strategy)
+                allow_upload_fallback = _video_strategy_allows_upload_fallback(video_send_strategy)
                 video_delivered = False
                 fallback_sent = False
                 if prefer_upload_first:
@@ -2141,12 +2143,13 @@ def register_handlers(engine: YukikoEngine) -> None:
                         event=event,
                         video_url=video_url,
                         stage_dir=napcat_media_stage_dir,
+                        trace_id=payload.trace_id,
                     )
                     if uploaded:
                         _log.info("video_send_via_upload_file | strategy=%s", video_send_strategy)
                         delivered = True
                         video_delivered = True
-                    if video_send_strategy == "upload_only":
+                    if upload_only:
                         if not video_delivered:
                             fallback = Message()
                             if not prefixed_sent:
@@ -2157,13 +2160,14 @@ def register_handlers(engine: YukikoEngine) -> None:
                             delivered = True
                             fallback_sent = True
 
-                if video_delivered or video_send_strategy == "upload_only":
+                if video_delivered or upload_only:
                     seg = None
                 else:
                     seg = None if video_issue else await _build_video_segment(
                         video_url,
                         stage_dir=napcat_media_stage_dir,
                         prefer_plain_path=False,
+                        trace_id=payload.trace_id,
                     )
                 if video_delivered:
                     pass
@@ -2183,6 +2187,7 @@ def register_handlers(engine: YukikoEngine) -> None:
                             video_url,
                             stage_dir=napcat_media_stage_dir,
                             prefer_plain_path=True,
+                            trace_id=payload.trace_id,
                         )
                         if uri_seg is not None:
                             try:
@@ -2199,20 +2204,35 @@ def register_handlers(engine: YukikoEngine) -> None:
                             seg = None
                     if not sent_video:
                         if send_exc is not None:
-                            _log.warning("video_send_fail | %s | trying upload_file fallback", send_exc)
+                            _log.warning(
+                                "video_send_fail | %s | upload_fallback_allowed=%s",
+                                send_exc,
+                                allow_upload_fallback,
+                            )
                         else:
-                            _log.warning("video_send_fail | safe_send_failed | trying upload_file fallback")
-                        # 尝试用 NapCat 文件 API 上传（适合大文件）
-                        uploaded = await _try_upload_video_file(
-                            bot=bot,
-                            event=event,
-                            video_url=video_url,
-                            stage_dir=napcat_media_stage_dir,
-                        )
-                        if uploaded:
-                            _log.info("video_send_via_upload_file | strategy=fallback")
-                            video_delivered = True
-                            delivered = True
+                            _log.warning(
+                                "video_send_fail | safe_send_failed | upload_fallback_allowed=%s",
+                                allow_upload_fallback,
+                            )
+                        # 可选降级到 NapCat 文件 API；direct_first 默认不把视频悄悄变群文件。
+                        if allow_upload_fallback:
+                            uploaded = await _try_upload_video_file(
+                                bot=bot,
+                                event=event,
+                                video_url=video_url,
+                                stage_dir=napcat_media_stage_dir,
+                                trace_id=payload.trace_id,
+                            )
+                            if uploaded:
+                                _log.info("video_send_via_upload_file | strategy=fallback")
+                                video_delivered = True
+                                delivered = True
+                        else:
+                            _log.warning(
+                                "media_delivery_upload_skip | trace=%s | strategy=%s | reason=inline_failed_no_file_fallback",
+                                payload.trace_id,
+                                video_send_strategy,
+                            )
                     else:
                         video_delivered = True
                         delivered = True
@@ -2230,7 +2250,10 @@ def register_handlers(engine: YukikoEngine) -> None:
                             "media_delivery_failed_exact | channel=video_all | video=%s",
                             clip_text(direct_url, 180),
                         )
-                        fallback_msg += Message("视频解析成功了，但 NapCat/QQ 发送失败：我已经尝试视频直发和文件上传。请检查 NapCat 对 QQ 容器暂存目录的读取权限。")
+                        if allow_upload_fallback or prefer_upload_first:
+                            fallback_msg += Message("视频解析成功了，但 NapCat/QQ 发送失败：我已经尝试视频直发和文件上传。请检查 NapCat 对 QQ 容器暂存目录的读取权限。")
+                        else:
+                            fallback_msg += Message("视频解析成功了，但 QQ 可预览视频直发失败；当前策略不自动降级成群文件。需要发文件时把 video_send_strategy 改成 direct_with_file_fallback 或 upload_file_first。")
                     await send_msg(fallback_msg)
                     delivered = True
                     fallback_sent = True

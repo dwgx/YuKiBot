@@ -1042,6 +1042,42 @@ class YukikoEngine:
         if not text:
             return EngineResponse(action="ignore", reason="empty_message")
 
+        reply_to_bot_for_strategy = bool(
+            normalize_text(str(message.reply_to_user_id or ""))
+            and normalize_text(str(message.reply_to_user_id or ""))
+            == normalize_text(str(message.bot_id or ""))
+        )
+        explicit_for_strategy = bool(
+            message.is_private
+            or message.mentioned
+            or reply_to_bot_for_strategy
+            or self._looks_like_bot_call(text)
+        )
+        early_strategy_mode = self._detect_bot_strategy_directive(
+            text,
+            message=message,
+            explicit_bot_addressed=explicit_for_strategy,
+            followup_candidate=False,
+        )
+        if (
+            early_strategy_mode
+            and not message.is_private
+            and self.admin.enabled
+            and not self.admin.is_group_whitelisted(message.group_id)
+        ):
+            self.logger.info(
+                "bot_strategy_directive_before_whitelist | trace=%s | group=%s | user=%s | mode=%s",
+                message.trace_id,
+                message.group_id,
+                message.user_id,
+                early_strategy_mode,
+            )
+            return await self._handle_bot_strategy_directive(
+                message=message,
+                text=text,
+                mode=early_strategy_mode,
+            )
+
         # ── 白名单检查（非私聊 + 权限系统启用时）──
         if not message.is_private and self.admin.enabled:
             if not self.admin.is_group_whitelisted(message.group_id):

@@ -1265,6 +1265,18 @@ async def _video_seg_with_thumb(
     if not ok:
         _log.warning("video_seg_reject_unhealthy | file=%s | reason=%s", actual_path.name, reason)
         return None
+    try:
+        actual_size = actual_path.stat().st_size
+    except Exception:
+        actual_size = 0
+    if actual_size > _VIDEO_SEND_MAX_BYTES:
+        _log.warning(
+            "video_seg_reject_too_large | file=%s | size=%d | max=%d",
+            actual_path.name,
+            actual_size,
+            _VIDEO_SEND_MAX_BYTES,
+        )
+        return None
     thumb_path = await _generate_video_thumbnail(actual_path)
 
     video_ref = str(actual_path) if prefer_plain_path else build_napcat_file_reference(actual_path, require_exists=True)
@@ -1296,19 +1308,33 @@ async def _build_video_segment(
     if target.startswith("file://"):
         local_path = napcat_file_uri_to_path(target)
         if local_path is None:
+            _log.warning("video_seg_reject_bad_file_uri | trace=%s | url=%s", normalize_text(trace_id), clip_text(target, 180))
             return None
         if local_path.exists() and local_path.is_file():
-            ok, _ = await _probe_local_video_health(local_path)
+            ok, reason = await _probe_local_video_health(local_path)
             if not ok:
+                _log.warning(
+                    "video_seg_reject_unhealthy | trace=%s | file=%s | reason=%s",
+                    normalize_text(trace_id),
+                    local_path.name,
+                    reason,
+                )
                 return None
             staged = _stage_media_for_napcat(local_path, stage_dir, trace_id=trace_id) or local_path
             return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
+        _log.warning("video_seg_reject_missing_file_uri | trace=%s | url=%s", normalize_text(trace_id), clip_text(target, 180))
         return None
 
     local_path = Path(target)
     if local_path.exists() and local_path.is_file():
-        ok, _ = await _probe_local_video_health(local_path)
+        ok, reason = await _probe_local_video_health(local_path)
         if not ok:
+            _log.warning(
+                "video_seg_reject_unhealthy | trace=%s | file=%s | reason=%s",
+                normalize_text(trace_id),
+                local_path.name,
+                reason,
+            )
             return None
         staged = _stage_media_for_napcat(local_path, stage_dir, trace_id=trace_id) or local_path
         return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
@@ -1323,8 +1349,14 @@ async def _build_video_segment(
     # 先下载到本地临时文件再发送。
     local_tmp = await _download_remote_video_to_tmp(target)
     if local_tmp is not None:
-        ok, _ = await _probe_local_video_health(local_tmp)
+        ok, reason = await _probe_local_video_health(local_tmp)
         if not ok:
+            _log.warning(
+                "video_seg_reject_unhealthy | trace=%s | file=%s | reason=%s",
+                normalize_text(trace_id),
+                local_tmp.name,
+                reason,
+            )
             return None
         staged = _stage_media_for_napcat(local_tmp, stage_dir, trace_id=trace_id) or local_tmp
         return await _video_seg_with_thumb(staged, prefer_plain_path=prefer_plain_path)
@@ -1382,6 +1414,29 @@ _VIDEO_SEND_MAX_BYTES = 25 * 1024 * 1024  # 压缩后仍超 25MB 走文件上传
 _NAPCAT_INLINE_VIDEO_MAX_BYTES = 100 * 1024 * 1024
 _FFMPEG_BIN = shutil.which("ffmpeg")
 _FFPROBE_BIN = shutil.which("ffprobe")
+
+
+def _normalize_video_send_strategy(strategy: str) -> str:
+    value = normalize_text(strategy).lower().replace("-", "_")
+    return value or "direct_first"
+
+
+def _video_strategy_upload_first(strategy: str) -> bool:
+    return _normalize_video_send_strategy(strategy) in {"upload_file_first", "upload_only"}
+
+
+def _video_strategy_upload_only(strategy: str) -> bool:
+    return _normalize_video_send_strategy(strategy) == "upload_only"
+
+
+def _video_strategy_allows_upload_fallback(strategy: str) -> bool:
+    return _normalize_video_send_strategy(strategy) in {
+        "direct_with_file_fallback",
+        "upload_file_first",
+        "upload_only",
+        "upload_fallback",
+        "file_fallback",
+    }
 
 
 def _default_napcat_media_stage_dir() -> Path:
@@ -1855,13 +1910,14 @@ async def _try_upload_video_file(
     video_url: str,
     *,
     stage_dir: str = "",
+    trace_id: str = "",
 ) -> bool:
     """用 NapCat 文件 API 发送本地视频：群聊走群文件，私聊走私聊文件。"""
     local_path = _as_local_video_path(video_url)
     if local_path is None:
         return False
     original_file_name = local_path.name
-    staged_path = _stage_media_for_napcat(local_path, stage_dir)
+    staged_path = _stage_media_for_napcat(local_path, stage_dir, trace_id=trace_id)
     if staged_path is not None:
         local_path = staged_path
     ok, reason = await _probe_local_video_health(local_path)

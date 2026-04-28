@@ -143,6 +143,34 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(segment.data["file"].startswith("file://"))
             self.assertTrue(segment.data["thumb"].startswith("file://"))
 
+    async def test_video_segment_rejects_inline_when_over_preview_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            video = Path(tmpdir) / "large.mp4"
+            video.write_bytes(b"video-bytes" * 32)
+
+            async def passthrough(path: Path) -> Path:
+                return path
+
+            async def healthy(path: Path) -> tuple[bool, str]:
+                return True, ""
+
+            with (
+                patch.object(app_helpers, "_compress_video_if_needed", passthrough),
+                patch.object(app_helpers, "_ensure_qq_preview_video", passthrough),
+                patch.object(app_helpers, "_probe_local_video_health", healthy),
+                patch.object(app_helpers, "_VIDEO_SEND_MAX_BYTES", 64),
+            ):
+                segment = await app_helpers._video_seg_with_thumb(video)
+
+            self.assertIsNone(segment)
+
+    def test_direct_first_video_strategy_does_not_allow_file_fallback(self) -> None:
+        self.assertFalse(app_helpers._video_strategy_upload_first("direct_first"))
+        self.assertFalse(app_helpers._video_strategy_upload_only("direct_first"))
+        self.assertFalse(app_helpers._video_strategy_allows_upload_fallback("direct_first"))
+        self.assertTrue(app_helpers._video_strategy_allows_upload_fallback("direct_with_file_fallback"))
+        self.assertTrue(app_helpers._video_strategy_upload_first("upload_file_first"))
+
     def test_stage_media_for_napcat_copies_to_configured_directory(self) -> None:
         with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stage_dir:
             video = Path(src_dir) / "demo.mp4"

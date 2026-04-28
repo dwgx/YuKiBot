@@ -3622,20 +3622,48 @@ async def chat_agent_text(request: Request):
                 )
 
     if video_url:
-        from app_helpers import _build_video_segment, _stage_media_for_napcat
+        from app_helpers import (
+            _build_video_segment,
+            _should_upload_video_file_first,
+            _stage_media_for_napcat,
+            _video_strategy_allows_upload_fallback,
+            _video_strategy_upload_first,
+        )
 
         staged_video_ref = ""
         delivery_errors: list[str] = []
+        bot_cfg = _engine.config.get("bot", {}) if isinstance(getattr(_engine, "config", None), dict) else {}
+        if not isinstance(bot_cfg, dict):
+            bot_cfg = {}
+        video_send_strategy = normalize_text(str(bot_cfg.get("video_send_strategy", "direct_first"))).lower() or "direct_first"
+        napcat_media_stage_dir = normalize_text(str(bot_cfg.get("napcat_media_stage_dir", "")))
+        prefer_upload_first = (
+            _video_strategy_upload_first(video_send_strategy)
+            or _should_upload_video_file_first(video_url)
+        )
+        allow_upload_fallback = (
+            prefer_upload_first
+            or _video_strategy_allows_upload_fallback(video_send_strategy)
+        )
 
         async def _send_video_segment(*, prefer_plain_path: bool) -> bool:
             nonlocal staged_video_ref, sent_message_id
             segment = await _build_video_segment(
                 video_url,
+                stage_dir=napcat_media_stage_dir,
                 prefer_plain_path=prefer_plain_path,
                 trace_id=trace_id,
             )
             if segment is None:
-                delivery_errors.append("build_video_segment_returned_none")
+                reason = f"build_video_segment_returned_none:plain={prefer_plain_path}"
+                delivery_errors.append(reason)
+                _log.warning(
+                    "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=inline_video_build | plain=%s | peer=%s | error=%s",
+                    trace_id,
+                    prefer_plain_path,
+                    peer_id,
+                    reason,
+                )
                 return False
             seg_type = normalize_text(str(getattr(segment, "type", ""))) or "video"
             seg_data = dict(getattr(segment, "data", {}) or {})
@@ -3667,27 +3695,34 @@ async def chat_agent_text(request: Request):
             return True
 
         video_delivered = False
-        for prefer_plain in (False, True):
-            try:
-                if await _send_video_segment(prefer_plain_path=prefer_plain):
-                    video_delivered = True
-                    break
-            except Exception as exc:
-                delivery_errors.append(str(exc))
-                _log.warning(
-                    "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=inline_video | plain=%s | peer=%s | error=%s",
-                    trace_id,
-                    prefer_plain,
-                    peer_id,
-                    exc,
-                )
+        if not prefer_upload_first:
+            for prefer_plain in (True, False):
+                try:
+                    if await _send_video_segment(prefer_plain_path=prefer_plain):
+                        video_delivered = True
+                        break
+                except Exception as exc:
+                    delivery_errors.append(str(exc))
+                    _log.warning(
+                        "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=inline_video | plain=%s | peer=%s | error=%s",
+                        trace_id,
+                        prefer_plain,
+                        peer_id,
+                        exc,
+                    )
+        else:
+            _log.info(
+                "media_delivery_inline_skip | source=webui_agent_text | trace=%s | strategy=%s | reason=upload_first",
+                trace_id,
+                video_send_strategy,
+            )
 
-        if not video_delivered:
+        if not video_delivered and allow_upload_fallback:
             upload_ref = staged_video_ref or video_url
             upload_path = napcat_file_uri_to_path(upload_ref) if upload_ref.lower().startswith("file://") else Path(upload_ref)
             if upload_path is not None and upload_path.exists() and upload_path.is_file():
                 staged_upload_path = (
-                    _stage_media_for_napcat(upload_path, trace_id=trace_id)
+                    _stage_media_for_napcat(upload_path, napcat_media_stage_dir, trace_id=trace_id)
                     or upload_path
                 )
                 abs_path = str(staged_upload_path.expanduser().resolve())
@@ -3742,6 +3777,14 @@ async def chat_agent_text(request: Request):
                         clip_text(abs_path, 180),
                         exc,
                     )
+
+        if not video_delivered and not allow_upload_fallback:
+            _log.warning(
+                "media_delivery_upload_skip | source=webui_agent_text | trace=%s | strategy=%s | reason=inline_failed_no_file_fallback | peer=%s",
+                trace_id,
+                video_send_strategy,
+                peer_id,
+            )
 
         if not video_delivered:
             _log.warning(
