@@ -181,10 +181,10 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(segment)
 
-    def test_direct_first_video_strategy_does_not_allow_file_fallback(self) -> None:
+    def test_direct_first_video_strategy_allows_file_fallback(self) -> None:
         self.assertFalse(app_helpers._video_strategy_upload_first("direct_first"))
         self.assertFalse(app_helpers._video_strategy_upload_only("direct_first"))
-        self.assertFalse(app_helpers._video_strategy_allows_upload_fallback("direct_first"))
+        self.assertTrue(app_helpers._video_strategy_allows_upload_fallback("direct_first"))
         self.assertTrue(app_helpers._video_strategy_allows_upload_fallback("direct_with_file_fallback"))
         self.assertTrue(app_helpers._video_strategy_upload_first("upload_file_first"))
 

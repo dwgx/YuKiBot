@@ -1450,6 +1450,7 @@ def _video_strategy_upload_only(strategy: str) -> bool:
 
 def _video_strategy_allows_upload_fallback(strategy: str) -> bool:
     return _normalize_video_send_strategy(strategy) in {
+        "direct_first",
         "direct_with_file_fallback",
         "upload_file_first",
         "upload_only",
@@ -1910,6 +1911,25 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
             new_size = compressed.stat().st_size
             _log.info("video_compress_ok | %s | %.1fMB -> %.1fMB",
                         src.name, size / 1024 / 1024, new_size / 1024 / 1024)
+            if new_size >= size and size <= _VIDEO_SEND_MAX_BYTES:
+                _log.warning(
+                    "video_compress_inflated | src=%s | original=%d | compressed=%d | fallback=source",
+                    src.name,
+                    size,
+                    new_size,
+                )
+                compressed.unlink(missing_ok=True)
+                return src
+            if new_size > _VIDEO_SEND_MAX_BYTES and size <= _VIDEO_SEND_MAX_BYTES:
+                _log.warning(
+                    "video_compress_too_large_keep_source | src=%s | original=%d | compressed=%d | max=%d",
+                    src.name,
+                    size,
+                    new_size,
+                    _VIDEO_SEND_MAX_BYTES,
+                )
+                compressed.unlink(missing_ok=True)
+                return src
             return compressed
         _log.warning("video_compress_fail | rc=%d | stderr=%s",
                     proc.returncode, (proc.stderr or b"")[:300])
