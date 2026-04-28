@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -49,6 +51,32 @@ class AppHelpersRegressionTests(unittest.TestCase):
 
 
 class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
+    async def test_remote_image_segment_downloads_to_base64_before_direct_url(self) -> None:
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+            async def get(self, url: str):
+                return SimpleNamespace(
+                    status_code=200,
+                    content=b"image-bytes",
+                    headers={"content-type": "image/jpeg"},
+                    url=url,
+                )
+
+        with patch.object(app_helpers.httpx, "AsyncClient", FakeAsyncClient):
+            segment = await app_helpers._build_image_segment_from_remote_url("https://example.com/cat.jpg")
+
+        self.assertIsNotNone(segment)
+        self.assertEqual(segment.type, "image")
+        self.assertEqual(segment.data["file"], "base64://" + base64.b64encode(b"image-bytes").decode("ascii"))
+
     async def test_video_segment_uses_napcat_file_uris_for_local_media(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             video = Path(tmpdir) / "demo.mp4"

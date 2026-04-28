@@ -3502,10 +3502,22 @@ async def chat_agent_text(request: Request):
             peer_id,
             clip_text(img, 180),
         )
-        if resolved_type == "group":
-            sent = await _onebot_call("send_group_msg", bot_id=bot_id, group_id=peer_num, message=payload)
-        else:
-            sent = await _onebot_call("send_private_msg", bot_id=bot_id, user_id=peer_num, message=payload)
+        api_name = "send_group_msg" if resolved_type == "group" else "send_private_msg"
+        try:
+            if resolved_type == "group":
+                sent = await _onebot_call(api_name, bot_id=bot_id, group_id=peer_num, message=payload)
+            else:
+                sent = await _onebot_call(api_name, bot_id=bot_id, user_id=peer_num, message=payload)
+        except Exception as exc:
+            _log.warning(
+                "media_delivery_failed_exact | source=webui_agent_text | trace=%s | channel=image | api=%s | peer=%s | image=%s | error=%s",
+                trace_id,
+                api_name,
+                peer_id,
+                clip_text(img, 180),
+                exc,
+            )
+            continue
         image_message_id = ""
         if isinstance(sent, dict):
             image_message_id = normalize_text(str(sent.get("message_id", "") or sent.get("id", "")))

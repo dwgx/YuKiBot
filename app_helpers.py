@@ -1189,8 +1189,26 @@ def _build_image_segment_from_local_path(path: Path) -> MessageSegment | None:
 
 
 async def _build_image_segment_from_remote_url(url: str) -> MessageSegment | None:
-    """构建远程图片段：优先直传 URL 让 NapCat 自行下载，无法确认是图片时 fallback 到 base64。"""
-    # 先用 HEAD 请求确认是图片（低开销）
+    """构建远程图片段：优先下载为 base64，避免 NapCat 被防盗链/CDN 网络差异卡住。"""
+    try:
+        async with httpx.AsyncClient(
+            timeout=_MEDIA_HTTP_TIMEOUT,
+            follow_redirects=True,
+            headers={"User-Agent": _MEDIA_USER_AGENT},
+        ) as client:
+            response = await client.get(url)
+    except Exception:
+        response = None
+    if response is not None and response.status_code == 200:
+        data = response.content
+        if data and len(data) <= _MEDIA_MAX_IMAGE_BYTES:
+            content_type = str(response.headers.get("content-type", "")).lower()
+            final_url = str(response.url).lower()
+            if "image/" in content_type or final_url.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
+                b64 = base64.b64encode(data).decode("ascii")
+                return MessageSegment.image(f"base64://{b64}")
+
+    # 下载失败或内容过大时，才 fallback 到直传 URL。
     looks_like_image = url.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"))
     if not looks_like_image:
         try:
@@ -1209,30 +1227,8 @@ async def _build_image_segment_from_remote_url(url: str) -> MessageSegment | Non
         except Exception:
             pass
     if looks_like_image:
-        # 直传 URL 给 NapCat，由 NapCat 自行下载，零内存开销。
         return MessageSegment.image(file=url)
-    # 无法从 URL/HEAD 判断是图片 → 下载后 base64 确认
-    try:
-        async with httpx.AsyncClient(
-            timeout=_MEDIA_HTTP_TIMEOUT,
-            follow_redirects=True,
-            headers={"User-Agent": _MEDIA_USER_AGENT},
-        ) as client:
-            response = await client.get(url)
-    except Exception:
-        return None
-    if response.status_code != 200:
-        return None
-    data = response.content
-    if not data or len(data) > _MEDIA_MAX_IMAGE_BYTES:
-        return None
-    content_type = str(response.headers.get("content-type", "")).lower()
-    if "image/" not in content_type:
-        final_url = str(response.url).lower()
-        if not final_url.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")):
-            return None
-    b64 = base64.b64encode(data).decode("ascii")
-    return MessageSegment.image(f"base64://{b64}")
+    return None
 
 
 async def _video_seg_with_thumb(
