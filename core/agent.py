@@ -2436,7 +2436,7 @@ class AgentLoop:
         ]
         if not domain_tools:
             return None
-        timeout = min(10.0, max(3.0, remaining - 2.0))
+        timeout = min(20.0, max(3.0, remaining - 2.0))
         if timeout <= 2.5:
             return None
         tool_docs = ""
@@ -2459,6 +2459,10 @@ class AgentLoop:
             lines.append(
                 "网络时光机/历史网页/Wayback 任务默认先调用 wayback_lookup；"
                 "只有用户明确要求按年份统计/时间线时才用 wayback_timeline。"
+            )
+        if active == "media_search" and "search_media" in domain_tools:
+            lines.append(
+                '媒体检索默认调用 search_media；args 必须包含 {"query":"主题关键词","media_type":"video|image|gif"}。'
             )
         if section.fallback_sections:
             lines.append(
@@ -2600,6 +2604,8 @@ class AgentLoop:
             '只输出 JSON: {"section_id":"分区ID","reason":"一句话原因","tool":"可选工具名","args":{}}。',
             "不能回答用户。先选择最合适分区；如果目标分区需要马上调用工具且参数足够，就填该分区真实工具名和 args。",
             "tool 可以为空；不能填 think、final_answer、navigate_section；不能选择目标分区 tools 以外的工具。",
+            "可执行任务不要只选分区：找/看/发图片视频通常同时给 search_media；网页归档通常同时给 wayback_lookup。",
+            '媒体检索 args 示例: {"query":"主题关键词","media_type":"video|image|gif"}。',
             "分区目录:",
         ]
         visible = {
