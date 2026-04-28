@@ -297,6 +297,36 @@ class _TimeoutThenSectionModelClient:
         )
 
 
+class _RecordingNavigatorModelClient:
+    enabled = True
+
+    def __init__(self):
+        self.models: list[str | None] = []
+
+    def supports_native_tool_calling(self) -> bool:
+        return False
+
+    async def chat_text_with_retry(
+        self,
+        messages,
+        max_tokens=0,
+        retries=0,
+        backoff=0.0,
+        model=None,
+    ):
+        _ = (messages, max_tokens, retries, backoff)
+        self.models.append(model)
+        return json.dumps(
+            {
+                "section_id": "media_search",
+                "reason": "用户要看视频",
+                "tool": "search_media",
+                "args": {"query": "异环宣传片", "media_type": "video"},
+            },
+            ensure_ascii=False,
+        )
+
+
 class _ErrorModelClient:
     enabled = True
 
@@ -1038,6 +1068,119 @@ class AgentPromptNavigatorTests(unittest.TestCase):
         )
         self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
         self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
+
+    def test_tiny_navigator_retry_uses_configured_model(self):
+        registry = _Registry()
+        client = _RecordingNavigatorModelClient()
+        loop = AgentLoop(
+            model_client=client,
+            tool_registry=registry,
+            config={
+                "agent": {
+                    "enable": True,
+                    "max_steps": 5,
+                    "fallback_on_parse_error": True,
+                    "navigator_retry_model": "gpt-5.4-mini",
+                },
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="给我发一个异环的视频",
+            trace_id="navigator-retry-model-test",
+        )
+        visible_tools = [
+            "think",
+            "final_answer",
+            "navigate_section",
+            "search_media",
+            "web_search",
+            "fetch_webpage",
+            "parse_video",
+            "search_download_resources",
+        ]
+        ctx.navigator_state = PromptNavigator.from_payload(
+            default_prompt_navigator_payload()
+        ).initial_state(ctx, visible_tools)
+
+        retry = asyncio.run(
+            loop._navigator_timeout_section_retry(
+                ctx=ctx,
+                step_idx=0,
+                tool_calls_made=0,
+                steps=[],
+                remaining=60.0,
+            )
+        )
+
+        self.assertEqual(client.models, ["gpt-5.4-mini"])
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry[0], "media_search")
+        self.assertEqual(retry[2], "search_media")
+
+    def test_fallback_does_not_leak_navigator_section_prompt(self):
+        loop = AgentLoop(
+            model_client=_TimeoutModelClient(),
+            tool_registry=_Registry(),
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="给我发一个异环的视频",
+            trace_id="navigator-fallback-leak-test",
+        )
+
+        result = asyncio.run(
+            loop._build_fallback_result(
+                ctx,
+                [
+                    {
+                        "tool": "navigate_section",
+                        "ok": True,
+                        "display": "当前分区: media_search\n当前分区可见工具: search_media",
+                    }
+                ],
+                tool_calls_made=0,
+                t0=time.monotonic(),
+                reason="llm_timeout",
+            )
+        )
+
+        self.assertNotIn("当前分区", result.reply_text)
+        self.assertNotIn("search_media", result.reply_text)
+
+    def test_last_success_display_ignores_navigator_observation(self):
+        display = AgentLoop._last_success_display(
+            [
+                {"tool": "web_search", "ok": True, "display": "搜索结果摘要"},
+                {
+                    "tool": "navigate_section",
+                    "ok": True,
+                    "display": "当前分区: media_search\n当前分区可见工具: search_media",
+                },
+            ]
+        )
+
+        self.assertEqual(display, "搜索结果摘要")
 
     def test_general_timeout_section_retry_can_seed_next_tool(self):
         registry = _Registry()

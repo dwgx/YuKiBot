@@ -49,8 +49,13 @@ class BaseLLMClient:
     ) -> dict[str, Any]:
         raise NotImplementedError
 
-    async def chat_text(self, messages: list[dict[str, str]], max_tokens: int | None = None) -> str:
-        data = await self.chat_completion(messages=messages, max_tokens=max_tokens)
+    async def chat_text(
+        self,
+        messages: list[dict[str, Any]],
+        max_tokens: int | None = None,
+        model: str | None = None,
+    ) -> str:
+        data = await self.chat_completion(messages=messages, max_tokens=max_tokens, model=model)
         choices = data.get("choices") or []
         if not choices:
             return ""
@@ -96,8 +101,9 @@ class BaseLLMClient:
 
     async def chat_text_with_retry(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         max_tokens: int | None = None,
+        model: str | None = None,
         retries: int = 2,
         backoff: float = 1.0,
     ) -> str:
@@ -106,7 +112,7 @@ class BaseLLMClient:
         last_exc: Exception | None = None
         for attempt in range(retries + 1):
             try:
-                return await self.chat_text(messages, max_tokens=max_tokens)
+                return await self.chat_text(messages, max_tokens=max_tokens, model=model)
             except Exception as exc:
                 last_exc = exc
                 if attempt < retries:

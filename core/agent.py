@@ -267,6 +267,7 @@ class AgentLoop:
         self.llm_step_timeout_seconds_after_tool = 32
         self.navigator_obvious_tool_timeout_seconds = 5.0
         self.navigator_preflight_plain_text = False
+        self.navigator_retry_model = ""
         self.total_timeout_seconds = 0
         self.queue_timeout_margin_seconds = 8
         self.prompt_policy = PromptPolicy.from_config({})
@@ -377,6 +378,9 @@ class AgentLoop:
         )
         self.navigator_preflight_plain_text = bool(
             agent_cfg.get("navigator_preflight_plain_text", False)
+        )
+        self.navigator_retry_model = normalize_text(
+            str(agent_cfg.get("navigator_retry_model", "") or "")
         )
         self.total_timeout_seconds = max(
             0, int(agent_cfg.get("total_timeout_seconds", 0))
@@ -2561,15 +2565,17 @@ class AgentLoop:
                     max_tokens=260,
                     retries=0,
                     backoff=0.0,
+                    **self._navigator_retry_model_kwargs(),
                 ),
                 timeout=timeout,
             )
         except Exception as exc:
             _log.info(
-                "navigator_timeout_tool_retry_failed | trace=%s | step=%d | section=%s | %s",
+                "navigator_timeout_tool_retry_failed | trace=%s | step=%d | section=%s | model=%s | %s",
                 ctx.trace_id,
                 step_idx,
                 active,
+                self.navigator_retry_model or "-",
                 exc,
             )
             return None
@@ -2700,14 +2706,16 @@ class AgentLoop:
                     max_tokens=220,
                     retries=0,
                     backoff=0.0,
+                    **self._navigator_retry_model_kwargs(),
                 ),
                 timeout=timeout,
             )
         except Exception as exc:
             _log.info(
-                "navigator_timeout_section_retry_failed | trace=%s | step=%d | %s",
+                "navigator_timeout_section_retry_failed | trace=%s | step=%d | model=%s | %s",
                 ctx.trace_id,
                 step_idx,
+                self.navigator_retry_model or "-",
                 exc,
             )
             return None
@@ -2776,6 +2784,10 @@ class AgentLoop:
         except Exception:
             return None
         return data if isinstance(data, dict) else None
+
+    def _navigator_retry_model_kwargs(self) -> dict[str, str]:
+        model = normalize_text(str(getattr(self, "navigator_retry_model", "") or ""))
+        return {"model": model} if model else {}
 
     @classmethod
     def _has_non_url_instruction_text(cls, ctx: AgentContext) -> bool:
@@ -5444,6 +5456,9 @@ class AgentLoop:
         for step in reversed(steps):
             if not bool(step.get("ok")):
                 continue
+            tool_name = normalize_text(str(step.get("tool", ""))).lower()
+            if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
+                continue
             display = normalize_text(str(step.get("display", "")))
             if display:
                 return display
@@ -5724,6 +5739,8 @@ class AgentLoop:
             if not display or not bool(step.get("ok")):
                 continue
             tool_name = normalize_text(str(step.get("tool", ""))).lower()
+            if tool_name in {"policy_guard", "think", NAVIGATE_SECTION_TOOL}:
+                continue
             if self._skip_raw_tool_display_in_fallback(tool_name, display):
                 continue
             if len(display) > 280:
