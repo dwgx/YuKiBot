@@ -3794,6 +3794,8 @@ class AgentLoop:
             "腾讯视频",
         )
         image_cues = (
+            "截图",
+            "封面",
             "图片",
             "图",
             "壁纸",
@@ -3825,9 +3827,17 @@ class AgentLoop:
         video_hit = any(cue in video_plain for cue in video_cues) or bool(
             re.search(r"\b(?:video|movie|clip)\b", video_plain)
         )
+        positive_video_hit = any(
+            cue in video_plain for cue in ("视频", "影片", "短片", "片段", "教程视频")
+        ) or bool(re.search(r"\b(?:video|movie|clip)\b", video_plain))
         image_hit = any(cue in image_plain for cue in image_cues) or bool(
             re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", image_plain)
         )
+        if image_hit and (
+            not positive_video_hit
+            or any(cue in image_plain for cue in ("截图", "封面", "图片", "图", "来张", "猫图", "表情包"))
+        ):
+            return "image"
         if video_hit:
             return "video"
         if image_hit:

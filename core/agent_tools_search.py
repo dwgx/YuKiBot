@@ -212,17 +212,8 @@ def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
 
 def _infer_media_search_type(query: str, explicit: str = "") -> str:
     explicit_type = normalize_text(explicit).lower()
-    if explicit_type in {"image", "img", "picture", "photo", "pic"}:
-        return "image"
-    if explicit_type in {"video", "movie", "clip", "vid"}:
-        return "video"
-    if explicit_type in {"gif", "动图"}:
-        return "gif"
-
     text = normalize_text(query).lower()
     compact = re.sub(r"\s+", "", text)
-    if any(cue in compact for cue in ("gif", "动图", "表情动图")):
-        return "gif"
     video_cues = (
         "视频",
         "影片",
@@ -242,6 +233,8 @@ def _infer_media_search_type(query: str, explicit: str = "") -> str:
         "腾讯视频",
     )
     image_cues = (
+        "截图",
+        "封面",
         "图片",
         "图",
         "搜图",
@@ -256,6 +249,10 @@ def _infer_media_search_type(query: str, explicit: str = "") -> str:
         "表情包",
         "贴图",
     )
+    if explicit_type in {"image", "img", "picture", "photo", "pic"}:
+        return "image"
+    if explicit_type in {"gif", "动图"} or any(cue in compact for cue in ("gif", "动图", "表情动图")):
+        return "gif"
     video_compact = re.sub(
         r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
         r"(?:视频|影片|短片|片段|video|clip)",
@@ -273,9 +270,21 @@ def _infer_media_search_type(query: str, explicit: str = "") -> str:
     video_hit = any(cue in video_compact for cue in video_cues) or bool(
         re.search(r"\b(?:video|movie|clip)\b", video_compact)
     )
+    positive_video_hit = any(
+        cue in video_compact for cue in ("视频", "影片", "短片", "片段", "教程视频")
+    ) or bool(re.search(r"\b(?:video|movie|clip)\b", video_compact))
     image_hit = any(cue in image_compact for cue in image_cues) or bool(
         re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", image_compact)
     )
+    if explicit_type in {"video", "movie", "clip", "vid"}:
+        if image_hit and not positive_video_hit:
+            return "image"
+        return "video"
+    if image_hit and (
+        not positive_video_hit
+        or any(cue in image_compact for cue in ("截图", "封面", "图片", "图", "来张", "猫图", "表情包"))
+    ):
+        return "image"
     if video_hit:
         return "video"
     if image_hit:

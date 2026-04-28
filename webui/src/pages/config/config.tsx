@@ -375,9 +375,13 @@ export default function ConfigPage() {
               if (arr.length <= 0) return;
               const next = String(arr[0]);
               if (field.path === "api.provider") {
+                const currentModel = String(getPath(config, "api.model") ?? "");
+                const previousModels = MODEL_OPTIONS[providerValue] || [];
+                const shouldResetModel = !currentModel
+                  || previousModels.some((item) => item.value === currentModel);
                 updateField(field.path, next);
                 const models = MODEL_OPTIONS[next] || [];
-                if (models.length > 0) {
+                if (shouldResetModel && models.length > 0) {
                   updateField("api.model", models[0].value);
                 }
                 return;

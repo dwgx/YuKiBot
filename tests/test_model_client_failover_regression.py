@@ -4,6 +4,7 @@ import asyncio
 import unittest
 
 from services.model_client import ModelClient
+from services.openai_compatible import OpenAICompatibleClient
 
 
 class _Primary401Client:
@@ -53,6 +54,39 @@ class _PrimaryTimeoutClient:
 
     async def chat_completion(self, messages, response_format=None, max_tokens=None):
         raise TimeoutError("request timed out while waiting for upstream")
+
+
+class _OpenAIModelFallbackClient(OpenAICompatibleClient):
+    def __init__(self) -> None:
+        super().__init__(
+            config={
+                "api_key": "x",
+                "base_url": "https://newapi.example",
+                "model": "bad-model",
+                "fallback_models": ["good-model"],
+                "stream_chat_completions": False,
+            },
+            provider="newapi",
+            default_base_url="https://newapi.example/v1",
+            default_env_key="NEWAPI_API_KEY",
+            prefer_v1=True,
+        )
+        self.models_seen: list[str] = []
+
+    async def _post_with_base_candidates(
+        self,
+        endpoint: str,
+        payload: dict,
+        headers: dict,
+        prefer_v1: bool,
+        stream_response: bool = False,
+    ) -> dict:
+        _ = endpoint, headers, prefer_v1, stream_response
+        model = str(payload.get("model", ""))
+        self.models_seen.append(model)
+        if model == "bad-model":
+            raise RuntimeError("HTTP 503: All credentials for model bad-model are cooling down")
+        return {"choices": [{"message": {"role": "assistant", "content": "model-ok"}}]}
 
 
 class ModelClientFailoverRegressionTests(unittest.TestCase):
@@ -140,6 +174,16 @@ class ModelClientFailoverRegressionTests(unittest.TestCase):
         finally:
             ModelClient._CLIENTS.clear()
             ModelClient._CLIENTS.update(original_clients)
+
+    def test_openai_compatible_can_fallback_between_models(self) -> None:
+        client = _OpenAIModelFallbackClient()
+
+        result = asyncio.run(
+            client.chat_text(messages=[{"role": "user", "content": "ping"}])
+        )
+
+        self.assertEqual(result, "model-ok")
+        self.assertEqual(client.models_seen, ["bad-model", "good-model"])
 
 
 if __name__ == "__main__":

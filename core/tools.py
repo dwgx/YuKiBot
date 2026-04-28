@@ -279,6 +279,23 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         ).rstrip("/")
         self._vision_api_key = normalize_text(str(vision_cfg.get("api_key", "")))
         self._vision_model = normalize_text(str(vision_cfg.get("model", "")))
+        fallback_models_raw = vision_cfg.get(
+            "fallback_models", vision_cfg.get("model_fallbacks", [])
+        )
+        if isinstance(fallback_models_raw, str):
+            fallback_model_items = re.split(r"[,;\n]+", fallback_models_raw)
+        elif isinstance(fallback_models_raw, (list, tuple, set)):
+            fallback_model_items = list(fallback_models_raw)
+        else:
+            fallback_model_items = []
+        self._vision_fallback_models: list[str] = []
+        seen_vision_models: set[str] = set()
+        for item in fallback_model_items:
+            model_text = normalize_text(str(item or ""))
+            model_key = model_text.lower()
+            if model_text and model_key not in seen_vision_models:
+                seen_vision_models.add(model_key)
+                self._vision_fallback_models.append(model_text)
         self._vision_prefer_v1 = bool(vision_cfg.get("prefer_v1", True))
         self._vision_temperature = float(vision_cfg.get("temperature", 0.2))
         self._vision_max_tokens = max(200, int(vision_cfg.get("max_tokens", 1200)))

@@ -24,19 +24,13 @@ export function ModelCombobox({
   inputClassNames,
   className,
 }: ModelComboboxProps) {
-  const items = useMemo(() => {
-    const current = String(value || "").trim();
-    const base = uniqueModelOptions(options);
-    if (current && !base.some((item) => item.value.toLowerCase() === current.toLowerCase())) {
-      return [
-        { value: current, label: current, description: "当前自定义模型" },
-        ...base,
-      ];
-    }
-    return base;
-  }, [options, value]);
+  const items = useMemo(() => uniqueModelOptions(options), [options]);
 
-  const selectedKey = value ? value : null;
+  const selectedKey = useMemo(() => {
+    const current = String(value || "").trim().toLowerCase();
+    if (!current) return null;
+    return items.find((item) => item.value.toLowerCase() === current)?.value ?? null;
+  }, [items, value]);
 
   return (
     <Autocomplete

@@ -11,9 +11,9 @@ export type PendingThinkingLog = { raw: string; at: number };
 export type ThinkingIslandSize = "sm" | "md" | "lg";
 export type ThinkingStage = "idle" | "routing" | "planning" | "executing" | "replying" | "done" | "cancelled" | "error";
 
-export const THINKING_ISLAND_DEFAULT_WIDTH: Record<ThinkingIslandSize, number> = { sm: 480, md: 640, lg: 820 };
+export const THINKING_ISLAND_DEFAULT_WIDTH: Record<ThinkingIslandSize, number> = { sm: 480, md: 720, lg: 980 };
 export const THINKING_ISLAND_MIN_WIDTH = 360;
-export const THINKING_ISLAND_MAX_WIDTH = 920;
+export const THINKING_ISLAND_MAX_WIDTH = 1280;
 export const THINKING_ISLAND_MIN_HEIGHT = 100;
 export const THINKING_ISLAND_MAX_HEIGHT = 500;
 export const THINKING_ISLAND_DEFAULT_HEIGHT = 160;

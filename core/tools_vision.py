@@ -1282,6 +1282,7 @@ class ToolVisionMixin:
         )
         if not api_key or not base_url or not model_name:
             return ""
+        model_candidates = self._candidate_vision_models(model_name, client)
 
         timeout_seconds = float(
             getattr(client, "timeout_seconds", self._vision_timeout_seconds)
@@ -1312,7 +1313,7 @@ class ToolVisionMixin:
             "vision_request%s | provider=%s | model=%s | image_ref=%s | timeout=%.1fs",
             _tool_trace_tag(),
             provider or "-",
-            model_name or "-",
+            ",".join(model_candidates) or model_name or "-",
             image_ref_kind,
             timeout_seconds,
         )
@@ -1389,27 +1390,6 @@ class ToolVisionMixin:
             except Exception:
                 return ""
 
-        payload = {
-            "model": model_name,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": SystemPromptRelay.vision_system_prompt_detailed(),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": image_ref, "detail": "auto"},
-                        },
-                    ],
-                },
-            ],
-            "temperature": temperature,
-            "max_tokens": max_tokens,
-        }
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
@@ -1418,36 +1398,87 @@ class ToolVisionMixin:
             base_url=base_url, prefer_v1=prefer_v1
         )
 
-        for base in candidates:
-            url = f"{base}/chat/completions"
-            try:
-                async with httpx.AsyncClient(timeout=timeout_seconds) as client_http:
-                    resp = await client_http.post(url, headers=headers, json=payload)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception:
-                continue
+        for candidate_model in model_candidates:
+            payload = {
+                "model": candidate_model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": SystemPromptRelay.vision_system_prompt_detailed(),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": prompt},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": image_ref, "detail": "auto"},
+                            },
+                        ],
+                    },
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            for base in candidates:
+                url = f"{base}/chat/completions"
+                try:
+                    async with httpx.AsyncClient(timeout=timeout_seconds) as client_http:
+                        resp = await client_http.post(url, headers=headers, json=payload)
+                    resp.raise_for_status()
+                    data = resp.json()
+                except Exception as exc:
+                    _tool_log.warning(
+                        "vision_provider_failed_exact%s | provider=%s | model=%s | url=%s | err=%s",
+                        _tool_trace_tag(),
+                        provider or "-",
+                        candidate_model or "-",
+                        url,
+                        str(exc)[:240],
+                    )
+                    continue
 
-            choices = data.get("choices") if isinstance(data, dict) else None
-            if not isinstance(choices, list) or not choices:
-                continue
-            message = (
-                choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
-            )
-            content = message.get("content", "")
-            if isinstance(content, str):
-                text = normalize_text(content)
-                if text:
-                    return text
-                continue
-            if isinstance(content, list):
-                parts: list[str] = []
-                for item in content:
-                    if isinstance(item, dict):
-                        parts.append(normalize_text(str(item.get("text", ""))))
-                text = normalize_text("".join(parts))
-                if text:
-                    return text
+                choices = data.get("choices") if isinstance(data, dict) else None
+                if not isinstance(choices, list) or not choices:
+                    _tool_log.warning(
+                        "vision_provider_failed_exact%s | provider=%s | model=%s | url=%s | err=empty_choices",
+                        _tool_trace_tag(),
+                        provider or "-",
+                        candidate_model or "-",
+                        url,
+                    )
+                    continue
+                message = (
+                    choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+                )
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    text = normalize_text(content)
+                    if text:
+                        return text
+                    _tool_log.warning(
+                        "vision_provider_failed_exact%s | provider=%s | model=%s | url=%s | err=empty_content",
+                        _tool_trace_tag(),
+                        provider or "-",
+                        candidate_model or "-",
+                        url,
+                    )
+                    continue
+                if isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, dict):
+                            parts.append(normalize_text(str(item.get("text", ""))))
+                    text = normalize_text("".join(parts))
+                    if text:
+                        return text
+                    _tool_log.warning(
+                        "vision_provider_failed_exact%s | provider=%s | model=%s | url=%s | err=empty_content_parts",
+                        _tool_trace_tag(),
+                        provider or "-",
+                        candidate_model or "-",
+                        url,
+                    )
 
         # 某些 OpenAI 兼容网关（如部分 skiapi/newapi）在 claude 模型下会返回空 content，
         # 这里自动补一次 Anthropic /messages 兼容路径，避免图片识别整体失效。
@@ -1633,6 +1664,48 @@ class ToolVisionMixin:
             and self._vision_model
             and self._vision_api_key
         )
+
+    def _candidate_vision_models(self, primary: str, client: Any | None) -> list[str]:
+        values: list[Any] = [primary]
+        values.extend(getattr(self, "_vision_fallback_models", []) or [])
+        if client is not None and not getattr(self, "_vision_model", ""):
+            client_cfg = getattr(client, "config", {}) or {}
+            if isinstance(client_cfg, dict):
+                values.extend(
+                    self._normalize_vision_model_list(
+                        client_cfg.get("vision_fallback_models", [])
+                    )
+                )
+                values.extend(
+                    self._normalize_vision_model_list(client_cfg.get("fallback_models", []))
+                )
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            text = normalize_text(str(item or ""))
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result or [primary]
+
+    @staticmethod
+    def _normalize_vision_model_list(raw: Any) -> list[str]:
+        if isinstance(raw, str):
+            values = re.split(r"[,;\n]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            text = normalize_text(str(item or ""))
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result
 
     async def _normalize_vision_answer(self, answer: str, prompt: str) -> str:
         content = normalize_text(answer)
@@ -1860,4 +1933,3 @@ class ToolVisionMixin:
         return any(cue in content for cue in scope_cues) and any(
             cue in content for cue in action_cues
         )
-

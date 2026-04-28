@@ -171,6 +171,7 @@ def _built_in_config_defaults() -> dict[str, Any]:
         "api": {
             "provider": "newapi",
             "model": "gpt-5-codex",
+            "fallback_models": [],
             "endpoint_type": "openai",
             "api_key": "",
             "base_url": "",
@@ -247,6 +248,15 @@ def _built_in_config_defaults() -> dict[str, Any]:
                 "resolve_total_timeout_seconds": 240,
                 "require_audio_for_send": True,
                 "validate_direct_url": True,
+            },
+            "vision": {
+                "enable": True,
+                "model_supports_image": "auto",
+                "route_text_model_to_local": True,
+                "fallback_models": [],
+                "timeout_seconds": 35,
+                "max_tokens": 1200,
+                "temperature": 0.2,
             },
         },
         "search_followup": {

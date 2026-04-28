@@ -5,6 +5,7 @@ import unittest
 from types import SimpleNamespace
 
 from core.agent import AgentLoop
+from core.agent_tools_search import _infer_media_search_type
 from core.config_templates import _built_in_config_defaults
 from core.engine import EngineMessage, YukikoEngine
 from core.router import RouterDecision, RouterEngine
@@ -205,6 +206,9 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
 
         self.assertEqual(AgentLoop._infer_media_type("\u52a8\u56fe\u8868\u60c5"), "gif")
         self.assertEqual(AgentLoop._infer_media_type("type=gif"), "gif")
+        self.assertEqual(AgentLoop._infer_media_type("来张抖音截图"), "image")
+        self.assertEqual(_infer_media_search_type("来张抖音截图", "video"), "image")
+        self.assertEqual(_infer_media_search_type("找一个抖音视频", ""), "video")
 
         self.assertEqual(
             AgentLoop._infer_resource_file_type("\u5b89\u5353\u5b89\u88c5\u5305"), ""

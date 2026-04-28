@@ -127,6 +127,7 @@ config:
   api:
     provider: newapi
     model: gpt-5-codex
+    fallback_models: []
     endpoint_type: openai
     api_key: ''
     base_url: ''
@@ -210,6 +211,7 @@ config:
       enable: true
       model_supports_image: auto
       route_text_model_to_local: true
+      fallback_models: []
       timeout_seconds: 35
       max_tokens: 1200
       temperature: 0.2

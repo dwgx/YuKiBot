@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
 from typing import Any
 
 import httpx
 
 from services.base_client import BaseLLMClient
+
+_log = logging.getLogger("yukiko.openai_compatible")
 
 
 class OpenAICompatibleClient(BaseLLMClient):
@@ -37,6 +41,9 @@ class OpenAICompatibleClient(BaseLLMClient):
         # 默认不在 openai_response 失败后回退 chat/completions，避免 Codex 通道误触发不支持端点。
         self.allow_response_fallback_to_chat = self._as_bool(
             config.get("allow_response_fallback_to_chat", False)
+        )
+        self.fallback_models = self._normalize_model_list(
+            config.get("fallback_models", config.get("model_fallbacks", []))
         )
         self._http_client: httpx.AsyncClient | None = None
         self.supports_multimodal_messages = True
@@ -76,11 +83,48 @@ class OpenAICompatibleClient(BaseLLMClient):
 
         resolved_max_tokens = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
         model_name = str(model or self.model).strip() or self.model
+        model_candidates = self._candidate_models(model_name)
+        last_exc: Exception | None = None
+        for index, candidate_model in enumerate(model_candidates):
+            try:
+                return await self._chat_completion_with_model(
+                    messages=messages,
+                    response_format=response_format,
+                    max_tokens=resolved_max_tokens,
+                    model_name=candidate_model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if index >= len(model_candidates) - 1 or not self._is_model_fallback_worthy(exc):
+                    raise
+                next_model = model_candidates[index + 1]
+                _log.warning(
+                    "model_fallback_try | provider=%s | model=%s -> %s | err=%s",
+                    self.provider,
+                    candidate_model,
+                    next_model,
+                    str(exc)[:220],
+                )
+        if last_exc:
+            raise last_exc
+        raise RuntimeError(f"{self.provider} 没有可用模型")
+
+    async def _chat_completion_with_model(
+        self,
+        messages: list[dict[str, Any]],
+        response_format: dict[str, str] | None,
+        max_tokens: int,
+        model_name: str,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": model_name,
             "messages": messages,
             "temperature": self.temperature,
-            "max_tokens": resolved_max_tokens,
+            "max_tokens": max_tokens,
         }
         if response_format:
             payload["response_format"] = response_format
@@ -105,7 +149,7 @@ class OpenAICompatibleClient(BaseLLMClient):
             try:
                 return await self._chat_completion_via_responses(
                     messages=messages,
-                    max_tokens=resolved_max_tokens,
+                    max_tokens=max_tokens,
                     headers=headers,
                     model_name=model_name,
                 )
@@ -144,6 +188,64 @@ class OpenAICompatibleClient(BaseLLMClient):
                 prefer_v1=self.prefer_v1,
                 stream_response=False,
             )
+
+    @staticmethod
+    def _normalize_model_list(raw: Any) -> list[str]:
+        if isinstance(raw, str):
+            values = re.split(r"[,;\n]+", raw)
+        elif isinstance(raw, (list, tuple, set)):
+            values = list(raw)
+        else:
+            values = []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            text = str(item or "").strip()
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result
+
+    def _candidate_models(self, primary: str) -> list[str]:
+        candidates = [primary, *self.fallback_models]
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in candidates:
+            text = str(item or "").strip()
+            key = text.lower()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result or [primary]
+
+    @staticmethod
+    def _is_model_fallback_worthy(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        if "401" in msg or "403" in msg or "unauthorized" in msg or "forbidden" in msg:
+            return False
+        return any(
+            cue in msg
+            for cue in (
+                "model_not_found",
+                "no available channel",
+                "cooling down",
+                "all credentials for model",
+                "rate limit",
+                "rate_limit",
+                "quota",
+                "429",
+                "502",
+                "503",
+                "504",
+                "timeout",
+                "timed out",
+                "upstream",
+                "service unavailable",
+                "responses 返回为空",
+                "返回为空",
+            )
+        )
 
     async def _chat_completion_via_responses(
         self,

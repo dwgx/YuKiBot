@@ -500,15 +500,17 @@ export default function SetupPage() {
   };
 
   const handleProviderChange = (val: string) => {
+    const previousModels = MODEL_OPTIONS[provider] || [];
+    const shouldResetModel = !model || previousModels.some((item) => item.value === model);
     setProvider(val);
     const info = PROVIDERS.find((item) => item.value === val);
     setEndpointType(info?.endpointType || "openai");
     const list = MODEL_OPTIONS[val] || [];
-    if (list.length > 0) {
+    if (shouldResetModel && list.length > 0) {
       setModel(list[0].value);
       return;
     }
-    if (info) setModel(info.model);
+    if (shouldResetModel && info) setModel(info.model);
   };
 
   const handleTestApi = async () => {
@@ -868,9 +870,13 @@ export default function SetupPage() {
                       const v = Array.from(keys)[0];
                       if (v) {
                         const nextProvider = String(v);
+                        const previousDefaults = IMAGE_GEN_DEFAULTS[imageGenProvider] || IMAGE_GEN_DEFAULTS.custom;
+                        const shouldResetModel = !imageGenModel || imageGenModel === previousDefaults.model;
                         setImageGenProvider(nextProvider);
                         const defaults = IMAGE_GEN_DEFAULTS[nextProvider] || IMAGE_GEN_DEFAULTS.custom;
-                        setImageGenModel(defaults.model);
+                        if (shouldResetModel) {
+                          setImageGenModel(defaults.model);
+                        }
                         if (shouldResetImageGenBaseUrl(imageGenBaseUrl)) {
                           setImageGenBaseUrl(defaults.baseUrl);
                         }
