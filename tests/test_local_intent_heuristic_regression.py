@@ -8,7 +8,6 @@ from unittest.mock import patch
 
 import core.tools_video as tools_video
 from core.agent import AgentLoop
-from core.agent_tools_search import _infer_media_search_type
 from core.config_templates import _built_in_config_defaults
 from core.engine import EngineMessage, YukikoEngine
 from core.router import RouterDecision, RouterEngine
@@ -322,19 +321,6 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
             ),
             "\u6240\u4ee5\u5462 \u5e2e\u6211\u770b",
         )
-
-        self.assertEqual(AgentLoop._infer_search_mode("\u641c\u56fe \u732b"), "image")
-        self.assertEqual(AgentLoop._infer_search_mode("/image cat"), "image")
-        self.assertEqual(AgentLoop._infer_search_mode("mode=image cat"), "image")
-        self.assertEqual(
-            AgentLoop._infer_search_mode("https://example.com/demo.mp4"), "video"
-        )
-
-        self.assertEqual(AgentLoop._infer_media_type("\u52a8\u56fe\u8868\u60c5"), "gif")
-        self.assertEqual(AgentLoop._infer_media_type("type=gif"), "gif")
-        self.assertEqual(AgentLoop._infer_media_type("来张抖音截图"), "image")
-        self.assertEqual(_infer_media_search_type("来张抖音截图", "video"), "image")
-        self.assertEqual(_infer_media_search_type("找一个抖音视频", ""), "video")
 
         self.assertEqual(
             AgentLoop._infer_resource_file_type("\u5b89\u5353\u5b89\u88c5\u5305"), ""

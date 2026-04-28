@@ -57,10 +57,14 @@ def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> N
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "检索关键词"},
-                    "media_type": {"type": "string", "description": "类型: image/video/gif"},
+                    "media_type": {
+                        "type": "string",
+                        "enum": ["image", "video", "gif"],
+                        "description": "LLM 根据用户需求显式选择的类型: image/video/gif",
+                    },
                     "limit": {"type": "integer", "description": "返回数量，默认5，最大8"},
                 },
-                "required": ["query"],
+                "required": ["query", "media_type"],
             },
             category="search",
         ),
@@ -79,10 +83,14 @@ def _register_search_tools(registry: AgentToolRegistry, search_engine: Any) -> N
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "媒体主题或关键词"},
-                    "media_type": {"type": "string", "description": "类型: image/video/gif"},
+                    "media_type": {
+                        "type": "string",
+                        "enum": ["image", "video", "gif"],
+                        "description": "LLM 根据用户需求显式选择的类型: image/video/gif",
+                    },
                     "limit": {"type": "integer", "description": "候选数量提示，默认5，最大8"},
                 },
-                "required": ["query"],
+                "required": ["query", "media_type"],
             },
             category="search",
         ),
@@ -151,10 +159,16 @@ def _make_search_handler(search_engine: Any) -> ToolHandler:
 def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
     async def handler(args: dict[str, Any], context: dict[str, Any]) -> ToolCallResult:
         query = normalize_text(str(args.get("query", "")))
-        media_type = normalize_text(str(args.get("media_type", "image"))).lower() or "image"
+        media_type = _normalize_media_search_type(args.get("media_type", ""))
         limit = max(1, min(8, int(args.get("limit", 5) or 5)))
         if not query:
             return ToolCallResult(ok=False, error="missing query", display="缺少 query")
+        if not media_type:
+            return ToolCallResult(
+                ok=False,
+                error="missing_media_type",
+                display="缺少 media_type。请根据 Prompt Navigator 分区提示显式填写 image/video/gif。",
+            )
 
         try:
             if media_type == "video":
@@ -210,86 +224,18 @@ def _make_search_web_media_handler(search_engine: Any) -> ToolHandler:
     return handler
 
 
-def _infer_media_search_type(query: str, explicit: str = "") -> str:
-    explicit_type = normalize_text(explicit).lower()
-    text = normalize_text(query).lower()
-    compact = re.sub(r"\s+", "", text)
-    video_cues = (
-        "视频",
-        "影片",
-        "短片",
-        "片段",
-        "教程视频",
-        "youtube",
-        "b站",
-        "bilibili",
-        "抖音",
-        "douyin",
-        "快手",
-        "kuaishou",
-        "acfun",
-        "爱奇艺",
-        "iqiyi",
-        "腾讯视频",
-    )
-    image_cues = (
-        "截图",
-        "封面",
-        "图片",
-        "图",
-        "搜图",
-        "找图",
-        "来张",
-        "壁纸",
-        "头像",
-        "配图",
-        "照片",
-        "梗图",
-        "猫图",
-        "表情包",
-        "贴图",
-    )
-    if explicit_type in {"image", "img", "picture", "photo", "pic"}:
+def _normalize_media_search_type(value: Any) -> str:
+    explicit_type = normalize_text(str(value or "")).lower()
+    compact = re.sub(r"\s+", "", explicit_type)
+    if compact.startswith("type="):
+        compact = compact.split("=", 1)[1]
+    if compact in {"image", "img", "picture", "photo", "pic", "图片", "圖", "图"}:
         return "image"
-    if explicit_type in {"gif", "动图"} or any(cue in compact for cue in ("gif", "动图", "表情动图")):
+    if compact in {"gif", "动图", "動圖"}:
         return "gif"
-    video_compact = re.sub(
-        r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
-        r"(?:视频|影片|短片|片段|video|clip)",
-        "",
-        compact,
-        flags=re.IGNORECASE,
-    )
-    image_compact = re.sub(
-        r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
-        r"(?:图片|图|壁纸|头像|配图|照片|image|photo|picture|wallpaper|avatar)",
-        "",
-        compact,
-        flags=re.IGNORECASE,
-    )
-    video_hit = any(cue in video_compact for cue in video_cues) or bool(
-        re.search(r"\b(?:video|movie|clip)\b", video_compact)
-    )
-    positive_video_hit = any(
-        cue in video_compact for cue in ("视频", "影片", "短片", "片段", "教程视频")
-    ) or bool(re.search(r"\b(?:video|movie|clip)\b", video_compact))
-    image_hit = any(cue in image_compact for cue in image_cues) or bool(
-        re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", image_compact)
-    )
-    if explicit_type in {"video", "movie", "clip", "vid"}:
-        if image_hit and not positive_video_hit:
-            return "image"
+    if compact in {"video", "movie", "clip", "vid", "视频", "影片"}:
         return "video"
-    if image_hit and (
-        not positive_video_hit
-        or any(cue in image_compact for cue in ("截图", "封面", "图片", "图", "来张", "猫图", "表情包"))
-    ):
-        return "image"
-    if video_hit:
-        return "video"
-    if image_hit:
-        return "image"
-    return "image"
+    return ""
 
 
 def _coerce_group_id(value: Any) -> int:
@@ -306,7 +252,13 @@ def _make_search_media_handler(search_engine: Any) -> ToolHandler:
         if not query:
             return ToolCallResult(ok=False, error="missing query", display="缺少 query")
 
-        media_type = _infer_media_search_type(query, str(args.get("media_type", "")))
+        media_type = _normalize_media_search_type(args.get("media_type", ""))
+        if not media_type:
+            return ToolCallResult(
+                ok=False,
+                error="missing_media_type",
+                display="缺少 media_type。请根据 Prompt Navigator 分区提示显式填写 image/video/gif。",
+            )
         tool_executor = context.get("tool_executor")
         if tool_executor is None:
             return ToolCallResult(

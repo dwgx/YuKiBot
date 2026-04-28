@@ -830,11 +830,6 @@ class AgentLoop:
         strict_tool_routing = self._strict_tool_routing_enabled()
         forced_media_tool = None
         force_tool_first = False
-        if not strict_tool_routing:
-            forced_media_tool = self._select_forced_media_tool(
-                ctx
-            ) or self._select_forced_web_tool(ctx)
-            force_tool_first = self._should_force_tool_first(ctx)
         model_client = getattr(self, "model_client", None)
         native_tool_calling = bool(
             getattr(model_client, "supports_native_tool_calling", lambda: False)()
@@ -898,7 +893,7 @@ class AgentLoop:
                 assistant_msg = {"role": "assistant", "content": response_text}
                 synthetic_tool_call = True
                 _log.info(
-                    "agent_force_media_tool_pre_llm | trace=%s | step=%d | tool=%s",
+                    "agent_legacy_media_tool_pre_llm | trace=%s | step=%d | tool=%s",
                     ctx.trace_id,
                     step_idx,
                     forced_name,
@@ -1168,7 +1163,7 @@ class AgentLoop:
                     continue
                 if force_tool_first and tool_calls_made == 0:
                     _log.info(
-                        "agent_force_tool_first_direct_text_block | trace=%s | step=%d | text=%s",
+                        "agent_legacy_tool_first_direct_text_block | trace=%s | step=%d | text=%s",
                         ctx.trace_id,
                         step_idx,
                         clip_text(response_text, 160),
@@ -1232,7 +1227,7 @@ class AgentLoop:
             ):
                 forced_name, forced_args = forced_media_tool
                 _log.info(
-                    "agent_force_media_tool_first | trace=%s | step=%d | from=%s | to=%s",
+                    "agent_legacy_media_tool_first | trace=%s | step=%d | from=%s | to=%s",
                     ctx.trace_id,
                     step_idx,
                     tool_name or "unknown",
@@ -1494,7 +1489,7 @@ class AgentLoop:
                     if forced_media_tool:
                         forced_name, forced_args = forced_media_tool
                         _log.info(
-                            "agent_force_media_tool_first | trace=%s | step=%d | from=final_answer | to=%s",
+                            "agent_legacy_media_tool_first | trace=%s | step=%d | from=final_answer | to=%s",
                             ctx.trace_id,
                             step_idx,
                             forced_name,
@@ -1510,7 +1505,7 @@ class AgentLoop:
                         audio_file = ""
                     else:
                         _log.info(
-                            "agent_force_tool_first | trace=%s | step=%d | text=%s",
+                            "agent_legacy_tool_first | trace=%s | step=%d | text=%s",
                             ctx.trace_id,
                             step_idx,
                             clip_text(ctx.message_text, 120),
@@ -2127,12 +2122,6 @@ class AgentLoop:
             "image_url",
             "download_file_extension",
             "recent_media_artifact",
-            "media_search_request",
-            "sticker_request",
-            "download_request",
-            "creative_generation_request",
-            "memory_request",
-            "bot_strategy_request",
         }:
             return True
         if ctx.media_summary or ctx.reply_media_summary:
@@ -2182,43 +2171,10 @@ class AgentLoop:
             )
             if url:
                 return "parse_video", {"url": url}
-        if (
-            active == "media_search"
-            and "search_media" in visible_tools
-            and self.tool_registry.has_tool("search_media")
-            and evidence & {"media_search_request"}
-        ):
-            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
-                " ".join(
-                    str(item or "")
-                    for item in (
-                        ctx.message_text,
-                        ctx.original_message_text,
-                        ctx.reply_to_text,
-                    )
-                )
-            )
-            query = normalize_text(_RE_URL_STRIP.sub(" ", merged))
-            query = re.sub(
-                r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我|我想看|我要看|想看|我要|我想|"
-                r"搜索|搜一下|搜下|搜|查一下|查下|找一下|找下|找|来个|来张|整一个|发一个|发个|推一个|推荐一个)\s*",
-                "",
-                query,
-                flags=re.IGNORECASE,
-            ).strip()
-            media_type = (
-                self._infer_media_type(ctx.message_text)
-                or self._infer_media_type(ctx.original_message_text)
-                or self._infer_media_type(merged)
-                or "image"
-            )
-            if query:
-                return "search_media", {"query": query, "media_type": media_type}
         if active == "download_resources" and evidence & {
-            "download_request",
             "download_file_extension",
         }:
-            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+            merged = normalize_text(
                 " ".join(
                     str(item or "")
                     for item in (
@@ -2239,68 +2195,6 @@ class AgentLoop:
                 if file_type:
                     payload["prefer_ext"] = file_type
                 return "smart_download", payload
-            query = normalize_text(_RE_URL_STRIP.sub(" ", merged))
-            query = re.sub(
-                r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我|我要|我想要|"
-                r"找一下|找下|找|搜索|搜一下|搜下|下载|下載|求)\s*",
-                "",
-                query,
-                flags=re.IGNORECASE,
-            ).strip()
-            if (
-                query
-                and "search_download_resources" in visible_tools
-                and self.tool_registry.has_tool("search_download_resources")
-            ):
-                payload = {"query": query, "limit": 8}
-                if file_type:
-                    payload["file_type"] = file_type
-                return "search_download_resources", payload
-        if (
-            active == "creative_generation"
-            and evidence & {"creative_generation_request"}
-        ):
-            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
-                " ".join(
-                    str(item or "")
-                    for item in (
-                        ctx.message_text,
-                        ctx.original_message_text,
-                        ctx.reply_to_text,
-                    )
-                )
-            )
-            prompt = self._infer_image_generation_prompt(merged)
-            for tool_name in ("generate_image_enhanced", "generate_image"):
-                if (
-                    prompt
-                    and tool_name in visible_tools
-                    and self.tool_registry.has_tool(tool_name)
-                ):
-                    return tool_name, {"prompt": prompt}
-        if active == "memory_knowledge" and evidence & {"memory_request"}:
-            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
-                " ".join(
-                    str(item or "")
-                    for item in (
-                        ctx.message_text,
-                        ctx.original_message_text,
-                        ctx.reply_to_text,
-                    )
-                )
-            )
-            fact = self._extract_memory_fact_for_fallback(merged)
-            if (
-                fact
-                and "remember_user_fact" in visible_tools
-                and self.tool_registry.has_tool("remember_user_fact")
-            ):
-                return "remember_user_fact", {"fact": fact}
-            if (
-                "recall_about_user" in visible_tools
-                and self.tool_registry.has_tool("recall_about_user")
-            ):
-                return "recall_about_user", {}
         if (
             active == "multimodal_media"
             and evidence & {"message_or_reply_media", "image_url", "url"}
@@ -2361,25 +2255,8 @@ class AgentLoop:
                     "question": normalize_text(ctx.message_text)
                     or "请简短分析这个视频",
                 }
-        if (
-            active == "music_audio"
-            and "music_play" in visible_tools
-            and self.tool_registry.has_tool("music_play")
-            and evidence & {"music_request"}
-        ):
-            music_args = self._extract_music_args_for_fallback(ctx)
-            if music_args.get("keyword") or music_args.get("title"):
-                return "music_play", music_args
-        if active == "sticker_emoji" and evidence & {"sticker_request"}:
-            sticker_tool, sticker_args = self._extract_sticker_args_for_fallback(ctx)
-            if (
-                sticker_tool in visible_tools
-                and self.tool_registry.has_tool(sticker_tool)
-                and sticker_args
-            ):
-                return sticker_tool, sticker_args
-        if active == "web_research" and evidence & {"url", "external_research_request"}:
-            merged = self._rebuild_query_with_context(ctx.message_text, ctx) or normalize_text(
+        if active == "web_research" and evidence & {"url"}:
+            merged = normalize_text(
                 " ".join(
                     str(item or "")
                     for item in (
@@ -2396,94 +2273,7 @@ class AgentLoop:
                 and self.tool_registry.has_tool("fetch_webpage")
             ):
                 return "fetch_webpage", {"url": url}
-            query = normalize_text(_RE_URL_STRIP.sub(" ", merged))
-            query = re.sub(
-                r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我|我想看|我要看|想看|看一下|看下|我想|我要|搜索|搜一下|搜下|查一下|查下|找一下|找下|找|你找啊|你找)\s*",
-                "",
-                query,
-                flags=re.IGNORECASE,
-            ).strip()
-            if (
-                query
-                and "web_search" in visible_tools
-                and self.tool_registry.has_tool("web_search")
-            ):
-                return "web_search", {"query": query, "mode": self._infer_search_mode(query)}
         return None
-
-    @staticmethod
-    def _extract_music_args_for_fallback(ctx: AgentContext) -> dict[str, str]:
-        parts: list[str] = []
-        seen: set[str] = set()
-        for item in (ctx.message_text, ctx.original_message_text, ctx.reply_to_text):
-            text = normalize_text(str(item or ""))
-            if text and text not in seen:
-                seen.add(text)
-                parts.append(text)
-        merged = normalize_text(" ".join(parts))
-        merged = _RE_URL_STRIP.sub(" ", merged)
-        merged = normalize_text(merged)
-        merged = re.sub(r"【[^】]{1,40}】", " ", merged).strip()
-        merged = re.sub(
-            r"^(帮我|幫我|给我|給我|请|請|麻烦|麻煩|你去|你帮我|你幫我)?\s*"
-            r"(点歌|點歌|来首|來首|放歌|播放|播一下|唱一首|听歌|聽歌|找歌|搜索歌曲|发语音|直接发语音)\s*",
-            "",
-            merged,
-            flags=re.IGNORECASE,
-        ).strip()
-        merged = re.sub(r"(直接)?(发|發)?语音[。.!！]*$", "", merged, flags=re.IGNORECASE)
-        merged = normalize_text(merged).strip(" ，,。.!！")
-        title = ""
-        artist = ""
-        match = re.match(r"(.{2,80}?)\s*[-—–]\s*(.{2,80})$", merged)
-        if match:
-            title = normalize_text(match.group(1)).strip(" ，,。.!！")
-            artist = normalize_text(match.group(2)).strip(" ，,。.!！")
-        args = {"keyword": clip_text(merged, 120)}
-        if title:
-            args["title"] = clip_text(title, 80)
-        if artist:
-            args["artist"] = clip_text(artist, 80)
-        return args
-
-    @staticmethod
-    def _extract_sticker_args_for_fallback(ctx: AgentContext) -> tuple[str, dict[str, str]]:
-        text = normalize_text(str(ctx.message_text or ctx.original_message_text or ctx.reply_to_text or ""))
-        text = re.sub(r"【[^】]{1,40}】", " ", text)
-        compact = re.sub(r"\s+", "", text.lower())
-        if any(cue in compact for cue in ("点赞", "點讚", "点个赞", "讚", "赞", "like")):
-            return "send_face", {"query": "赞"}
-        if any(cue in compact for cue in ("doge", "吃瓜", "玫瑰", "爱心", "ok", "微笑", "哭", "开心")):
-            query = normalize_text(
-                re.sub(
-                    r"(发|發|来|來|给我|給我|一个|一個|表情包|表情|qq|经典|經典|贴纸|貼紙)",
-                    " ",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-            ).strip(" ，,。.!！")
-            return "send_face", {"query": query or "随机"}
-        if any(cue in compact for cue in ("qq表情", "经典表情", "經典表情")):
-            query = normalize_text(
-                re.sub(
-                    r"(发|發|来|來|给我|給我|一个|一個|qq|经典|經典|表情)",
-                    " ",
-                    text,
-                    flags=re.IGNORECASE,
-                )
-            ).strip(" ，,。.!！")
-            return "send_face", {"query": query or "随机"}
-        query = normalize_text(
-            re.sub(
-                r"(发|發|来|來|给我|給我|一个|一個|表情包|表情|贴纸|貼紙|emoji|emote)",
-                " ",
-                text,
-                flags=re.IGNORECASE,
-            )
-        ).strip(" ，,。.!！")
-        if not query or any(cue in compact for cue in ("随机", "隨機", "random")):
-            query = "随机"
-        return "send_emoji", {"query": clip_text(query, 80)}
 
     @staticmethod
     def _has_only_navigator_tool_policy_blocks(steps: list[dict[str, Any]]) -> bool:
@@ -3420,9 +3210,6 @@ class AgentLoop:
 
         if tool_name == "web_search":
             _set_if_empty("query", contextual_query or text)
-            mode = normalize_text(str(fixed.get("mode", ""))).lower()
-            if not mode:
-                _set_if_empty("mode", self._infer_search_mode(contextual_query or text))
         elif tool_name in {"lookup_wiki"}:
             _set_if_empty(
                 "keyword", self._infer_lookup_keyword(contextual_query or text)
@@ -3482,12 +3269,6 @@ class AgentLoop:
             _set_if_empty("query", contextual_query or text)
         elif tool_name in {"search_web_media", "search_media"}:
             _set_if_empty("query", contextual_query or text)
-            _set_if_empty(
-                "media_type",
-                self._infer_media_type(text)
-                or self._infer_media_type(ctx.original_message_text)
-                or self._infer_media_type(contextual_query or text),
-            )
         elif tool_name == "resolve_image":
             _set_if_empty(
                 "url",
@@ -3548,10 +3329,6 @@ class AgentLoop:
                 _set_if_empty("qq_number", str(qq_id))
         elif tool_name in {"send_emoji", "send_sticker"}:
             _set_if_empty("query", self._infer_emoji_query(contextual_query or text))
-        elif tool_name in {"generate_image", "generate_image_enhanced"}:
-            _set_if_empty(
-                "prompt", self._infer_image_generation_prompt(contextual_query or text)
-            )
 
         return fixed
 
@@ -3877,131 +3654,6 @@ class AgentLoop:
         t = _RE_PUNCTUATION_CJK.sub(" ", t)
         t = _RE_WHITESPACE.sub(" ", t).strip()
         return t[:80]
-
-    @staticmethod
-    def _infer_search_mode(text: str) -> str:
-        t = normalize_text(text).lower()
-        plain = _RE_WHITESPACE.sub("", t)
-        if "mode=image" in plain:
-            return "image"
-        if "mode=video" in plain:
-            return "video"
-        if _RE_SLASH_IMAGE.search(t):
-            return "image"
-        if _RE_SLASH_VIDEO.search(t):
-            return "video"
-        if re.search(
-            r"https?://\S+\.(mp4|mov|m4v|webm|mkv|avi|flv|wmv|m3u8)(?:\?\S*)?$",
-            t,
-        ):
-            return "video"
-        if any(cue in plain for cue in ("搜图", "找图", "图片", "壁纸", "头像", "照片")):
-            return "image"
-        if any(
-            cue in plain
-            for cue in (
-                "搜视频",
-                "找视频",
-                "视频",
-                "影片",
-                "短片",
-                "片段",
-                "youtube",
-                "b站",
-                "bilibili",
-                "抖音",
-                "douyin",
-                "快手",
-                "kuaishou",
-                "acfun",
-                "爱奇艺",
-                "iqiyi",
-                "腾讯视频",
-            )
-        ):
-            return "video"
-        return "text"
-
-    @staticmethod
-    def _infer_media_type(text: str) -> str:
-        t = normalize_text(text).lower()
-        if "type=gif" in _RE_WHITESPACE.sub("", t):
-            return "gif"
-        if "type=video" in _RE_WHITESPACE.sub("", t):
-            return "video"
-        if "type=image" in _RE_WHITESPACE.sub("", t):
-            return "image"
-        plain = _RE_WHITESPACE.sub("", t)
-        if any(cue in plain for cue in ("gif", "动图")):
-            return "gif"
-        video_cues = (
-            "视频",
-            "影片",
-            "短片",
-            "片段",
-            "教程视频",
-            "youtube",
-            "b站",
-            "bilibili",
-            "抖音",
-            "douyin",
-            "快手",
-            "kuaishou",
-            "acfun",
-            "爱奇艺",
-            "iqiyi",
-            "腾讯视频",
-        )
-        image_cues = (
-            "截图",
-            "封面",
-            "图片",
-            "图",
-            "壁纸",
-            "头像",
-            "配图",
-            "照片",
-            "搜图",
-            "找图",
-            "来张",
-            "梗图",
-            "猫图",
-            "表情包",
-            "贴图",
-        )
-        video_plain = re.sub(
-            r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
-            r"(?:视频|影片|短片|片段|video|clip)",
-            "",
-            plain,
-            flags=re.IGNORECASE,
-        )
-        image_plain = re.sub(
-            r"(?:不要|别|別|不是|不用|无需|禁止)[^，。,.!?！？；;]{0,10}"
-            r"(?:图片|图|壁纸|头像|配图|照片|image|photo|picture|wallpaper|avatar)",
-            "",
-            plain,
-            flags=re.IGNORECASE,
-        )
-        video_hit = any(cue in video_plain for cue in video_cues) or bool(
-            re.search(r"\b(?:video|movie|clip)\b", video_plain)
-        )
-        positive_video_hit = any(
-            cue in video_plain for cue in ("视频", "影片", "短片", "片段", "教程视频")
-        ) or bool(re.search(r"\b(?:video|movie|clip)\b", video_plain))
-        image_hit = any(cue in image_plain for cue in image_cues) or bool(
-            re.search(r"\b(?:image|photo|picture|wallpaper|avatar)\b", image_plain)
-        )
-        if image_hit and (
-            not positive_video_hit
-            or any(cue in image_plain for cue in ("截图", "封面", "图片", "图", "来张", "猫图", "表情包"))
-        ):
-            return "image"
-        if video_hit:
-            return "video"
-        if image_hit:
-            return "image"
-        return ""
 
     @staticmethod
     def _infer_resource_file_type(text: str) -> str:
@@ -4503,185 +4155,8 @@ class AgentLoop:
     def _looks_like_profile_analysis_request(self, text: str) -> bool:
         return _shared_qq_profile_request(text, config=self.config)
 
-    @staticmethod
-    def _looks_like_image_generation_request(text: str) -> bool:
-        t = normalize_text(text).lower()
-        if not t:
-            return False
-        compact = _RE_WHITESPACE.sub("", t)
-        direct_cues = (
-            "生图",
-            "生圖",
-            "画图",
-            "畫圖",
-            "绘图",
-            "繪圖",
-            "作图",
-            "作圖",
-            "出图",
-            "出圖",
-            "生成图片",
-            "生成圖片",
-            "生成一张图",
-            "生成一張圖",
-            "画一张",
-            "畫一張",
-            "来一张图",
-            "來一張圖",
-            "画个",
-            "畫個",
-            "帮我画",
-            "幫我畫",
-        )
-        if any(cue in t for cue in direct_cues):
-            return True
-        subject_pattern = (
-            r"(?:图|圖|图片|圖片|照片|头像|頭像|壁纸|壁紙|插画|插畫|立绘|立繪|封面|表情包|猫娘|貓娘|二次元|anime|猫|貓|狗|风景|風景|少女|男孩|女孩)"
-        )
-        generation_patterns = (
-            rf"(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|替我|帮忙|幫忙|来|來)?"
-            rf"(?:生成|做|整)(?:一张|一張|个|個|张|張)?[^\n。！？!?]{{0,24}}{subject_pattern}",
-            rf"(?:^|[\s，,。.!?：:])(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|替我|帮忙|幫忙|来|來|想|要)?"
-            rf"(?:画|畫|绘|繪)(?:一张|一張|个|個|张|張|幅|一下)?[^\n。！？!?]{{0,24}}{subject_pattern}",
-            rf"{subject_pattern}[^\n。！？!?]{{0,10}}(?:生成|做|整)",
-        )
-        if any(re.search(pattern, t) for pattern in generation_patterns):
-            return True
-
-        concise_generation = bool(
-            re.match(
-                r"^(?:请|請|麻烦|麻煩|帮我|幫我|给我|給我|来|來|想|要)?"
-                r"(?:生成|做|整|画|畫|绘|繪)"
-                r"(?:一只|一隻|一个|一個|一张|一張|个|個|张|張|幅)?",
-                compact,
-            )
-        )
-        if not concise_generation:
-            return False
-
-        non_image_cues = (
-            "代码",
-            "程式",
-            "脚本",
-            "腳本",
-            "配置",
-            "文案",
-            "文章",
-            "作文",
-            "总结",
-            "總結",
-            "摘要",
-            "报告",
-            "報告",
-            "日报",
-            "日報",
-            "周报",
-            "週報",
-            "月报",
-            "月報",
-            "清单",
-            "清單",
-            "列表",
-            "表格",
-            "方案",
-            "计划",
-            "計劃",
-            "json",
-            "yaml",
-            "yml",
-            "sql",
-            "markdown",
-            "md文档",
-            "md文件",
-            "函数",
-            "函數",
-            "接口",
-            "指令",
-            "命令",
-            "随机数",
-        )
-        if any(cue in compact for cue in non_image_cues):
-            return False
-        return True
-
-    @staticmethod
-    def _infer_image_generation_prompt(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-        stripped = content
-        prefixes = (
-            "请",
-            "請",
-            "麻烦",
-            "麻煩",
-            "帮我",
-            "幫我",
-            "给我",
-            "給我",
-            "来",
-            "來",
-            "生成",
-            "画",
-            "畫",
-            "绘",
-            "繪",
-            "做",
-            "整",
-            "出",
-            "一张",
-            "一張",
-            "一个",
-            "一個",
-            "张",
-            "張",
-            "个",
-            "個",
-        )
-        changed = True
-        while changed:
-            changed = False
-            for prefix in prefixes:
-                if stripped.lower().startswith(prefix.lower()):
-                    stripped = normalize_text(stripped[len(prefix) :])
-                    changed = True
-        stripped = re.sub(r"(图片|圖片|图|圖|照片)\s*$", "", stripped, flags=re.IGNORECASE)
-        stripped = normalize_text(stripped)
-        return stripped or content
-
-    @staticmethod
-    def _extract_memory_fact_for_fallback(text: str) -> str:
-        content = normalize_text(text)
-        if not content:
-            return ""
-        compact = _RE_WHITESPACE.sub("", content)
-        if not any(
-            cue in compact
-            for cue in (
-                "记住",
-                "記住",
-                "帮我记",
-                "幫我記",
-                "记一下",
-                "記一下",
-                "写入记忆",
-                "寫入記憶",
-            )
-        ):
-            return ""
-        stripped = re.sub(
-            r"^(请|請|麻烦|麻煩|帮我|幫我)?\s*(记住|記住|记一下|記一下|帮我记|幫我記|写入记忆|寫入記憶)\s*[：:，,。 ]*",
-            "",
-            content,
-            flags=re.IGNORECASE,
-        ).strip()
-        stripped = re.sub(r"(这件事|這件事|这条|這條|这个|這個)?\s*(吧|。|！|!)*$", "", stripped).strip()
-        if len(stripped) < 2 or len(stripped) > 240:
-            return ""
-        return stripped
-
     def _should_force_tool_first(self, ctx: AgentContext) -> bool:
-        """判断当前请求是否必须先进行工具调用。"""
+        """Return True only for structural inputs that require tool handling."""
         text = normalize_text(ctx.message_text).lower()
         if not text and not ctx.media_summary and not ctx.reply_media_summary:
             return False
@@ -4694,42 +4169,6 @@ class AgentLoop:
 
         # 任何外链默认工具优先（解析/抓取/校验）
         if _RE_URL_SCHEME.search(text):
-            return True
-
-        # 明确搜索/查证请求（需要外部信息）
-        if any(
-            k in text
-            for k in (
-                "搜索",
-                "查一下",
-                "查查",
-                "帮我查",
-                "联网",
-                "最新",
-                "新闻",
-                "资料",
-                "安装包",
-                "资源包",
-                "下载链接",
-                "下载地址",
-                "网盘",
-            )
-        ):
-            return True
-
-        # 目标人物/QQ 资料分析：用户给了 QQ 号、@某人或引用了某人的消息，默认先走工具。
-        target_entity_exists = (
-            bool(self._extract_candidate_qq_id(ctx))
-            or bool(ctx.at_other_user_ids)
-            or bool(normalize_text(str(ctx.reply_to_user_id)))
-        )
-        if target_entity_exists and self._looks_like_profile_analysis_request(text):
-            return True
-
-        # 视频解析/下载类请求
-        if any(k in text for k in ("解析", "下载")) and any(
-            v in text for v in ("视频", "链接", "bv", "av")
-        ):
             return True
 
         return False

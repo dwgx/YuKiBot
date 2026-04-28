@@ -271,39 +271,36 @@ def _looks_like_video_heavy_request(text: str, raw_segments: list[dict[str, Any]
         return True
     if re.search(r"\bbv[0-9a-z]{6,}\b", content, flags=re.IGNORECASE):
         return True
-    cues = (
-        "视频",
-        "解析",
+    if re.search(r"\.(?:mp4|webm|mov|m4v|mkv)(?:\b|[?#/])", content):
+        return True
+    if not _RE_WEB_URL.search(content):
+        return False
+    video_domains = (
         "bilibili",
         "b23.tv",
-        "抖音",
         "douyin",
-        "快手",
         "kuaishou",
         "acfun",
         "v.qq.com",
         "m.v.qq.com",
-        "腾讯视频",
-        "騰訊視頻",
         "youku",
         "iqiyi",
         "mgtv",
         "youtube",
         "youtu.be",
-        "小红书",
         "xiaohongshu",
         "xhslink",
     )
-    return any(cue in content for cue in cues)
+    return any(domain in content for domain in video_domains)
 
 
 def _looks_like_download_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
     content = _message_and_segment_blob(text, raw_segments).lower()
-    cues = (
-        "下载",
-        "安装包",
-        "网盘",
-        "download",
+    if bool(re.search(r"\.(?:exe|apk|zip|rar|7z|dmg|pkg|msi)(?:\b|[?#/])", content)):
+        return True
+    if not _RE_WEB_URL.search(content):
+        return False
+    storage_domains = (
         "pan.baidu",
         "lanzou",
         "123pan",
@@ -311,9 +308,7 @@ def _looks_like_download_heavy_request(text: str, raw_segments: list[dict[str, A
         "aliyundrive",
         "alipan",
     )
-    if any(cue in content for cue in cues):
-        return True
-    return bool(re.search(r"\.(?:exe|apk|zip|rar|7z|dmg|pkg|msi)(?:\b|[?#/])", content))
+    return any(domain in content for domain in storage_domains)
 
 
 def _looks_like_web_heavy_request(text: str, raw_segments: list[dict[str, Any]]) -> bool:
@@ -324,25 +319,7 @@ def _looks_like_web_heavy_request(text: str, raw_segments: list[dict[str, Any]])
         return False
     if _looks_like_video_heavy_request(text, raw_segments) or _looks_like_download_heavy_request(text, raw_segments):
         return False
-    cues = (
-        "网站",
-        "网页",
-        "页面",
-        "官网",
-        "打开",
-        "看看",
-        "看下",
-        "帮我看",
-        "分析",
-        "介绍",
-        "是什么",
-        "安全吗",
-        "website",
-        "webpage",
-        "site",
-        "page",
-    )
-    return any(cue in content for cue in cues)
+    return True
 
 
 def _looks_like_sticker_learning_request(

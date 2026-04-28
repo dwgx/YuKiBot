@@ -112,6 +112,7 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
             "你现在使用 Prompt Navigator。先阅读分区目录，只在当前分区工具足够时执行；"
             "如果当前分区缺少工具、说明不匹配、或任务需要跨能力，先调用 navigate_section(section_id, reason) "
             "切到更合适的分区。切换后按新分区提示和新工具范围继续，不要臆造工具结果。"
+            "自然语言意图必须由你根据目录和当前分区提示判断，本地只提供 URL、媒体段、引用、权限等结构信号。"
         ),
         "sections": {
             "general_chat": {
@@ -119,13 +120,20 @@ def default_prompt_navigator_payload() -> dict[str, Any]:
                 "when_to_use": "没有明确结构化媒体、链接、下载、管理或记忆任务时，从这里开始。",
                 "tools": ["think", "final_answer", "navigate_section"],
                 "instructions": (
-                    "先判断是否能直接自然回复。若用户实际在要联网、看图、解析链接、下载、点歌、记忆或管理，"
-                    "不要硬答，调用 navigate_section 切到对应分区。"
+                    "先判断是否能直接自然回复。若用户实际在要联网、找/看/发送图片视频/GIF、看图、解析链接、下载、点歌、生成内容、"
+                    "发送表情、记忆或管理/调整机器人行为，不要硬答，调用 navigate_section 切到对应分区。"
+                    "例如想看某主题视频/图片应切 media_search；要闭嘴/少回复/恢复活跃应切 qq_admin_social。"
                 ),
                 "fallback_sections": [
                     "web_research",
                     "multimodal_media",
+                    "media_search",
+                    "video_url",
+                    "download_resources",
+                    "music_audio",
+                    "creative_generation",
                     "sticker_emoji",
+                    "qq_admin_social",
                     "memory_knowledge",
                     "fallback_debug",
                 ],
@@ -611,24 +619,8 @@ class PromptNavigator:
             add("multimodal_media", "message_or_reply_media")
         if any(_DOWNLOAD_EXT_RE.search(url) for url in urls):
             add("download_resources", "download_file_extension")
-        if self._looks_like_download_request(ctx):
-            add("download_resources", "download_request")
-        if self._looks_like_creative_generation_request(ctx):
-            add("creative_generation", "creative_generation_request")
         if urls:
             add("web_research", "url")
-        if self._looks_like_sticker_request(ctx):
-            add("sticker_emoji", "sticker_request")
-        if self._looks_like_media_search_request(ctx):
-            add("media_search", "media_search_request")
-        if self._looks_like_music_request(ctx):
-            add("music_audio", "music_request")
-        if self._looks_like_web_research_request(ctx):
-            add("web_research", "external_research_request")
-        if self._looks_like_memory_request(ctx):
-            add("memory_knowledge", "memory_request")
-        if self._looks_like_bot_strategy_request(ctx):
-            add("qq_admin_social", "bot_strategy_request")
         if getattr(ctx, "at_other_user_ids", None):
             add("qq_admin_social", "mention_target")
 
@@ -742,342 +734,6 @@ class PromptNavigator:
         if "multimedia.nt.qq.com.cn/download" in text:
             return True
         return bool(_IMAGE_EXT_RE.search(text))
-
-    @staticmethod
-    def _looks_like_web_research_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        cues = (
-            "搜索",
-            "搜一下",
-            "搜下",
-            "查一下",
-            "查下",
-            "查查",
-            "找一下",
-            "找下",
-            "你找",
-            "找啊",
-            "去找",
-            "帮我找",
-            "帮我查",
-            "网络时光机",
-            "wayback",
-            "官网",
-            "教程",
-            "攻略",
-            "资料",
-            "新闻",
-            "最新",
-            "下载地址",
-        )
-        return any(cue in text for cue in cues)
-
-    @staticmethod
-    def _looks_like_download_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        compact = re.sub(r"\s+", "", text)
-        if any(token in compact for token in ("/download", "download=1", "prefer_ext=")):
-            return True
-        resource_cues = (
-            "下载",
-            "下載",
-            "安装包",
-            "安裝包",
-            "资源包",
-            "資源包",
-            "压缩包",
-            "壓縮包",
-            "直链",
-            "直鏈",
-            "apk",
-            "ipa",
-            "exe",
-            "msi",
-            "zip",
-            "rar",
-            "7z",
-            "pdf",
-            "download",
-            "installer",
-            "package",
-        )
-        action_cues = (
-            "找",
-            "搜",
-            "给我",
-            "給我",
-            "发",
-            "發",
-            "下",
-            "要",
-            "need",
-            "find",
-            "send",
-        )
-        return any(cue in compact for cue in resource_cues) and any(
-            cue in compact for cue in action_cues
-        )
-
-    @staticmethod
-    def _looks_like_creative_generation_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        compact = re.sub(r"\s+", "", text)
-        direct_cues = (
-            "生图",
-            "生圖",
-            "画图",
-            "畫圖",
-            "绘图",
-            "繪圖",
-            "作图",
-            "作圖",
-            "出图",
-            "出圖",
-            "生成图片",
-            "生成圖片",
-            "生成一张图",
-            "生成一張圖",
-            "画一张",
-            "畫一張",
-            "画个",
-            "畫個",
-            "帮我画",
-            "幫我畫",
-            "ai绘画",
-            "ai繪畫",
-            "generateimage",
-            "drawapicture",
-            "makeanimage",
-        )
-        return any(cue in compact for cue in direct_cues)
-
-    @staticmethod
-    def _looks_like_memory_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        compact = re.sub(r"\s+", "", text)
-        cues = (
-            "记住",
-            "記住",
-            "帮我记",
-            "幫我記",
-            "记一下",
-            "記一下",
-            "写入记忆",
-            "寫入記憶",
-            "我的记忆",
-            "我的記憶",
-            "你记得",
-            "你記得",
-            "还记得",
-            "還記得",
-            "回忆",
-            "回憶",
-            "你知道我是谁",
-            "你知道我是誰",
-            "rememberthis",
-            "recall",
-            "memory",
-        )
-        return any(cue in compact for cue in cues)
-
-    @staticmethod
-    def _looks_like_bot_strategy_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        resume_cues = ("可以说话", "恢复说话", "别闭嘴", "不用闭嘴", "不要闭嘴", "活跃")
-        quiet_cues = (
-            "闭嘴",
-            "别说话",
-            "不要说话",
-            "别回复",
-            "别回",
-            "少说话",
-            "安静点",
-            "安静一下",
-            "沉默一下",
-            "消停",
-            "回复频率",
-            "冷漠模式",
-            "安静模式",
-        )
-        return any(cue in text for cue in resume_cues + quiet_cues)
-
-    @staticmethod
-    def _looks_like_media_search_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        if _URL_RE.search(text):
-            return False
-        media_cues = (
-            "视频",
-            "影片",
-            "片段",
-            "图片",
-            "图",
-            "壁纸",
-            "头像",
-            "梗图",
-            "猫图",
-            "表情包",
-            "贴图",
-            "gif",
-            "动图",
-            "image",
-            "photo",
-            "video",
-            "clip",
-            "youtube",
-            "b站",
-            "bilibili",
-            "抖音",
-            "douyin",
-            "快手",
-            "kuaishou",
-            "acfun",
-            "爱奇艺",
-            "iqiyi",
-            "腾讯视频",
-            "v.qq.com",
-        )
-        action_cues = (
-            "找",
-            "搜",
-            "看",
-            "发",
-            "给我",
-            "来个",
-            "来张",
-            "整",
-            "推",
-            "推荐",
-            "want",
-            "show",
-            "send",
-            "find",
-            "search",
-        )
-        return any(cue in text for cue in media_cues) and any(cue in text for cue in action_cues)
-
-    @staticmethod
-    def _looks_like_sticker_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text:
-            return False
-        sticker_cues = (
-            "表情包",
-            "表情",
-            "贴纸",
-            "貼紙",
-            "emoji",
-            "emote",
-            "mface",
-            "qq表情",
-            "经典表情",
-            "經典表情",
-            "doge",
-            "吃瓜",
-            "点赞",
-            "點讚",
-            "点个赞",
-        )
-        action_cues = (
-            "发",
-            "發",
-            "来",
-            "來",
-            "给我",
-            "給我",
-            "整",
-            "随机",
-            "隨機",
-            "学习",
-            "學習",
-            "添加",
-            "收录",
-            "收錄",
-            "纠正",
-            "糾正",
-            "扫描",
-            "掃描",
-            "list",
-            "send",
-            "random",
-        )
-        return any(cue in text for cue in sticker_cues) and any(cue in text for cue in action_cues)
-
-    @staticmethod
-    def _looks_like_music_request(ctx: Any) -> bool:
-        parts: list[str] = []
-        for attr in ("message_text", "original_message_text", "reply_to_text"):
-            text = normalize_text(str(getattr(ctx, attr, "") or ""))
-            if text:
-                parts.append(text)
-        text = normalize_text(" ".join(parts)).lower()
-        if not text or _URL_RE.search(text):
-            return False
-        cues = (
-            "点歌",
-            "點歌",
-            "来首",
-            "來首",
-            "放歌",
-            "播放音乐",
-            "播首",
-            "播一下",
-            "听歌",
-            "聽歌",
-            "找歌",
-            "搜索歌曲",
-            "music",
-            "song",
-        )
-        return any(cue in text for cue in cues)
-
 
 def _dedupe(items: list[str]) -> list[str]:
     out: list[str] = []

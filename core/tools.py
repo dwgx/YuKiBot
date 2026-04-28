@@ -2361,21 +2361,15 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
         if not content:
             return False
         plain = re.sub(r"\s+", "", content)
-        if "/download" in plain:
+        if any(token in plain for token in ("/download", "download=1", "upload=true", "prefer_ext=")):
             return True
-        cues = (
-            "下载",
-            "发给我",
-            "发我",
-            "安装包",
-            "启动器",
-            "客户端",
-            "release",
-            "releases",
-            "installer",
-            "setup",
+        return bool(
+            re.search(
+                r"\.(?:exe|apk|ipa|msi|zip|rar|7z|dmg|pkg|jar)(?:\b|[?#/])",
+                content,
+                flags=re.IGNORECASE,
+            )
         )
-        return any(cue in content for cue in cues)
 
     def _looks_like_software_download_request(self, text: str) -> bool:
         content = normalize_text(text).lower()
@@ -2383,15 +2377,8 @@ class ToolExecutor(ToolAiMethodMixin, ToolMusicExecMixin, ToolGithubMixin, ToolS
             return False
         if not self._looks_like_download_request_text(content):
             return False
-        # 避免把“下载视频/图片”误判成软件安装包下载。
-        media_cues = ("视频", "图", "图片", "壁纸", "抖音", "快手", "b站", "bilibili")
-        if any(cue in content for cue in media_cues):
-            return False
         software_cues = (
             "hmcl",
-            "启动器",
-            "安装包",
-            "客户端",
             ".exe",
             ".msi",
             ".apk",

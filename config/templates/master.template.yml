@@ -576,7 +576,7 @@ prompts:
     strict_tool_routing: true
     default_section: general_chat
     max_switches: 3
-    root_prompt: 当前使用 Prompt Navigator。先看分区目录和当前分区提示；如果当前分区缺少工具或任务更适合其他分区，先调用 navigate_section(section_id, reason) 切换，再继续执行。不要伪造工具结果。
+    root_prompt: 当前使用 Prompt Navigator。先看分区目录和当前分区提示；如果当前分区缺少工具或任务更适合其他分区，先调用 navigate_section(section_id, reason) 切换，再继续执行。不要伪造工具结果。自然语言意图必须由你根据目录和当前分区提示判断，本地只提供 URL、媒体段、引用、权限等结构信号。
     sections:
       general_chat:
         name: 普通对话与澄清
@@ -585,11 +585,17 @@ prompts:
         - think
         - final_answer
         - navigate_section
-        instructions: 先判断是否能直接自然回复。若用户实际在要联网、看图、解析链接、下载、点歌、记忆或管理，不要硬答，调用 navigate_section 切到对应分区。
+        instructions: 先判断是否能直接自然回复。若用户实际在要联网、找/看/发送图片视频/GIF、看图、解析链接、下载、点歌、生成内容、发送表情、记忆或管理/调整机器人行为，不要硬答，调用 navigate_section 切到对应分区。例如想看某主题视频/图片应切 media_search；要闭嘴/少回复/恢复活跃应切 qq_admin_social。
         fallback_sections:
         - web_research
         - multimodal_media
+        - media_search
+        - video_url
+        - download_resources
+        - music_audio
+        - creative_generation
         - sticker_emoji
+        - qq_admin_social
         - memory_knowledge
         - fallback_debug
         failure_policy: 不确定任务类型时，用一句话澄清；发现缺工具时切分区。

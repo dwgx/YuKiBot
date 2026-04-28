@@ -49,32 +49,36 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         ctx = _Ctx()
         ctx.message_text = "我要看异环的新手教程"
         state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "web_search"])
-        self.assertEqual(state.active_section, "web_research")
-        self.assertIn("external_research_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("external_research_request", state.evidence)
+        block = nav.render_system_block(state, nav.scoped_tools(state))
+        self.assertIn("web_research", block)
+        self.assertIn("media_search", block)
 
     def test_media_search_request_preselects_media_search_without_url(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         ctx = _Ctx()
         ctx.message_text = "给我找一个异环新手教程视频，直接发最合适的"
         state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "search_media"])
-        self.assertEqual(state.active_section, "media_search")
-        self.assertIn("media_search_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("media_search_request", state.evidence)
+        self.assertIn("media_search", nav.render_system_block(state, nav.scoped_tools(state)))
 
     def test_short_image_request_preselects_media_search(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         ctx = _Ctx()
         ctx.message_text = "来张猫图"
         state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "search_media"])
-        self.assertEqual(state.active_section, "media_search")
-        self.assertIn("media_search_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("media_search_request", state.evidence)
 
     def test_music_request_preselects_music_section_without_url(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
         ctx = _Ctx()
         ctx.message_text = "点歌 Never Gonna Give You Up - Rick Astley，直接发语音"
         state = nav.initial_state(ctx, ["think", "final_answer", "navigate_section", "music_play"])
-        self.assertEqual(state.active_section, "music_audio")
-        self.assertIn("music_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("music_request", state.evidence)
 
     def test_download_request_preselects_download_section_without_url(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -84,8 +88,8 @@ class PromptNavigatorConfigTests(unittest.TestCase):
             ctx,
             ["think", "final_answer", "navigate_section", "search_download_resources"],
         )
-        self.assertEqual(state.active_section, "download_resources")
-        self.assertIn("download_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("download_request", state.evidence)
 
     def test_creative_generation_request_preselects_creative_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -95,8 +99,8 @@ class PromptNavigatorConfigTests(unittest.TestCase):
             ctx,
             ["think", "final_answer", "navigate_section", "generate_image_enhanced"],
         )
-        self.assertEqual(state.active_section, "creative_generation")
-        self.assertIn("creative_generation_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("creative_generation_request", state.evidence)
 
     def test_memory_request_preselects_memory_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -106,8 +110,8 @@ class PromptNavigatorConfigTests(unittest.TestCase):
             ctx,
             ["think", "final_answer", "navigate_section", "recall_about_user"],
         )
-        self.assertEqual(state.active_section, "memory_knowledge")
-        self.assertIn("memory_request", state.evidence)
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("memory_request", state.evidence)
 
     def test_sticker_request_preselects_sticker_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -116,9 +120,10 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         state = nav.initial_state(
             ctx, ["think", "final_answer", "navigate_section", "send_face"]
         )
-        self.assertEqual(state.active_section, "sticker_emoji")
-        self.assertIn("sticker_request", state.evidence)
-        self.assertIn("send_face", nav.scoped_tools(state))
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("sticker_request", state.evidence)
+        self.assertNotIn("send_face", nav.scoped_tools(state))
+        self.assertIn("sticker_emoji", nav.render_system_block(state, nav.scoped_tools(state)))
 
     def test_bot_strategy_request_preselects_admin_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -127,9 +132,10 @@ class PromptNavigatorConfigTests(unittest.TestCase):
         state = nav.initial_state(
             ctx, ["think", "final_answer", "navigate_section", "admin_command"]
         )
-        self.assertEqual(state.active_section, "qq_admin_social")
-        self.assertIn("bot_strategy_request", state.evidence)
-        self.assertIn("admin_command", nav.scoped_tools(state))
+        self.assertEqual(state.active_section, "general_chat")
+        self.assertNotIn("bot_strategy_request", state.evidence)
+        self.assertNotIn("admin_command", nav.scoped_tools(state))
+        self.assertIn("qq_admin_social", nav.render_system_block(state, nav.scoped_tools(state)))
 
     def test_common_video_platform_urls_with_suffix_text_preselect_video_section(self):
         nav = PromptNavigator.from_payload(default_prompt_navigator_payload())
@@ -770,9 +776,8 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["web_search"])
-        self.assertEqual(registry.calls[0][1]["query"], "异环的新手教程")
-        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_media_search_llm_timeout_falls_back_to_search_media_tool(self):
         registry = _Registry()
@@ -800,16 +805,37 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
-        self.assertEqual(registry.calls[0][1]["media_type"], "video")
-        self.assertIn("异环新手教程视频", registry.calls[0][1]["query"])
-        self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
-        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_media_search_fallback_prefers_current_image_request_over_reply_video_text(self):
         registry = _Registry()
         loop = AgentLoop(
-            model_client=_TimeoutModelClient(),
+            model_client=_SequencedModelClient(
+                [
+                    json.dumps(
+                        {
+                            "tool": "navigate_section",
+                            "args": {
+                                "section_id": "media_search",
+                                "reason": "用户要发送图片，当前分区没有媒体检索工具",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "tool": "search_media",
+                            "args": {"query": "猫图", "media_type": "image"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {"tool": "final_answer", "args": {"text": "给你猫图。"}},
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
             tool_registry=registry,
             config={
                 "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
@@ -835,8 +861,64 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         self.assertEqual([name for name, _ in registry.calls], ["search_media"])
         self.assertEqual(registry.calls[0][1]["media_type"], "image")
+        self.assertEqual(registry.calls[0][1]["query"], "猫图")
         self.assertEqual(result.image_url, "https://example.test/image.jpg")
         self.assertEqual(result.video_url, "")
+
+    def test_media_search_free_text_uses_navigator_switch_before_tool(self):
+        registry = _Registry()
+        loop = AgentLoop(
+            model_client=_SequencedModelClient(
+                [
+                    json.dumps(
+                        {
+                            "tool": "navigate_section",
+                            "args": {
+                                "section_id": "media_search",
+                                "reason": "用户想看主题视频，需要进入媒体检索分区",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {
+                            "tool": "search_media",
+                            "args": {"query": "异环宣传片", "media_type": "video"},
+                        },
+                        ensure_ascii=False,
+                    ),
+                    json.dumps(
+                        {"tool": "final_answer", "args": {"text": "找到视频。"}},
+                        ensure_ascii=False,
+                    ),
+                ]
+            ),
+            tool_registry=registry,
+            config={
+                "agent": {"enable": True, "max_steps": 5, "fallback_on_parse_error": True},
+                "admin": {"super_users": []},
+                "queue": {"process_timeout_seconds": 120},
+            },
+        )
+        loop.high_risk_control_enable = False
+        ctx = AgentContext(
+            conversation_id="group:1:user:2",
+            user_id="2",
+            user_name="tester",
+            group_id=1,
+            bot_id="bot",
+            is_private=False,
+            mentioned=True,
+            message_text="我想看异环宣传片，找最合适的直接发",
+            trace_id="navigator-media-search-switch-test",
+        )
+
+        result = asyncio.run(loop.run(ctx))
+
+        self.assertEqual([name for name, _ in registry.calls], ["search_media"])
+        self.assertEqual(registry.calls[0][1], {"query": "异环宣传片", "media_type": "video"})
+        self.assertEqual(result.video_url, "/tmp/yukiko/search.mp4")
+        self.assertTrue(any(step.get("tool") == "navigate_section" for step in result.steps))
 
     def test_media_search_tool_image_survives_text_only_final_answer(self):
         registry = _Registry()
@@ -911,10 +993,8 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["search_download_resources"])
-        self.assertIn("OBS Windows 安装包 exe", registry.calls[0][1]["query"])
-        self.assertEqual(registry.calls[0][1]["file_type"], "exe")
-        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_creative_generation_llm_timeout_falls_back_to_image_tool(self):
         registry = _Registry()
@@ -942,10 +1022,8 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["generate_image_enhanced"])
-        self.assertIn("赛博猫娘头像", registry.calls[0][1]["prompt"])
-        self.assertEqual(result.image_url, "https://example.test/generated.png")
-        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_memory_llm_timeout_falls_back_to_recall_tool(self):
         registry = _Registry()
@@ -973,9 +1051,8 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["recall_about_user"])
-        self.assertEqual(result.reply_text, "recall ok")
-        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_music_llm_timeout_falls_back_to_music_play_tool(self):
         registry = _Registry()
@@ -1003,11 +1080,8 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["music_play"])
-        self.assertEqual(registry.calls[0][1]["keyword"], "Never Gonna Give You Up - Rick Astley")
-        self.assertEqual(registry.calls[0][1]["title"], "Never Gonna Give You Up")
-        self.assertEqual(registry.calls[0][1]["artist"], "Rick Astley")
-        self.assertEqual(result.audio_file, "/tmp/yukiko/song.mp3")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_sticker_llm_timeout_falls_back_to_send_face_tool(self):
         registry = _Registry()
@@ -1035,9 +1109,8 @@ class AgentPromptNavigatorTests(unittest.TestCase):
 
         result = asyncio.run(loop.run(ctx))
 
-        self.assertEqual([name for name, _ in registry.calls], ["send_face"])
-        self.assertEqual(registry.calls[0][1]["query"], "赞")
-        self.assertEqual(result.reason, "agent_fallback_llm_timeout")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.reason, "agent_llm_timeout")
 
     def test_multimodal_llm_timeout_falls_back_to_analyze_image_tool(self):
         registry = _Registry()

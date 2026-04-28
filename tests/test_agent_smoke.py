@@ -564,10 +564,10 @@ class AgentProtectionTests(unittest.TestCase):
         self.assertTrue(loop._should_force_tool_first(ctx))
 
     def test_force_tool_first_for_search(self):
-        """包含搜索关键词的消息应强制走工具路径。"""
+        """纯自然语言搜索请求交给 Prompt Navigator/LLM 分区判断。"""
         loop = _make_loop([])
         ctx = _make_ctx(message_text="帮我搜索一下 python 教程")
-        self.assertTrue(loop._should_force_tool_first(ctx))
+        self.assertFalse(loop._should_force_tool_first(ctx))
 
     def test_no_force_tool_for_greeting(self):
         """普通问候不强制走工具。"""
