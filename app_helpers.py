@@ -1836,6 +1836,26 @@ def _compress_video_sync(src: Path, max_bytes: int = _VIDEO_SEND_COMPRESS_THRESH
     if compressed.exists() and compressed.stat().st_size > _MEDIA_MIN_VIDEO_BYTES:
         try:
             if compressed.stat().st_mtime >= src_mtime:
+                cached_size = compressed.stat().st_size
+                if cached_size >= size and size <= _VIDEO_SEND_MAX_BYTES:
+                    _log.warning(
+                        "video_compress_cache_inflated | src=%s | original=%d | cached=%d | fallback=source",
+                        src.name,
+                        size,
+                        cached_size,
+                    )
+                    compressed.unlink(missing_ok=True)
+                    return src
+                if cached_size > _VIDEO_SEND_MAX_BYTES and size <= _VIDEO_SEND_MAX_BYTES:
+                    _log.warning(
+                        "video_compress_cache_too_large_keep_source | src=%s | original=%d | cached=%d | max=%d",
+                        src.name,
+                        size,
+                        cached_size,
+                        _VIDEO_SEND_MAX_BYTES,
+                    )
+                    compressed.unlink(missing_ok=True)
+                    return src
                 cached_info = _read_media_stream_info_sync(compressed)
                 cached_has_audio = bool(normalize_text(cached_info.get("audio_codec", "")))
                 if src_has_audio and not cached_has_audio:

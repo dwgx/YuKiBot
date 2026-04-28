@@ -188,6 +188,23 @@ class AppHelpersNapCatMediaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(app_helpers._video_strategy_allows_upload_fallback("direct_with_file_fallback"))
         self.assertTrue(app_helpers._video_strategy_upload_first("upload_file_first"))
 
+    def test_inflated_cached_compressed_video_falls_back_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            src = Path(tmpdir) / "demo.mp4"
+            compressed = src.with_suffix(".compressed.mp4")
+            src.write_bytes(b"s" * (190 * 1024))
+            compressed.write_bytes(b"c" * (220 * 1024))
+
+            with patch.object(
+                app_helpers,
+                "_read_media_stream_info_sync",
+                lambda path: {"video_codec": "h264", "audio_codec": "", "pix_fmt": "yuv420p"},
+            ):
+                result = app_helpers._compress_video_sync(src, max_bytes=180 * 1024)
+
+        self.assertEqual(result, src)
+        self.assertFalse(compressed.exists())
+
     def test_stage_media_for_napcat_copies_to_configured_directory(self) -> None:
         with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as stage_dir:
             video = Path(src_dir) / "demo.mp4"
