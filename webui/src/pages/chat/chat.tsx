@@ -282,6 +282,17 @@ export default function ChatPage() {
   const shrinkThinkingIsland = useCallback(() => {
     setThinkingIslandWidth((prev) => clampThinkingIslandWidth(prev - 120));
   }, []);
+  const expandThinkingIsland = useCallback(() => {
+    setThinkingIslandWidth((prev) => clampThinkingIslandWidth(Math.max(prev, THINKING_ISLAND_DEFAULT_WIDTH.lg)));
+    setThinkingIslandExpanded(true);
+  }, []);
+  const toggleThinkingIslandExpanded = useCallback(() => {
+    if (thinkingIslandExpanded) {
+      setThinkingIslandExpanded(false);
+      return;
+    }
+    expandThinkingIsland();
+  }, [expandThinkingIsland, thinkingIslandExpanded]);
   const beginThinkingIslandResize = useCallback((evt: ReactPointerEvent<HTMLDivElement>) => {
     if (evt.button !== 0) return;
     evt.preventDefault();
@@ -1448,7 +1459,7 @@ export default function ChatPage() {
                     damping: 24,
                     mass: 0.75
                   }}
-                  className="pointer-events-none fixed inset-x-0 top-3 z-[120] flex justify-center px-3"
+                  className={`thinking-island-overlay-host pointer-events-none fixed inset-x-0 top-3 z-[120] flex justify-center px-3 ${thinkingIslandExpanded ? "is-expanded" : ""}`}
                 >
                   <motion.div
                     drag
@@ -1461,7 +1472,7 @@ export default function ChatPage() {
                       x: thinkingIslandOffset.x,
                       y: thinkingIslandOffset.y,
                       width: getThinkingIslandWidthStyle(thinkingIslandWidth),
-                      maxWidth: "calc(100vw - 24px)",
+                      maxWidth: thinkingIslandExpanded ? "calc(100vw - 32px)" : "calc(100vw - 24px)",
                       touchAction: "none",
                     }}
                     whileDrag={{ scale: 1.02, boxShadow: "0 20px 40px rgba(0,0,0,0.15)" }}
@@ -1475,7 +1486,7 @@ export default function ChatPage() {
                         y: thinkingIslandDragOriginRef.current.y + info.offset.y,
                       }, thinkingIslandWidth));
                     }}
-                    className={`pointer-events-auto select-none overflow-hidden rounded-2xl border border-primary/20 bg-content1/95 shadow-lg backdrop-blur-xl ${thinkingActive ? "thinking-island-live" : ""}`}
+                    className={`thinking-island-panel pointer-events-auto select-none overflow-hidden rounded-2xl border border-primary/20 bg-content1/95 shadow-lg backdrop-blur-xl ${thinkingIslandExpanded ? "is-expanded" : ""} ${thinkingActive ? "thinking-island-live" : ""}`}
                   >
                     <div
                       className="thinking-island-resize-handle absolute inset-y-3 right-0 z-20 w-2 cursor-ew-resize"
@@ -1491,7 +1502,7 @@ export default function ChatPage() {
                     <div
                       className="flex select-none items-start gap-2 px-3 py-2"
                       onPointerDown={beginThinkingIslandDrag}
-                      onDoubleClick={() => setThinkingIslandExpanded((prev) => !prev)}
+                      onDoubleClick={toggleThinkingIslandExpanded}
                     >
                       <div
                         className="flex h-9 w-9 shrink-0 cursor-grab items-center justify-center rounded-full bg-primary/10 ring-1 ring-primary/20 select-none touch-none active:cursor-grabbing"
@@ -1576,7 +1587,7 @@ export default function ChatPage() {
                           size="sm"
                           variant="light"
                           isIconOnly
-                          onPress={() => setThinkingIslandExpanded((prev) => !prev)}
+                          onPress={toggleThinkingIslandExpanded}
                           className="text-default-600"
                         >
                           {thinkingIslandExpanded ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
@@ -1611,70 +1622,72 @@ export default function ChatPage() {
                           }}
                           className="overflow-hidden border-t border-default-200"
                         >
-                          <div className="grid grid-cols-2 gap-2 px-3 pt-2 text-[10px] text-default-500">
+                          <div className="grid grid-cols-2 gap-2 px-3 pt-2 text-[10px] text-default-500 md:grid-cols-4">
                             <div className="truncate">trace: {selectedState?.last_trace_id || selectedState?.latest_trace_id || "等待分配"}</div>
                             <div className="text-right">尺寸: {thinkingIslandSize.toUpperCase()} / {Math.round(thinkingIslandWidth)}px</div>
                             <div>最近流包: {lastStreamPacketLabel}</div>
                             <div className="text-right">累计流包: {thinkingStreamPacketCount}</div>
                           </div>
-                          <div
-                            ref={thinkingScrollRef}
-                            style={{ maxHeight: `${thinkingIslandHeight}px` }}
-                            className="mt-1 space-y-1.5 overflow-auto px-3 py-2"
-                          >
-                            {thinkingPreviewLines.length === 0 && (
-                              <p className="text-xs text-default-500">已接入会话，等待更具体的思考流。</p>
-                            )}
-                            {thinkingPreviewLines.map((line, idx) => (
-                              <motion.div
-                                key={`${idx}-${line}`}
-                                initial={{ opacity: 0, y: 8, scale: 0.96 }}
-                                animate={{ opacity: 1, y: 0, scale: 1 }}
-                                exit={{ opacity: 0, scale: 0.96 }}
-                                transition={{
-                                  type: "spring",
-                                  stiffness: 400,
-                                  damping: 30,
-                                  mass: 0.5,
-                                  delay: idx * 0.015
-                                }}
-                                className="rounded-2xl border border-default-200 bg-content2/80 px-3 py-2 text-xs text-default-700 backdrop-blur-sm"
-                              >
-                                {line}
-                              </motion.div>
-                            ))}
-                          </div>
-                          <div className="space-y-2 px-3 pb-3">
-                            <Textarea
-                              label="临时改目标"
-                              labelPlacement="outside"
-                              minRows={1}
-                              value={thinkingDraft}
-                              onValueChange={setThinkingDraft}
-                              onKeyDown={onRetargetInputKeyDown}
-                              placeholder="比如：先别继续搜图，先给我3个候选并说明理由"
-                              classNames={INPUT_CLASSES}
-                            />
-                            <div className="flex flex-wrap items-center justify-end gap-2">
-                              <Button
-                                size="sm"
-                                color="warning"
-                                variant="flat"
-                                startContent={<Square size={13} />}
-                                onPress={interruptConversation}
-                                isDisabled={!thinkingActive || sending}
-                              >
-                                取消当前任务
-                              </Button>
-                              <Button
-                                size="sm"
-                                color="primary"
-                                onPress={retargetConversation}
-                                isDisabled={!thinkingDraft.trim() || retargeting}
-                                isLoading={retargeting}
-                              >
-                                强制改目标
-                              </Button>
+                          <div className="thinking-island-expanded-grid px-3 py-2">
+                            <div
+                              ref={thinkingScrollRef}
+                              style={{ maxHeight: `${thinkingIslandHeight}px` }}
+                              className="space-y-1.5 overflow-auto pr-1"
+                            >
+                              {thinkingPreviewLines.length === 0 && (
+                                <p className="text-xs text-default-500">已接入会话，等待更具体的思考流。</p>
+                              )}
+                              {thinkingPreviewLines.map((line, idx) => (
+                                <motion.div
+                                  key={`${idx}-${line}`}
+                                  initial={{ opacity: 0, y: 8, scale: 0.96 }}
+                                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                                  exit={{ opacity: 0, scale: 0.96 }}
+                                  transition={{
+                                    type: "spring",
+                                    stiffness: 400,
+                                    damping: 30,
+                                    mass: 0.5,
+                                    delay: idx * 0.015
+                                  }}
+                                  className="rounded-2xl border border-default-200 bg-content2/80 px-3 py-2 text-xs text-default-700 backdrop-blur-sm"
+                                >
+                                  {line}
+                                </motion.div>
+                              ))}
+                            </div>
+                            <div className="space-y-2">
+                              <Textarea
+                                label="临时改目标"
+                                labelPlacement="outside"
+                                minRows={3}
+                                value={thinkingDraft}
+                                onValueChange={setThinkingDraft}
+                                onKeyDown={onRetargetInputKeyDown}
+                                placeholder="比如：先别继续搜图，先给我3个候选并说明理由"
+                                classNames={INPUT_CLASSES}
+                              />
+                              <div className="flex flex-wrap items-center justify-end gap-2">
+                                <Button
+                                  size="sm"
+                                  color="warning"
+                                  variant="flat"
+                                  startContent={<Square size={13} />}
+                                  onPress={interruptConversation}
+                                  isDisabled={!thinkingActive || sending}
+                                >
+                                  取消当前任务
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  color="primary"
+                                  onPress={retargetConversation}
+                                  isDisabled={!thinkingDraft.trim() || retargeting}
+                                  isLoading={retargeting}
+                                >
+                                  强制改目标
+                                </Button>
+                              </div>
                             </div>
                           </div>
                         </motion.div>

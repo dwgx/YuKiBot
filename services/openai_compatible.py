@@ -155,10 +155,25 @@ class OpenAICompatibleClient(BaseLLMClient):
                 )
             except Exception as exc:
                 is_empty = "返回为空" in str(exc)
-                if not is_empty and not self.allow_response_fallback_to_chat:
+                gateway_fallback = self._is_responses_gateway_fallback_worthy(exc)
+                if (
+                    not is_empty
+                    and not self.allow_response_fallback_to_chat
+                    and not gateway_fallback
+                ):
                     raise
-                if not is_empty and not self._is_responses_fallback_worthy(exc):
+                if (
+                    not is_empty
+                    and not gateway_fallback
+                    and not self._is_responses_fallback_worthy(exc)
+                ):
                     raise
+                _log.warning(
+                    "responses_endpoint_fallback_to_chat | provider=%s | model=%s | err=%s",
+                    self.provider,
+                    model_name,
+                    str(exc)[:220],
+                )
 
         try:
             data = await self._post_with_base_candidates(
@@ -760,5 +775,23 @@ class OpenAICompatibleClient(BaseLLMClient):
             "responses endpoint",
             "no route",
             "method not allowed",
+        )
+        return any(cue in msg for cue in cues)
+
+    @staticmethod
+    def _is_responses_gateway_fallback_worthy(exc: Exception) -> bool:
+        msg = str(exc or "").lower()
+        if "cooling down" in msg or "all credentials for model" in msg:
+            return False
+        cues = (
+            "接口返回非 json",
+            "non json",
+            "invalid json",
+            "<!doctype",
+            "bad gateway",
+            "gateway timeout",
+            "502",
+            "503",
+            "504",
         )
         return any(cue in msg for cue in cues)

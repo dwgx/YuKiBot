@@ -69,6 +69,40 @@ html.theme-animating * {
   animation: thinkingIslandGlow 3.2s cubic-bezier(0.33, 1, 0.68, 1) infinite;
 }
 
+.thinking-island-overlay-host {
+  padding-inline: max(0.75rem, env(safe-area-inset-left)) max(0.75rem, env(safe-area-inset-right));
+}
+
+.thinking-island-overlay-host.is-expanded {
+  top: max(0.75rem, env(safe-area-inset-top));
+}
+
+.thinking-island-panel {
+  transition:
+    border-color 180ms ease,
+    background-color 180ms ease,
+    box-shadow 180ms ease;
+}
+
+.thinking-island-panel.is-expanded {
+  box-shadow:
+    0 24px 64px rgba(15, 23, 42, 0.18),
+    0 0 0 1px rgba(59, 130, 246, 0.08);
+}
+
+.thinking-island-expanded-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.75rem;
+}
+
+@media (min-width: 900px) {
+  .thinking-island-expanded-grid {
+    grid-template-columns: minmax(0, 1fr) minmax(280px, 340px);
+    align-items: start;
+  }
+}
+
 @keyframes thinkingProgressSweep {
   0% {
     transform: translateX(-140%);

@@ -106,6 +106,39 @@ class _OpenAIModelFallbackHtmlClient(_OpenAIModelFallbackClient):
         return {"choices": [{"message": {"role": "assistant", "content": "model-ok"}}]}
 
 
+class _OpenAIResponsesHtmlFallbackClient(OpenAICompatibleClient):
+    def __init__(self) -> None:
+        super().__init__(
+            config={
+                "api_key": "x",
+                "base_url": "https://newapi.example",
+                "model": "gpt-test",
+                "endpoint_type": "openai_response",
+                "stream_chat_completions": False,
+            },
+            provider="newapi",
+            default_base_url="https://newapi.example/v1",
+            default_env_key="NEWAPI_API_KEY",
+            prefer_v1=True,
+        )
+        self.calls: list[tuple[str, str]] = []
+
+    async def _post_with_base_candidates(
+        self,
+        endpoint: str,
+        payload: dict,
+        headers: dict,
+        prefer_v1: bool,
+        stream_response: bool = False,
+    ) -> dict:
+        _ = headers, prefer_v1, stream_response
+        model = str(payload.get("model", ""))
+        self.calls.append((endpoint, model))
+        if endpoint == "/responses":
+            raise RuntimeError("接口返回非 JSON：<!doctype html><html>")
+        return {"choices": [{"message": {"role": "assistant", "content": "chat-ok"}}]}
+
+
 class ModelClientFailoverRegressionTests(unittest.TestCase):
     def _build_client(self) -> ModelClient:
         cfg = {
@@ -211,6 +244,19 @@ class ModelClientFailoverRegressionTests(unittest.TestCase):
 
         self.assertEqual(result, "model-ok")
         self.assertEqual(client.models_seen, ["bad-model", "good-model"])
+
+    def test_responses_html_falls_back_to_chat_completions(self) -> None:
+        client = _OpenAIResponsesHtmlFallbackClient()
+
+        result = asyncio.run(
+            client.chat_text(messages=[{"role": "user", "content": "ping"}])
+        )
+
+        self.assertEqual(result, "chat-ok")
+        self.assertEqual(
+            client.calls,
+            [("/responses", "gpt-test"), ("/chat/completions", "gpt-test")],
+        )
 
 
 if __name__ == "__main__":

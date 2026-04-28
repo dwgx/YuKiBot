@@ -202,7 +202,12 @@ class ToolVideoMixin:
             return ToolResult(
                 ok=False,
                 tool_name=method_name,
-                payload={"text": "当前只支持抖音/快手/B站/AcFun 视频链接解析"},
+                payload={
+                    "text": (
+                        "parse_video 只支持抖音/快手/B站/AcFun/腾讯视频/"
+                        "爱奇艺/YouTube/优酷/直链视频。"
+                    )
+                },
                 error="unsupported_video_platform",
             )
         if not self._is_platform_video_detail_url(url):
@@ -2987,6 +2992,8 @@ class ToolVideoMixin:
             return "B站限流了（412），稍等一会儿再试就好。也可以换个链接。"
         if code == "video_no_audio_all_formats":
             return "这条视频解析到的都是无音轨版本（发送后会没声音），我已拦截。你换个分享链接我再试。"
+        if code == "iqiyi_phantomjs_missing":
+            return "这条爱奇艺/iQ.com 链接需要 PhantomJS 才能解析，当前运行环境没有这个依赖。请安装 PhantomJS 后再试，或换一个可公开下载的视频链接。"
         if code == "parse_api_failed":
             return "解析服务这次没拿到可用直链。你可以重发原视频链接，我会继续尝试本地解析。"
         if code == "resolver_disabled":
@@ -3104,6 +3111,8 @@ class ToolVideoMixin:
             )
             if download_error == "video_no_audio_all_formats":
                 self._last_video_resolve_diagnostic[url] = "video_no_audio_all_formats"
+            elif download_error == "iqiyi_phantomjs_missing":
+                self._last_video_resolve_diagnostic[url] = "iqiyi_phantomjs_missing"
             elif "Requested format is not available" in download_error:
                 self._last_video_resolve_diagnostic[url] = "format_unavailable"
             elif (
@@ -3294,6 +3303,7 @@ class ToolVideoMixin:
         is_acfun = "acfun.cn" in host or "acfun.com" in host
         is_youtube = "youtube.com" in host or host.endswith("youtu.be")
         is_iqiyi = "iqiyi.com" in host or "qiyi.com" in host or "iq.com" in host
+        is_bilibili = "bilibili.com" in host or host.endswith("b23.tv")
         is_tencent = "v.qq.com" in host or (
             "qq.com" in host
             and "/x/" in normalize_text(urlparse(source_url).path).lower()
@@ -3314,7 +3324,7 @@ class ToolVideoMixin:
             "logger": _SilentYTDLPLogger(),
         }
         # B站: 添加 try_look=1 参数，无需登录即可获取 720p/1080p
-        if "bilibili.com" in host or host.endswith("b23.tv"):
+        if is_bilibili:
             common_options["extractor_args"] = {"BiliBili": {"try_look": ["1"]}}
             bili_headers = dict(common_options.get("http_headers") or {})
             bili_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -3332,7 +3342,7 @@ class ToolVideoMixin:
             common_options["cookiesfrombrowser"] = (self._video_cookies_from_browser,)
         _tmp_cookie_file = self._inject_platform_cookiefile(common_options, source_url)
 
-        if "bilibili.com" in host or host.endswith("b23.tv"):
+        if is_bilibili:
             # B站经常是分段流；无 ffmpeg 时优先单文件中低清晰度，保证可发
             # 优先 h264(avc) 编码，避免 av1 导致 NapCat 缩略图生成失败。
             # 放宽格式限制，增加更多 fallback 避免 "Requested format is not available"
@@ -3398,8 +3408,10 @@ class ToolVideoMixin:
             # AcFun HLS 的 best 往往会选 720p60/1080p，群聊投递容易超时。
             # 先取小清晰度，必要时再回退到高码率。
             format_candidates = [
+                "bestvideo[height<=480]/bv*[height<=480]/best[height<=480]",
                 "best[ext=mp4][height<=480]/best[height<=480]",
                 "best[ext=mp4][height<=540]/best[height<=540]",
+                "bestvideo[height<=720]/bv*[height<=720]/best[height<=720]",
                 "best[ext=mp4][height<=720]/best[height<=720]",
                 "best[ext=mp4]",
                 "best",
@@ -3452,6 +3464,8 @@ class ToolVideoMixin:
             )
             if iqiyi_path is not None:
                 return iqiyi_path
+            if self._last_video_download_error.get(source_url) == "iqiyi_phantomjs_missing":
+                return None
         require_audio = bool(
             "bilibili.com" in host
             or host.endswith("b23.tv")
@@ -3578,16 +3592,17 @@ class ToolVideoMixin:
                                 clip_text(last_error, 120),
                             )
                             return fallback_after_error
-                    # 412 Precondition Failed: B站限流，等待后重试下一个格式
-                    if "412" in last_error:
+                    # 412 Precondition Failed: B站风控/限流，继续撞格式会拖慢 80s+ 且无收益。
+                    if is_bilibili and "412" in last_error:
+                        self._last_video_download_error[source_url] = (
+                            "bilibili_412_throttled"
+                        )
                         _ytdlp_log.warning(
-                            "video_download_412_throttled%s | url=%s | waiting",
+                            "video_download_412_throttled%s | url=%s | abort_fast",
                             _tool_trace_tag(),
                             source_url[:80],
                         )
-                        import time
-
-                        time.sleep(2)
+                        break
                     continue
 
             fallback = self._pick_downloaded_video_fallback(digest)
@@ -3621,7 +3636,7 @@ class ToolVideoMixin:
                 )
                 return None
             if last_error:
-                self._last_video_download_error[source_url] = last_error
+                self._last_video_download_error.setdefault(source_url, last_error)
             return None
         finally:
             if _tmp_cookie_file:
@@ -3671,7 +3686,10 @@ class ToolVideoMixin:
                 **macos_subprocess_kwargs(),
             )
         except Exception as exc:
-            self._last_video_download_error[source_url] = normalize_text(str(exc))
+            err = normalize_text(str(exc))
+            if "phantomjs" in err.lower() and "not found" in err.lower():
+                err = "iqiyi_phantomjs_missing"
+            self._last_video_download_error[source_url] = err
             return None
 
         fallback = self._pick_iqiyi_subprocess_output(digest)
@@ -3695,6 +3713,8 @@ class ToolVideoMixin:
                 return fallback
 
         err = normalize_text((proc.stderr or proc.stdout or "").strip())
+        if "phantomjs" in err.lower() and "not found" in err.lower():
+            err = "iqiyi_phantomjs_missing"
         self._last_video_download_error[source_url] = err or f"yt_dlp_exit_{proc.returncode}"
         _ytdlp_log.warning(
             "iqiyi_subprocess_download_failed%s | code=%s | error=%s",

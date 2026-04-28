@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
+import core.tools_video as tools_video
 from core.agent import AgentLoop
 from core.agent_tools_search import _infer_media_search_type
 from core.config_templates import _built_in_config_defaults
@@ -16,6 +19,46 @@ from core.trigger import TriggerEngine
 class _DummyExecutor(ToolExecutor):
     def __init__(self) -> None:
         super().__init__(None, None, lambda *args, **kwargs: None, {})
+
+
+class _Bilibili412YoutubeDL:
+    calls: list[str] = []
+
+    def __init__(self, options: dict) -> None:
+        self.options = options
+        self.calls.append(str(options.get("format", "")))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def extract_info(self, source_url: str, download: bool = True):
+        _ = source_url, download
+        raise RuntimeError("HTTP Error 412: Precondition Failed")
+
+
+class _AcFunVideoOnlyYoutubeDL:
+    calls: list[str] = []
+
+    def __init__(self, options: dict) -> None:
+        self.options = options
+        self.calls.append(str(options.get("format", "")))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+    def extract_info(self, source_url: str, download: bool = True):
+        _ = source_url, download
+        outtmpl = str(self.options.get("outtmpl", ""))
+        path = Path(outtmpl.replace("%(id)s", "ac10315127").replace("%(ext)s", "mp4"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 1024)
+        return {"requested_downloads": [{"filepath": str(path)}]}
 
 
 class LocalIntentHeuristicRegressionTests(unittest.TestCase):
@@ -59,6 +102,71 @@ class LocalIntentHeuristicRegressionTests(unittest.TestCase):
         self.assertTrue(executor._video_require_audio_for_send)
         self.assertTrue(executor._allow_silent_video_for_url("https://www.acfun.cn/v/ac10315127"))
         self.assertFalse(executor._allow_silent_video_for_url("https://www.bilibili.com/video/BV1xx411c7mD/"))
+
+    def test_bilibili_412_aborts_after_first_format(self) -> None:
+        executor = _DummyExecutor()
+        url = "https://www.bilibili.com/video/BV1xx411c7mD/"
+        _Bilibili412YoutubeDL.calls = []
+
+        with patch.object(tools_video, "YoutubeDL", _Bilibili412YoutubeDL):
+            result = executor._download_platform_video_sync(url)
+
+        self.assertIsNone(result)
+        self.assertEqual(len(_Bilibili412YoutubeDL.calls), 1)
+        self.assertEqual(
+            executor._last_video_download_error.get(url),
+            "bilibili_412_throttled",
+        )
+
+    def test_acfun_video_only_returns_first_valid_file(self) -> None:
+        executor = _DummyExecutor()
+        url = "https://www.acfun.cn/v/ac10315127"
+        _AcFunVideoOnlyYoutubeDL.calls = []
+
+        with patch.object(tools_video, "YoutubeDL", _AcFunVideoOnlyYoutubeDL):
+            result = executor._download_platform_video_sync(url)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(_AcFunVideoOnlyYoutubeDL.calls), 1)
+        self.assertTrue(str(result).endswith(".mp4"))
+        executor._safe_unlink(result)
+
+    def test_video_unsupported_message_lists_all_supported_platforms(self) -> None:
+        executor = _DummyExecutor()
+
+        result = asyncio.run(
+            executor._method_browser_resolve_video(
+                "parse_video",
+                {"url": "https://example.com/watch?v=1"},
+                "",
+            )
+        )
+
+        text = str((result.payload or {}).get("text", ""))
+        self.assertFalse(result.ok)
+        self.assertIn("腾讯视频", text)
+        self.assertIn("爱奇艺", text)
+        self.assertIn("YouTube", text)
+        self.assertIn("优酷", text)
+
+    def test_iqiyi_phantomjs_missing_has_specific_diagnostic(self) -> None:
+        executor = _DummyExecutor()
+        url = "https://www.iqiyi.com/v_19rr7p0r18.html"
+        proc = SimpleNamespace(returncode=1, stderr="PhantomJS not found", stdout="")
+
+        with patch.object(tools_video.subprocess, "run", return_value=proc):
+            result = executor._download_iqiyi_video_subprocess_sync(
+                url,
+                "iqiyi-test",
+                str(executor._video_cache_dir / "iqiyi-test_%(id)s.%(ext)s"),
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(executor._last_video_download_error.get(url), "iqiyi_phantomjs_missing")
+        self.assertIn(
+            "PhantomJS",
+            executor._build_video_resolve_failed_text("iqiyi_phantomjs_missing"),
+        )
 
     def test_directed_image_still_enters_agent(self) -> None:
         engine = YukikoEngine.__new__(YukikoEngine)
